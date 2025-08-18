@@ -43,6 +43,54 @@ go version
 
 Project prep:
 
+After Creating a github reprository and cloning it into the WSL: cloning doesn’t log you in. Even if it’s your repo, pushing needs authentication. The easiest, solid fix is to use SSH for this cloned repo.
+
+Follow these steps exactly (in WSL, inside ~/coinbase):
+
+1) Confirm you’re on the right repo/branch
+cd ~/coinbase
+git remote -v     # should show https://github.com/chidi150c/coinbase.git
+git status
+
+2) Create an SSH key in WSL (skip if you already have one)
+ssh-keygen -t ed25519 -C "chidi150c@gmail.com"
+# press Enter to accept defaults
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/id_ed25519
+cat ~/.ssh/id_ed25519.pub
+
+
+Copy the output.
+
+3) Add the key to GitHub
+
+GitHub → Settings → SSH and GPG keys → New SSH key → paste the key → Save.
+
+Test from WSL:
+
+ssh -T git@github.com
+# Expect: "Hi chidi150c! You've successfully authenticated…"
+
+4) Point this repo’s remote to SSH (away from HTTPS)
+git remote set-url origin git@github.com:chidi150c/coinbase.git
+git remote -v   # now should show git@github.com:chidi150c/coinbase.git
+
+5) Ensure your branch is named main, then push
+git branch -M main           # rename current branch to main (safe if it's new)
+git push -u origin main
+
+
+That’s it. You should now be able to push without any VS Code credential helper errors.
+
+Why this works (quickly):
+
+Your repo was cloned via HTTPS, which needs a token/password to push.
+
+Switching to SSH uses your SSH key instead—no prompts, no Windows helper sockets.
+
+
+
+
 mkdir -p ~/coinbot && cd ~/coinbot
 go mod init example.com/coinbot
 # create .env, paste variables
