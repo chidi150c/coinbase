@@ -1,1 +1,68 @@
+# ---- OS / Editors ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- Logs & PIDs ----
+*.log
+bot.log
+nohup.out
+*.pid
+
+# ---- Secrets & Env (keep example) ----
 .env
+.env.*
+!.env.example
+*.envrc
+
+# Certificates / keys (sidecar PEM lives in .env but be safe)
+*.pem
+*.key
+*.crt
+*.p12
+*.der
+*.jks
+*.keystore
+
+# ---- Go build artifacts ----
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.test
+cover.out
+coverage/
+build/
+dist/
+out/
+bin/
+tmp/
+
+# ---- Python (FastAPI sidecar) ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+.venv/
+venv/
+env/
+.cache/
+.pytest_cache/
+htmlcov/
+
+# ---- Data / scratch ----
+runs/
+tmp/
+*.sqlite*
+*.db
+*.csv.tmp
+*.json.tmp
+
+# ---- Docker / local overrides (if any) ----
+docker-compose.override.yml
+*.local.yml
