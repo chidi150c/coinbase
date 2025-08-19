@@ -1,0 +1,4 @@
+coinbase-advanced-py
+fastapi
+uvicorn
+python-dotenv
