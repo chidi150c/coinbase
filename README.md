@@ -367,3 +367,313 @@ Multiline PEM issues
 Keep the PEM in .env exactly as a single line with \n sequences; the sidecar expands them automatically.
 
 ============================================================================================
+
+# 5) Restart Prometheus cleanly
+docker compose down
+docker compose up -d prometheus
+
+# get the IP address of the WSL VM
+ip -4 addr show eth0 | awk '/inet /{print $2}' | cut -d/ -f1
+
+cd ~/coinbase/monitoring
+docker compose down
+docker compose up -d --build
+
+# Prometheus Targets
+# -> http://localhost:9090/targets   (coinbase-bot should be UP)
+
+# Quick queries (Prometheus /graph)
+# bot_decisions_total
+# bot_orders_total
+# bot_equity_usd
+
+1. Find the running Go process
+ps aux | grep '[g]o run'
+
+
+or, if you compiled it:
+
+ps aux | grep '[c]oinbase'
+
+
+That will show the PID(s) of any leftover bot processes.
+
+2. Kill the process
+
+Example (replace 12345 with the PID you saw):
+
+kill -9 12345
+
+
+If multiple:
+
+pkill -f "go run"
+pkill -f "coinbase"
+
+3. Verify it’s gone
+ps aux | grep coinbase
+
+1. Make the env directory
+sudo mkdir -p /opt/coinbase/env
+sudo chown root:root /opt/coinbase/env
+sudo chmod 700 /opt/coinbase/env
+
+2. Create bot.env
+sudo nano /opt/coinbase/env/bot.env
+sudo nano /opt/coinbase/env/bridge.env
+
+Paste this content:
+
+Beautiful — everything rebuilt and started cleanly 🎉
+
+Do these quick verifications:
+
+Prometheus targets
+Open: http://localhost:9090/targets
+
+Expect:
+
+prometheus → UP
+
+coinbase-bot → UP (scraping bot:8080)
+
+Prometheus queries (http://localhost:9090/graph
+)
+Run:
+
+bot_decisions_total
+
+bot_orders_total
+
+bot_equity_usd
+
+Grafana login
+http://localhost:3000
+ (admin / admin on first run)
+
+Optional logs (only if something’s off)
+
+docker logs coinbase-bot --tail=100
+docker logs coinbase-bridge --tail=100
+docker logs prometheus --tail=100
+
+
+If coinbase-bot isn’t UP yet, tell me the status message shown on the Targets page (e.g., DNS fail, connection refused, etc.) and I’ll zero in on it. Otherwise, you’re done with the WSL2↔Docker networking saga — the stack is now production-style with secure env files and internal-only service wiring.
+
+# 1) See the exact error from the bot container
+docker compose logs --no-color --tail=200 bot
+
+# 2) Quick DNS sanity from Prometheus container (optional)
+docker compose exec prometheus sh -lc 'getent hosts bot || echo "no getent"; echo ---; (wget -qO- http://bot:8080/metrics | head) || echo "wget failed"'
+
+
+docker logs coinbase-bot --tail=50
+
+==========================================================================================
+
+Coinbase Monitoring Stack – Troubleshooting Procedure
+1. Manage containers
+
+Bring the stack down and back up (clean build):
+
+cd ~/coinbase/monitoring
+docker compose down
+docker compose up -d --build
+
+
+Check running containers:
+
+docker compose ps
+
+2. Inspect logs
+
+Follow logs for a specific service:
+
+docker logs -f coinbase-bot
+docker logs -f coinbase-bridge
+docker logs -f prometheus
+docker logs -f grafana
+
+
+Tail last 50 lines:
+
+docker logs coinbase-bot --tail=50
+
+3. Restart a single service
+
+Stop + remove only the bot, then rebuild it:
+
+docker compose stop bot
+docker compose rm -f bot
+docker compose up -d --build bot
+
+4. Debug connectivity inside containers
+
+Enter a container shell:
+
+docker exec -it coinbase-bot /bin/sh
+
+
+Test connectivity to bridge:
+
+curl http://bridge:8787/health
+curl http://bridge:8787/candles?granularity=ONE_MINUTE&limit=2&product_id=BTC-USD
+
+5. Verify Prometheus scraping
+
+Open Prometheus targets page in browser:
+
+http://localhost:9090/targets
+
+
+Or query from CLI inside Prometheus container:
+
+docker exec -it prometheus /bin/sh
+curl http://bot:8080/metrics
+
+6. Environment & configuration edits
+
+Edit bot environment file:
+
+sudo nano /opt/coinbase/env/bot.env
+
+
+Edit Prometheus config:
+
+sudo nano ~/coinbase/monitoring/prometheus.yml
+
+
+✅ With these, you have a full troubleshooting workflow:
+
+Rebuild stack
+
+Check container status
+
+Inspect logs for errors
+
+Restart individual services
+
+Test inter-service connectivity
+
+Verify Prometheus targets
+
+Adjust environment/config files
+
+sudoedit /opt/coinbase/env/bot.env
+sudoedit /opt/coinbase/env/bridge.env
+docker compose up -d --build bot bridge
+
+docker exec -it grafana curl http://prometheus:9090/-/healthy
+docker exec -it coinbase-bot curl http://localhost:8080/metrics
+
+================================================================================================
+More About Paper Mode
+================================================================================================
+
+In our setup, paper mode means the bot runs end-to-end exactly like live trading except it doesn’t place real orders. Orders are simulated inside the bot’s paper broker and we still pull real market data via the bridge.
+
+What paper mode does (in our bot)
+
+Real-time market data: fetched from the FastAPI bridge (/candles, /product, etc.).
+
+Signals & risk checks: the strategy, MA filters, thresholds, and safeties all run the same.
+
+Order simulation: when the strategy decides to trade, it calls the broker interface; with DRY_RUN=true, the paper broker is used (no Coinbase order is sent).
+
+Portfolio tracking: paper broker updates a simulated USD cash balance and position; fills are typically modeled as immediate market fills near the quote price (implementation in broker_paper.go).
+
+Monitoring: Prometheus shows:
+
+bot_decisions_total{signal="buy|sell|flat"}
+
+bot_orders_total{mode="paper",side="BUY|SELL"} (increments on simulated fills)
+
+bot_equity_usd (paper equity curve)
+
+Safety rails still apply: LONG_ONLY=true, ORDER_MIN_USD, MAX_DAILY_LOSS_PCT stop new orders or size them down in paper just like live.
+
+Why it’s useful
+
+Safe forward testing: run against live prices without risking funds.
+
+Tune thresholds: adjust env knobs and watch decisions/orders/equity in Grafana.
+
+Ops rehearsal: validates bridge, env, logging, metrics, dashboards, and alerts.
+
+What paper mode can’t prove (limitations)
+
+Execution reality: no real slippage, spread widening, or partial fills; paper assumes “ideal” market-order fills.
+
+Exchange constraints: won’t hit real rate limits, auth errors, order throttles, maintenance windows, or venue outages.
+
+Liquidity effects: doesn’t account for your order moving the market; depth isn’t modeled.
+
+Fees & rebates: unless explicitly modeled, fees may be ignored or approximated.
+
+Balance/transfer flows: no actual fiat/crypto settlement, reserving, or withdrawal holds.
+
+Infra edge cases: won’t surface cardinals like webhook callbacks, cancel/replace races, or Coinbase idiosyncrasies.
+
+Typical knobs you can tweak in paper (examples)
+
+(These are examples—use the actual env keys your strategy.go and model.go read.)
+
+Probability/thresholds: e.g., PUP_BUY_THRESH=0.53, PUP_SELL_THRESH=0.47
+
+MA filter: MA_FILTER_ENABLED=true|false, MA_FAST=10, MA_SLOW=30
+
+Trade sizing caps: ORDER_MIN_USD=5.00, MAX_DAILY_LOSS_PCT=1.0
+
+Interval: -interval 15 (seconds between decisions)
+
+If you want to SEE bot_orders_total increment now (still safe)
+
+Temporarily make buys easier (stay long-only):
+
+sudo sed -i 's/^LONG_ONLY=.*/LONG_ONLY=true/' /opt/coinbase/env/bot.env
+sudo sed -i 's/^DRY_RUN=.*/DRY_RUN=true/' /opt/coinbase/env/bot.env
+# Example: lower buy threshold; disable MA filter if you have such flags
+# (replace with your real keys)
+# echo 'PUP_BUY_THRESH=0.52' | sudo tee -a /opt/coinbase/env/bot.env
+# echo 'MA_FILTER_ENABLED=false' | sudo tee -a /opt/coinbase/env/bot.env
+
+cd ~/coinbase/monitoring
+docker compose up -d --build bot
+
+
+Watch:
+
+Prometheus: increase(bot_orders_total[5m])
+
+Logs: docker logs -f coinbase-bot
+
+Graduating to live (only when you explicitly opt in)
+
+Set API keys in /opt/coinbase/env/bot.env and /opt/coinbase/env/bridge.env.
+
+Flip DRY_RUN=false (keep LONG_ONLY=true if you want).
+
+Keep ORDER_MIN_USD small and MAX_DAILY_LOSS_PCT protective.
+
+Kill switch: docker compose stop bot (or revert DRY_RUN=true) immediately restores paper mode.
+
+If you want, paste the small section of your strategy.go that reads envs and I’ll give precise key names + safe example values tailored to your bot for paper-mode tuning.
+
+
+================================================================================================
+docker exec -it coinbase-bot bash
+go run . -backtest /data/candles.csv
+
+
+cd ~/coinbase/monitoring
+
+# Stop the always-on bot so logs are clean (Prom/Grafana/bridge stay up)
+docker compose stop bot
+
+# Sanity: show CSV header you already verified
+docker compose run --rm --no-deps bot \
+  /bin/sh -lc 'head -n 3 /app/data/BTC-USD.csv'
+
+# Run the backtest (safe sandbox)
+docker compose run --rm --no-deps bot \
+  /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1

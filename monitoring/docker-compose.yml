@@ -1,31 +1,74 @@
 version: "3.8"
 
 services:
+  # === Go bot ===
+  bot:
+    image: golang:1.23
+    container_name: coinbase-bot
+    working_dir: /app
+    volumes:
+      - ..:/app                          # mount repo RW so Go can build/run
+    env_file:
+      - /opt/coinbase/env/bot.env        # externalized env
+    command: ["/usr/local/go/bin/go", "run", ".", "-live", "-interval", "15"]
+    expose:
+      - "8080"
+    restart: unless-stopped
+    networks:
+      monitoring_network:
+        aliases: [bot]
+
+  # === FastAPI sidecar ===
+  bridge:
+    image: python:3.11-slim
+    container_name: coinbase-bridge
+    working_dir: /app/bridge
+    volumes:
+      - ../bridge:/app/bridge:ro
+    env_file:
+      - /opt/coinbase/env/bridge.env
+    command: >
+      bash -lc "pip install --no-cache-dir fastapi uvicorn coinbase-advanced-py python-dotenv &&
+                uvicorn app:app --host 0.0.0.0 --port 8787"
+    expose:
+      - "8787"
+    restart: unless-stopped
+    networks:
+      monitoring_network:
+        aliases: [bridge]
+
+  # === Prometheus ===
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - monitoring_prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
-    ports:
-      - "9090:9090"
+    ports: ["9090:9090"]
     restart: unless-stopped
-    extra_hosts:   # 👈 makes host.docker.internal resolve inside container
-      - "host.docker.internal:host-gateway"
+    networks: [monitoring_network]
 
+  # === Grafana ===
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
-    ports:
-      - "3000:3000"
+    ports: ["3000:3000"]
     volumes:
       - monitoring_grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    depends_on: [prometheus, bot, bridge]
+    networks: [monitoring_network]
 
 volumes:
   monitoring_prometheus_data:
   monitoring_grafana_data:
+
+networks:
+  monitoring_network:
+    driver: bridge

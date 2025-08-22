@@ -8,4 +8,4 @@ scrape_configs:
 
   - job_name: "coinbase-bot"
     static_configs:
-      - targets: ["host.docker.internal:8080"]
+      - targets: ["bot:8080"]
