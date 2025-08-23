@@ -677,3 +677,209 @@ docker compose run --rm --no-deps bot \
 # Run the backtest (safe sandbox)
 docker compose run --rm --no-deps bot \
   /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1
+
+
+Verify
+
+Bot logs should show more frequent FLAT→BUY transitions:
+
+docker logs -f coinbase-bot | sed -n 's/.*\(BUY\|FLAT\|SELL\).*/\0/p'
+
+
+Prometheus queries:
+
+sum by (signal) (increase(bot_decisions_total[5m]))
+
+sum by (side,mode) (increase(bot_orders_total[5m]))
+
+Grafana “Orders per 5m (mode/side)” should begin to show bars (BUY/paper).
+
+
+A) Backtest (Prometheus-visible) — no code changes
+
+We’ll run backtest as the bot service (so Prometheus keeps scraping bot:8080), using a one-time compose override.
+
+cd ~/coinbase/monitoring
+
+# 1) Create a temporary override to switch bot into backtest mode
+cat > docker-compose.override.yml <<'YAML'
+services:
+  bot:
+    command: ["/usr/local/go/bin/go", "run", ".", "-backtest", "/app/data/BTC-USD.csv", "-interval", "1"]
+YAML
+
+# 2) Bring up Prometheus/Grafana/bridge (if not already up)
+docker compose up -d prometheus grafana bridge
+
+# 3) Start the bot (now running the backtest under the service name "bot")
+docker compose up -d --build bot
+==============================================================
+cd ~/coinbase/monitoring
+
+# create/overwrite the override to run backtest as the bot service
+cat > docker-compose.override.yml <<'YAML'
+services:
+  bot:
+    command: ["/usr/local/go/bin/go", "run", ".", "-backtest", "/app/data/BTC-USD.csv", "-interval", "1"]
+YAML
+
+# sanity check
+echo "---- override ----"
+cat docker-compose.override.yml
+==========================================================
+docker compose up -d prometheus grafana bridge
+docker compose up -d --build bot
+docker logs -f coinbase-bot
+============================================================
+# Edit bot env (add or update these keys)
+sudo sed -i \
+  -e 's/^BUY_THRESHOLD=.*/BUY_THRESHOLD=0.50/; t; $ a BUY_THRESHOLD=0.50' \
+  -e 's/^SELL_THRESHOLD=.*/SELL_THRESHOLD=0.50/; t; $ a SELL_THRESHOLD=0.50' \
+  -e 's/^USE_MA_FILTER=.*/USE_MA_FILTER=false/; t; $ a USE_MA_FILTER=false' \
+  /opt/coinbase/env/bot.env
+
+# sanity
+grep -E 'BUY_THRESHOLD|SELL_THRESHOLD|USE_MA_FILTER' /opt/coinbase/env/bot.env
+
+
+====================================================================
+✅ main.go (entrypoint)
+
+Loads env/config, builds trader, broker, model.
+
+Starts the HTTP server (/metrics + /healthz) once on cfg.Port (default 8080).
+
+Then branches:
+
+runBacktest(ctx, csvBacktest, trader, model) if -backtest is set and -live is false.
+
+Otherwise, runLive(...).
+
+On exit, it shuts the server down gracefully
+.
+
+👉 This is correct — the metrics goroutine runs in both live and backtest. No port conflict.
+
+✅ backtest.go
+
+Loads candles from CSV.
+
+Splits into train/test.
+
+Calls model.fit(...).
+
+Forces DryRun = true (so all trades are paper).
+
+Loops test candles and calls trader.step(...).
+
+This already increments bot_decisions_total{signal=…} and bot_orders_total{mode="paper",side=…} inside Trader.step.
+
+Ends with mtxPnL.Set(trader.EquityUSD()).
+
+No extra HTTP server code inside backtest anymore
+.
+
+👉 This is also correct — metrics are incremented during backtest, and since main.go already serves /metrics, Prometheus/Grafana can scrape them.
+
+🔒 Invariants confirmed
+
+Single metrics goroutine → no port conflicts.
+
+Metrics names/labels untouched (bot_orders_total, bot_decisions_total, bot_equity_usd).
+
+DRY_RUN=true enforced in backtest.
+
+Backtest and live share the same /metrics endpoint.
+
+✅ So the combination is now stable:
+
+Run docker compose run --rm --no-deps bot /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1.
+
+While that container runs, Prometheus target coinbase-bot will be UP and Grafana panels will fill.
+
+When finished, bring back the live loop with docker compose up -d bot.
+=====================================================================================
+Sweet — here’s a tight runbook to backtest with metrics visible (so Prometheus/Grafana update), then return to live (paper) mode.
+
+Backtest (one-off, scraped by Prometheus)
+
+Uses your existing CSV at /app/data/BTC-USD.csv. We’ll stop the always-on bot, then run a temporary bot container with the service’s network alias bot so Prometheus can scrape bot:8080 while the backtest runs.
+
+cd ~/coinbase/monitoring
+
+# 0) Stop the always-on bot so the backtest owns :8080 and the alias "bot"
+docker compose stop bot
+
+# 1) Sanity check CSV (optional)
+docker compose run --rm --no-deps bot /bin/sh -lc 'head -n 3 /app/data/BTC-USD.csv'
+
+# 2) Run backtest as a one-off container **with service aliases**
+#    --use-aliases ensures this container is reachable as "bot" on the compose network
+docker compose run --rm --no-deps --use-aliases bot \
+  /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1
+
+What to watch (while step 2 runs)
+
+Prometheus targets: http://localhost:9090/targets
+ → coinbase-bot (bot:8080) should be UP while the backtest is running.
+
+Prometheus queries (http://localhost:9090/graph
+):
+
+sum by (signal) (increase(bot_decisions_total[1m]))
+
+sum by (mode, side) (increase(bot_orders_total[1m]))
+
+bot_equity_usd
+
+Grafana dashboard panels should begin to move during the run.
+
+Tip: If your CSV is short, backtest may finish before Prometheus (15s interval) scrapes much. Using -interval 1 slows each step, giving Prometheus time to collect.
+
+Return to live (paper) loop
+# Bring the always-on bot back (paper-safe; DRY_RUN=true)
+docker compose up -d bot
+
+echo "BRIDGE_URL=http://bridge:8787" | sudo tee -a /opt/coinbase/env/bot.env
+============================================================================
+# List docker networks and look for your compose network
+docker network ls | grep monitoring_monitoring_network
+
+# Inspect it (you should see the attached containers under "Containers")
+docker network inspect monitoring_monitoring_network | sed -n '1,120p'
+
+# Check your services are up and attached
+docker compose ps
+
+
+========================================================================================
+
+🔹 How to fetch new candles into BTC-USD.csv
+
+Run this from your project root (~/coinbase): 
+
+ ~/coinbase/monitoring
+
+# One-shot fetch of 6,000 latest candles into CSV
+Run it inside the bot container (compose network, uses bridge:8787):
+
+cd ~/coinbase/monitoring
+docker compose run --rm bot go run /app/tools/backfill_bridge_paged.go \
+  -product BTC-USD \
+  -granularity ONE_MINUTE \
+  -limit 300 \
+  -pages 20 \
+  -out /app/data/BTC-USD.csv
+
+
+Verify the dataset size & a couple of lines:
+
+docker compose run --rm bot sh -lc 'wc -l /app/data/BTC-USD.csv; head -n 3 /app/data/BTC-USD.csv; tail -n 3 /app/data/BTC-USD.csv'
+
+
+Then re-run your backtest with the larger CSV:
+
+docker compose run --rm -p 8080:8080 bot \
+  /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1
+
+

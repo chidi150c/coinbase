@@ -140,6 +140,14 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *AIM
 	trader.cfg.DryRun = true
 
 	win, loss := 0, 0
+	// Optional slow-down so Prometheus can scrape during backtest
+	slowMs := 0
+	if v := os.Getenv("BACKTEST_SLEEP_MS"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms >= 0 {
+			slowMs = ms
+		}
+	}
+	
 	for i := 50; i < len(test); i++ {
 		select {
 		case <-ctx.Done():
@@ -160,6 +168,9 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *AIM
 		}
 		if i%100 == 0 {
 			log.Printf("[BT] i=%d msg=%s", i, msg)
+		}
+		if slowMs > 0 {
+			time.Sleep(time.Duration(slowMs) * time.Millisecond)
 		}
 	}
 

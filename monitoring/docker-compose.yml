@@ -16,7 +16,9 @@ services:
     restart: unless-stopped
     networks:
       monitoring_network:
-        aliases: [bot]
+        aliases:
+          - bot
+          - coinbase-bot    
 
   # === FastAPI sidecar ===
   bridge:

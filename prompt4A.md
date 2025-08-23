@@ -5,13 +5,22 @@ Codebase
 
 Go bot package (~/coinbase/):
 env.go, config.go, indicators.go, model.go, strategy.go, trader.go, metrics.go, backtest.go, live.go, main.go, broker.go, broker_bridge.go, broker_paper.go
-Extra: ~/coinbase/data/BTC-USD.csv
 
-Python FastAPI bridge (~/coinbase/bridge/app.py)
-Wraps coinbase.rest.RESTClient
+Datasets/Bridge/Tools:
+
+~/coinbase/data/BTC-USD.csv
+
+~/coinbase/data/app.py (FastAPI bridge)
+
+~/coinbase/tools/backfill_bridge.go
+
+~/coinbase/tools/backfill_bridge_paged.go
 
 Monitoring stack (~/coinbase/monitoring/):
-docker-compose.yml, prometheus/prometheus.yml
+
+docker-compose.yml
+
+prometheus/prometheus.yml
 
 Flags / Modes
 
@@ -21,17 +30,17 @@ Flags / Modes
 
 -interval <seconds>
 
-HTTP Endpoints
+Endpoints
 
-Bot: /healthz, /metrics (port 8080)
+Bot (8080): /healthz, /metrics
 
-Bridge: /health, /accounts?limit=, /product/{id}, /candles?product_id=&granularity=&limit=, /orders/market_buy, /order/market (port 8787)
+Bridge (8787): /health, /accounts?limit=, /product/{id}, /candles?product_id=&granularity=&limit=&start=&end=, /orders/market_buy, /order/market
 
 Prometheus: :9090
 
 Grafana: :3000
 
-Metrics (Prometheus)
+Metrics
 
 bot_orders_total{mode="paper|live",side="BUY|SELL"}
 
@@ -40,39 +49,42 @@ bot_decisions_total{signal="buy|sell|flat"}
 bot_equity_usd
 
 Environment
-bot.env (/opt/coinbase/env/bot.env)
+Bot (/opt/coinbase/env/bot.env)
 DRY_RUN=true
 LONG_ONLY=true
 ORDER_MIN_USD=5.00
 MAX_DAILY_LOSS_PCT=1.0
-BUY_THRESHOLD=0.55
-SELL_THRESHOLD=0.45
-USE_MA_FILTER=true
-MA_FAST=10
-MA_SLOW=30
-BRIDGE_URL=http://coinbase-bridge:8787
+RISK_PER_TRADE_PCT=0.25
+USD_EQUITY=1000.00
+TAKE_PROFIT_PCT=0.8
+STOP_LOSS_PCT=0.4
 PORT=8080
+BRIDGE_URL=http://bridge:8787
+PRODUCT_ID=BTC-USD
+GRANULARITY=ONE_MINUTE
+BUY_THRESHOLD=0.50
+SELL_THRESHOLD=0.50
+USE_MA_FILTER=false
+BACKTEST_SLEEP_MS=500
 
-bridge.env (/opt/coinbase/env/bridge.env)
-COINBASE_API_KEY=…
-COINBASE_API_SECRET=…
+Bridge (/opt/coinbase/env/bridge.env)
+COINBASE_API_KEY=...
+COINBASE_API_SECRET=...
 PORT=8787
 
 
-Permissions: /opt/coinbase/env/ → drwxr-x--- root:docker; files → -rw-r----- root:docker
+Permissions: /opt/coinbase/env/ → drwxr-x--- root:docker ; files → -rw-r----- root:docker
 
 Strategy / Model
 
 Logistic-like pUp with MA(10)/MA(30) filter
 
-Thresholds tunable via env (BUY_THRESHOLD, SELL_THRESHOLD, USE_MA_FILTER, MA_FAST, MA_SLOW)
+Tunable thresholds via env (BUY_THRESHOLD, SELL_THRESHOLD, USE_MA_FILTER, MA_FAST, MA_SLOW)
 
 Monitoring Stack
-docker-compose.yml services
+Services (docker-compose)
 
-bot (coinbase-bot)
-
-Image: golang:1.23
+bot (golang:1.23)
 
 Volumes: ..:/app:ro, /opt/coinbase/env/bot.env:/app/.env:ro
 
@@ -80,33 +92,23 @@ Command: /usr/local/go/bin/go run . -live -interval 15
 
 Expose: 8080
 
-Network: monitoring_network
+Network: monitoring_monitoring_network
 
-bridge (coinbase-bridge)
-
-Image: python:3.11-slim
+bridge (python:3.11-slim)
 
 Volumes: ../bridge:/app/bridge:ro, /opt/coinbase/env/bridge.env:/app/.env:ro
 
-Command: bash -lc "pip install --no-cache-dir fastapi==0.115.0 uvicorn==0.30.6 coinbase-advanced-py==1.0.0 && uvicorn app:app --host 0.0.0.0 --port 8787"
+Command: pip install fastapi==0.115.0 uvicorn==0.30.6 coinbase-advanced-py==1.0.0 python-dotenv==1.0.1 && uvicorn app:app --host 0.0.0.0 --port 8787
 
 Expose: 8787
 
-Network: monitoring_network
-
-prometheus
-
-Image: prom/prometheus:latest
+prometheus (prom/prometheus:latest)
 
 Ports: 9090:9090
 
 Volumes: ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml, monitoring_prometheus_data:/prometheus
 
-Network: monitoring_network
-
-grafana
-
-Image: grafana/grafana:latest
+grafana (grafana/grafana:latest)
 
 Ports: 3000:3000
 
@@ -114,15 +116,13 @@ Env: GF_SECURITY_ADMIN_USER=admin, GF_SECURITY_ADMIN_PASSWORD=admin
 
 Volumes: monitoring_grafana_data:/var/lib/grafana
 
-Network: monitoring_network
-
-prometheus.yml
+Prometheus config
 global:
   scrape_interval: 15s
 scrape_configs:
   - job_name: "coinbase-bot"
     static_configs:
-      - targets: ["coinbase-bot:8080"]
+      - targets: ["bot:8080"]
   - job_name: "prometheus"
     static_configs:
       - targets: ["localhost:9090"]
@@ -133,35 +133,43 @@ monitoring_prometheus_data
 
 monitoring_grafana_data
 
+Backfill Tools
+
+backfill_bridge.go: one-shot 300 candles → CSV
+
+backfill_bridge_paged.go: multi-page (~6000 rows) → CSV
+
 Runtime / Logs
 
-Bot:
+Bot live: /usr/local/go/bin/go run . -live -interval 15
 
-Live: /usr/local/go/bin/go run . -live -interval 15
+Bot backtest: /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1
 
-Backtest: /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1
+Logs:
 
-Logs: serving metrics on :8080/metrics, Starting coinbase-bridge — product=BTC-USD dry_run=true
+serving metrics on :8080/metrics
+
+[BT] i=N msg=... (FLAT, HOLD, PAPER BUY/SELL)
+
+Backtest complete. Wins=X Losses=Y Equity=Z
 
 Error if bridge down: candles err: connect: connection refused
 
-Bridge:
+Bridge: uvicorn app:app --host 0.0.0.0 --port 8787
 
-Command: uvicorn app:app --host 0.0.0.0 --port 8787
+Prometheus: scrapes bot:8080 and localhost:9090
 
-Prometheus:
+Grafana: http://localhost:3000 (admin/admin)
 
-Config path: ~/coinbase/monitoring/prometheus/prometheus.yml
+Current Dataset
 
-Scrapes localhost:9090, coinbase-bot:8080
+Path: ~/coinbase/data/BTC-USD.csv
 
-Grafana:
+Rows: ~6001 (header + 6000 candles)
 
-Port: 3000
+Granularity: ONE_MINUTE
 
-Admin creds: admin/admin
-
-Datasource: http://prometheus:9090
+Span: ~100 hours (~4.2 days)
 
 Operating rules:
 

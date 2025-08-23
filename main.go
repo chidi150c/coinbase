@@ -84,11 +84,8 @@ func main() {
 	defer cancel()
 
 	if csvBacktest != "" && !live {
-+        // Start /metrics & /healthz in backtest too so Prometheus can scrape
-+        go serveHTTPMetricsAndHealthz()  // <- whatever your metrics/http starter is named
-+        runBacktest(ctx, csvBacktest, trader, model)
-+        return
-+    } else {
+		runBacktest(ctx, csvBacktest, trader, model)
+	} else {
 		runLive(ctx, trader, model, intervalSec)
 	}
 
