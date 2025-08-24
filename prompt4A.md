@@ -1,55 +1,31 @@
-You are joining an existing Coinbase Advanced Trade bot project.
-Invariant baseline (must remain stable and NOT be re-generated):
+You are joining an existing Coinbase Advanced Trade bot project. Invariant baseline (must remain stable and NOT be re-generated):
 
-Codebase
+Codebase (~/coinbase/)
 
-Go bot package (~/coinbase/):
-env.go, config.go, indicators.go, model.go, strategy.go, trader.go, metrics.go, backtest.go, live.go, main.go, broker.go, broker_bridge.go, broker_paper.go
+Go sources: env.go, config.go, indicators.go, model.go, strategy.go, trader.go, metrics.go, backtest.go, live.go, main.go, broker.go, broker_bridge.go, broker_paper.go
 
-Datasets/Bridge/Tools:
+Data: data/BTC-USD.csv (~6001 rows, ONE_MINUTE granularity, ~100h span)
 
-~/coinbase/data/BTC-USD.csv
+Bridge: bridge/app.py (FastAPI, Coinbase REST), requirements.txt
 
-~/coinbase/data/app.py (FastAPI bridge)
+Tools: tools/backfill_bridge.go, tools/backfill_bridge_paged.go
 
-~/coinbase/tools/backfill_bridge.go
+Misc: .env.example, .git*, README.md, verify.txt, bot.log, bot.pid
 
-~/coinbase/tools/backfill_bridge_paged.go
-
-Monitoring stack (~/coinbase/monitoring/):
+Monitoring Stack (~/coinbase/monitoring/)
 
 docker-compose.yml
 
 prometheus/prometheus.yml
 
-Flags / Modes
+grafana/, grafana-data/ (host dir)
 
--live
+Environment (external, /opt/coinbase/env/)
+Permissions: drwxr-x--- root:docker ; files -rw-r----- root:docker
 
--backtest <csv>
-
--interval <seconds>
-
-Endpoints
-
-Bot (8080): /healthz, /metrics
-
-Bridge (8787): /health, /accounts?limit=, /product/{id}, /candles?product_id=&granularity=&limit=&start=&end=, /orders/market_buy, /order/market
-
-Prometheus: :9090
-
-Grafana: :3000
-
-Metrics
-
-bot_orders_total{mode="paper|live",side="BUY|SELL"}
-
-bot_decisions_total{signal="buy|sell|flat"}
-
-bot_equity_usd
-
-Environment
-Bot (/opt/coinbase/env/bot.env)
+bot.env
+PRODUCT_ID=BTC-USD
+GRANULARITY=ONE_MINUTE
 DRY_RUN=true
 LONG_ONLY=true
 ORDER_MIN_USD=5.00
@@ -58,146 +34,161 @@ RISK_PER_TRADE_PCT=0.25
 USD_EQUITY=1000.00
 TAKE_PROFIT_PCT=0.8
 STOP_LOSS_PCT=0.4
-PORT=8080
-BRIDGE_URL=http://bridge:8787
-PRODUCT_ID=BTC-USD
-GRANULARITY=ONE_MINUTE
-BUY_THRESHOLD=0.50
+BUY_THRESHOLD=0.48
 SELL_THRESHOLD=0.50
 USE_MA_FILTER=false
 BACKTEST_SLEEP_MS=500
+PORT=8080
+BRIDGE_URL=http://bridge:8787
 
-Bridge (/opt/coinbase/env/bridge.env)
-COINBASE_API_KEY=...
-COINBASE_API_SECRET=...
+bridge.env
+COINBASE_API_KEY_NAME=organizations/.../apiKeys/...
+COINBASE_API_PRIVATE_KEY=-----BEGIN EC PRIVATE KEY----- ...
+COINBASE_API_BASE=https://api.coinbase.com
+
 PORT=8787
 
-
-Permissions: /opt/coinbase/env/ → drwxr-x--- root:docker ; files → -rw-r----- root:docker
-
-Strategy / Model
-
-Logistic-like pUp with MA(10)/MA(30) filter
-
-Tunable thresholds via env (BUY_THRESHOLD, SELL_THRESHOLD, USE_MA_FILTER, MA_FAST, MA_SLOW)
-
-Monitoring Stack
-Services (docker-compose)
+Docker Compose (monitoring/docker-compose.yml)
 
 bot (golang:1.23)
-
-Volumes: ..:/app:ro, /opt/coinbase/env/bot.env:/app/.env:ro
-
-Command: /usr/local/go/bin/go run . -live -interval 15
-
-Expose: 8080
-
-Network: monitoring_monitoring_network
+working_dir=/app ; volumes: ..:/app ; env_file=/opt/coinbase/env/bot.env
+command (default): /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1
+restart="no" ; expose: 8080 ; network alias: bot, coinbase-bot
 
 bridge (python:3.11-slim)
-
-Volumes: ../bridge:/app/bridge:ro, /opt/coinbase/env/bridge.env:/app/.env:ro
-
-Command: pip install fastapi==0.115.0 uvicorn==0.30.6 coinbase-advanced-py==1.0.0 python-dotenv==1.0.1 && uvicorn app:app --host 0.0.0.0 --port 8787
-
-Expose: 8787
+working_dir=/app/bridge ; volumes: ../bridge:/app/bridge:ro ; env_file=/opt/coinbase/env/bridge.env
+command: pip install fastapi uvicorn coinbase-advanced-py python-dotenv && uvicorn app:app --host 0.0.0.0 --port 8787
+expose: 8787 ; restart=unless-stopped ; alias: bridge
 
 prometheus (prom/prometheus:latest)
-
-Ports: 9090:9090
-
-Volumes: ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml, monitoring_prometheus_data:/prometheus
+ports: 9090:9090 ; volumes: ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml, monitoring_prometheus_data:/prometheus
+restart=unless-stopped
 
 grafana (grafana/grafana:latest)
+ports: 3000:3000 ; env: GF_SECURITY_ADMIN_USER=admin, GF_SECURITY_ADMIN_PASSWORD=admin
+volumes: monitoring_grafana_data:/var/lib/grafana
+depends_on: [prometheus, bot, bridge]
 
-Ports: 3000:3000
+Volumes: monitoring_prometheus_data, monitoring_grafana_data
+Network: monitoring_network (bridge)
 
-Env: GF_SECURITY_ADMIN_USER=admin, GF_SECURITY_ADMIN_PASSWORD=admin
-
-Volumes: monitoring_grafana_data:/var/lib/grafana
-
-Prometheus config
-global:
-  scrape_interval: 15s
+Prometheus (prometheus/prometheus.yml)
+global: scrape_interval=15s
 scrape_configs:
-  - job_name: "coinbase-bot"
-    static_configs:
-      - targets: ["bot:8080"]
-  - job_name: "prometheus"
-    static_configs:
-      - targets: ["localhost:9090"]
 
-Volumes
+job_name: "prometheus", targets: ["localhost:9090"]
 
-monitoring_prometheus_data
+job_name: "coinbase-bot", targets: ["bot:8080"]
 
-monitoring_grafana_data
+Bot HTTP (8080, internal)
 
-Backfill Tools
+GET /healthz → ok
 
-backfill_bridge.go: one-shot 300 candles → CSV
+GET /metrics → Prometheus exposition (bot_* metrics)
 
-backfill_bridge_paged.go: multi-page (~6000 rows) → CSV
+Bridge HTTP (8787, internal)
 
-Runtime / Logs
+GET /health → {"ok":true}
 
-Bot live: /usr/local/go/bin/go run . -live -interval 15
+GET /accounts?limit= → get_accounts
 
-Bot backtest: /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1
+GET /product/{id} → get_product
 
-Logs:
+GET /candles?product_id=&granularity=&limit=&start=&end= → normalized OHLCV list
 
-serving metrics on :8080/metrics
+POST /orders/market_buy {client_order_id, product_id, quote_size}
 
-[BT] i=N msg=... (FLAT, HOLD, PAPER BUY/SELL)
+POST /order/market {product_id, side=BUY|SELL, quote_size, client_order_id?}
 
-Backtest complete. Wins=X Losses=Y Equity=Z
+Metrics (exported)
 
-Error if bridge down: candles err: connect: connection refused
+bot_orders_total{mode="paper|live",side="BUY|SELL"}
 
-Bridge: uvicorn app:app --host 0.0.0.0 --port 8787
+bot_decisions_total{signal="buy|sell|flat"}
 
-Prometheus: scrapes bot:8080 and localhost:9090
+bot_equity_usd
 
-Grafana: http://localhost:3000 (admin/admin)
+Bot Features & Behavior
 
-Current Dataset
+Strategy: logistic-like pUp, thresholds BUY_THRESHOLD / SELL_THRESHOLD ; optional MA(10)/MA(30) filter (USE_MA_FILTER).
 
-Path: ~/coinbase/data/BTC-USD.csv
+Trader (trader.go): position state, equity tracking, risk sizing, stop/take logic.
 
-Rows: ~6001 (header + 6000 candles)
+Long-only:
 
-Granularity: ONE_MINUTE
+If flat & SELL → ignore (no shorts).
 
-Span: ~100 hours (~4.2 days)
+If long & SELL → exit (close).
+
+Safety: DRY_RUN=true (paper mode), LONG_ONLY=true, ORDER_MIN_USD floor, MAX_DAILY_LOSS_PCT guard.
+
+Config via env.go/config.go (reads /opt/coinbase/env/bot.env).
+
+Paper broker (broker_paper.go), bridge broker (broker_bridge.go).
+
+Backtest (backtest.go): 70/30 split, walk-forward, warmup 50 candles, supports BACKTEST_SLEEP_MS pacing, updates bot_equity_usd.
+
+Live (live.go): polls bridge /candles, steps trader.
+
+Main (main.go): flags -live, -backtest <csv>, -interval <s>, starts HTTP /healthz + /metrics.
+
+Backfill Tools (tools/)
+
+backfill_bridge.go → one-shot fetch (~300 candles)
+
+backfill_bridge_paged.go → paged fetch (~6000 rows)
+
+Monitoring Usage
+
+Start stack:
+
+cd ~/coinbase/monitoring
+docker compose down && docker compose up -d
+
+
+Bot health/metrics:
+
+docker compose exec -T bot sh -lc "curl -sS http://localhost:8080/healthz; \
+curl -sS http://localhost:8080/metrics | grep -E '^(bot_decisions_total|bot_orders_total|bot_equity_usd)'"
+
+
+Switch to live: set bot command → /usr/local/go/bin/go run . -live -interval 15 ; restart=unless-stopped.
+
+Switch to backtest: set bot command → /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1.
+
+Ports & Networking
+
+bot:8080 (internal)
+
+bridge:8787 (internal)
+
+prometheus:9090:9090 (host)
+
+grafana:3000:3000 (host)
 
 Operating rules:
 
-Do NOT rewrite, reformat, or re-emit existing files unless explicitly instructed to replace a specific file.
+Do NOT rewrite, reformat, or re-emit existing files unless explicitly instructed.
 
-Default to INCREMENTAL CHANGES ONLY. If you need context from an existing file, ASK ME to paste that file or the relevant snippet.
-
-Never change defaults to place real orders. Keep DRY_RUN=true & LONG_ONLY=true unless I explicitly opt in.
+Default to INCREMENTAL CHANGES ONLY; ask for file context if needed.
 
 Preserve all public behavior, flags, routes, metrics names, env keys, and file paths.
 
 How to respond:
 
-First, list Required Inputs you need (e.g., “paste current strategy.go”, “what Slack webhook URL?”, “what Docker base image?”).
+List Required Inputs you need.
 
-Then provide a brief Plan (1–5 bullets).
+Provide a brief Plan.
 
-Deliver changes as:
-a) Minimal unified diffs/patches for specific files (or full new file content if it’s a new file), and/or
-b) Exact shell commands and env additions (clearly marked), and
-c) A short Runbook to test/verify (/healthz, /metrics, backtest, live dry-run).
+Deliver changes as diffs/patches, shell commands/env additions, and short runbooks.
 
 Constraints:
 
-Keep dependencies minimal; if adding any, list precise version pins and why.
+Keep dependencies minimal; list precise versions if added.
 
 Maintain metrics compatibility and logging style.
 
-Any live-trading change must include an explicit safety callout and a revert/kill instruction.
+Any live-trading change must include explicit safety callout and revert instructions.
 
-Goal: Extend the bot safely and incrementally [...] without repeating or replacing the existing foundation.
+Goal:
+Extend the bot safely and incrementally while implementing this phase, without repeating or replacing the existing foundation.

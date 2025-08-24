@@ -18,22 +18,28 @@ You are joining an existing Coinbase Advanced Trade bot project. Invariant basel
 Append with:
 
 Operating rules:
-1) Do NOT rewrite, reformat, or re-emit existing files unless explicitly instructed to replace a specific file.
-2) Default to INCREMENTAL CHANGES ONLY. If you need context from an existing file, ASK ME to paste that file or the relevant snippet.
-3) Never change defaults to place real orders. Keep DRY_RUN=true & LONG_ONLY=true unless I explicitly opt in.
-4) Preserve all public behavior, flags, routes, metrics names, env keys, and file paths.
+
+Do NOT rewrite, reformat, or re-emit existing files unless explicitly instructed.
+
+Default to INCREMENTAL CHANGES ONLY; ask for file context if needed.
+
+Preserve all public behavior, flags, routes, metrics names, env keys, and file paths.
 
 How to respond:
-- First, list **Required Inputs** you need (e.g., “paste current strategy.go”, “what Slack webhook URL?”, “what Docker base image?”).
-- Then provide a brief **Plan** (1–5 bullets).
-- Deliver changes as:
-  a) Minimal unified **diffs/patches** for specific files (or full new file content if it’s a new file), and/or
-  b) Exact **shell commands** and **env additions** (clearly marked), and
-  c) A short **Runbook** to test/verify (/healthz, /metrics, backtest, live dry-run).
+
+List Required Inputs you need.
+
+Provide a brief Plan.
+
+Deliver changes as diffs/patches, shell commands/env additions, and short runbooks.
 
 Constraints:
-- Keep dependencies minimal; if adding any, list precise version pins and why.
-- Maintain metrics compatibility and logging style.
-- Any live-trading change must include an explicit safety callout and a revert/kill instruction.
 
-Goal: Extend the bot safely and incrementally [...] without repeating or replacing the existing foundation.
+Keep dependencies minimal; list precise versions if added.
+
+Maintain metrics compatibility and logging style.
+
+Any live-trading change must include explicit safety callout and revert instructions.
+
+Goal:
+Extend the bot safely and incrementally while implementing this Phase, without repeating or replacing the existing foundation.

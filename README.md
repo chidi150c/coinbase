@@ -883,3 +883,91 @@ docker compose run --rm -p 8080:8080 bot \
   /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1
 
 
+===================================================================
+safest way is to throw away everything after your last good commit and reset the working tree.
+
+From your repo root (~/coinbase):
+
+1. Check commit history
+git log --oneline --decorate --graph -n 5
+
+
+This shows the last 5 commits. Identify the hash of the last good commit (say abc1234).
+
+2. If you just want to go back to the last commit (HEAD)
+git reset --hard HEAD
+
+
+This removes all uncommitted changes and restores the working tree to the last commit you made.
+
+3. If you want to go back to a specific commit
+git reset --hard abc1234
+
+
+Replace abc1234 with the commit hash from step 1.
+
+4. If you want to keep your messed-up changes somewhere (just in case)
+
+Before resetting, you can stash them:
+
+git stash push -m "before reset"
+
+
+Then do the reset. You can recover the stash later if needed:
+
+git stash list
+git stash apply stash@{0}
+
+5. Verify
+git status
+git diff
+
+
+Both should show a clean tree. Run your backtest/live again:
+
+cd ~/coinbase/monitoring
+docker compose build bot
+docker compose up -d bot
+========================================================================
+
+cd ~/coinbase
+
+# compile just the bot (root main package)
+go build .
+
+# or just run it
+go run . -backtest data/BTC-USD.csv -interval 1
+# or
+go run . -live -interval 15
+
+cd ~/coinbase/monitoring
+
+# Make sure envs are in place (paths from your baseline)
+ls -l /opt/coinbase/env/bot.env   # DRY_RUN=true LONG_ONLY=true ...
+ls -l /opt/coinbase/env/bridge.env
+
+# Start full stack
+docker compose down
+docker compose up -d
+docker compose ps
+
+
+==============================================================
+backtest mode watcher:
+
+watch -n 1 "docker compose exec -T bot sh -lc \"curl -sS http://localhost:8080/metrics | grep -E '^(bot_equity_usd|bot_decisions_total|bot_orders_total)' || true\""
+============================================================================
+What’s happening now
+
+Your bot exports counters:
+
+bot_equity_usd → your simulated balance.
+
+bot_decisions_total{signal="buy|sell|flat"} → how many decisions so far.
+
+bot_orders_total{mode="paper", side="BUY|SELL"} → how many orders so far.
+
+Prometheus stores those numbers over time.
+
+Grafana visualizes them with queries called PromQL.
+

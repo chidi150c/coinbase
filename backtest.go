@@ -139,7 +139,11 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *AIM
 	// Force paper for backtest accounting
 	trader.cfg.DryRun = true
 
+	// Initialize equity gauge so Prometheus shows a value immediately
+	mtxPnL.Set(trader.EquityUSD())
+
 	win, loss := 0, 0
+
 	// Optional slow-down so Prometheus can scrape during backtest
 	slowMs := 0
 	if v := os.Getenv("BACKTEST_SLEEP_MS"); v != "" {
@@ -147,7 +151,10 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *AIM
 			slowMs = ms
 		}
 	}
-	
+	log.Printf("Backtest: csv=%s rows=%d train=%d test=%d pace=%dms",
+		csvPath, len(candles), len(train), len(test), slowMs)
+
+	// Warm-up 50 candles, then step forward
 	for i := 50; i < len(test); i++ {
 		select {
 		case <-ctx.Done():
@@ -156,6 +163,11 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *AIM
 		default:
 		}
 		msg, _ := trader.step(ctx, test[:i+1])
+
+		// Keep Prometheus equity gauge in sync each tick
+		mtxPnL.Set(trader.EquityUSD())
+
+		// Count wins/losses on exits
 		if strings.HasPrefix(msg, "EXIT") {
 			if idx := strings.LastIndex(msg, "P/L="); idx >= 0 {
 				pl, _ := strconv.ParseFloat(msg[idx+4:], 64)
@@ -166,14 +178,34 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *AIM
 				}
 			}
 		}
+
+		// Periodic progress
 		if i%100 == 0 {
 			log.Printf("[BT] i=%d msg=%s", i, msg)
 		}
+
+		// Pace the loop for observability
 		if slowMs > 0 {
 			time.Sleep(time.Duration(slowMs) * time.Millisecond)
 		}
 	}
 
-	log.Printf("Backtest complete. Wins=%d Losses=%d Equity=%.2f", win, loss, trader.EquityUSD())
+	trainN := len(train)
+	testN := len(test)
+	evalN := 0
+	if testN > 50 {
+		evalN = testN - 50
+	}
+	log.Printf(
+		"Backtest complete. Train=%d Test=%d Evaluated=%d Wins=%d Losses=%d Equity=%.2f",
+		trainN, testN, evalN, win, loss, trader.EquityUSD(),
+	)
 	mtxPnL.Set(trader.EquityUSD())
+
+	// Hold briefly after completion so Prometheus (or a human) can scrape one last time
+	if slowMs > 0 {
+		hold := time.Duration(slowMs) * time.Millisecond
+		log.Printf("Backtest done; holding for %s so Prometheus can scrape...", hold)
+		time.Sleep(hold)
+	}
 }
