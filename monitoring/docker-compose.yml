@@ -1,39 +1,33 @@
-version: "3.8"
+version: "3.9"
 
 services:
-  # === Go bot ===
   bot:
     image: golang:1.23
-    container_name: coinbase-bot
     working_dir: /app
     volumes:
-      - ..:/app                          # mount repo RW so Go can build/run
+      - ..:/app
     env_file:
-      - /opt/coinbase/env/bot.env        # externalized env
-    #command: ["/usr/local/go/bin/go", "run", ".", "-live", "-interval", "15"]
-    #restart: unless-stopped
-    command: /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1
-    restart: "no"
+      - /opt/coinbase/env/bot.env
+    command: /usr/local/go/bin/go run . -live -interval 15
+    #command: /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1
+    restart: unless-stopped
     expose:
       - "8080"
     networks:
       monitoring_network:
-        aliases:
-          - bot
-          - coinbase-bot    
+        aliases: [bot, coinbase-bot]
 
-  # === FastAPI sidecar ===
   bridge:
     image: python:3.11-slim
-    container_name: coinbase-bridge
     working_dir: /app/bridge
     volumes:
       - ../bridge:/app/bridge:ro
     env_file:
       - /opt/coinbase/env/bridge.env
     command: >
-      bash -lc "pip install --no-cache-dir fastapi uvicorn coinbase-advanced-py python-dotenv &&
-                uvicorn app:app --host 0.0.0.0 --port 8787"
+      sh -lc "apt-get update && apt-get install -y bash &&
+          bash -lc 'pip install --no-cache-dir fastapi uvicorn coinbase-advanced-py python-dotenv &&
+                    uvicorn app:app --host 0.0.0.0 --port 8787'"
     expose:
       - "8787"
     restart: unless-stopped
@@ -41,33 +35,32 @@ services:
       monitoring_network:
         aliases: [bridge]
 
-  # === Prometheus ===
   prometheus:
     image: prom/prometheus:latest
-    container_name: prometheus
+    ports:
+      - "9090:9090"
     volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
       - monitoring_prometheus_data:/prometheus
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-    ports: ["9090:9090"]
     restart: unless-stopped
-    networks: [monitoring_network]
+    networks:
+      - monitoring_network
 
-  # === Grafana ===
   grafana:
     image: grafana/grafana:latest
-    container_name: grafana
+    ports:
+      - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    ports: ["3000:3000"]
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
     volumes:
       - monitoring_grafana_data:/var/lib/grafana
-    restart: unless-stopped
-    depends_on: [prometheus, bot, bridge]
-    networks: [monitoring_network]
+    depends_on:
+      - prometheus
+      - bot
+      - bridge
+    networks:
+      - monitoring_network
 
 volumes:
   monitoring_prometheus_data:
