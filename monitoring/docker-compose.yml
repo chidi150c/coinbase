@@ -18,16 +18,16 @@ services:
         aliases: [bot, coinbase-bot]
 
   bridge:
-    image: python:3.11-slim
+    build:
+      context: ../bridge
+      dockerfile: Dockerfile
+    image: coinbase-bridge:curl
     working_dir: /app/bridge
     volumes:
       - ../bridge:/app/bridge:ro
     env_file:
       - /opt/coinbase/env/bridge.env
-    command: >
-      sh -lc "apt-get update && apt-get install -y bash &&
-          bash -lc 'pip install --no-cache-dir fastapi uvicorn coinbase-advanced-py python-dotenv &&
-                    uvicorn app:app --host 0.0.0.0 --port 8787'"
+    # use CMD from Dockerfile (no inline command override)
     expose:
       - "8787"
     restart: unless-stopped

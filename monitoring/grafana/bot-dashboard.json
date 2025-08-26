@@ -1,0 +1,112 @@
+{
+  "overwrite": true,
+  "dashboard": {
+    "id": null,
+    "uid": null,
+    "title": "Coinbase Bot Monitor",
+    "tags": ["coinbase", "bot", "crypto"],
+    "timezone": "browser",
+    "schemaVersion": 36,
+    "version": 5,
+    "panels": [
+      {
+        "type": "timeseries",
+        "title": "Equity (USD)",
+        "targets": [
+          { "expr": "bot_equity_usd", "legendFormat": "Equity", "refId": "A" }
+        ],
+        "id": 1,
+        "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 }
+      },
+      {
+        "type": "timeseries",
+        "title": "Decisions (buy/sell/flat)",
+        "targets": [
+          {
+            "expr": "increase(bot_decisions_total{signal=\"buy\"}[5m])",
+            "legendFormat": "Buy signals (5m)",
+            "refId": "A"
+          },
+          {
+            "expr": "increase(bot_decisions_total{signal=\"sell\"}[5m])",
+            "legendFormat": "Sell signals (5m)",
+            "refId": "B"
+          },
+          {
+            "expr": "increase(bot_decisions_total{signal=\"flat\"}[5m])",
+            "legendFormat": "Flat signals (5m)",
+            "refId": "C"
+          }
+        ],
+        "id": 6,
+        "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 }
+      },
+      {
+        "type": "timeseries",
+        "title": "Orders Placed (BUY vs SELL)",
+        "targets": [
+          {
+            "expr": "increase(bot_orders_total{mode=\"live\",side=\"BUY\"}[1h])",
+            "legendFormat": "BUY (1h)",
+            "refId": "A"
+          },
+          {
+            "expr": "increase(bot_orders_total{mode=\"live\",side=\"SELL\"}[1h])",
+            "legendFormat": "SELL (1h)",
+            "refId": "B"
+          }
+        ],
+        "id": 2,
+        "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 }
+      },
+      {
+        "type": "stat",
+        "title": "Circuit Breaker Status",
+        "targets": [
+          {
+            "expr": "clamp_max(sum(increase(bot_decisions_total{signal=\"flat\"}[5m])), 1) - clamp_max(sum(increase(bot_orders_total{mode=\"live\"}[5m])), 1)",
+            "refId": "A"
+          }
+        ],
+        "options": {
+          "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+          "orientation": "auto",
+          "textMode": "value",
+          "valueMappings": [
+            {
+              "options": {
+                "0": { "text": "OK", "color": "green" },
+                "1": { "text": "ACTIVE", "color": "red" }
+              },
+              "type": "value"
+            }
+          ]
+        },
+        "id": 3,
+        "gridPos": { "h": 4, "w": 12, "x": 0, "y": 24 }
+      },
+      {
+        "type": "stat",
+        "title": "Total Trades",
+        "targets": [
+          { "expr": "sum(bot_orders_total{mode=\"live\"})", "refId": "A" }
+        ],
+        "id": 4,
+        "gridPos": { "h": 4, "w": 12, "x": 12, "y": 24 }
+      },
+      {
+        "type": "timeseries",
+        "title": "Daily P/L (USD)",
+        "targets": [
+          {
+            "expr": "bot_equity_usd - (bot_equity_usd offset 1d)",
+            "legendFormat": "Δ P/L (24h)",
+            "refId": "A"
+          }
+        ],
+        "id": 5,
+        "gridPos": { "h": 8, "w": 24, "x": 0, "y": 28 }
+      }
+    ]
+  }
+}
