@@ -970,4 +970,150 @@ bot_orders_total{mode="paper", side="BUY|SELL"} → how many orders so far.
 Prometheus stores those numbers over time.
 
 Grafana visualizes them with queries called PromQL.
+==============================================================================
 
+# Run this from your host shell
+cd ~/coinbase/monitoring
+
+# Start the services if not already running
+docker compose up -d bot bridge
+
+# Exec into bot and curl the bridge service
+docker compose exec bot sh -lc 'apk add --no-cache curl >/dev/null 2>&1 || true; \
+  curl -s http://bridge:8787/health; \
+  echo; \
+  curl -s "http://bridge:8787/accounts?limit=1"; echo'
+
+  
+==========================================================
+Then reload just the bridge and verify it’s serving:
+
+cd ~/coinbase/monitoring
+docker compose up -d bridge
+docker compose logs --tail=50 bridge | grep -E "Uvicorn running|Application startup complete"
+
+
+Curl it from the bot container (same network):
+
+docker compose exec bot bash -lc '
+  apt-get update -qq && apt-get install -y -qq curl;
+  echo "---- HEALTH ----";
+  curl -s http://bridge:8787/health; echo;
+  echo "---- ACCOUNTS ----";
+  curl -s "http://bridge:8787/accounts?limit=1"; echo
+'
+=====================================================
+
+Do exactly this
+# 1) Confirm current value (should show DRY_RUN=true)
+sudo awk -F= '$1=="DRY_RUN"{print "DRY_RUN="$2}' /opt/coinbase/env/bot.env
+
+# 2) Switch to live
+sudo sed -i 's/^DRY_RUN=.*/DRY_RUN=false/' /opt/coinbase/env/bot.env
+sudo awk -F= '$1=="DRY_RUN"{print "DRY_RUN="$2}' /opt/coinbase/env/bot.env
+
+# 3) Make sure compose command is live mode (should show: ... go run . -live -interval 15)
+cd ~/coinbase/monitoring
+docker compose ps
+
+# 4) Recreate bot so it reads the updated env file
+docker compose up -d --force-recreate --no-deps bot
+
+# 5) Verify in logs (look for dry_run=false and the safety banner)
+docker compose logs --tail=20 bot
+docker compose logs -f bot | grep -E "Starting | \\[SAFETY\\]"
+
+# or more info with
+
+docker compose logs -f bot | grep -E "Starting|\\[SAFETY\\]|LIVE ORDER|EXIT|CIRCUIT_BREAKER|step err"
+
+# You want to see a line like:
+
+Starting coinbase-bridge — product=BTC-USD dry_run=false
+[SAFETY] LONG_ONLY=true | ORDER_MIN_USD=5.00 | RISK_PER_TRADE_PCT=0.25 | MAX_DAILY_LOSS_PCT=1.00 | TAKE_PROFIT
+
+# 6) Force a recreate of ONLY the bot (re-reads env_file)
+cd ~/coinbase/monitoring
+docker compose up -d --force-recreate --no-deps bot
+
+=======================================================
+
+# Runtime Processes
+
+# 7) Stack start:
+cd ~/coinbase/monitoring
+docker compose down && docker compose up -d
+
+# 8} Bot health/metrics:
+docker compose exec -T bot sh -lc "curl -sS http://localhost:8080/healthz; \
+curl -sS http://localhost:8080/metrics | grep -E '^(bot_decisions_total|bot_orders_total|bot_equity_usd)'"
+
+# Override on the fly (no file edits)
+
+# Docker Compose lets you override the command at runtime:
+
+# 9)Backtest:
+
+docker compose run --rm bot /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1
+
+
+# 10)Live:
+
+docker compose run --rm bot /usr/local/go/bin/go run . -live -interval 15
+
+=======================================================
+# Nice — the loop is ticking 👍 (bot_decisions_total is incrementing).
+# Quick next checks to confirm live trading is wired end-to-end:
+# 11)Orders & equity:
+
+docker compose exec -T bot sh -lc 'curl -s http://localhost:8080/metrics | grep "^bot_orders_total"'
+docker compose exec -T bot sh -lc 'curl -s http://localhost:8080/metrics | grep "^bot_equity_usd"'
+
+
+# 12)Runtime logs (live events):
+
+docker compose logs -f bot | grep -E "LIVE ORDER|EXIT|CIRCUIT_BREAKER"
+
+
+# (Optional) Nudge a quick trade safely, then restore:
+# 13)make exits quicker and buys slightly easier
+sudo sed -i 's/^TAKE_PROFIT_PCT=.*/TAKE_PROFIT_PCT=0.20/' /opt/coinbase/env/bot.env
+sudo sed -i 's/^STOP_LOSS_PCT=.*/STOP_LOSS_PCT=0.20/'     /opt/coinbase/env/bot.env
+sudo sed -i 's/^BUY_THRESHOLD=.*/BUY_THRESHOLD=0.47/'     /opt/coinbase/env/bot.env
+docker compose up -d --force-recreate --no-deps bot
+
+# 14)after you see LIVE ORDER / EXIT:
+sudo sed -i 's/^TAKE_PROFIT_PCT=.*/TAKE_PROFIT_PCT=0.8/' /opt/coinbase/env/bot.env
+sudo sed -i 's/^STOP_LOSS_PCT=.*/STOP_LOSS_PCT=0.4/'     /opt/coinbase/env/bot.env
+sudo sed -i 's/^BUY_THRESHOLD=.*/BUY_THRESHOLD=0.48/'    /opt/coinbase/env/bot.env
+docker compose up -d --force-recreate --no-deps bot
+
+
+# 15)Kill-switch / rollback:
+
+sudo sed -i 's/^DRY_RUN=.*/DRY_RUN=true/' /opt/coinbase/env/bot.env
+docker compose up -d --force-recreate --no-deps bot
+
+================
+docker compose exec -T bot sh -lc 'curl -s http://localhost:8080/healthz; echo; \
+  curl -s http://localhost:8080/metrics | grep -E "^(bot_orders_total|bot_decisions_total|bot_equity_usd)"'
+
+==================================================
+# Option 2: Override on the fly (no file edits)
+
+# Docker Compose lets you override the command at runtime:
+
+# Backtest:
+
+docker compose run --rm bot /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1
+
+
+# Live:
+
+docker compose run --rm bot /usr/local/go/bin/go run . -live -interval 15
+
+========================================
+# Flip to paper while we diagnose
+sudo sed -i 's/^DRY_RUN=.*/DRY_RUN=true/' /opt/coinbase/env/bot.env
+cd ~/coinbase/monitoring
+docker compose restart bot

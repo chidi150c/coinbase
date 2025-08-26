@@ -31,6 +31,11 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 	log.Printf("Starting %s — product=%s dry_run=%v",
 		trader.broker.Name(), trader.cfg.ProductID, trader.cfg.DryRun)
 
+	// Safety banner for operators (no behavior change)
+	log.Printf("[SAFETY] LONG_ONLY=%v | ORDER_MIN_USD=%.2f | RISK_PER_TRADE_PCT=%.2f | MAX_DAILY_LOSS_PCT=%.2f | TAKE_PROFIT_PCT=%.2f | STOP_LOSS_PCT=%.2f",
+		trader.cfg.LongOnly, trader.cfg.OrderMinUSD, trader.cfg.RiskPerTradePct,
+		trader.cfg.MaxDailyLossPct, trader.cfg.TakeProfitPct, trader.cfg.StopLossPct)
+
 	// Warmup candles
 	var history []Candle
 	if cs, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 300); err == nil && len(cs) > 0 {
@@ -61,17 +66,15 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 			return
 
 		case <-ticker.C:
-			// Pull the freshest candle(s)
-			cs, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 2)
-			if err != nil || len(cs) == 0 {
-				if err != nil {
-					log.Printf("candles err: %v", err)
-				}
+			// Poll the latest candle(s) from the bridge; prefer real OHLCV
+			latestSlice, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 1)
+			if err != nil || len(latestSlice) == 0 {
+				log.Printf("poll err: %v", err)
 				continue
 			}
-			latest := cs[len(cs)-1]
+			latest := latestSlice[0]
 
-			// Append or replace the last bucket if we're still in the same minute
+			// Append or replace the last candle if timestamps match
 			if len(history) == 0 || latest.Time.After(history[len(history)-1].Time) {
 				history = append(history, latest)
 			} else {

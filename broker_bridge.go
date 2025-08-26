@@ -15,10 +15,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,26 +24,26 @@ import (
 	"github.com/google/uuid"
 )
 
+// BridgeBroker talks to the local FastAPI bridge.
 type BridgeBroker struct {
 	base string
 	hc   *http.Client
 }
 
 func NewBridgeBroker(base string) *BridgeBroker {
-    base = strings.TrimSpace(base)
-    if i := strings.IndexAny(base, " \t#"); i >= 0 { // cut trailing comment/space
-        base = strings.TrimSpace(base[:i])
-    }
-    if base == "" {
-        base = "http://127.0.0.1:8787"
-    }
-    base = strings.TrimRight(base, "/")
-    return &BridgeBroker{
-        base: base,
-        hc:   &http.Client{Timeout: 15 * time.Second},
-    }
+	base = strings.TrimSpace(base)
+	if i := strings.IndexAny(base, " \t#"); i >= 0 { // cut trailing comment/space
+		base = strings.TrimSpace(base[:i])
+	}
+	if base == "" {
+		base = "http://127.0.0.1:8787"
+	}
+	base = strings.TrimRight(base, "/")
+	return &BridgeBroker{
+		base: base,
+		hc:   &http.Client{Timeout: 15 * time.Second},
+	}
 }
-
 
 func (bb *BridgeBroker) Name() string { return "coinbase-bridge" }
 
@@ -64,6 +62,7 @@ func (bb *BridgeBroker) GetNowPrice(ctx context.Context, product string) (float6
 		return 0, err
 	}
 	defer res.Body.Close()
+
 	if res.StatusCode >= 300 {
 		b, _ := io.ReadAll(res.Body)
 		return 0, fmt.Errorf("product %d: %s", res.StatusCode, string(b))
@@ -100,19 +99,20 @@ func (bb *BridgeBroker) GetRecentCandles(ctx context.Context, product, granulari
 		return nil, err
 	}
 	defer res.Body.Close()
+
 	if res.StatusCode >= 300 {
 		b, _ := io.ReadAll(res.Body)
 		return nil, fmt.Errorf("candles %d: %s", res.StatusCode, string(b))
 	}
 
-	// Expected: array of rows with string/float fields
+	// Bridge returns normalized rows with string/number fields; parse defensively.
 	type row struct {
-		Start  any `json:"start"`
-		Open   any `json:"open"`
-		High   any `json:"high"`
-		Low    any `json:"low"`
-		Close  any `json:"close"`
-		Volume any `json:"volume"`
+		Time   string      `json:"time"`
+		Open   any         `json:"open"`
+		High   any         `json:"high"`
+		Low    any         `json:"low"`
+		Close  any         `json:"close"`
+		Volume any         `json:"volume"`
 	}
 	var rows []row
 	if err := json.NewDecoder(res.Body).Decode(&rows); err != nil {
@@ -124,31 +124,31 @@ func (bb *BridgeBroker) GetRecentCandles(ctx context.Context, product, granulari
 		case float64:
 			return t
 		case string:
-			f, _ := strconv.ParseFloat(t, 64)
+			f, _ := strconv.ParseFloat(strings.TrimSpace(t), 64)
 			return f
 		default:
-			return math.NaN()
+			return 0
 		}
 	}
-	parseT := func(v any) time.Time {
-		switch t := v.(type) {
-		case string:
-			if tt, err := time.Parse(time.RFC3339, t); err == nil {
-				return tt
-			}
-			if sec, err := strconv.ParseInt(t, 10, 64); err == nil {
-				return time.Unix(sec, 0).UTC()
-			}
-		case float64:
-			return time.Unix(int64(t), 0).UTC()
+	parseT := func(s string) time.Time {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return time.Time{}
+		}
+		// Try RFC3339 first, then unix seconds
+		if ts, err := time.Parse(time.RFC3339, s); err == nil {
+			return ts.UTC()
+		}
+		if sec, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return time.Unix(sec, 0).UTC()
 		}
 		return time.Time{}
 	}
 
-	out := make([]Candle, 0, len(rows))
+	candles := make([]Candle, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, Candle{
-			Time:   parseT(r.Start),
+		candles = append(candles, Candle{
+			Time:   parseT(r.Time),
 			Open:   parseF(r.Open),
 			High:   parseF(r.High),
 			Low:    parseF(r.Low),
@@ -156,14 +156,21 @@ func (bb *BridgeBroker) GetRecentCandles(ctx context.Context, product, granulari
 			Volume: parseF(r.Volume),
 		})
 	}
-	// Ensure ascending time
-	sort.Slice(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
-	return out, nil
+	// sort to chronological if needed (stable pass)
+	for i := 1; i < len(candles); i++ {
+		if candles[i].Time.Before(candles[i-1].Time) {
+			for j := i; j > 0 && candles[j].Time.Before(candles[j-1].Time); j-- {
+				candles[j], candles[j-1] = candles[j-1], candles[j]
+			}
+		}
+	}
+	return candles, nil
 }
 
 // --- Orders ---
 
 func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, side OrderSide, quoteUSD float64) (*PlacedOrder, error) {
+	// Minimal update: send side and quote_size to unified /order/market endpoint.
 	u := bb.base + "/order/market"
 	body := map[string]any{
 		"product_id": product,
@@ -184,17 +191,18 @@ func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, si
 		return nil, err
 	}
 	defer res.Body.Close()
+
 	b, _ := io.ReadAll(res.Body)
 	if res.StatusCode >= 300 {
-		return nil, fmt.Errorf("order %d: %s", res.StatusCode, string(b))
+		return nil, fmt.Errorf("bridge order %d: %s", res.StatusCode, string(b))
 	}
 
-	// Try normalized sidecar shape first
+	// Try to parse a normalized bridge response first.
 	var norm struct {
-		OrderID    string `json:"order_id"`
-		AvgPrice   string `json:"avg_price"`
-		FilledBase string `json:"filled_base"`
-		QuoteSpent string `json:"quote_spent"`
+		OrderID     string `json:"order_id"`
+		AvgPrice    string `json:"avg_price"`
+		FilledBase  string `json:"filled_base"`
+		QuoteSpent  string `json:"quote_spent"`
 	}
 	if err := json.Unmarshal(b, &norm); err == nil && (norm.OrderID != "" || norm.AvgPrice != "" || norm.FilledBase != "" || norm.QuoteSpent != "") {
 		price, _ := strconv.ParseFloat(norm.AvgPrice, 64)
@@ -211,66 +219,24 @@ func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, si
 		}, nil
 	}
 
-	// Fallback: flexible parsing of SDK response
-	var m map[string]any
-	_ = json.Unmarshal(b, &m)
-
-	readStr := func(keys ...string) string {
-		for _, k := range keys {
-			if v, ok := m[k]; ok {
-				switch t := v.(type) {
-				case string:
-					if strings.TrimSpace(t) != "" {
-						return t
-					}
-				case float64:
-					return strconv.FormatFloat(t, 'f', -1, 64)
-				case map[string]any:
-					if vv, ok := t["value"]; ok {
-						if s, ok := vv.(string); ok && s != "" {
-							return s
-						}
-					}
-				}
-			}
-		}
-		return ""
+	// Fallback: just extract an order_id if present; leave price/base/quote as zeroes.
+	var generic map[string]any
+	_ = json.Unmarshal(b, &generic)
+	id := ""
+	if v, ok := generic["order_id"]; ok {
+		id = fmt.Sprintf("%v", v)
 	}
-
-	orderID := readStr("order_id", "orderId", "id")
-	priceStr := readStr("avg_price", "average_price", "price", "executed_price", "filled_average_price")
-	baseStr := readStr("filled_base", "filled_size", "filled_base_size", "size", "executed_size")
-	quoteStr := readStr("quote_spent", "filled_value", "quote_size", "cost", "notional")
-
-	price, _ := strconv.ParseFloat(priceStr, 64)
-	var base, quote float64
-	if q, err := strconv.ParseFloat(quoteStr, 64); err == nil {
-		quote = q
-	}
-	if bsz, err := strconv.ParseFloat(baseStr, 64); err == nil {
-		base = bsz
-	}
-
-	// Best-effort derivations
-	if price == 0 {
-		if p, err := bb.GetNowPrice(ctx, product); err == nil {
-			price = p
-		}
-	}
-	if base == 0 && price > 0 && quote > 0 {
-		base = quote / price
-	}
-	if quote == 0 && price > 0 && base > 0 {
-		quote = base * price
+	if strings.TrimSpace(id) == "" {
+		id = uuid.New().String()
 	}
 
 	return &PlacedOrder{
-		ID:         firstNonEmpty(orderID, uuid.New().String()),
+		ID:         id,
 		ProductID:  product,
 		Side:       side,
-		Price:      price,
-		BaseSize:   base,
-		QuoteSpent: quote,
+		Price:      0,
+		BaseSize:   0,
+		QuoteSpent: 0,
 		CreateTime: time.Now().UTC(),
 	}, nil
 }

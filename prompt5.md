@@ -1,4 +1,4 @@
-Distill the merged specification into a single invariant project specification.
+Distill the Merged Specification (A+B) into a single invariant project specification.
 Output must be no longer than Text A.
 Use a sectioned bullet-point format.
 
@@ -27,7 +27,7 @@ Preserve all public behavior, flags, routes, metrics names, env keys, and file p
 
 How to respond:
 
-List Required Inputs you need.
+List Required Inputs you need (e.g., “paste current strategy.go”, “what Slack webhook URL?”, “what Docker base image?”).
 
 Provide a brief Plan.
 
