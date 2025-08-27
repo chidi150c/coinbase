@@ -50,3 +50,8 @@ func loadConfigFromEnv() Config {
 		BridgeURL:       getEnv("BRIDGE_URL", "http://127.0.0.1:8787"),
 	}
 }
+
+// UseLiveEquity returns true if live balances should rebase equity.
+func (c *Config) UseLiveEquity() bool {
+	return getEnvBool("USE_LIVE_EQUITY", false)
+}

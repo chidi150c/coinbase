@@ -1117,3 +1117,80 @@ docker compose run --rm bot /usr/local/go/bin/go run . -live -interval 15
 sudo sed -i 's/^DRY_RUN=.*/DRY_RUN=true/' /opt/coinbase/env/bot.env
 cd ~/coinbase/monitoring
 docker compose restart bot
+============================================================
+# Bounce the stack to load Alertmanager + rules
+docker compose up -d
+
+# Verify Prometheus loaded rules
+curl -s http://localhost:9090/api/v1/rules | jq '.data.groups[].name'
+
+# Verify Alertmanager is up
+curl -s http://localhost:9093/-/ready
+
+================================================================
+# Fire a test Slack alert (no impact on trading)
+# Send a synthetic alert directly to Alertmanager:
+START="$(date -u +%FT%TZ)"
+curl -s -X POST http://localhost:9093/api/v2/alerts \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<JSON
+[
+  {
+    "labels": { "alertname":"TestAlert", "severity":"info" },
+    "annotations": {
+      "summary":"Test alert from Alertmanager",
+      "description":"Manual test to verify Slack wiring."
+    },
+    "startsAt": "$START"
+  }
+]
+JSON
+
+=====================================================
+
+Or in a single command
+docker compose down && docker compose up -d
+
+
+That will:
+
+Stop bot, bridge, prometheus, grafana, alertmanager
+
+Recreate them with the current configs
+
+Restart them detached
+
+Verify afterwards
+# Check container status
+docker compose ps
+
+# Bot health
+curl -s http://localhost:8080/healthz
+
+# Bridge health
+curl -s http://localhost:8787/health
+
+# Prometheus rules loaded
+curl -s http://localhost:9090/api/v1/rules | jq '.data.groups[].name'
+
+# Alertmanager healthy
+curl -s http://localhost:9093/-/ready
+
+=============================================================
+
+docker compose exec bot sh -lc 'printenv | egrep "USE_LIVE_EQUITY|DRY_RUN|BRIDGE_URL|PRODUCT_ID"'
+
+
+=========================================================
+
+
+# 1) sanity-check the env file really has the line
+sudo tail -n +5 /opt/coinbase/env/bot.env
+
+# 2) force-recreate the bot container so it re-reads the env file
+docker compose up -d --force-recreate --no-deps bot
+
+# 3) confirm inside the container
+docker compose exec bot sh -lc 'printenv | egrep "USE_LIVE_EQUITY|DRY_RUN|BRIDGE_URL|PRODUCT_ID"'
+
+
