@@ -4,7 +4,7 @@ Codebase (~/coinbase/)
 
 Go sources: env.go, config.go, indicators.go, model.go, strategy.go, trader.go, metrics.go, backtest.go, live.go, main.go, broker.go, broker_bridge.go, broker_paper.go
 
-Data: data/BTC-USD.csv (~6001 rows, ONE_MINUTE, ~100h span)
+Data: data/BTC-USD.csv (~6001 rows, ONE_MINUTE, ~100h)
 
 Bridge: bridge/app.py, bridge/requirements.txt
 
@@ -14,45 +14,68 @@ Misc: .env, .env.example, .git*, README.md, verify.txt, bot.log, bot.pid
 
 Monitoring (~/coinbase/monitoring/)
 
-Files: docker-compose.yml, prometheus/prometheus.yml, grafana/, grafana-data/
+Files: docker-compose.yml, prometheus/prometheus.yml, prometheus/rules.yml, alertmanager/alertmanager.yml, grafana/bot-dashboard.json, grafana/, grafana-data/
 
 Volumes: monitoring_prometheus_data, monitoring_grafana_data
 
 Network: monitoring_network
 
-Services (docker-compose.yml):
+Services (docker-compose.yml)
 
-bot (golang:1.23): working_dir=/app, volumes=..:/app, env_file=/opt/coinbase/env/bot.env
+bot: golang:1.23, workdir /app, volume ..:/app, env /opt/coinbase/env/bot.env, expose 8080, aliases bot, coinbase-bot, restart unless-stopped, logging json-file (10m/5).
 
-Backtest: /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1, restart="no"
+Backtest: /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1 (restart="no")
 
-Live: /usr/local/go/bin/go run . -live -interval 15, restart=unless-stopped
+Live: /usr/local/go/bin/go run . -live -interval 15 (restart=unless-stopped)
 
-expose: 8080; aliases: bot, coinbase-bot
+bridge: build ../bridge (Dockerfile), image coinbase-bridge:curl, workdir /app/bridge, volume ../bridge:/app/bridge:ro, env /opt/coinbase/env/bridge.env, expose 8787, alias bridge, restart unless-stopped, logging json-file (10m/5).
 
-bridge (python:3.11-slim): working_dir=/app/bridge, volumes=../bridge:/app/bridge:ro, env_file=/opt/coinbase/env/bridge.env
+prometheus: prom/prometheus:latest, ports 9090:9090, volumes:
 
-command: pip install fastapi uvicorn coinbase-advanced-py python-dotenv && uvicorn app:app --host 0.0.0.0 --port 8787
+./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
 
-expose: 8787; restart=unless-stopped; alias: bridge
+./prometheus/rules.yml:/etc/prometheus/rules.yml:ro
 
-prometheus (prom/prometheus:latest): ports 9090:9090; volumes: ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml, monitoring_prometheus_data:/prometheus
+monitoring_prometheus_data:/prometheus
 
-grafana (grafana/grafana:latest): ports 3000:3000; env: GF_SECURITY_ADMIN_USER=admin, GF_SECURITY_ADMIN_PASSWORD=admin; volumes: monitoring_grafana_data:/var/lib/grafana; depends_on: [prometheus, bot, bridge]
+alertmanager: prom/alertmanager:latest, port 9093:9093, volume ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro.
 
-Prometheus (~/coinbase/monitoring/prometheus/prometheus.yml)
+grafana: grafana/grafana:latest, port 3000:3000, env GF_SECURITY_ADMIN_USER=admin, GF_SECURITY_ADMIN_PASSWORD=admin, volume monitoring_grafana_data:/var/lib/grafana, depends on prometheus, bot, bridge.
 
-global: scrape_interval=15s
+Prometheus (prometheus/prometheus.yml)
 
-scrape_configs:
+global.scrape_interval=15s
 
-job_name="prometheus", targets=["localhost:9090"]
+rule_files: /etc/prometheus/rules.yml
 
-job_name="coinbase-bot", targets=["bot:8080"]
+alerting.targets=["alertmanager:9093"]
+
+Scrape jobs:
+
+prometheus: localhost:9090
+
+coinbase-bot: bot:8080
+
+Prometheus Rules (prometheus/rules.yml)
+
+Group coinbase-bot.rules:
+
+BotDown: up{job="coinbase-bot"} == 0, for=2m, severity=critical
+
+NoDecisionsRecently: increase(bot_decisions_total[30m]) == 0, for=30m, severity=warning
+
+EquityDropRapid: (max_over_time(bot_equity_usd[1h]) - bot_equity_usd)/clamp_min(max_over_time(bot_equity_usd[1h]),0.0001) > 0.01, for=5m, severity=critical
+
+Alertmanager (alertmanager/alertmanager.yml)
+
+Route: receiver=slack, group_by=[alertname], group_wait=10s, group_interval=2m, repeat_interval=2h
+
+Receiver slack: api_url=https://hooks.slack.com/services/..., send_resolved=true, posts to webhook’s default channel
 
 Environment (/opt/coinbase/env/)
 
-bot.env:
+bot.env
+
 PRODUCT_ID=BTC-USD
 GRANULARITY=ONE_MINUTE
 DRY_RUN=false
@@ -61,29 +84,28 @@ ORDER_MIN_USD=5.00
 MAX_DAILY_LOSS_PCT=1.0
 RISK_PER_TRADE_PCT=0.25
 USD_EQUITY=1000.00
-TAKE_PROFIT_PCT=0.8
-STOP_LOSS_PCT=0.4
-BUY_THRESHOLD=0.48
+TAKE_PROFIT_PCT=0.20
+STOP_LOSS_PCT=0.20
+BUY_THRESHOLD=0.47
 SELL_THRESHOLD=0.50
 USE_MA_FILTER=false
 BACKTEST_SLEEP_MS=500
 PORT=8080
 BRIDGE_URL=http://bridge:8787
 
-bridge.env:
+
+bridge.env
+
 COINBASE_API_KEY_NAME=organizations/.../apiKeys/...
 COINBASE_API_PRIVATE_KEY=-----BEGIN EC PRIVATE KEY----- ...
 COINBASE_API_BASE=https://api.coinbase.com
-
 PORT=8787
-
-Defaults (from code): BUY_THRESHOLD=0.55, SELL_THRESHOLD=0.45, USE_MA_FILTER=true, DRY_RUN=true, LONG_ONLY=true, ORDER_MIN_USD=5, MAX_DAILY_LOSS_PCT=1.0, RISK_PER_TRADE_PCT=0.25, USD_EQUITY=1000, TAKE_PROFIT_PCT=0.8, STOP_LOSS_PCT=0.4, BACKTEST_SLEEP_MS=0, PORT=8080, BRIDGE_URL=http://127.0.0.1:8787
 
 HTTP Endpoints
 
 Bot (8080): GET /healthz, GET /metrics
 
-Bridge (8787): GET /health, GET /accounts?limit=, GET /product/{id}, GET /candles?product_id=&granularity=&limit=&start=&end=, POST /order/market {product_id, side=BUY|SELL, quote_size, client_order_id?}, POST /orders/market_buy
+Bridge (8787): GET /health, /accounts?limit=, /product/{id}, /candles?product_id=&granularity=&limit=&start=&end=, POST /order/market, POST /orders/market_buy
 
 Metrics (Prometheus Exported)
 
@@ -95,37 +117,21 @@ bot_equity_usd
 
 Features & Behavior
 
-Strategy: pUp scoring, BUY_THRESHOLD / SELL_THRESHOLD, optional MA(10)/MA(30) filter
+Strategy: pUp scoring, BUY/SELL thresholds, optional MA(10/30) filter
 
 Trader: long-only, equity tracking, risk sizing, stop/take, circuit breaker
 
-Safety: DRY_RUN, ORDER_MIN_USD=5, RISK_PER_TRADE_PCT=0.25, TAKE_PROFIT_PCT=0.8, STOP_LOSS_PCT=0.4, MAX_DAILY_LOSS_PCT=1.0
+Safety: DRY_RUN, ORDER_MIN_USD=5, MAX_DAILY_LOSS_PCT=1.0, RISK_PER_TRADE_PCT=0.25, TAKE_PROFIT_PCT=0.20, STOP_LOSS_PCT=0.20
 
-Backtest: 70/30 split, warmup 50, BACKTEST_SLEEP_MS pacing, updates bot_equity_usd
+Backtest: 70/30 split, warmup=50, pacing via BACKTEST_SLEEP_MS
 
-Live: polls /candles every -interval (default 60, typical 15), runs trader
+Live: polls candles every interval (default 60s, typical 15s)
 
-Startup log:
-Starting coinbase-bridge — product=BTC-USD dry_run=<true|false>
-[SAFETY] LONG_ONLY=<..> | ORDER_MIN_USD=<..> | RISK_PER_TRADE_PCT=<..> | MAX_DAILY_LOSS_PCT=<..> | TAKE_PROFIT_PCT=<..> | STOP_LOSS_PCT=<..>
+Monitoring: Prometheus + Alertmanager + Grafana with Slack alerts
 
-Grafana Dashboard (~/coinbase/monitoring/grafana/bot-dashboard.json)
+Grafana Dashboard (grafana/bot-dashboard.json)
 
-Panels:
-
-Equity (USD): bot_equity_usd
-
-Decisions: increase(bot_decisions_total{signal}[5m])
-
-Orders Placed: increase(bot_orders_total{mode="live",side}[1h])
-
-Circuit Breaker Status:
-expr: clamp_max(sum(increase(bot_decisions_total{signal="flat"}[5m])),1) - clamp_max(sum(increase(bot_orders_total{mode="live"}[5m])),1)
-mapping: 0=OK, 1=ACTIVE
-
-Total Trades: sum(bot_orders_total{mode="live"})
-
-Daily P/L: bot_equity_usd - (bot_equity_usd offset 1d)
+Panels: Equity USD, Decisions, Orders Placed, Circuit Breaker Status, Total Trades, Daily P/L
 
 Tools (~/coinbase/tools/)
 
@@ -139,17 +145,15 @@ Runtime Processes
 
 Start monitoring: cd ~/coinbase/monitoring && docker compose up -d
 
-Health checks:
+Health checks: curl -s http://bridge:8787/health, curl -s http://localhost:8080/healthz
 
-Bridge: curl -s http://bridge:8787/health
+Switch to live: DRY_RUN=false, /usr/local/go/bin/go run . -live -interval 15
 
-Bot: curl -s http://localhost:8080/healthz
-
-Switch to live: DRY_RUN=false in bot.env; command /usr/local/go/bin/go run . -live -interval 15, restart=unless-stopped
-
-Switch to backtest: command /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1, restart="no", BACKTEST_SLEEP_MS=500
+Switch to backtest: /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1, BACKTEST_SLEEP_MS=500
 
 Kill-switch: DRY_RUN=true + restart bot, or docker compose stop bot
+
+Test alert: POST to http://localhost:9093/api/v2/alerts with JSON payload containing labels, annotations, startsAt
 
 Operating rules:
 

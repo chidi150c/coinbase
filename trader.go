@@ -64,6 +64,16 @@ func (t *Trader) EquityUSD() float64 {
 	return t.equityUSD
 }
 
+// SetEquityUSD safely updates trader equity and the equity metric.
+func (t *Trader) SetEquityUSD(v float64) {
+	t.mu.Lock()
+	t.equityUSD = v
+	t.mu.Unlock()
+
+	// update the metric with same naming style
+	mtxPnL.Set(v)
+}
+
 func midnightUTC(ts time.Time) time.Time {
 	y, m, d := ts.Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
