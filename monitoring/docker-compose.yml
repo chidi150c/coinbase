@@ -6,6 +6,7 @@ services:
     working_dir: /app
     volumes:
       - ..:/app
+      - /opt/coinbase/env:/opt/coinbase/env:ro 
     env_file:
       - /opt/coinbase/env/bot.env
     command: /usr/local/go/bin/go run . -live -interval 15
@@ -13,6 +14,11 @@ services:
     restart: unless-stopped
     expose:
       - "8080"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
     networks:
       monitoring_network:
         aliases: [bot, coinbase-bot]
@@ -25,12 +31,18 @@ services:
     working_dir: /app/bridge
     volumes:
       - ../bridge:/app/bridge:ro
+      - /opt/coinbase/env:/opt/coinbase/env:ro 
     env_file:
       - /opt/coinbase/env/bridge.env
     # use CMD from Dockerfile (no inline command override)
     expose:
       - "8787"
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
     networks:
       monitoring_network:
         aliases: [bridge]
@@ -42,6 +54,16 @@ services:
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
       - monitoring_prometheus_data:/prometheus
+    restart: unless-stopped
+    networks:
+      - monitoring_network
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
     restart: unless-stopped
     networks:
       - monitoring_network

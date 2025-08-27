@@ -1,0 +1,27 @@
+groups:
+- name: coinbase-bot.rules
+  rules:
+  - alert: BotDown
+    expr: up{job="coinbase-bot"} == 0
+    for: 2m
+    labels: { severity: critical }
+    annotations:
+      summary: "Coinbase bot metrics endpoint is down"
+      description: "Prometheus cannot scrape bot:8080 for 2 minutes."
+
+  - alert: NoDecisionsRecently
+    expr: increase(bot_decisions_total[30m]) == 0
+    for: 30m
+    labels: { severity: warning }
+    annotations:
+      summary: "No strategy decisions for 30m"
+      description: "Investigate data feed or logic stalls."
+
+  - alert: EquityDropRapid
+    expr: (max_over_time(bot_equity_usd[1h]) - bot_equity_usd)
+          / clamp_min(max_over_time(bot_equity_usd[1h]), 0.0001) > 0.01
+    for: 5m
+    labels: { severity: critical }
+    annotations:
+      summary: "Equity dropped >1% vs last-hour max"
+      description: "Check stops/circuit-breakers and market conditions."
