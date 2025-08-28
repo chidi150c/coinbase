@@ -67,6 +67,16 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 	// Fit the tiny model
 	model.fit(history, 0.05, 4)
 
+	// (Phase-7 opt-in) initial extended head training (no effect unless MODEL_MODE=extended)
+	var mdlExt *ExtendedLogit
+	if trader.cfg.Extended().ModelMode == ModelModeExtended {
+		if fe, la := BuildExtendedFeatures(history, true); len(fe) > 0 {
+			mdlExt = NewExtendedLogit(len(fe[0]))
+			mdlExt.FitMiniBatch(fe, la, 0.05, 6, 64)
+		}
+	}
+	var lastRefit *time.Time
+
 	// Minimal addition: one-time live-equity rebase (opt-in; no effect unless enabled)
 	if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun && trader.cfg.BridgeURL != "" {
 		ctxInit, cancelInit := context.WithTimeout(context.Background(), 5*time.Second)
@@ -99,6 +109,21 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				history = history[len(history)-1000:]
 			}
 
+			// (Phase-7 opt-in) walk-forward refit (hourly or env-driven minutes)
+			lastRefit, mdlExt = maybeWalkForwardRefit(trader.cfg, mdlExt, history, lastRefit)
+
+			// --- Small, opt-in addition: tick-price nudge (no effect unless USE_TICK_PRICE=true) ---
+			// If enabled, fetch /price from the bridge (fed by Coinbase WS) and update the last candle
+			// intra-interval to react slightly faster than the candle cadence.
+			if getEnvBool("USE_TICK_PRICE", false) && trader.cfg.BridgeURL != "" {
+				ctxPx, cancelPx := context.WithTimeout(ctx, 2*time.Second)
+				if px, stale, err := fetchBridgePrice(ctxPx, trader.cfg.BridgeURL, trader.cfg.ProductID); err == nil && !stale && px > 0 {
+					applyTickToLastCandle(history, px)
+				}
+				cancelPx()
+			}
+			// ---------------------------------------------------------------------
+
 			// Step the trader
 			msg, err := trader.step(ctx, history)
 			if err != nil {
@@ -115,7 +140,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 					base, quote := splitProductID(trader.cfg.ProductID)
 					eq := computeLiveEquity(bal, base, quote, latest.Close)
 					log.Printf("[EQUITY] calc=%.2f USD=%.2f BTC=%.6f price=%.2f",
-            		eq, bal["USD"], bal["BTC"], latest.Close)
+						eq, bal["USD"], bal["BTC"], latest.Close)
 					if eq > 0 {
 						trader.SetEquityUSD(eq)
 					}
@@ -137,25 +162,25 @@ func monotonicNowSeconds() float64 {
 
 // Matches the Bridge /accounts response shape:
 type bridgeAccountsResp struct {
-    Accounts []bridgeAccount `json:"accounts"`
-    HasNext  bool            `json:"has_next"`
-    Cursor   string          `json:"cursor"`
-    Size     int             `json:"size"`
+	Accounts []bridgeAccount `json:"accounts"`
+	HasNext  bool            `json:"has_next"`
+	Cursor   string          `json:"cursor"`
+	Size     int             `json:"size"`
 }
 type bridgeAmount struct {
-    Value    string `json:"value"`
-    Currency string `json:"currency"`
+	Value    string `json:"value"`
+	Currency string `json:"currency"`
 }
 type bridgeAccount struct {
-    Currency         string       `json:"currency"`
-    AvailableBalance bridgeAmount `json:"available_balance"` // <- use .Value
-    Type             string       `json:"type"`
-    Platform         string       `json:"platform"`
+	Currency         string       `json:"currency"`
+	AvailableBalance bridgeAmount `json:"available_balance"` // <- use .Value
+	Type             string       `json:"type"`
+	Platform         string       `json:"platform"`
 }
 
 func fetchBridgeAccounts(ctx context.Context, bridgeURL string) (map[string]float64, error) {
-    // ask for more to avoid pagination edge-cases
-    u := strings.TrimRight(bridgeURL, "/") + "/accounts?limit=250"
+	// ask for more to avoid pagination edge-cases
+	u := strings.TrimRight(bridgeURL, "/") + "/accounts?limit=250"
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return nil, err
@@ -170,13 +195,13 @@ func fetchBridgeAccounts(ctx context.Context, bridgeURL string) (map[string]floa
 		return nil, fmt.Errorf("bridge /accounts %d: %s", resp.StatusCode, string(b))
 	}
 	var payload bridgeAccountsResp
-    if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return nil, err
 	}
 	out := make(map[string]float64, len(payload.Accounts))
-    for _, r := range payload.Accounts {
-        v, _ := strconv.ParseFloat(strings.TrimSpace(r.AvailableBalance.Value), 64)
-        out[strings.ToUpper(strings.TrimSpace(r.Currency))] = v
+	for _, r := range payload.Accounts {
+		v, _ := strconv.ParseFloat(strings.TrimSpace(r.AvailableBalance.Value), 64)
+		out[strings.ToUpper(strings.TrimSpace(r.Currency))] = v
 	}
 	return out, nil
 }
@@ -194,10 +219,10 @@ func splitProductID(pid string) (base, quote string) {
 
 // Equity = quoteBalance + USD + baseBalance*lastPrice
 func computeLiveEquity(bal map[string]float64, base, quote string, lastPrice float64) float64 {
-     // USD account only (don't double count)
-     q := bal[strings.ToUpper(quote)]       // quote is "USD" for BTC-USD
-     b := bal[strings.ToUpper(base)]        // "BTC"
-     return q + b*lastPrice
+	// USD account only (don't double count)
+	q := bal[strings.ToUpper(quote)]       // quote is "USD" for BTC-USD
+	b := bal[strings.ToUpper(base)]        // "BTC"
+	return q + b*lastPrice
 }
 
 func initLiveEquity(ctx context.Context, cfg Config, trader *Trader, lastPrice float64) {
@@ -213,4 +238,73 @@ func initLiveEquity(ctx context.Context, cfg Config, trader *Trader, lastPrice f
 	if eq > 0 {
 		trader.SetEquityUSD(eq)
 	}
+}
+
+// ---- Phase-7: walk-forward refit (opt-in; env-driven minutes) ----
+
+func maybeWalkForwardRefit(cfg Config, mdl *ExtendedLogit, history []Candle, lastRefit *time.Time) (*time.Time, *ExtendedLogit) {
+	if cfg.Extended().ModelMode != ModelModeExtended || cfg.Extended().WalkForwardMin <= 0 {
+		return lastRefit, mdl
+	}
+	now := time.Now().UTC()
+	if lastRefit == nil || now.Sub(*lastRefit) >= time.Duration(cfg.Extended().WalkForwardMin)*time.Minute {
+		fe, la := BuildExtendedFeatures(history, true)
+		if len(fe) >= 100 {
+			if mdl == nil {
+				mdl = NewExtendedLogit(len(fe[0]))
+			}
+			mdl.FitMiniBatch(fe, la, 0.05, 6, 64)
+			IncWalkForwardFits()
+		}
+		t := now
+		return &t, mdl
+	}
+	return lastRefit, mdl
+}
+
+// ---- Small, opt-in additions: tick-price helpers (used only if USE_TICK_PRICE=true) ----
+
+type bridgePriceResp struct {
+	ProductID string  `json:"product_id"`
+	Price     float64 `json:"price"`
+	TS        string  `json:"ts"`
+	Stale     bool    `json:"stale"`
+}
+
+func fetchBridgePrice(ctx context.Context, bridgeURL, productID string) (float64, bool, error) {
+	u := strings.TrimRight(bridgeURL, "/") + "/price?product_id=" + productID
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return 0, false, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return 0, false, fmt.Errorf("bridge /price %d: %s", resp.StatusCode, string(b))
+	}
+	var payload bridgePriceResp
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return 0, false, err
+	}
+	return payload.Price, payload.Stale, nil
+}
+
+func applyTickToLastCandle(history []Candle, lastPrice float64) {
+	if len(history) == 0 || lastPrice <= 0 {
+	 return
+	}
+	i := len(history) - 1
+	c := history[i]
+	if lastPrice > c.High {
+		c.High = lastPrice
+	}
+	if lastPrice < c.Low || c.Low == 0 {
+		c.Low = lastPrice
+	}
+	c.Close = lastPrice
+	history[i] = c
 }
