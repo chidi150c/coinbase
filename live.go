@@ -77,10 +77,19 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 	}
 	var lastRefit *time.Time
 
+	// Track if we've successfully rebased equity from live balances.
+	// If not using live equity or in DryRun, we consider equity "ready".
+	eqReady := !(trader.cfg.UseLiveEquity() && !trader.cfg.DryRun && trader.cfg.BridgeURL != "")
+
 	// Minimal addition: one-time live-equity rebase (opt-in; no effect unless enabled)
 	if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun && trader.cfg.BridgeURL != "" {
 		ctxInit, cancelInit := context.WithTimeout(context.Background(), 5*time.Second)
-		initLiveEquity(ctxInit, trader.cfg, trader, history[len(history)-1].Close)
+		if attempt := attemptLiveEquityRebase(ctxInit, trader.cfg, trader, history[len(history)-1].Close); attempt {
+			eqReady = true
+		} else {
+			// Do not set equity yet; keep waiting and logging.
+			log.Printf("[EQUITY] waiting for bridge accounts (initial rebase pending)")
+		}
 		cancelInit()
 	}
 
@@ -131,7 +140,6 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				continue
 			}
 			log.Printf("%s", msg)
-			mtxPnL.Set(trader.EquityUSD())
 
 			// Minimal addition: per-tick live-equity refresh (opt-in; no effect unless enabled)
 			if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun && trader.cfg.BridgeURL != "" {
@@ -139,13 +147,28 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				if bal, err := fetchBridgeAccounts(ctxEq, trader.cfg.BridgeURL); err == nil {
 					base, quote := splitProductID(trader.cfg.ProductID)
 					eq := computeLiveEquity(bal, base, quote, latest.Close)
-					log.Printf("[EQUITY] calc=%.2f USD=%.2f BTC=%.6f price=%.2f",
-						eq, bal["USD"], bal["BTC"], latest.Close)
 					if eq > 0 {
+						if !eqReady {
+							log.Printf("[EQUITY] live balances received; rebased equity to %.2f (USD=%.2f %s=%.6f price=%.2f)",
+								eq, bal["USD"], base, bal[strings.ToUpper(base)], latest.Close)
+						}
 						trader.SetEquityUSD(eq)
+						eqReady = true
+					} else if !eqReady {
+						log.Printf("[EQUITY] waiting for bridge accounts (eq<=0)")
 					}
+				} else if !eqReady {
+					log.Printf("[EQUITY] waiting for bridge accounts (error: %v)", err)
 				}
 				cancelEq()
+			}
+
+			// Export equity metric only when ready (prevents startup spike to USD_EQUITY).
+			if eqReady || trader.cfg.DryRun || !trader.cfg.UseLiveEquity() {
+				mtxPnL.Set(trader.EquityUSD())
+			} else {
+				// Keep operators informed without changing public identifiers or routes.
+				log.Printf("[EQUITY] waiting for bridge accounts (metric withheld)")
 			}
 		}
 	}
@@ -220,24 +243,36 @@ func splitProductID(pid string) (base, quote string) {
 // Equity = quoteBalance + USD + baseBalance*lastPrice
 func computeLiveEquity(bal map[string]float64, base, quote string, lastPrice float64) float64 {
 	// USD account only (don't double count)
-	q := bal[strings.ToUpper(quote)]       // quote is "USD" for BTC-USD
-	b := bal[strings.ToUpper(base)]        // "BTC"
+	q := bal[strings.ToUpper(quote)] // quote is "USD" for BTC-USD
+	b := bal[strings.ToUpper(base)]  // "BTC"
 	return q + b*lastPrice
 }
 
 func initLiveEquity(ctx context.Context, cfg Config, trader *Trader, lastPrice float64) {
+	// Attempt a first rebase; if it fails, do not set equity—just log that we're waiting.
 	if lastPrice <= 0 {
+		log.Printf("[EQUITY] waiting for bridge accounts (last price unavailable)")
 		return
 	}
+	if ok := attemptLiveEquityRebase(ctx, cfg, trader, lastPrice); !ok {
+		log.Printf("[EQUITY] waiting for bridge accounts (initial rebase pending)")
+	}
+}
+
+// attemptLiveEquityRebase tries to fetch balances and set equity once they are valid.
+// Returns true on success, false on any error or non-positive equity.
+func attemptLiveEquityRebase(ctx context.Context, cfg Config, trader *Trader, lastPrice float64) bool {
 	bal, err := fetchBridgeAccounts(ctx, cfg.BridgeURL)
 	if err != nil {
-		return
+		return false
 	}
 	base, quote := splitProductID(cfg.ProductID)
 	eq := computeLiveEquity(bal, base, quote, lastPrice)
 	if eq > 0 {
 		trader.SetEquityUSD(eq)
+		return true
 	}
+	return false
 }
 
 // ---- Phase-7: walk-forward refit (opt-in; env-driven minutes) ----
@@ -295,7 +330,7 @@ func fetchBridgePrice(ctx context.Context, bridgeURL, productID string) (float64
 
 func applyTickToLastCandle(history []Candle, lastPrice float64) {
 	if len(history) == 0 || lastPrice <= 0 {
-	 return
+		return
 	}
 	i := len(history) - 1
 	c := history[i]
