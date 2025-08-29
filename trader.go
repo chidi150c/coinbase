@@ -20,8 +20,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -41,7 +44,9 @@ type Trader struct {
 	cfg        Config
 	broker     Broker
 	model      *AIMicroModel
-	pos        *Position
+	pos        *Position        // kept for backward compatibility with earlier logic
+	lots       []*Position      // NEW: multiple lots when pyramiding is enabled
+	lastAdd    time.Time        // NEW: last time a pyramid add was placed
 	dailyStart time.Time
 	dailyPnL   float64
 	mu         sync.Mutex
@@ -91,6 +96,81 @@ func (t *Trader) canTrade() bool {
 	return t.dailyPnL > -limit
 }
 
+// ---- helpers for pyramiding ----
+
+func allowPyramiding() bool {
+	return getEnvBool("ALLOW_PYRAMIDING", false)
+}
+func pyramidMinSeconds() int {
+	return getEnvInt("PYRAMID_MIN_SECONDS_BETWEEN", 0)
+}
+func pyramidMinAdversePct() float64 {
+	return getEnvFloat("PYRAMID_MIN_ADVERSE_PCT", 0.0) // 0 = no adverse-move requirement
+}
+
+// latestEntry returns the most recent long lot entry price, or 0 if none.
+func (t *Trader) latestEntry() float64 {
+	if len(t.lots) == 0 {
+		return 0
+	}
+	return t.lots[len(t.lots)-1].OpenPrice
+}
+
+// aggregateOpen sets t.pos to the latest lot (for legacy reads) or nil.
+func (t *Trader) aggregateOpen() {
+	if len(t.lots) == 0 {
+		t.pos = nil
+		return
+	}
+	// keep last lot as representative for legacy checks
+	t.pos = t.lots[len(t.lots)-1]
+}
+
+// closeLotAtIndex closes a single lot at idx (assumes mutex held), performing I/O unlocked.
+func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (string, error) {
+	price := c[len(c)-1].Close
+	lot := t.lots[idx]
+	closeSide := SideSell
+	if lot.Side == SideSell {
+		closeSide = SideBuy
+	}
+	base := lot.SizeBase
+	quote := base * price
+
+	// unlock for I/O
+	t.mu.Unlock()
+	if !t.cfg.DryRun {
+		if _, err := t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote); err != nil {
+			if t.cfg.Extended().UseDirectSlack {
+				postSlack(fmt.Sprintf("ERR step: %v", err))
+			}
+			return "", fmt.Errorf("close order failed: %w", err)
+		}
+		mtxOrders.WithLabelValues("live", string(closeSide)).Inc()
+	}
+	// re-lock
+	t.mu.Lock()
+	// refresh price snapshot (best-effort)
+	price = c[len(c)-1].Close
+
+	pl := (price - lot.OpenPrice) * base
+	if lot.Side == SideSell {
+		pl = (lot.OpenPrice - price) * base
+	}
+	t.dailyPnL += pl
+	t.equityUSD += pl
+
+	// remove lot idx
+	t.lots = append(t.lots[:idx], t.lots[idx+1:]...)
+	t.aggregateOpen()
+
+	msg := fmt.Sprintf("EXIT %s at %.2f P/L=%.2f", c[len(c)-1].Time.Format(time.RFC3339), price, pl)
+	if t.cfg.Extended().UseDirectSlack {
+		postSlack(msg)
+	}
+	return msg, nil
+}
+
 // ---- Core tick ----
 
 // step consumes the current candle history and may place/close a position.
@@ -115,58 +195,39 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		}
 	}
 
-	// If we have an open position, check stop/take and close if triggered.
-	if t.pos != nil {
+	// --- EXIT path: if any lots are open, evaluate TP/SL for each and close those that trigger.
+	if len(t.lots) > 0 {
 		price := c[len(c)-1].Close
-		triggerExit := false
-		if t.pos.Side == SideBuy && (price <= t.pos.Stop || price >= t.pos.Take) {
-			triggerExit = true
-		}
-		if t.pos.Side == SideSell && (price >= t.pos.Stop || price <= t.pos.Take) {
-			triggerExit = true
-		}
-
-		if triggerExit {
-			closeSide := SideSell
-			if t.pos.Side == SideSell {
-				closeSide = SideBuy
+		for i := 0; i < len(t.lots); {
+			lot := t.lots[i]
+			trigger := false
+			if lot.Side == SideBuy && (price <= lot.Stop || price >= lot.Take) {
+				trigger = true
 			}
-			base := t.pos.SizeBase
-			quote := base * price
-
-			// Release lock before network I/O (placing the closing order).
-			t.mu.Unlock()
-			if !t.cfg.DryRun {
-				if _, err := t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote); err != nil {
-					return "", fmt.Errorf("close order failed: %w", err)
+			if lot.Side == SideSell && (price >= lot.Stop || price <= lot.Take) {
+				trigger = true
+			}
+			if trigger {
+				msg, err := t.closeLotAtIndex(ctx, c, i)
+				if err != nil {
+					t.mu.Unlock()
+					return "", err
 				}
-				mtxOrders.WithLabelValues("live", string(closeSide)).Inc()
+				// closeLotAtIndex removed index i; continue without i++
+				t.mu.Unlock()
+				return msg, nil
 			}
-
-			// Re-lock and update state.
-			t.mu.Lock()
-			price = c[len(c)-1].Close // refresh snapshot after I/O
-
-			pl := (price - t.pos.OpenPrice) * base
-			if t.pos.Side == SideSell {
-				pl = (t.pos.OpenPrice - price) * base
-			}
-			t.dailyPnL += pl
-			t.equityUSD += pl
-			t.pos = nil
-
-			msg := fmt.Sprintf("EXIT %s at %.2f P/L=%.2f", now.Format(time.RFC3339), price, pl)
-			t.mu.Unlock()
-			return msg, nil
+			i++ // no trigger; move to next
 		}
-
-		// Still in position; nothing to do this tick.
-		t.mu.Unlock()
-		return "HOLD", nil
+		// Still have at least one lot; HOLD for this tick unless we’re adding (pyramiding) below.
+		// We intentionally fall through to allow an additional BUY if enabled.
 	}
 
-	// Flat: enforce daily loss circuit breaker.
+	// Flat (no lots) or pyramiding add both must respect the daily loss circuit breaker.
 	if !t.canTrade() {
+		if t.cfg.Extended().UseDirectSlack {
+			postSlack("CIRCUIT_BREAKER_DAILY_LOSS — trading paused")
+		}
 		t.mu.Unlock()
 		return "CIRCUIT_BREAKER_DAILY_LOSS", nil
 	}
@@ -175,8 +236,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	d := decide(c, t.model)
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
 
-	// Long-only: veto SELL entries when flat (spot constraint).
-	if d.Signal == Sell && t.cfg.LongOnly {
+	price := c[len(c)-1].Close
+
+	// Long-only veto for SELL when flat; unchanged behavior.
+	if d.Signal == Sell && t.cfg.LongOnly && len(t.lots) == 0 {
 		t.mu.Unlock()
 		return fmt.Sprintf("FLAT (long-only) [%s]", d.Reason), nil
 	}
@@ -185,9 +248,37 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		return fmt.Sprintf("FLAT [%s]", d.Reason), nil
 	}
 
-	// Sizing
-	price := c[len(c)-1].Close
-	quote := (t.cfg.RiskPerTradePct / 100.0) * t.equityUSD
+	// Determine if we are opening first lot or attempting a pyramid add.
+	isAdd := len(t.lots) > 0 && allowPyramiding() && d.Signal == Buy
+
+	// Gating for pyramiding adds (time spacing & adverse move from last entry).
+	if isAdd {
+		// spacing
+		if s := pyramidMinSeconds(); s > 0 && time.Since(t.lastAdd) < time.Duration(s)*time.Second {
+			t.mu.Unlock()
+			return "HOLD", nil
+		}
+		// adverse move from last entry price (e.g., >= 0.30 means price <= last*(1-0.0030))
+		if pct := pyramidMinAdversePct(); pct > 0 {
+			last := t.latestEntry()
+			if last > 0 {
+				minDrop := last * (1.0 - pct/100.0)
+				if !(price <= minDrop) {
+					t.mu.Unlock()
+					return "HOLD", nil
+				}
+			}
+		}
+	}
+
+	// Sizing (risk % of current equity, with optional volatility adjust already supported).
+	riskPct := t.cfg.RiskPerTradePct
+	if t.cfg.Extended().VolRiskAdjust {
+		f := volRiskFactor(c)
+		riskPct = riskPct * f
+		SetVolRiskFactorMetric(f)
+	}
+	quote := (riskPct / 100.0) * t.equityUSD
 	if quote < t.cfg.OrderMinUSD {
 		quote = t.cfg.OrderMinUSD
 	}
@@ -202,18 +293,21 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		take = price * (1.0 - t.cfg.TakeProfitPct/100.0)
 	}
 
-	// Release lock around live network I/O.
+	// Place live order without holding the lock.
 	t.mu.Unlock()
 	if !t.cfg.DryRun {
 		if _, err := t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote); err != nil {
+			if t.cfg.Extended().UseDirectSlack {
+				postSlack(fmt.Sprintf("ERR step: %v", err))
+			}
 			return "", err
 		}
 		mtxOrders.WithLabelValues("live", string(side)).Inc()
 	}
 
-	// Re-lock to mutate state.
+	// Re-lock to mutate state (append new lot or first lot).
 	t.mu.Lock()
-	t.pos = &Position{
+	newLot := &Position{
 		OpenPrice: price,
 		Side:      side,
 		SizeBase:  base,
@@ -221,6 +315,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		Take:      take,
 		OpenTime:  now,
 	}
+	t.lots = append(t.lots, newLot)
+	t.lastAdd = now
+	t.aggregateOpen()
+
 	msg := ""
 	if t.cfg.DryRun {
 		mtxOrders.WithLabelValues("paper", string(side)).Inc()
@@ -229,6 +327,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	} else {
 		msg = fmt.Sprintf("LIVE ORDER %s quote=%.2f stop=%.2f take=%.2f [%s]",
 			d.Signal, quote, stop, take, d.Reason)
+	}
+	if t.cfg.Extended().UseDirectSlack {
+		postSlack(msg)
 	}
 	t.mu.Unlock()
 	return msg, nil
@@ -244,5 +345,51 @@ func signalLabel(s Signal) string {
 		return "sell"
 	default:
 		return "flat"
+	}
+}
+
+// ---- Phase-7 helpers (append-only; optional features) ----
+
+// postSlack sends a best-effort Slack webhook message if SLACK_WEBHOOK is set.
+// No impact on baseline behavior or logging; errors are ignored.
+func postSlack(msg string) {
+	hook := getEnv("SLACK_WEBHOOK", "")
+	if hook == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	body := map[string]string{"text": msg}
+	bs, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, "POST", hook, bytes.NewReader(bs))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	_, _ = http.DefaultClient.Do(req)
+}
+
+// volRiskFactor derives a multiplicative factor from recent relative volatility.
+// Returns ~0.6–0.8 in high vol, ~1.0 normal, up to ~1.2 in very low vol.
+func volRiskFactor(c []Candle) float64 {
+	if len(c) < 40 {
+		return 1.0
+	}
+	cl := make([]float64, len(c))
+	for i := range c {
+		cl[i] = c[i].Close
+	}
+	std20 := RollingStd(cl, 20)
+	i := len(std20) - 1
+	relVol := std20[i] / (cl[i] + 1e-12)
+	switch {
+	case relVol > 0.02:
+		return 0.6
+	case relVol > 0.01:
+		return 0.8
+	case relVol < 0.004:
+		return 1.2
+	default:
+		return 1.0
 	}
 }

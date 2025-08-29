@@ -18,6 +18,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"time"
 )
@@ -104,4 +105,87 @@ func decide(c []Candle, m *AIMicroModel) Decision {
 		return Decision{Signal: Sell, Confidence: 1 - pUp, Reason: reason}
 	}
 	return Decision{Signal: Flat, Confidence: 0.5, Reason: reason}
+}
+
+// ---- Extended features + pUp helper (opt-in; baseline remains unchanged) ----
+
+// BuildExtendedFeatures constructs a richer feature set for the extended model.
+// If train==true, it also returns next-bar "up" labels; otherwise labels is nil.
+// Features per row:
+//   [ ret1, ret5, RSI14/100, ZScore20, ATR14/Close, MACD_hist(12,26,9), OBV_norm, Std20/Close ]
+func BuildExtendedFeatures(c []Candle, train bool) ([][]float64, []float64) {
+	if len(c) < 60 {
+		return nil, nil
+	}
+	close := make([]float64, len(c))
+	for i := range c { close[i] = c[i].Close }
+
+	rsis := RSI(c, 14)
+	zs := ZScore(c, 20)
+	atr := ATR(c, 14)
+	atrPct := make([]float64, len(c))
+	for i := range c {
+		if c[i].Close > 0 {
+			atrPct[i] = atr[i] / c[i].Close
+		}
+	}
+
+	_, _, hist := MACD(close, 12, 26, 9)
+	obv := OBV(c)
+	// Normalize OBV by max-abs to keep it bounded
+	maxAbs := 1.0
+	for i := range obv {
+		if v := math.Abs(obv[i]); v > maxAbs {
+			maxAbs = v
+		}
+	}
+	obvN := make([]float64, len(obv))
+	for i := range obv {
+		obvN[i] = obv[i] / maxAbs
+	}
+
+	std20 := RollingStd(close, 20)
+
+	feats := [][]float64{}
+	var labels []float64
+	for i := 26; i < len(c)-1; i++ {
+		ret1 := (c[i].Close - c[i-1].Close) / (c[i-1].Close + 1e-12)
+		ret5 := (c[i].Close - c[i-5].Close) / (c[i-5].Close + 1e-12)
+		volPct := std20[i] / (c[i].Close + 1e-12)
+		f := []float64{
+			ret1,
+			ret5,
+			rsis[i] / 100.0,
+			zs[i],
+			atrPct[i],
+			hist[i],
+			obvN[i],
+			volPct,
+		}
+		feats = append(feats, f)
+		if train {
+			up := 0.0
+			if c[i+1].Close > c[i].Close {
+				up = 1.0
+			}
+			labels = append(labels, up)
+		}
+	}
+	return feats, labels
+}
+
+// ComputePUpextended returns pUp from the extended logistic model for the
+// most recent feature row. If features are unavailable, returns 0.5.
+func ComputePUpextended(c []Candle, mdl *ExtendedLogit) float64 {
+	fe, _ := BuildExtendedFeatures(c, false)
+
+	// Only log if we actually have features
+	if len(fe) == 0 || mdl == nil {
+		log.Printf("[DEBUG] pUp: no features or model (len(fe)=%d, mdl_nil=%v)", len(fe), mdl == nil)
+		return 0.5
+	}
+
+	last := fe[len(fe)-1]
+	log.Printf("[DEBUG] features[n-1]=%+v", last)
+	return mdl.Predict(last)
 }

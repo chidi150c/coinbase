@@ -53,6 +53,14 @@ func main() {
 	initThresholdsFromEnv()
 	cfg := loadConfigFromEnv()
 
+	// (Phase-7 opt-in): expose model mode in metrics without changing behavior.
+	// Tiny L2-logistic head is enabled elsewhere when MODEL_MODE=extended.
+	if cfg.Extended().ModelMode == ModelModeExtended {
+		SetModelModeMetric("extended")
+	} else {
+		SetModelModeMetric("baseline")
+	}
+
 	// ---- Broker wiring ----
 	var broker Broker
 	if cfg.BridgeURL != "" {
