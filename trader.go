@@ -28,23 +28,6 @@ import (
 	"net/http"
 	"sync"
 	"time"
-
-	"github.com/prometheus/client_golang/prometheus/promauto"
-)
-
-var (
-    mtxOpens   = promauto.NewCounter(prometheus.CounterOpts{
-        Name: "bot_positions_opened_total",
-        Help: "Total number of opened positions (lots)",
-    })
-    mtxWins    = promauto.NewCounter(prometheus.CounterOpts{
-        Name: "bot_positions_wins_total",
-        Help: "Total number of winning (profitable) closes",
-    })
-    mtxLosses  = promauto.NewCounter(prometheus.CounterOpts{
-        Name: "bot_positions_losses_total",
-        Help: "Total number of losing (unprofitable) closes",
-    })
 )
 
 // ---- Position & Trader ----
@@ -187,6 +170,14 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 	}
 	t.dailyPnL += pl
 	t.equityUSD += pl
+
+	// ---- NEW (minimal): increment unified trades counter by result on close ----
+	if pl > 0 {
+		mtxTrades.WithLabelValues("win").Inc()
+	} else if pl < 0 {
+		mtxTrades.WithLabelValues("loss").Inc()
+	}
+	// --------------------------------------------------------------------------
 
 	// remove lot idx
 	t.lots = append(t.lots[:idx], t.lots[idx+1:]...)
@@ -358,6 +349,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	t.lots = append(t.lots, newLot)
 	t.lastAdd = now
 	t.aggregateOpen()
+
+	// ---- NEW (minimal): increment unified trades counter for open ----
+	mtxTrades.WithLabelValues("open").Inc()
+	// -----------------------------------------------------------------
 
 	msg := ""
 	if t.cfg.DryRun {
