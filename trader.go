@@ -51,6 +51,9 @@ type Trader struct {
 	dailyPnL   float64
 	mu         sync.Mutex
 	equityUSD  float64
+
+	// NEW (minimal): optional extended head passed through to decide(); nil if unused.
+	mdlExt *ExtendedLogit
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -77,6 +80,13 @@ func (t *Trader) SetEquityUSD(v float64) {
 
 	// update the metric with same naming style
 	mtxPnL.Set(v)
+}
+
+// NEW (minimal): allow live loop to inject/refresh the optional extended model.
+func (t *Trader) SetExtendedModel(m *ExtendedLogit) {
+	t.mu.Lock()
+	t.mdlExt = m
+	t.mu.Unlock()
 }
 
 func midnightUTC(ts time.Time) time.Time {
@@ -232,8 +242,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		return "CIRCUIT_BREAKER_DAILY_LOSS", nil
 	}
 
-	// Make a decision.
-	d := decide(c, t.model)
+	// Make a decision (MINIMAL change: pass optional extended model).
+	d := decide(c, t.model, t.mdlExt)
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
 
 	price := c[len(c)-1].Close
@@ -325,7 +335,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		msg = fmt.Sprintf("PAPER %s quote=%.2f base=%.6f stop=%.2f take=%.2f [%s]",
 			d.Signal, quote, base, stop, take, d.Reason)
 	} else {
-		msg = fmt.Sprintf("LIVE ORDER %s quote=%.2f stop=%.2f take=%.2f [%s]",
+		msg = fmt.Sprintf("[LIVE ORDER] %s quote=%.2f stop=%.2f take=%.2f [%s]",
 			d.Signal, quote, stop, take, d.Reason)
 	}
 	if t.cfg.Extended().UseDirectSlack {
