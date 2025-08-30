@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -249,7 +250,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	price := c[len(c)-1].Close
 
 	// Long-only veto for SELL when flat; unchanged behavior.
-	if d.Signal == Sell && t.cfg.LongOnly && len(t.lots) == 0 {
+	if d.Signal == Sell && t.cfg.LongOnly{
 		t.mu.Unlock()
 		return fmt.Sprintf("FLAT (long-only) [%s]", d.Reason), nil
 	}
@@ -261,26 +262,30 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// Determine if we are opening first lot or attempting a pyramid add.
 	isAdd := len(t.lots) > 0 && allowPyramiding() && d.Signal == Buy
 
-	// Gating for pyramiding adds (time spacing & adverse move from last entry).
+	// Gating for pyramiding adds — NOW MANDATORY: spacing + adverse move.
 	if isAdd {
-		// spacing
-		if s := pyramidMinSeconds(); s > 0 && time.Since(t.lastAdd) < time.Duration(s)*time.Second {
+		// 1) Spacing: always enforce (s=0 means no wait; set >0 to require time gap)
+		s := pyramidMinSeconds()
+		if time.Since(t.lastAdd) < time.Duration(s)*time.Second {
 			t.mu.Unlock()
+			log.Printf("[DEBUG] pyramid: blocked by spacing; since_last=%v need>=%ds", time.Since(t.lastAdd), s)
 			return "HOLD", nil
 		}
-		// adverse move from last entry price (e.g., >= 0.30 means price <= last*(1-0.0030))
-		if pct := pyramidMinAdversePct(); pct > 0 {
-			last := t.latestEntry()
-			if last > 0 {
-				minDrop := last * (1.0 - pct/100.0)
-				if !(price <= minDrop) {
-					t.mu.Unlock()
-					return "HOLD", nil
-				}
+
+		// 2) Adverse move vs last entry: always enforce
+		//    (pct=0 means price must be <= last entry; set >0 for a stricter drop)
+		pct := pyramidMinAdversePct()
+		last := t.latestEntry()
+		if last > 0 {
+			minDrop := last * (1.0 - pct/100.0)
+			if !(price <= minDrop) {
+				t.mu.Unlock()
+				log.Printf("[DEBUG] pyramid: blocked by adverse%%; price=%.2f last=%.2f need<=%.2f (%.3f%%)",
+					price, last, minDrop, pct)
+				return "HOLD", nil
 			}
 		}
 	}
-
 	// Sizing (risk % of current equity, with optional volatility adjust already supported).
 	riskPct := t.cfg.RiskPerTradePct
 	if t.cfg.Extended().VolRiskAdjust {
