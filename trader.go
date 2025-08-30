@@ -28,6 +28,23 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+var (
+    mtxOpens   = promauto.NewCounter(prometheus.CounterOpts{
+        Name: "bot_positions_opened_total",
+        Help: "Total number of opened positions (lots)",
+    })
+    mtxWins    = promauto.NewCounter(prometheus.CounterOpts{
+        Name: "bot_positions_wins_total",
+        Help: "Total number of winning (profitable) closes",
+    })
+    mtxLosses  = promauto.NewCounter(prometheus.CounterOpts{
+        Name: "bot_positions_losses_total",
+        Help: "Total number of losing (unprofitable) closes",
+    })
 )
 
 // ---- Position & Trader ----
@@ -209,6 +226,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --- EXIT path: if any lots are open, evaluate TP/SL for each and close those that trigger.
 	if len(t.lots) > 0 {
 		price := c[len(c)-1].Close
+
 		for i := 0; i < len(t.lots); {
 			lot := t.lots[i]
 			trigger := false
@@ -249,8 +267,15 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	price := c[len(c)-1].Close
 
+	// --- NEW (minimal): ignore discretionary SELL signals while lots are open; exits are TP/SL only.
+	if len(t.lots) > 0 && d.Signal == Sell {
+		t.mu.Unlock()
+		return "HOLD", nil
+	}
+	// ----------------------------------------------------------------------
+
 	// Long-only veto for SELL when flat; unchanged behavior.
-	if d.Signal == Sell && t.cfg.LongOnly{
+	if d.Signal == Sell && t.cfg.LongOnly {
 		t.mu.Unlock()
 		return fmt.Sprintf("FLAT (long-only) [%s]", d.Reason), nil
 	}
