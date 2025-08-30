@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -48,7 +49,6 @@ func (s Signal) String() string {
 	}
 }
 
-
 const (
 	Flat Signal = iota
 	Buy
@@ -75,19 +75,31 @@ func (d Decision) SignalToSide() OrderSide {
 }
 
 // decide computes a trading decision from recent candles and the model.
-func decide(c []Candle, m *AIMicroModel) Decision {
+func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 	if len(c) < 40 {
 		return Decision{Signal: Flat, Confidence: 0, Reason: "not_enough_data"}
 	}
 	i := len(c) - 1
 
-	// Features
+	// Features for baseline micro-model
 	rsis := RSI(c, 14)
 	zs := ZScore(c, 20)
 	ret1 := (c[i].Close - c[i-1].Close) / c[i-1].Close
 	ret5 := (c[i].Close - c[i-5].Close) / c[i-5].Close
 	features := []float64{ret1, ret5, rsis[i] / 100.0, zs[i]}
+
+	// Base pUp from the micro-model
 	pUp := m.predict(features)
+
+	// --- MINIMAL CHANGE: if MODEL_MODE=extended and a model is provided, use it for pUp.
+	if strings.EqualFold(getEnv("MODEL_MODE", "baseline"), "extended") {
+		if mdl != nil {
+			pUp = ComputePUpextended(c, mdl)
+		} else {
+			log.Printf("[DEBUG] extended mode requested but no mdlExt present; using micro-model pUp")
+		}
+	}
+	// ----------------------------------------------------------------------
 
 	// Regime filter
 	smaFast := SMA(c, 10)
@@ -98,12 +110,15 @@ func decide(c []Candle, m *AIMicroModel) Decision {
 
 	// BUY if pUp clears threshold and (optionally) MA filter
 	if pUp > buyThreshold && (!useMAFilter || filterOK) {
+	log.Printf("[DEBUG] Decision=Buy, pUp=%.3f, buyThresh=%.3f, sellThresh=%.3f, filterOK=%v", pUp, buyThreshold, sellThreshold, filterOK)
 		return Decision{Signal: Buy, Confidence: pUp, Reason: reason}
 	}
 	// SELL if pUp below threshold and (optionally) MA filter is bearish
 	if pUp < sellThreshold && (!useMAFilter || !filterOK) {
+	log.Printf("[DEBUG] Decision=Sell, pUp=%.3f, buyThresh=%.3f, sellThresh=%.3f, filterOK=%v", pUp, buyThreshold, sellThreshold, filterOK)
 		return Decision{Signal: Sell, Confidence: 1 - pUp, Reason: reason}
 	}
+	log.Printf("[DEBUG] Decision=Flat, pUp=%.3f, buyThresh=%.3f, sellThresh=%.3f, filterOK=%v", pUp, buyThreshold, sellThreshold, filterOK)
 	return Decision{Signal: Flat, Confidence: 0.5, Reason: reason}
 }
 
@@ -118,7 +133,9 @@ func BuildExtendedFeatures(c []Candle, train bool) ([][]float64, []float64) {
 		return nil, nil
 	}
 	close := make([]float64, len(c))
-	for i := range c { close[i] = c[i].Close }
+	for i := range c {
+		close[i] = c[i].Close
+	}
 
 	rsis := RSI(c, 14)
 	zs := ZScore(c, 20)
