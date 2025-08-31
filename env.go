@@ -86,6 +86,14 @@ func loadBotEnv() {
 		"RISK_PER_TRADE_PCT": {}, "USD_EQUITY": {}, "TAKE_PROFIT_PCT": {},
 		"STOP_LOSS_PCT": {}, "ORDER_MIN_USD": {}, "LONG_ONLY": {}, "PORT": {}, "BRIDGE_URL": {},
 		"BUY_THRESHOLD": {}, "SELL_THRESHOLD": {}, "USE_MA_FILTER": {}, "BACKTEST_SLEEP_MS": {},
+		// ---- new, opt-in pyramiding/env-driven toggles ----
+		"ALLOW_PYRAMIDING":             {},
+		"PYRAMID_MIN_SECONDS_BETWEEN":  {},
+		"PYRAMID_MIN_ADVERSE_PCT":      {},
+		"USE_TICK_PRICE":               {},
+		"TICK_INTERVAL_SEC":            {},
+		"CANDLE_RESYNC_SEC":            {},
+		"DAILY_BREAKER_MARK_TO_MARKET": {},
 	}
 
 	s := bufio.NewScanner(f)

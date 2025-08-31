@@ -55,3 +55,35 @@ func loadConfigFromEnv() Config {
 func (c *Config) UseLiveEquity() bool {
 	return getEnvBool("USE_LIVE_EQUITY", false)
 }
+
+// ---- Phase-7 toggles (append-only; no behavior changes unless envs set) ----
+
+// ModelMode selects the prediction path; baseline is the default.
+type ModelMode string
+
+const (
+	ModelModeBaseline ModelMode = "baseline"
+	ModelModeExtended ModelMode = "extended"
+)
+
+// ExtendedToggles exposes optional Phase-7 features without altering existing behavior.
+type ExtendedToggles struct {
+	ModelMode      ModelMode // baseline (default) or extended
+	WalkForwardMin int       // minutes between live refits; 0 disables
+	VolRiskAdjust  bool      // enable volatility-aware risk sizing
+	UseDirectSlack bool      // true if SLACK_WEBHOOK is set (optional direct pings)
+}
+
+// Extended reads optional Phase-7 toggles from env. Defaults preserve baseline behavior.
+func (c *Config) Extended() ExtendedToggles {
+	mm := ModelMode(getEnv("MODEL_MODE", string(ModelModeBaseline)))
+	if mm != ModelModeExtended {
+		mm = ModelModeBaseline
+	}
+	return ExtendedToggles{
+		ModelMode:      mm,
+		WalkForwardMin: getEnvInt("WALK_FORWARD_MIN", 0),
+		VolRiskAdjust:  getEnvBool("VOL_RISK_ADJUST", false),
+		UseDirectSlack: getEnv("SLACK_WEBHOOK", "") != "",
+	}
+}

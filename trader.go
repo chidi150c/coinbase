@@ -171,13 +171,12 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 	t.dailyPnL += pl
 	t.equityUSD += pl
 
-	// ---- NEW (minimal): increment unified trades counter by result on close ----
-	if pl > 0 {
+	// --- NEW: increment win/loss trades ---
+	if pl >= 0 {
 		mtxTrades.WithLabelValues("win").Inc()
-	} else if pl < 0 {
+	} else {
 		mtxTrades.WithLabelValues("loss").Inc()
 	}
-	// --------------------------------------------------------------------------
 
 	// remove lot idx
 	t.lots = append(t.lots[:idx], t.lots[idx+1:]...)
@@ -217,7 +216,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --- EXIT path: if any lots are open, evaluate TP/SL for each and close those that trigger.
 	if len(t.lots) > 0 {
 		price := c[len(c)-1].Close
-
 		for i := 0; i < len(t.lots); {
 			lot := t.lots[i]
 			trigger := false
@@ -254,16 +252,15 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// Make a decision (MINIMAL change: pass optional extended model).
 	d := decide(c, t.model, t.mdlExt)
-	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
-
-	price := c[len(c)-1].Close
-
 	// --- NEW (minimal): ignore discretionary SELL signals while lots are open; exits are TP/SL only.
 	if len(t.lots) > 0 && d.Signal == Sell {
 		t.mu.Unlock()
 		return "HOLD", nil
 	}
 	// ----------------------------------------------------------------------
+	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
+
+	price := c[len(c)-1].Close
 
 	// Long-only veto for SELL when flat; unchanged behavior.
 	if d.Signal == Sell && t.cfg.LongOnly {
@@ -334,6 +331,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			return "", err
 		}
 		mtxOrders.WithLabelValues("live", string(side)).Inc()
+		// --- NEW: count trade open (live) ---
+		mtxTrades.WithLabelValues("open").Inc()
+	} else {
+		// --- NEW: count trade open (paper) ---
+		mtxTrades.WithLabelValues("open").Inc()
 	}
 
 	// Re-lock to mutate state (append new lot or first lot).
@@ -349,10 +351,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	t.lots = append(t.lots, newLot)
 	t.lastAdd = now
 	t.aggregateOpen()
-
-	// ---- NEW (minimal): increment unified trades counter for open ----
-	mtxTrades.WithLabelValues("open").Inc()
-	// -----------------------------------------------------------------
+	
+	// mtxTrades.WithLabelValues("open").Inc()
 
 	msg := ""
 	if t.cfg.DryRun {
