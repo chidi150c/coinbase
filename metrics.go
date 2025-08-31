@@ -64,12 +64,22 @@ var (
 			Help: "Number of walk-forward refits performed in live mode.",
 		},
 	)
+
+	// bot_trades_total counts trades by result (open|win|loss).
+	mtxTrades = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "bot_trades_total",
+			Help: "Trades counted by result (open|win|loss).",
+		},
+		[]string{"result"},
+	)
 )
 
 func init() {
 	prometheus.MustRegister(mtxOrders, mtxDecisions, mtxPnL)
 	// Register new metrics without altering existing ones.
 	prometheus.MustRegister(botModelMode, botVolRiskFactor, botWalkForwardFits)
+	prometheus.MustRegister(mtxTrades)
 }
 
 // Helper setters (optional use by other files; do not impact existing behavior)

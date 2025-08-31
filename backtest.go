@@ -121,8 +121,8 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *AIM
 	if err != nil {
 		log.Fatalf("backtest load: %v", err)
 	}
-	if len(candles) < 200 {
-		log.Fatalf("need >=200 candles, have %d", len(candles))
+	if len(candles) < 1000 {
+		log.Fatalf("need >=1000 candles, have %d", len(candles))
 	}
 
 	// Train/test split
@@ -137,7 +137,8 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *AIM
 	model.fit(train, 0.05, 4)
 
 	// (Phase-7 opt-in) Train extended head if enabled (no behavior change unless other files use it)
-	_ = trainExtendedIfEnabled(trader.cfg, train)
+	trader.mdlExt = trainExtendedIfEnabled(trader.cfg, train)
+
 
 	// Force paper for backtest accounting
 	trader.cfg.DryRun = true
@@ -157,8 +158,8 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *AIM
 	log.Printf("Backtest: csv=%s rows=%d train=%d test=%d pace=%dms",
 		csvPath, len(candles), len(train), len(test), slowMs)
 
-	// Warm-up 50 candles, then step forward
-	for i := 50; i < len(test); i++ {
+	// Warm-up 100 candles, then step forward
+	for i := 100; i < len(test); i++ {
 		select {
 		case <-ctx.Done():
 			log.Println("backtest canceled")
@@ -196,8 +197,8 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *AIM
 	trainN := len(train)
 	testN := len(test)
 	evalN := 0
-	if testN > 50 {
-		evalN = testN - 50
+	if testN > 100 {
+		evalN = testN - 100
 	}
 	log.Printf(
 		"Backtest complete. Train=%d Test=%d Evaluated=%d Wins=%d Losses=%d Equity=%.2f",

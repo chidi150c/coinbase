@@ -94,6 +94,7 @@ func loadBotEnv() {
 		"TICK_INTERVAL_SEC":            {},
 		"CANDLE_RESYNC_SEC":            {},
 		"DAILY_BREAKER_MARK_TO_MARKET": {},
+		"FEE_RATE_PCT": {},
 	}
 
 	s := bufio.NewScanner(f)

@@ -26,6 +26,7 @@ type Config struct {
 	StopLossPct     float64
 	OrderMinUSD     float64
 	LongOnly        bool // prevent SELL entries when flat on spot
+	FeeRatePct float64 // new: % fee applied on entry/exit trades
 
 	// Ops
 	Port      int
@@ -46,6 +47,7 @@ func loadConfigFromEnv() Config {
 		StopLossPct:     getEnvFloat("STOP_LOSS_PCT", 0.4),
 		OrderMinUSD:     getEnvFloat("ORDER_MIN_USD", 5.00),
 		LongOnly:        getEnvBool("LONG_ONLY", true),
+		FeeRatePct:      getEnvFloat("FEE_RATE_PCT", 0.3), // new
 		Port:            getEnvInt("PORT", 8080),
 		BridgeURL:       getEnv("BRIDGE_URL", "http://127.0.0.1:8787"),
 	}

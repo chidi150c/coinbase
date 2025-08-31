@@ -282,3 +282,87 @@ def order_market(payload: MarketOrder):
         raise RuntimeError("RESTClient missing market_order_sell/place_market_order")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+# === INCREMENTAL ADDITIONS: optional WS ticker + /price endpoint (opt-in) ===
+
+# These additions are fully optional and do not change existing behavior unless enabled via env:
+#   COINBASE_WS_ENABLE=true
+#   COINBASE_WS_PRODUCTS=BTC-USD[,ETH-USD,...]
+#   COINBASE_WS_URL=wss://advanced-trade-ws.coinbase.com
+#   COINBASE_WS_STALE_SEC=10
+import asyncio
+import time
+try:
+    import websockets  # type: ignore
+except Exception:
+    websockets = None  # degrade gracefully if package not present
+
+WS_ENABLE = os.getenv("COINBASE_WS_ENABLE", "false").lower() == "true"
+WS_URL = os.getenv("COINBASE_WS_URL", "wss://advanced-trade-ws.coinbase.com")
+WS_PRODUCTS = [p.strip() for p in os.getenv("COINBASE_WS_PRODUCTS", "BTC-USD").split(",") if p.strip()]
+WS_STALE_SEC = int(os.getenv("COINBASE_WS_STALE_SEC", "10"))
+
+_last_ticks: Dict[str, Dict[str, float]] = {}  # {"BTC-USD": {"price": 12345.67, "ts": 1690000000.0}}
+_ws_task: Optional[asyncio.Task] = None
+
+async def _ws_consume():
+    if not WS_ENABLE:
+        return
+    if websockets is None:
+        print("[bridge] websockets not installed; WS disabled")
+        return
+    # Coinbase Advanced Trade WS subscribe format
+    payload = {"type": "subscribe", "channels": [{"name": "ticker", "product_ids": WS_PRODUCTS}]}
+    backoff = 1
+    while True:
+        try:
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
+                await ws.send(json.dumps(payload))
+                print(f"[bridge] WS connected: {WS_URL} products={WS_PRODUCTS}")
+                backoff = 1
+                async for msg in ws:
+                    try:
+                        ev = json.loads(msg)
+                        pid = ev.get("product_id") or ev.get("productId") or ev.get("product")
+                        price = ev.get("price") or ev.get("last_trade_price") or ev.get("best_ask") or ev.get("best_bid")
+                        # If top-level keys missing, try event-wrapped payloads
+                        if not (pid and price):
+                            events = ev.get("events") or []
+                            if events and isinstance(events, list):
+                                e0 = events[0]
+                                if isinstance(e0, dict) and "tickers" in e0 and e0["tickers"]:
+                                    t0 = e0["tickers"][0]
+                                    pid = t0.get("product_id") or t0.get("productId")
+                                    price = t0.get("price")
+                        if pid and price:
+                            try:
+                                p = float(price)
+                                ts = time.time()
+                                _last_ticks[pid] = {"price": p, "ts": ts}
+                            except Exception:
+                                pass
+                    except Exception:
+                        continue
+        except Exception as e:
+            print(f"[bridge] WS error: {e}; reconnecting in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+@app.on_event("startup")
+async def _startup_ws():
+    if WS_ENABLE and websockets is not None:
+        loop = asyncio.get_event_loop()
+        global _ws_task
+        if _ws_task is None:
+            _ws_task = loop.create_task(_ws_consume())
+            print(f"[bridge] WS ticker enabled; products={WS_PRODUCTS}")
+
+@app.get("/price")
+def price(product_id: str = Query(..., alias="product_id")):
+    rec = _last_ticks.get(product_id)
+    if not rec:
+        return {"error": "no_tick", "product_id": product_id}
+    ts = rec["ts"]
+    stale = (time.time() - ts) > WS_STALE_SEC
+    t_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+    return {"product_id": product_id, "price": rec["price"], "ts": t_iso, "stale": stale}

@@ -365,6 +365,70 @@ API key not authorized or IP allowlist mismatch.
 
 Multiline PEM issues
 Keep the PEM in .env exactly as a single line with \n sequences; the sidecar expands them automatically.
+=============================================================================================
+
+Great question 👍 Let me unpack how AI is used in your bot (based on the files we’ve walked through: strategy.go, model.go, live.go, and the env flags):
+
+1. Tiny Logistic Model ("AI MicroModel")
+
+File: model.go
+
+At startup (warmup), the bot collects ~300 recent candles (OHLCV).
+
+It extracts simple technical features (like returns, moving averages, maybe RSI) and feeds them into a tiny logistic regression model (AIMicroModel).
+
+That logistic regression outputs a probability pUp = "probability price goes up next interval".
+
+Parameters are fit quickly in-memory (fit or FitMiniBatch with learning rate and batch size).
+
+This is the "AI" core: not deep learning, but a simple ML classifier updated online.
+
+2. Decision Logic (Strategy Layer)
+
+File: strategy.go
+
+Each tick (candle or /price nudge), the bot queries the model for pUp.
+
+It then applies threshold rules from your env:
+
+If pUp > BUY_THRESHOLD → BUY
+
+If pUp < SELL_THRESHOLD → SELL
+
+Else → FLAT
+
+Those thresholds are effectively the “policy knob” that translates the model’s probability into actions.
+
+3. Extended Mode (Phase-7)
+
+If MODEL_MODE=extended, then in addition to the tiny model, the bot builds extended feature sets (more indicators, multiple lookbacks).
+
+It trains a slightly larger logistic regression (ExtendedLogit) in mini-batches.
+
+This lets the model adapt intraday (e.g., walk-forward refit every 60 minutes if WALK_FORWARD_MIN=60).
+
+Still simple ML (linear logistic regression), but with more features and retraining for drift.
+
+4. Runtime Updates
+
+During live trading:
+
+Each new candle (or tick nudged candle) → update features → feed into model → get pUp.
+
+If WALK_FORWARD_MIN > 0 → model re-fits periodically, using the most recent history (online learning).
+
+This means the AI is not static; it keeps adapting as market conditions shift.
+
+5. Not Used For
+
+The AI is not directly doing position sizing, PnL management, or circuit breaking.
+
+That’s handled by rule-based risk controls (env vars like RISK_PER_TRADE_PCT, MAX_DAILY_LOSS_PCT, pyramiding rules, etc.).
+
+The AI only outputs directional probability (pUp), which is then interpreted by strategy thresholds.
+
+✅ In plain words:
+The AI in your bot is a lightweight logistic regression classifier that predicts whether the next price move is up or down. It’s continuously retrained on recent candles, and its output probability (pUp) is thresholded into BUY/SELL/FLAT. The AI itself doesn’t know about your balance or trades—it just gives a probability; the strategy/risk logic wraps around it.
 
 ============================================================================================
 
@@ -1193,4 +1257,264 @@ docker compose up -d --force-recreate --no-deps bot
 # 3) confirm inside the container
 docker compose exec bot sh -lc 'printenv | egrep "USE_LIVE_EQUITY|DRY_RUN|BRIDGE_URL|PRODUCT_ID"'
 
+===========================================================
 
+git log --oneline --decorate --graph --all --max-count=15
+
+# 1) switch to main and make it match origin/main exactly
+git checkout main
+git fetch origin
+git reset --hard origin/main   # resets local main to the remote main
+
+# 2) merge your feature branch into main
+git merge --no-ff fix/live-equity
+
+# 3) push updated main
+git push origin main
+
+# 4) delete the feature branch (optional)
+git branch -D fix/live-equity
+git push origin --delete fix/live-equity
+
+
+===========================================================
+
+# 1) See last logs for the bot (why it restarts)
+docker compose logs --no-color --tail=200 bot
+
+# 2) Reproduce build in a clean one-off container to get compile errors immediately
+docker compose run --rm bot bash -lc 'go vet ./... && go build ./...'
+
+==========================================================================================
+# uploading Grafana DashBoard
+curl -X POST -H "Content-Type: application/json" \
+  -u admin:admin \
+  http://localhost:3000/api/dashboards/db \
+  -d @dashboard.json
+
+===================================================================================
+
+tree -L 2 ~/coinbase
+
+Required inputs (no secrets)
+
+✅ Confirm you’re OK to run the bot at 1s cadence (much noisier logs/CPU).
+
+✅ Confirm you’re OK with aggressive sizing (example below uses 20% of equity per trade with 0.8% TP / 0.4% SL). If you want milder, say so and I’ll give a safer preset.
+
+========================================================================================================
+
+3) Aggressive sizing + TP-only behavior (no practical SL)
+
+Important nuance: in your code, STOP_LOSS_PCT=0.00 makes stop equal to entry price, which can exit almost immediately on any dip. To effectively ignore stop-loss, set an absurdly large value so it never triggers.
+
+Update these in /opt/coinbase/env/bot.env:
+
+# ~20% of equity per trade (≈$19 on $96)
+sudo sed -i 's/^RISK_PER_TRADE_PCT=.*/RISK_PER_TRADE_PCT=20.0/' /opt/coinbase/env/bot.env
+
+# Take-profit at +0.8% (percentage units)
+sudo sed -i 's/^TAKE_PROFIT_PCT=.*/TAKE_PROFIT_PCT=0.80/' /opt/coinbase/env/bot.env
+
+# Effectively disable stop-loss by setting it impossibly wide
+sudo sed -i 's/^STOP_LOSS_PCT=.*/STOP_LOSS_PCT=1000.0/' /opt/coinbase/env/bot.env
+
+# Keep a daily breaker on (2%); adjust if you want more leash
+sudo sed -i 's/^MAX_DAILY_LOSS_PCT=.*/MAX_DAILY_LOSS_PCT=2.0/' /opt/coinbase/env/bot.env
+
+# Ensure long-only & ticks
+sudo sed -i 's/^LONG_ONLY=.*/LONG_ONLY=true/' /opt/coinbase/env/bot.env
+sudo grep -q "^USE_TICK_PRICE=" /opt/coinbase/env/bot.env || echo "USE_TICK_PRICE=true" | sudo tee -a /opt/coinbase/env/bot.env
+
+# bounce the bot to load env
+docker compose -f ~/coinbase/monitoring/docker-compose.yml up -d bot
+
+============================================================================
+# 
+# 1) Show the active trading env toggles
+grep -E '^(DRY_RUN|USE_LIVE_EQUITY|MAX_DAILY_LOSS_PCT|RISK_PER_TRADE_PCT|TAKE_PROFIT_PCT|STOP_LOSS_PCT|LONG_ONLY|USE_TICK_PRICE)=' /opt/coinbase/env/bot.env
+
+# 2) Last 400 bot log lines around trade decisions/exits
+docker compose -f ~/coinbase/monitoring/docker-compose.yml logs --tail=400 bot \
+ | egrep -i 'LIVE ORDER|PAPER (BUY|SELL)|EXIT|CIRCUIT|EQUITY|step err|shutdown'
+
+# 3) Current metrics sample (look for equity value the bot exported)
+docker compose exec bot sh -lc 'curl -s http://localhost:8080/metrics | egrep -m5 "bot_equity_usd|bot_orders_total|bot_decisions_total" && echo'
+
+=========================================================================
+
+# Nice—trade counters are in. Here’s what I’d do next, in order:
+
+# Restart & sanity-check
+
+docker compose restart bot
+
+# Verify metrics expose the new counter:
+docker compose exec bot sh -lc 'curl -s http://localhost:8080/metrics | egrep -m5 "bot_trades_total|bot_decisions_total|bot_orders_total"'
+
+# You should see:
+
+bot_trades_total{result="open"}
+
+bot_trades_total{result="win"}
+
+bot_trades_total{result="loss"}
+
+# Quick functional checks
+
+# Open a tiny position (DryRun true if you want) and confirm open increments.
+
+# Force a TP/SL on a small lot (tight TP/SL) and watch win or loss increment on exit.
+
+Confirm bot_orders_total{mode="live|paper"} keeps matching actual orders.
+
+Grafana panels (optional but recommended)
+
+“Opens”: sum(increase(bot_trades_total{result="open"}[1h]))
+
+“Wins/Losses”:
+
+sum(increase(bot_trades_total{result="win"}[1h]))
+
+sum(increase(bot_trades_total{result="loss"}[1h]))
+
+Win rate:
+sum(increase(bot_trades_total{result="win"}[1h])) / sum(increase(bot_trades_total{result=~"win|loss"}[1h]))
+
+Alert ideas
+
+No opens for N hours (stuck bot): sum(increase(bot_trades_total{result="open"}[6h])) == 0
+
+Loss streak: increase(bot_trades_total{result="loss"}[1h]) > 5
+
+Confirm strategy behavior matches your intent
+
+While lots are open, discretionary SELL signals are ignored; only TP/SL closes will exit. Watch logs to ensure you see “HOLD” on SELLs during open lots and EXIT logs only on TP/SL triggers.
+
+Extended model & thresholds sanity
+
+If you’re using MODEL_MODE=extended, keep the debug logs on briefly and ensure features[n-1] lines are moving and Decision=... pUp=... looks reasonable.
+
+Keep thresholds at standard (e.g., ~0.47/0.50) while validating pUp dynamics.
+
+Pyramid rules validation
+
+If pyramiding is enabled, test spacing/adverse-move gates and look for the [DEBUG] pyramid: blocks when adds are suppressed.
+
+(Optional) Backtest/Replay
+
+If you have a replay harness, run a short session to confirm opens/TP/SL exits produce the expected counts without touching live capital.
+
+If you want, I can also add a tiny “win rate” gauge (computed) and a “last_trade_pl” gauge so you can watch outcomes at a glance.
+
+=================================================================
+BACKTEST
+=================================================================
+Switch to backtest (persistent)
+
+Toggle the commands in docker-compose.yml:
+
+sudo sed -i 's#^\(\s*\)command: /usr/local/go/bin/go run \. -live -interval .*#\1#command: /usr/local/go/bin/go run . -live -interval 15#' ~/coinbase/monitoring/docker-compose.yml
+sudo sed -i 's#^\(\s*\)#command: /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1#;t; s#^\(\s*\)#command: /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1#' ~/coinbase/monitoring/docker-compose.yml
+
+
+(That comments the live line if present and ensures the backtest line is active.)
+
+Restart just the bot:
+
+docker compose -f ~/coinbase/monitoring/docker-compose.yml up -d --force-recreate --no-deps bot
+
+One-off backtest (no compose edit)
+docker compose -f ~/coinbase/monitoring/docker-compose.yml run --rm bot \
+  /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1
+
+Make sure the CSV exists
+
+Your compose mounts the repo at /app, so the backtester expects data/BTC-USD.csv in your repo:
+
+ls -lh ~/coinbase/data/BTC-USD.csv
+
+
+If you need a quick sample from the bridge (1-min candles), you can dump recent data (adjust limit as you like):
+
+docker compose exec bot sh -lc '
+curl -s "http://bridge:8787/candles?product_id=$PRODUCT_ID&granularity=ONE_MINUTE&limit=300" |
+python - <<PY
+import sys, json, csv
+rows=json.load(sys.stdin)
+w=csv.writer(sys.stdout)
+w.writerow(["time","open","high","low","close","volume"])
+for r in rows:
+    w.writerow([r["start"],r["open"],r["high"],r["low"],r["close"],r["volume"]])
+PY
+' > ~/coinbase/data/BTC-USD.csv
+
+Verify it’s backtesting
+
+Logs should look like a backtest loop (no live order placements):
+
+docker compose logs -f bot | head -n 50
+
+
+Metrics should still emit decisions/orders, but orders will be paper (not “live”):
+
+docker compose exec bot sh -lc 'curl -s http://localhost:8080/metrics | egrep -m10 "bot_decisions_total|bot_orders_total|bot_trades_total"'
+
+(Optional) Env tweaks while backtesting
+
+USE_TICK_PRICE is irrelevant in backtest; you can leave it as is.
+
+DRY_RUN is ignored by the backtester (it doesn’t hit the live broker), so no change needed.
+
+Want me to also wire a simple backtest report (final PnL, win/loss/open counts) to print at the end?
+
+===============================================================
+
+docker compose exec bot sh -lc 'curl -s http://localhost:8080/metrics | egrep -m10 "bot_decisions_total|bot_orders_total|bot_trades_total"'
+
+==============================================================
+
+watch -n 1 "docker compose exec -T bot sh -lc \"curl -sS http://localhost:8080/metrics | grep -E '^(bot_equity_usd|bot_decisions_total|bot_orders_total|bot_trades_total)' || true\""
+
+================================================================================
+
+✅ 1. Check from inside the running container
+
+You can open a shell into the bot container and print its environment:
+
+docker compose exec bot env | grep -E 'DRY_RUN|GRANULARITY|USE_TICK_PRICE|CANDLE_RESYNC_SEC|TICK_INTERVAL_SEC|WALK_FORWARD_MIN|TAKE_PROFIT_PCT|STOP_LOSS_PCT'
+
+
+This will dump only the variables you care about.
+If you want everything:
+
+docker compose exec bot env
+
+✅ 2. Inspect directly from Compose
+
+If you suspect overrides from your docker-compose.yml or .env file, check what’s mounted:
+
+cat monitoring/docker-compose.yml
+cat /opt/coinbase/env/bot.env
+
+
+Your bot likely loads from /opt/coinbase/env/bot.env (since I saw sed edits earlier).
+
+✅ 3. Add debug logging inside the bot (optional)
+
+If you want to log the parsed values as the bot sees them, you can sprinkle a one-liner in main.go or live.go after config load:
+
+log.Printf("[CONFIG] USE_TICK_PRICE=%v TICK_INTERVAL_SEC=%d CANDLE_RESYNC_SEC=%d WALK_FORWARD_MIN=%d TAKE_PROFIT_PCT=%.2f STOP_LOSS_PCT=%.2f",
+    getEnvBool("USE_TICK_PRICE", false),
+    getEnvInt("TICK_INTERVAL_SEC", 1),
+    getEnvInt("CANDLE_RESYNC_SEC", 60),
+    getEnvInt("WALK_FORWARD_MIN", 0),
+    getEnvFloat("TAKE_PROFIT_PCT", 0.0),
+    getEnvFloat("STOP_LOSS_PCT", 0.0))
+
+
+That way every restart prints the effective values into your logs.
+
+⚡ I’d recommend method 1 first (docker compose exec bot env | grep ...) to verify if what’s set inside the container matches your bot.env.
+
+👉 Do you want me to add that [CONFIG] debug block permanently into main.go so every startup shows exactly what thresholds and tunables are being used?

@@ -81,7 +81,13 @@ func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 	}
 	i := len(c) - 1
 
-	// Features for baseline micro-model
+	// --- NEW: debug last/prev close before computing features
+	if i-1 >= 0 {
+		log.Printf("[DEBUG] lastClose=%.2f prevClose=%.2f", c[i].Close, c[i-1].Close)
+	}
+	// ---
+
+	// Features
 	rsis := RSI(c, 14)
 	zs := ZScore(c, 20)
 	ret1 := (c[i].Close - c[i-1].Close) / c[i-1].Close
@@ -91,15 +97,15 @@ func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 	// Base pUp from the micro-model
 	pUp := m.predict(features)
 
-	// --- MINIMAL CHANGE: if MODEL_MODE=extended and a model is provided, use it for pUp.
+	// If MODEL_MODE=extended and an extended model exists, use it for pUp.
 	if strings.EqualFold(getEnv("MODEL_MODE", "baseline"), "extended") {
 		if mdl != nil {
+			// ComputePUpextended logs a debug line when features/model exist.
 			pUp = ComputePUpextended(c, mdl)
 		} else {
 			log.Printf("[DEBUG] extended mode requested but no mdlExt present; using micro-model pUp")
 		}
 	}
-	// ----------------------------------------------------------------------
 
 	// Regime filter
 	smaFast := SMA(c, 10)
@@ -110,15 +116,15 @@ func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 
 	// BUY if pUp clears threshold and (optionally) MA filter
 	if pUp > buyThreshold && (!useMAFilter || filterOK) {
-	log.Printf("[DEBUG] Decision=Buy, pUp=%.3f, buyThresh=%.3f, sellThresh=%.3f, filterOK=%v", pUp, buyThreshold, sellThreshold, filterOK)
+	//log.Printf("[DEBUG] Decision=Buy, pUp=%.3f, buyThresh=%.3f, sellThresh=%.3f, filterOK=%v", pUp, buyThreshold, sellThreshold, filterOK)
 		return Decision{Signal: Buy, Confidence: pUp, Reason: reason}
 	}
 	// SELL if pUp below threshold and (optionally) MA filter is bearish
 	if pUp < sellThreshold && (!useMAFilter || !filterOK) {
-	log.Printf("[DEBUG] Decision=Sell, pUp=%.3f, buyThresh=%.3f, sellThresh=%.3f, filterOK=%v", pUp, buyThreshold, sellThreshold, filterOK)
+	//log.Printf("[DEBUG] Decision=Sell, pUp=%.3f, buyThresh=%.3f, sellThresh=%.3f, filterOK=%v", pUp, buyThreshold, sellThreshold, filterOK)
 		return Decision{Signal: Sell, Confidence: 1 - pUp, Reason: reason}
 	}
-	log.Printf("[DEBUG] Decision=Flat, pUp=%.3f, buyThresh=%.3f, sellThresh=%.3f, filterOK=%v", pUp, buyThreshold, sellThreshold, filterOK)
+	//log.Printf("[DEBUG] Decision=Flat, pUp=%.3f, buyThresh=%.3f, sellThresh=%.3f, filterOK=%v", pUp, buyThreshold, sellThreshold, filterOK)
 	return Decision{Signal: Flat, Confidence: 0.5, Reason: reason}
 }
 
@@ -203,6 +209,6 @@ func ComputePUpextended(c []Candle, mdl *ExtendedLogit) float64 {
 	}
 
 	last := fe[len(fe)-1]
-	log.Printf("[DEBUG] features[n-1]=%+v", last)
+	// log.Printf("[DEBUG] features[n-1]=%+v", last)
 	return mdl.Predict(last)
 }

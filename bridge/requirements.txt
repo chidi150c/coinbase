@@ -2,3 +2,5 @@ coinbase-advanced-py
 fastapi
 uvicorn
 python-dotenv
+
+websockets==12.0

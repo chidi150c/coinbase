@@ -113,3 +113,118 @@ func ZScore(c []Candle, n int) []float64 {
 	}
 	return out
 }
+
+// ---- Advanced indicators (append-only) ----
+
+// EMA returns the n-period exponential moving average of the given values.
+// For n <= 1 or empty input, returns zeros aligned to vals.
+func EMA(vals []float64, n int) []float64 {
+	out := make([]float64, len(vals))
+	if len(vals) == 0 || n <= 1 {
+		return out
+	}
+	k := 2.0 / (float64(n) + 1.0)
+	out[0] = vals[0]
+	for i := 1; i < len(vals); i++ {
+		out[i] = vals[i]*k + out[i-1]*(1-k)
+	}
+	return out
+}
+
+// ATR returns the n-period Average True Range using Wilder smoothing.
+// Output is aligned to c; early indices ramp up until the first full window.
+func ATR(c []Candle, n int) []float64 {
+	out := make([]float64, len(c))
+	if len(c) == 0 || n <= 1 {
+		return out
+	}
+	tr := make([]float64, len(c))
+	for i := range c {
+		if i == 0 {
+			tr[i] = c[i].High - c[i].Low
+			continue
+		}
+		h, l, pc := c[i].High, c[i].Low, c[i-1].Close
+		a := h - l
+		b := math.Abs(h - pc)
+		d := math.Abs(l - pc)
+		tr[i] = math.Max(a, math.Max(b, d))
+	}
+	var sum float64
+	for i := range c {
+		if i < n {
+			sum += tr[i]
+			if i == n-1 {
+				out[i] = sum / float64(n)
+			}
+		} else {
+			out[i] = (out[i-1]*(float64(n)-1) + tr[i]) / float64(n)
+		}
+	}
+	return out
+}
+
+// MACD computes MACD (fast EMA - slow EMA), its signal line, and histogram.
+func MACD(close []float64, fast, slow, signal int) (macd, signalLine, hist []float64) {
+	emaFast := EMA(close, fast)
+	emaSlow := EMA(close, slow)
+	macd = make([]float64, len(close))
+	for i := range close {
+		macd[i] = emaFast[i] - emaSlow[i]
+	}
+	signalLine = EMA(macd, signal)
+	hist = make([]float64, len(close))
+	for i := range close {
+		hist[i] = macd[i] - signalLine[i]
+	}
+	return
+}
+
+// OBV computes On-Balance Volume over candles and returns a cumulative series.
+func OBV(c []Candle) []float64 {
+	out := make([]float64, len(c))
+	for i := 1; i < len(c); i++ {
+		switch {
+		case c[i].Close > c[i-1].Close:
+			out[i] = out[i-1] + c[i].Volume
+		case c[i].Close < c[i-1].Close:
+			out[i] = out[i-1] - c[i].Volume
+		default:
+			out[i] = out[i-1]
+		}
+	}
+	return out
+}
+
+// RollingStd returns the rolling standard deviation over window n for vals.
+// For indices < n-1, the function returns NaN to indicate insufficient data.
+func RollingStd(vals []float64, n int) []float64 {
+	out := make([]float64, len(vals))
+	if n <= 1 {
+		for i := range out {
+			out[i] = math.NaN()
+		}
+		return out
+	}
+	var sum, sumSq float64
+	for i := 0; i < len(vals); i++ {
+		x := vals[i]
+		sum += x
+		sumSq += x * x
+		if i >= n {
+			sum -= vals[i-n]
+			sumSq -= vals[i-n] * vals[i-n]
+		}
+		if i >= n-1 {
+			mean := sum / float64(n)
+			variance := (sumSq / float64(n)) - mean*mean
+			if variance < 0 {
+				variance = 0
+			}
+			out[i] = math.Sqrt(variance)
+		} else {
+			out[i] = math.NaN()
+		}
+	}
+	return out
+}
