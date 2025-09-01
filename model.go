@@ -201,15 +201,4 @@ func (m *ExtendedLogit) FitMiniBatch(feats [][]float64, labels []float64, lr flo
 
 // ---- Minimal additions to support decide() extended-branch wiring ----
 
-// currentExtModel holds the active extended model when available.
-var currentExtModel *ExtendedLogit
 
-// SetCurrentExtendedModel stores the active extended model (no side effects).
-func SetCurrentExtendedModel(m *ExtendedLogit) {
-	currentExtModel = m
-}
-
-// CurrentExtendedModel returns the active extended model, or nil if unset.
-func CurrentExtendedModel() *ExtendedLogit {
-	return currentExtModel
-}

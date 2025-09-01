@@ -31,6 +31,7 @@ type Config struct {
 	// Ops
 	Port      int
 	BridgeURL string // e.g., http://127.0.0.1:8787
+	MaxHistoryCandle int
 }
 
 // loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
@@ -50,6 +51,7 @@ func loadConfigFromEnv() Config {
 		FeeRatePct:      getEnvFloat("FEE_RATE_PCT", 0.3), // new
 		Port:            getEnvInt("PORT", 8080),
 		BridgeURL:       getEnv("BRIDGE_URL", "http://127.0.0.1:8787"),
+		MaxHistoryCandle: getEnvInt("MAX_HISTORY_CANDLES", 5000),
 	}
 }
 

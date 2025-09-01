@@ -83,7 +83,7 @@ func (bb *BridgeBroker) GetRecentCandles(ctx context.Context, product, granulari
 	q.Set("product_id", product)
 	q.Set("granularity", granularity)
 	if limit <= 0 {
-		limit = 300
+		limit = 350
 	}
 	q.Set("limit", strconv.Itoa(limit))
 

@@ -1,235 +1,4 @@
-Generate a full copy of {{// FILE: config.go
-// Package main – Runtime configuration model and loader.
-//
-// This file defines the Config struct (all the knobs your bot uses) and a
-// helper to populate it from environment variables. The .env file is read
-// by loadBotEnv() (see env.go), so you can tune behavior without exports.
-//
-// Typical flow (see main.go):
-//   loadBotEnv()
-//   initThresholdsFromEnv()
-//   cfg := loadConfigFromEnv()
-package main
-
-// Config holds all runtime knobs for trading and operations.
-type Config struct {
-	// Trading target
-	ProductID   string // e.g., "BTC-USD"
-	Granularity string // e.g., "ONE_MINUTE"
-
-	// Safety
-	DryRun          bool
-	MaxDailyLossPct float64
-	RiskPerTradePct float64
-	USDEquity       float64
-	TakeProfitPct   float64
-	StopLossPct     float64
-	OrderMinUSD     float64
-	LongOnly        bool // prevent SELL entries when flat on spot
-
-	// Ops
-	Port      int
-	BridgeURL string // e.g., http://127.0.0.1:8787
-}
-
-// loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
-// and returns a Config with sane defaults if keys are missing.
-func loadConfigFromEnv() Config {
-	return Config{
-		ProductID:       getEnv("PRODUCT_ID", "BTC-USD"),
-		Granularity:     getEnv("GRANULARITY", "ONE_MINUTE"),
-		DryRun:          getEnvBool("DRY_RUN", true),
-		MaxDailyLossPct: getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
-		RiskPerTradePct: getEnvFloat("RISK_PER_TRADE_PCT", 0.25),
-		USDEquity:       getEnvFloat("USD_EQUITY", 1000.0),
-		TakeProfitPct:   getEnvFloat("TAKE_PROFIT_PCT", 0.8),
-		StopLossPct:     getEnvFloat("STOP_LOSS_PCT", 0.4),
-		OrderMinUSD:     getEnvFloat("ORDER_MIN_USD", 5.00),
-		LongOnly:        getEnvBool("LONG_ONLY", true),
-		Port:            getEnvInt("PORT", 8080),
-		BridgeURL:       getEnv("BRIDGE_URL", "http://127.0.0.1:8787"),
-	}
-}
-
-// UseLiveEquity returns true if live balances should rebase equity.
-func (c *Config) UseLiveEquity() bool {
-	return getEnvBool("USE_LIVE_EQUITY", false)
-}
-
-// ---- Phase-7 toggles (append-only; no behavior changes unless envs set) ----
-
-// ModelMode selects the prediction path; baseline is the default.
-type ModelMode string
-
-const (
-	ModelModeBaseline ModelMode = "baseline"
-	ModelModeExtended ModelMode = "extended"
-)
-
-// ExtendedToggles exposes optional Phase-7 features without altering existing behavior.
-type ExtendedToggles struct {
-	ModelMode      ModelMode // baseline (default) or extended
-	WalkForwardMin int       // minutes between live refits; 0 disables
-	VolRiskAdjust  bool      // enable volatility-aware risk sizing
-	UseDirectSlack bool      // true if SLACK_WEBHOOK is set (optional direct pings)
-}
-
-// Extended reads optional Phase-7 toggles from env. Defaults preserve baseline behavior.
-func (c *Config) Extended() ExtendedToggles {
-	mm := ModelMode(getEnv("MODEL_MODE", string(ModelModeBaseline)))
-	if mm != ModelModeExtended {
-		mm = ModelModeBaseline
-	}
-	return ExtendedToggles{
-		ModelMode:      mm,
-		WalkForwardMin: getEnvInt("WALK_FORWARD_MIN", 0),
-		VolRiskAdjust:  getEnvBool("VOL_RISK_ADJUST", false),
-		UseDirectSlack: getEnv("SLACK_WEBHOOK", "") != "",
-	}
-}
-}} and {{// FILE: env.go
-// Package main – Environment helpers for the trading bot.
-//
-// This file provides:
-//   1) Small helpers to read environment variables with sane defaults
-//      (strings, ints, floats, bools).
-//   2) A safe loader (loadBotEnv) that reads /opt/coinbase/env/bot.env only,
-//      ignoring secrets meant for the Python bridge.
-//   3) Strategy threshold knobs (buyThreshold, sellThreshold, useMAFilter) and an
-//      initializer (initThresholdsFromEnv) so you can tune behavior via env
-//      without recompiling.
-//
-// Notes:
-//   • The bot never requires `export $(cat .env ...)`.
-//   • The Python FastAPI sidecar uses its own /opt/coinbase/env/bridge.env.
-
-package main
-
-import (
-	"bufio"
-	"log"
-	"os"
-	"strconv"
-	"strings"
-)
-
-// --------- Env helpers (used across files) ---------
-
-func getEnv(key, def string) string {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		return v
-	}
-	return def
-}
-func getEnvFloat(key string, def float64) float64 {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return def
-	}
-	f, err := strconv.ParseFloat(v, 64)
-	if err != nil {
-		return def
-	}
-	return f
-}
-func getEnvBool(key string, def bool) bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
-	switch v {
-	case "1", "true", "y", "yes":
-		return true
-	case "0", "false", "n", "no":
-		return false
-	case "":
-		return def
-	default:
-		return def
-	}
-}
-func getEnvInt(key string, def int) int {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return def
-	}
-	i, err := strconv.Atoi(v)
-	if err != nil {
-		return def
-	}
-	return i
-}
-
-// --------- .env loader (bot-only) ---------
-
-// loadBotEnv reads /opt/coinbase/env/bot.env and sets ONLY the keys the Go bot needs.
-// It won't override variables already in the environment and ignores secrets not required.
-func loadBotEnv() {
-	path := "/opt/coinbase/env/bot.env"
-	f, err := os.Open(path)
-	if err != nil {
-		log.Printf("env: %s not found, relying on process env", path)
-		return
-	}
-	defer f.Close()
-
-	needed := map[string]struct{}{
-		"PRODUCT_ID": {}, "GRANULARITY": {}, "DRY_RUN": {}, "MAX_DAILY_LOSS_PCT": {},
-		"RISK_PER_TRADE_PCT": {}, "USD_EQUITY": {}, "TAKE_PROFIT_PCT": {},
-		"STOP_LOSS_PCT": {}, "ORDER_MIN_USD": {}, "LONG_ONLY": {}, "PORT": {}, "BRIDGE_URL": {},
-		"BUY_THRESHOLD": {}, "SELL_THRESHOLD": {}, "USE_MA_FILTER": {}, "BACKTEST_SLEEP_MS": {},
-		// ---- new, opt-in pyramiding/env-driven toggles ----
-		"ALLOW_PYRAMIDING":             {},
-		"PYRAMID_MIN_SECONDS_BETWEEN":  {},
-		"PYRAMID_MIN_ADVERSE_PCT":      {},
-		"USE_TICK_PRICE":               {},
-		"TICK_INTERVAL_SEC":            {},
-		"CANDLE_RESYNC_SEC":            {},
-		"DAILY_BREAKER_MARK_TO_MARKET": {},
-	}
-
-	s := bufio.NewScanner(f)
-	for s.Scan() {
-		line := strings.TrimSpace(s.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if strings.HasPrefix(line, "export ") {
-			line = strings.TrimSpace(line[len("export "):])
-		}
-		eq := strings.Index(line, "=")
-		if eq <= 0 {
-			continue
-		}
-		key := strings.TrimSpace(line[:eq])
-		if _, ok := needed[key]; !ok {
-			continue
-		}
-		val := strings.TrimSpace(line[eq+1:])
-		if len(val) >= 2 && ((val[0] == '"' && val[len(val)-1] == '"') || (val[0] == '\'' && val[len(val)-1] == '\'')) {
-			val = val[1 : len(val)-1]
-		}
-		if idx := strings.Index(val, "#"); idx >= 0 {
-			val = strings.TrimSpace(val[:idx])
-		}
-		if os.Getenv(key) == "" {
-			_ = os.Setenv(key, val)
-		}
-	}
-	log.Printf("env: loaded %s", path)
-}
-
-// --------- Tunable strategy thresholds (initialized in main) ---------
-
-var (
-	buyThreshold  float64
-	sellThreshold float64
-	useMAFilter   bool
-)
-
-func initThresholdsFromEnv() {
-	buyThreshold = getEnvFloat("BUY_THRESHOLD", 0.55)
-	sellThreshold = getEnvFloat("SELL_THRESHOLD", 0.45)
-	useMAFilter = getEnvBool("USE_MA_FILTER", true)
-}
-}} and {{// FILE: trader.go
+Generate a full copy of {{// FILE: trader.go
 // Package main – Position/risk management and the synchronized trading loop.
 //
 // What’s here:
@@ -270,6 +39,8 @@ type Position struct {
 	Stop      float64
 	Take      float64
 	OpenTime  time.Time
+	// --- NEW: record entry fee for later P/L adjustment ---
+	EntryFee float64
 }
 
 type Trader struct {
@@ -399,6 +170,12 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 	if lot.Side == SideSell {
 		pl = (lot.OpenPrice - price) * base
 	}
+
+	// --- NEW: apply exit fee ---
+	exitFee := quote * (t.cfg.FeeRatePct / 100.0)
+	pl -= lot.EntryFee // subtract entry fee recorded
+	pl -= exitFee      // subtract exit fee now
+
 	t.dailyPnL += pl
 	t.equityUSD += pl
 
@@ -413,7 +190,8 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 	t.lots = append(t.lots[:idx], t.lots[idx+1:]...)
 	t.aggregateOpen()
 
-	msg := fmt.Sprintf("EXIT %s at %.2f P/L=%.2f", c[len(c)-1].Time.Format(time.RFC3339), price, pl)
+	msg := fmt.Sprintf("EXIT %s at %.2f P/L=%.2f (fees=%.4f)",
+		c[len(c)-1].Time.Format(time.RFC3339), price, pl, lot.EntryFee+exitFee)
 	if t.cfg.Extended().UseDirectSlack {
 		postSlack(msg)
 	}
@@ -447,6 +225,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --- EXIT path: if any lots are open, evaluate TP/SL for each and close those that trigger.
 	if len(t.lots) > 0 {
 		price := c[len(c)-1].Close
+		nearestStop := 0.0
+		nearestTake := 0.0
 		for i := 0; i < len(t.lots); {
 			lot := t.lots[i]
 			trigger := false
@@ -466,23 +246,43 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				t.mu.Unlock()
 				return msg, nil
 			}
+
+			if lot.Side == SideBuy {
+				if nearestStop == 0 || lot.Stop > nearestStop { // highest stop for long
+					nearestStop = lot.Stop
+				}
+				if nearestTake == 0 || lot.Take < nearestTake { // lowest take for long
+					nearestTake = lot.Take
+				}
+			} else { // SideSell
+				if nearestStop == 0 || lot.Stop < nearestStop { // lowest stop for short
+					nearestStop = lot.Stop
+				}
+				if nearestTake == 0 || lot.Take > nearestTake { // highest take for short
+					nearestTake = lot.Take
+				}
+			}
+
 			i++ // no trigger; move to next
 		}
+		log.Printf("[DEBUG] nearest stop=%.2f take=%.2f across %d lots", nearestStop, nearestTake, len(t.lots))
 		// Still have at least one lot; HOLD for this tick unless we’re adding (pyramiding) below.
 		// We intentionally fall through to allow an additional BUY if enabled.
 	}
 
 	// Flat (no lots) or pyramiding add both must respect the daily loss circuit breaker.
-	if !t.canTrade() {
-		if t.cfg.Extended().UseDirectSlack {
-			postSlack("CIRCUIT_BREAKER_DAILY_LOSS — trading paused")
-		}
-		t.mu.Unlock()
-		return "CIRCUIT_BREAKER_DAILY_LOSS", nil
-	}
+	// if !t.canTrade() {
+	// 	if t.cfg.Extended().UseDirectSlack {
+	// 		postSlack("CIRCUIT_BREAKER_DAILY_LOSS — trading paused")
+	// 	}
+	// 	t.mu.Unlock()
+	// 	return "CIRCUIT_BREAKER_DAILY_LOSS", nil
+	// }
 
 	// Make a decision (MINIMAL change: pass optional extended model).
 	d := decide(c, t.model, t.mdlExt)
+	log.Printf("[DEBUG] Lots=%d, Decision=%s Reason=%s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v", len(t.lots), d.Signal, d.Reason, buyThreshold, sellThreshold, t.cfg.LongOnly)
+	
 	// --- NEW (minimal): ignore discretionary SELL signals while lots are open; exits are TP/SL only.
 	if len(t.lots) > 0 && d.Signal == Sell {
 		t.mu.Unlock()
@@ -552,6 +352,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		take = price * (1.0 - t.cfg.TakeProfitPct/100.0)
 	}
 
+	// --- apply entry fee ---
+		entryFee := quote * (t.cfg.FeeRatePct / 100.0)
+	if t.cfg.DryRun {
+		t.equityUSD -= entryFee
+	}
+
 	// Place live order without holding the lock.
 	t.mu.Unlock()
 	if !t.cfg.DryRun {
@@ -562,10 +368,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			return "", err
 		}
 		mtxOrders.WithLabelValues("live", string(side)).Inc()
-		// --- NEW: count trade open (live) ---
 		mtxTrades.WithLabelValues("open").Inc()
 	} else {
-		// --- NEW: count trade open (paper) ---
 		mtxTrades.WithLabelValues("open").Inc()
 	}
 
@@ -578,21 +382,20 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		Stop:      stop,
 		Take:      take,
 		OpenTime:  now,
+		EntryFee:  entryFee,
 	}
 	t.lots = append(t.lots, newLot)
 	t.lastAdd = now
 	t.aggregateOpen()
 	
-	// mtxTrades.WithLabelValues("open").Inc()
-
 	msg := ""
 	if t.cfg.DryRun {
 		mtxOrders.WithLabelValues("paper", string(side)).Inc()
-		msg = fmt.Sprintf("PAPER %s quote=%.2f base=%.6f stop=%.2f take=%.2f [%s]",
-			d.Signal, quote, base, stop, take, d.Reason)
+		msg = fmt.Sprintf("PAPER %s quote=%.2f base=%.6f stop=%.2f take=%.2f fee=%.4f [%s]",
+			d.Signal, quote, base, stop, take, entryFee, d.Reason)
 	} else {
-		msg = fmt.Sprintf("[LIVE ORDER] %s quote=%.2f stop=%.2f take=%.2f [%s]",
-			d.Signal, quote, stop, take, d.Reason)
+		msg = fmt.Sprintf("[LIVE ORDER] %s quote=%.2f stop=%.2f take=%.2f fee=%.4f [%s]",
+			d.Signal, quote, stop, take, entryFee, d.Reason)
 	}
 	if t.cfg.Extended().UseDirectSlack {
 		postSlack(msg)
@@ -659,8 +462,345 @@ func volRiskFactor(c []Candle) float64 {
 		return 1.0
 	}
 }
-}} with only the necessary minimal changes to implement {{add FeeRatePct field to Config loaded from environment variable FEE_RATE_PCT with default 0.1 and apply it to subtract entry and exit fees from equity and P/L in trader.go}}.
+}}, {{// FILE: config.go
+// Package main – Runtime configuration model and loader.
+//
+// This file defines the Config struct (all the knobs your bot uses) and a
+// helper to populate it from environment variables. The .env file is read
+// by loadBotEnv() (see env.go), so you can tune behavior without exports.
+//
+// Typical flow (see main.go):
+//   loadBotEnv()
+//   initThresholdsFromEnv()
+//   cfg := loadConfigFromEnv()
+package main
+
+// Config holds all runtime knobs for trading and operations.
+type Config struct {
+	// Trading target
+	ProductID   string // e.g., "BTC-USD"
+	Granularity string // e.g., "ONE_MINUTE"
+
+	// Safety
+	DryRun          bool
+	MaxDailyLossPct float64
+	RiskPerTradePct float64
+	USDEquity       float64
+	TakeProfitPct   float64
+	StopLossPct     float64
+	OrderMinUSD     float64
+	LongOnly        bool // prevent SELL entries when flat on spot
+	FeeRatePct float64 // new: % fee applied on entry/exit trades
+
+	// Ops
+	Port      int
+	BridgeURL string // e.g., http://127.0.0.1:8787
+	MaxHistoryCandle int
+}
+
+// loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
+// and returns a Config with sane defaults if keys are missing.
+func loadConfigFromEnv() Config {
+	return Config{
+		ProductID:       getEnv("PRODUCT_ID", "BTC-USD"),
+		Granularity:     getEnv("GRANULARITY", "ONE_MINUTE"),
+		DryRun:          getEnvBool("DRY_RUN", true),
+		MaxDailyLossPct: getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
+		RiskPerTradePct: getEnvFloat("RISK_PER_TRADE_PCT", 0.25),
+		USDEquity:       getEnvFloat("USD_EQUITY", 1000.0),
+		TakeProfitPct:   getEnvFloat("TAKE_PROFIT_PCT", 0.8),
+		StopLossPct:     getEnvFloat("STOP_LOSS_PCT", 0.4),
+		OrderMinUSD:     getEnvFloat("ORDER_MIN_USD", 5.00),
+		LongOnly:        getEnvBool("LONG_ONLY", true),
+		FeeRatePct:      getEnvFloat("FEE_RATE_PCT", 0.3), // new
+		Port:            getEnvInt("PORT", 8080),
+		BridgeURL:       getEnv("BRIDGE_URL", "http://127.0.0.1:8787"),
+		MaxHistoryCandle: getEnvInt("MAX_HISTORY_CANDLES", 5000),
+	}
+}
+
+// UseLiveEquity returns true if live balances should rebase equity.
+func (c *Config) UseLiveEquity() bool {
+	return getEnvBool("USE_LIVE_EQUITY", false)
+}
+
+// ---- Phase-7 toggles (append-only; no behavior changes unless envs set) ----
+
+// ModelMode selects the prediction path; baseline is the default.
+type ModelMode string
+
+const (
+	ModelModeBaseline ModelMode = "baseline"
+	ModelModeExtended ModelMode = "extended"
+)
+
+// ExtendedToggles exposes optional Phase-7 features without altering existing behavior.
+type ExtendedToggles struct {
+	ModelMode      ModelMode // baseline (default) or extended
+	WalkForwardMin int       // minutes between live refits; 0 disables
+	VolRiskAdjust  bool      // enable volatility-aware risk sizing
+	UseDirectSlack bool      // true if SLACK_WEBHOOK is set (optional direct pings)
+}
+
+// Extended reads optional Phase-7 toggles from env. Defaults preserve baseline behavior.
+func (c *Config) Extended() ExtendedToggles {
+	mm := ModelMode(getEnv("MODEL_MODE", string(ModelModeBaseline)))
+	if mm != ModelModeExtended {
+		mm = ModelModeBaseline
+	}
+	return ExtendedToggles{
+		ModelMode:      mm,
+		WalkForwardMin: getEnvInt("WALK_FORWARD_MIN", 0),
+		VolRiskAdjust:  getEnvBool("VOL_RISK_ADJUST", false),
+		UseDirectSlack: getEnv("SLACK_WEBHOOK", "") != "",
+	}
+}
+}}, {{// FILE: env.go
+// Package main – Environment helpers for the trading bot.
+//
+// This file provides:
+//   1) Small helpers to read environment variables with sane defaults
+//      (strings, ints, floats, bools).
+//   2) A safe loader (loadBotEnv) that reads /opt/coinbase/env/bot.env only,
+//      ignoring secrets meant for the Python bridge.
+//   3) Strategy threshold knobs (buyThreshold, sellThreshold, useMAFilter) and an
+//      initializer (initThresholdsFromEnv) so you can tune behavior via env
+//      without recompiling.
+//
+// Notes:
+//   • The bot never requires `export $(cat .env ...)`.
+//   • The Python FastAPI sidecar uses its own /opt/coinbase/env/bridge.env.
+
+package main
+
+import (
+	"bufio"
+	"log"
+	"os"
+	"strconv"
+	"strings"
+)
+
+// --------- Env helpers (used across files) ---------
+
+func getEnv(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
+}
+func getEnvFloat(key string, def float64) float64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return def
+	}
+	return f
+}
+func getEnvBool(key string, def bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch v {
+	case "1", "true", "y", "yes":
+		return true
+	case "0", "false", "n", "no":
+		return false
+	case "":
+		return def
+	default:
+		return def
+	}
+}
+func getEnvInt(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	i, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return i
+}
+
+// --------- .env loader (bot-only) ---------
+
+// loadBotEnv reads /opt/coinbase/env/bot.env and sets ONLY the keys the Go bot needs.
+// It won't override variables already in the environment and ignores secrets not required.
+func loadBotEnv() {
+	path := "/opt/coinbase/env/bot.env"
+	f, err := os.Open(path)
+	if err != nil {
+		log.Printf("env: %s not found, relying on process env", path)
+		return
+	}
+	defer f.Close()
+
+	needed := map[string]struct{}{
+		"PRODUCT_ID": {}, "GRANULARITY": {}, "DRY_RUN": {}, "MAX_DAILY_LOSS_PCT": {},
+		"RISK_PER_TRADE_PCT": {}, "USD_EQUITY": {}, "TAKE_PROFIT_PCT": {},
+		"STOP_LOSS_PCT": {}, "ORDER_MIN_USD": {}, "LONG_ONLY": {}, "PORT": {}, "BRIDGE_URL": {},
+		"BUY_THRESHOLD": {}, "SELL_THRESHOLD": {}, "USE_MA_FILTER": {}, "BACKTEST_SLEEP_MS": {},
+		// ---- new, opt-in pyramiding/env-driven toggles ----
+		"ALLOW_PYRAMIDING":             {},
+		"PYRAMID_MIN_SECONDS_BETWEEN":  {},
+		"PYRAMID_MIN_ADVERSE_PCT":      {},
+		"USE_TICK_PRICE":               {},
+		"TICK_INTERVAL_SEC":            {},
+		"CANDLE_RESYNC_SEC":            {},
+		"DAILY_BREAKER_MARK_TO_MARKET": {},
+		"FEE_RATE_PCT": {},
+	}
+
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(line[len("export "):])
+		}
+		eq := strings.Index(line, "=")
+		if eq <= 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		if _, ok := needed[key]; !ok {
+			continue
+		}
+		val := strings.TrimSpace(line[eq+1:])
+		if len(val) >= 2 && ((val[0] == '"' && val[len(val)-1] == '"') || (val[0] == '\'' && val[len(val)-1] == '\'')) {
+			val = val[1 : len(val)-1]
+		}
+		if idx := strings.Index(val, "#"); idx >= 0 {
+			val = strings.TrimSpace(val[:idx])
+		}
+		if os.Getenv(key) == "" {
+			_ = os.Setenv(key, val)
+		}
+	}
+	log.Printf("env: loaded %s", path)
+}
+
+// --------- Tunable strategy thresholds (initialized in main) ---------
+
+var (
+	buyThreshold  float64
+	sellThreshold float64
+	useMAFilter   bool
+)
+
+func initThresholdsFromEnv() {
+	buyThreshold = getEnvFloat("BUY_THRESHOLD", 0.55)
+	sellThreshold = getEnvFloat("SELL_THRESHOLD", 0.45)
+	useMAFilter = getEnvBool("USE_MA_FILTER", true)
+}
+}} and {{version: "3.9"
+
+services:
+  bot:
+    image: golang:1.23
+    working_dir: /app
+    volumes:
+      - ..:/app
+      - /opt/coinbase/env:/opt/coinbase/env:ro 
+    env_file:
+      - /opt/coinbase/env/bot.env
+    command: ["/usr/local/go/bin/go","run",".","-live","-interval","1"]
+    #command: /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1
+    restart: unless-stopped
+    expose:
+      - "8080"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      monitoring_network:
+        aliases: [bot, coinbase-bot]
+
+  bridge:
+    build:
+      context: ../bridge
+      dockerfile: Dockerfile
+    image: coinbase-bridge:curl
+    working_dir: /app/bridge
+    volumes:
+      - ../bridge:/app/bridge:ro
+      - /opt/coinbase/env:/opt/coinbase/env:ro 
+    env_file:
+      - /opt/coinbase/env/bridge.env
+    # use CMD from Dockerfile (no inline command override)
+    expose:
+      - "8787"
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      monitoring_network:
+        aliases: [bridge]
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - monitoring_prometheus_data:/prometheus
+    restart: unless-stopped
+    networks:
+      - monitoring_network
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    restart: unless-stopped
+    networks:
+      - monitoring_network
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - monitoring_grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - bot
+      - bridge
+    networks:
+      - monitoring_network
+
+volumes:
+  monitoring_prometheus_data:
+  monitoring_grafana_data:
+
+networks:
+  monitoring_network:
+    driver: bridge
+}}  with only the necessary minimal changes to implement {{CHANGE_DESCRIPTION: add state serialization in trader.go by saving equity, open positions, and model weights into a JSON state file on each tick and reload them on startup if present.
+
+CHANGE_DESCRIPTION: update config.go to include STATE_FILE path (default /opt/coinbase/state/bot_state.json) configurable via env.
+
+CHANGE_DESCRIPTION: add persistence directory volume in monitoring/docker-compose.yml for the bot container to mount /opt/coinbase/state.}}.
 Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()).
 Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline.
-Only apply the minimal edits required to implement {{add FeeRatePct field to Config loaded from environment variable FEE_RATE_PCT with default 0.1 and apply it to subtract entry and exit fees from equity and P/L in trader.go}}.
+Only apply the minimal edits required to implement {{CHANGE_DESCRIPTION: add state serialization in trader.go by saving equity, open positions, and model weights into a JSON state file on each tick and reload them on startup if present.
+
+CHANGE_DESCRIPTION: update config.go to include STATE_FILE path (default /opt/coinbase/state/bot_state.json) configurable via env.
+
+CHANGE_DESCRIPTION: add persistence directory volume in monitoring/docker-compose.yml for the bot container to mount /opt/coinbase/state.}}.
 Return the complete file, copy-paste ready.

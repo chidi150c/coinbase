@@ -225,6 +225,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --- EXIT path: if any lots are open, evaluate TP/SL for each and close those that trigger.
 	if len(t.lots) > 0 {
 		price := c[len(c)-1].Close
+		nearestStop := 0.0
+		nearestTake := 0.0
 		for i := 0; i < len(t.lots); {
 			lot := t.lots[i]
 			trigger := false
@@ -244,24 +246,43 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				t.mu.Unlock()
 				return msg, nil
 			}
+
+			if lot.Side == SideBuy {
+				if nearestStop == 0 || lot.Stop > nearestStop { // highest stop for long
+					nearestStop = lot.Stop
+				}
+				if nearestTake == 0 || lot.Take < nearestTake { // lowest take for long
+					nearestTake = lot.Take
+				}
+			} else { // SideSell
+				if nearestStop == 0 || lot.Stop < nearestStop { // lowest stop for short
+					nearestStop = lot.Stop
+				}
+				if nearestTake == 0 || lot.Take > nearestTake { // highest take for short
+					nearestTake = lot.Take
+				}
+			}
+
 			i++ // no trigger; move to next
 		}
+		log.Printf("[DEBUG] nearest stop=%.2f take=%.2f across %d lots", nearestStop, nearestTake, len(t.lots))
 		// Still have at least one lot; HOLD for this tick unless we’re adding (pyramiding) below.
 		// We intentionally fall through to allow an additional BUY if enabled.
 	}
 
 	// Flat (no lots) or pyramiding add both must respect the daily loss circuit breaker.
-	if !t.canTrade() {
-		if t.cfg.Extended().UseDirectSlack {
-			postSlack("CIRCUIT_BREAKER_DAILY_LOSS — trading paused")
-		}
-		t.mu.Unlock()
-		return "CIRCUIT_BREAKER_DAILY_LOSS", nil
-	}
+	// if !t.canTrade() {
+	// 	if t.cfg.Extended().UseDirectSlack {
+	// 		postSlack("CIRCUIT_BREAKER_DAILY_LOSS — trading paused")
+	// 	}
+	// 	t.mu.Unlock()
+	// 	return "CIRCUIT_BREAKER_DAILY_LOSS", nil
+	// }
 
 	// Make a decision (MINIMAL change: pass optional extended model).
 	d := decide(c, t.model, t.mdlExt)
 	log.Printf("[DEBUG] Lots=%d, Decision=%s Reason=%s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v", len(t.lots), d.Signal, d.Reason, buyThreshold, sellThreshold, t.cfg.LongOnly)
+	
 	// --- NEW (minimal): ignore discretionary SELL signals while lots are open; exits are TP/SL only.
 	if len(t.lots) > 0 && d.Signal == Sell {
 		t.mu.Unlock()
@@ -331,9 +352,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		take = price * (1.0 - t.cfg.TakeProfitPct/100.0)
 	}
 
-	// --- NEW: apply entry fee ---
-	entryFee := quote * (t.cfg.FeeRatePct / 100.0)
-	t.equityUSD -= entryFee
+	// --- apply entry fee ---
+		entryFee := quote * (t.cfg.FeeRatePct / 100.0)
+	if t.cfg.DryRun {
+		t.equityUSD -= entryFee
+	}
 
 	// Place live order without holding the lock.
 	t.mu.Unlock()
@@ -364,7 +387,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	t.lots = append(t.lots, newLot)
 	t.lastAdd = now
 	t.aggregateOpen()
-
+	
 	msg := ""
 	if t.cfg.DryRun {
 		mtxOrders.WithLabelValues("paper", string(side)).Inc()

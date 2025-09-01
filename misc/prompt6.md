@@ -1,4 +1,4 @@
-Now I want the distilled invariant baseline to be no longer than the original Text A (≈[200] lines).
+Now I want the distilled invariant baseline to be no longer than ≈[200] lines.
 So,give me a version that’s ≤ [200] lines (say ~[190–200] lines) as long as nothing important is lost. 
 
 The draft you gave expanded to ~[237] lines because it carried some redundant explanatory bullets and repeated details (e.g., env vars listed in multiple places, duplicated notes about long-only behavior, ports restated twice). The goal is a compact but complete baseline that can be used to prompt another AI to reproduce the current state of the project.

@@ -35,7 +35,7 @@ func (p *PaperBroker) GetNowPrice(ctx context.Context, product string) (float64,
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.price <= 0 {
-		p.price = 50000 // default bootstrap price if none seen yet
+		p.price = 108000 // default bootstrap price if none seen yet
 	}
 	return p.price, nil
 }
