@@ -6,6 +6,12 @@
 //   • GetNowPrice:      GET /product/{product_id} -> price
 //   • GetRecentCandles: GET /candles?product_id=...&granularity=...&limit=...
 //   • PlaceMarketQuote: POST /order/market {product_id, side, quote_size}
+//
+// Minimal update in this version:
+// After placing a market order, immediately call GET /order/{order_id}
+// and populate filled fields (filled_size, average_filled_price) into the
+// returned PlacedOrder. If the enrichment call fails, fall back to the prior
+// behavior (returning an order ID with zeroed fills/notional).
 
 package main
 
@@ -197,7 +203,7 @@ func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, si
 		return nil, fmt.Errorf("bridge order %d: %s", res.StatusCode, string(b))
 	}
 
-	// Try to parse a normalized bridge response first.
+	// Try to parse a normalized bridge response first (legacy support).
 	var norm struct {
 		OrderID     string `json:"order_id"`
 		AvgPrice    string `json:"avg_price"`
@@ -208,6 +214,15 @@ func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, si
 		price, _ := strconv.ParseFloat(norm.AvgPrice, 64)
 		base, _ := strconv.ParseFloat(norm.FilledBase, 64)
 		quote, _ := strconv.ParseFloat(norm.QuoteSpent, 64)
+
+		// Enrich via GET /order/{order_id} if we can (minimal change; ignore errors).
+		enrichPrice, enrichBase, _ := bb.tryFetchOrderFill(ctx, norm.OrderID)
+		if enrichBase > 0 && enrichPrice > 0 {
+			price = enrichPrice
+			base = enrichBase
+			quote = price * base
+		}
+
 		return &PlacedOrder{
 			ID:         firstNonEmpty(norm.OrderID, uuid.New().String()),
 			ProductID:  product,
@@ -219,24 +234,38 @@ func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, si
 		}, nil
 	}
 
-	// Fallback: just extract an order_id if present; leave price/base/quote as zeroes.
+	// Fallback: extract an order_id (top-level or under success_response.order_id).
 	var generic map[string]any
 	_ = json.Unmarshal(b, &generic)
 	id := ""
 	if v, ok := generic["order_id"]; ok {
 		id = fmt.Sprintf("%v", v)
 	}
+	if id == "" {
+		if sr, ok := generic["success_response"].(map[string]any); ok {
+			if v, ok2 := sr["order_id"]; ok2 {
+				id = fmt.Sprintf("%v", v)
+			}
+		}
+	}
 	if strings.TrimSpace(id) == "" {
 		id = uuid.New().String()
+	}
+
+	// Minimal addition: immediately query /order/{order_id} to obtain fills.
+	price, base, _ := bb.tryFetchOrderFill(ctx, id)
+	quote := 0.0
+	if price > 0 && base > 0 {
+		quote = price * base
 	}
 
 	return &PlacedOrder{
 		ID:         id,
 		ProductID:  product,
 		Side:       side,
-		Price:      0,
-		BaseSize:   0,
-		QuoteSpent: 0,
+		Price:      price,
+		BaseSize:   base,
+		QuoteSpent: quote,
 		CreateTime: time.Now().UTC(),
 	}, nil
 }
@@ -250,4 +279,43 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// tryFetchOrderFill calls GET /order/{order_id} and returns (avgPrice, filledBase, err).
+// This is a best-effort enrichment; errors are swallowed by the caller for minimal impact.
+func (bb *BridgeBroker) tryFetchOrderFill(ctx context.Context, orderID string) (avgPrice float64, filledBase float64, err error) {
+	if strings.TrimSpace(orderID) == "" {
+		return 0, 0, fmt.Errorf("empty order id")
+	}
+	u := fmt.Sprintf("%s/order/%s", bb.base, url.PathEscape(orderID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set("User-Agent", "coinbot/bridge")
+
+	res, err := bb.hc.Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode >= 300 {
+		b, _ := io.ReadAll(res.Body)
+		return 0, 0, fmt.Errorf("order fetch %d: %s", res.StatusCode, string(b))
+	}
+
+	var out struct {
+		OrderID            string `json:"order_id"`
+		Status             string `json:"status"`
+		FilledSize         string `json:"filled_size"`
+		AverageFilledPrice string `json:"average_filled_price"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		return 0, 0, err
+	}
+
+	fp, _ := strconv.ParseFloat(strings.TrimSpace(out.AverageFilledPrice), 64)
+	fs, _ := strconv.ParseFloat(strings.TrimSpace(out.FilledSize), 64)
+	return fp, fs, nil
 }
