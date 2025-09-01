@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -43,6 +44,15 @@ type Position struct {
 	EntryFee float64
 }
 
+// BotState is the persistent snapshot of trader state.
+type BotState struct {
+	EquityUSD  float64
+	DailyStart time.Time
+	DailyPnL   float64
+	Lots       []*Position
+	Model      *AIMicroModel
+}
+
 type Trader struct {
 	cfg        Config
 	broker     Broker
@@ -57,16 +67,27 @@ type Trader struct {
 
 	// NEW (minimal): optional extended head passed through to decide(); nil if unused.
 	mdlExt *ExtendedLogit
+
+	// NEW: path to persisted state file
+	stateFile string
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
-	return &Trader{
+	t := &Trader{
 		cfg:        cfg,
 		broker:     broker,
 		model:      model,
 		equityUSD:  cfg.USDEquity,
 		dailyStart: midnightUTC(time.Now().UTC()),
+		stateFile:  cfg.StateFile,
 	}
+	// Try to load state if exists
+	if err := t.loadState(); err == nil {
+		log.Printf("[INFO] trader state restored from %s", t.stateFile)
+	} else {
+		log.Printf("[INFO] no prior state restored: %v", err)
+	}
+	return t
 }
 
 func (t *Trader) EquityUSD() float64 {
@@ -83,6 +104,8 @@ func (t *Trader) SetEquityUSD(v float64) {
 
 	// update the metric with same naming style
 	mtxPnL.Set(v)
+	// persist new state
+	_ = t.saveState()
 }
 
 // NEW (minimal): allow live loop to inject/refresh the optional extended model.
@@ -101,12 +124,8 @@ func (t *Trader) updateDaily(date time.Time) {
 	if midnightUTC(date) != t.dailyStart {
 		t.dailyStart = midnightUTC(date)
 		t.dailyPnL = 0
+		_ = t.saveState()
 	}
-}
-
-func (t *Trader) canTrade() bool {
-	limit := t.cfg.MaxDailyLossPct / 100.0 * t.equityUSD
-	return t.dailyPnL > -limit
 }
 
 // ---- helpers for pyramiding ----
@@ -195,6 +214,8 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 	if t.cfg.Extended().UseDirectSlack {
 		postSlack(msg)
 	}
+	// persist new state
+	_ = t.saveState()
 	return msg, nil
 }
 
@@ -266,29 +287,16 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			i++ // no trigger; move to next
 		}
 		log.Printf("[DEBUG] nearest stop=%.2f take=%.2f across %d lots", nearestStop, nearestTake, len(t.lots))
-		// Still have at least one lot; HOLD for this tick unless we’re adding (pyramiding) below.
-		// We intentionally fall through to allow an additional BUY if enabled.
 	}
 
-	// Flat (no lots) or pyramiding add both must respect the daily loss circuit breaker.
-	// if !t.canTrade() {
-	// 	if t.cfg.Extended().UseDirectSlack {
-	// 		postSlack("CIRCUIT_BREAKER_DAILY_LOSS — trading paused")
-	// 	}
-	// 	t.mu.Unlock()
-	// 	return "CIRCUIT_BREAKER_DAILY_LOSS", nil
-	// }
-
-	// Make a decision (MINIMAL change: pass optional extended model).
 	d := decide(c, t.model, t.mdlExt)
 	log.Printf("[DEBUG] Lots=%d, Decision=%s Reason=%s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v", len(t.lots), d.Signal, d.Reason, buyThreshold, sellThreshold, t.cfg.LongOnly)
-	
-	// --- NEW (minimal): ignore discretionary SELL signals while lots are open; exits are TP/SL only.
+
+	// Ignore discretionary SELL signals while lots are open; exits are TP/SL only.
 	if len(t.lots) > 0 && d.Signal == Sell {
 		t.mu.Unlock()
 		return "HOLD", nil
 	}
-	// ----------------------------------------------------------------------
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
 
 	price := c[len(c)-1].Close
@@ -353,7 +361,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	// --- apply entry fee ---
-		entryFee := quote * (t.cfg.FeeRatePct / 100.0)
+	entryFee := quote * (t.cfg.FeeRatePct / 100.0)
 	if t.cfg.DryRun {
 		t.equityUSD -= entryFee
 	}
@@ -387,7 +395,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	t.lots = append(t.lots, newLot)
 	t.lastAdd = now
 	t.aggregateOpen()
-	
+
 	msg := ""
 	if t.cfg.DryRun {
 		mtxOrders.WithLabelValues("paper", string(side)).Inc()
@@ -400,6 +408,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	if t.cfg.Extended().UseDirectSlack {
 		postSlack(msg)
 	}
+	// persist new state
+	_ = t.saveState()
 	t.mu.Unlock()
 	return msg, nil
 }
@@ -415,6 +425,53 @@ func signalLabel(s Signal) string {
 	default:
 		return "flat"
 	}
+}
+
+// ---- Persistence helpers ----
+
+func (t *Trader) saveState() error {
+	if t.stateFile == "" {
+		return nil
+	}
+	state := BotState{
+		EquityUSD:  t.equityUSD,
+		DailyStart: t.dailyStart,
+		DailyPnL:   t.dailyPnL,
+		Lots:       t.lots,
+		Model:      t.model,
+	}
+	bs, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := t.stateFile + ".tmp"
+	if err := os.WriteFile(tmp, bs, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, t.stateFile)
+}
+
+func (t *Trader) loadState() error {
+	if t.stateFile == "" {
+		return fmt.Errorf("no state file configured")
+	}
+	bs, err := os.ReadFile(t.stateFile)
+	if err != nil {
+		return err
+	}
+	var st BotState
+	if err := json.Unmarshal(bs, &st); err != nil {
+		return err
+	}
+	t.equityUSD = st.EquityUSD
+	t.dailyStart = st.DailyStart
+	t.dailyPnL = st.DailyPnL
+	t.lots = st.Lots
+	if st.Model != nil {
+		t.model = st.Model
+	}
+	t.aggregateOpen()
+	return nil
 }
 
 // ---- Phase-7 helpers (append-only; optional features) ----
