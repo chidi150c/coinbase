@@ -46,11 +46,14 @@ type Position struct {
 
 // BotState is the persistent snapshot of trader state.
 type BotState struct {
-	EquityUSD  float64
-	DailyStart time.Time
-	DailyPnL   float64
-	Lots       []*Position
-	Model      *AIMicroModel
+	EquityUSD      float64
+	DailyStart     time.Time
+	DailyPnL       float64
+	Lots           []*Position
+	Model          *AIMicroModel
+	MdlExt         *ExtendedLogit
+	WalkForwardMin int
+	LastFit        time.Time
 }
 
 type Trader struct {
@@ -70,6 +73,9 @@ type Trader struct {
 
 	// NEW: path to persisted state file
 	stateFile string
+
+	// NEW: track last model fit time for walk-forward
+	lastFit time.Time
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -368,8 +374,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// Place live order without holding the lock.
 	t.mu.Unlock()
+	var placed *PlacedOrder
 	if !t.cfg.DryRun {
-		if _, err := t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote); err != nil {
+		var err error
+		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
+		if err != nil {
 			if t.cfg.Extended().UseDirectSlack {
 				postSlack(fmt.Sprintf("ERR step: %v", err))
 			}
@@ -383,10 +392,43 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// Re-lock to mutate state (append new lot or first lot).
 	t.mu.Lock()
+
+	// --- MINIMAL CHANGE: use actual filled size/price when available ---
+	priceToUse := price
+	baseRequested := base
+	baseToUse := baseRequested
+	actualQuote := quote
+
+	if placed != nil {
+		if placed.Price > 0 {
+			priceToUse = placed.Price
+		}
+		if placed.BaseSize > 0 {
+			baseToUse = placed.BaseSize
+		}
+		if placed.QuoteSpent > 0 {
+			actualQuote = placed.QuoteSpent
+		}
+		// Log WARN on partial fill (filled < requested) with a small tolerance.
+		const tol = 1e-9
+		if baseToUse+tol < baseRequested {
+			log.Printf("[WARN] partial fill: requested_base=%.8f filled_base=%.8f (%.2f%%)",
+				baseRequested, baseToUse, 100.0*(baseToUse/baseRequested))
+		}
+	}
+
+	// Recompute entry fee from actualQuote (keeps behavior identical otherwise).
+	entryFee = actualQuote * (t.cfg.FeeRatePct / 100.0)
+	if t.cfg.DryRun {
+		// already deducted above for DryRun using quote; adjust to the actualQuote delta
+		delta := (actualQuote - quote) * (t.cfg.FeeRatePct / 100.0)
+		t.equityUSD -= delta
+	}
+
 	newLot := &Position{
-		OpenPrice: price,
+		OpenPrice: priceToUse,
 		Side:      side,
-		SizeBase:  base,
+		SizeBase:  baseToUse,
 		Stop:      stop,
 		Take:      take,
 		OpenTime:  now,
@@ -400,10 +442,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	if t.cfg.DryRun {
 		mtxOrders.WithLabelValues("paper", string(side)).Inc()
 		msg = fmt.Sprintf("PAPER %s quote=%.2f base=%.6f stop=%.2f take=%.2f fee=%.4f [%s]",
-			d.Signal, quote, base, stop, take, entryFee, d.Reason)
+			d.Signal, actualQuote, baseToUse, stop, take, entryFee, d.Reason)
 	} else {
 		msg = fmt.Sprintf("[LIVE ORDER] %s quote=%.2f stop=%.2f take=%.2f fee=%.4f [%s]",
-			d.Signal, quote, stop, take, entryFee, d.Reason)
+			d.Signal, actualQuote, stop, take, entryFee, d.Reason)
 	}
 	if t.cfg.Extended().UseDirectSlack {
 		postSlack(msg)
@@ -434,11 +476,14 @@ func (t *Trader) saveState() error {
 		return nil
 	}
 	state := BotState{
-		EquityUSD:  t.equityUSD,
-		DailyStart: t.dailyStart,
-		DailyPnL:   t.dailyPnL,
-		Lots:       t.lots,
-		Model:      t.model,
+		EquityUSD:      t.equityUSD,
+		DailyStart:     t.dailyStart,
+		DailyPnL:       t.dailyPnL,
+		Lots:           t.lots,
+		Model:          t.model,
+		MdlExt:         t.mdlExt,
+		WalkForwardMin: t.cfg.Extended().WalkForwardMin,
+		LastFit:        t.lastFit,
 	}
 	bs, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -470,11 +515,17 @@ func (t *Trader) loadState() error {
 	if st.Model != nil {
 		t.model = st.Model
 	}
+	if st.MdlExt != nil {
+		t.mdlExt = st.MdlExt
+	}
+	if !st.LastFit.IsZero() {
+		t.lastFit = st.LastFit
+	}
 	t.aggregateOpen()
 	return nil
 }
 
-// ---- Phase-7 helpers (append-only; optional features) ----
+// ---- Phase-7 helpers ----
 
 // postSlack sends a best-effort Slack webhook message if SLACK_WEBHOOK is set.
 // No impact on baseline behavior or logging; errors are ignored.
