@@ -312,7 +312,7 @@ async def _ws_consume():
         print("[bridge] websockets not installed; WS disabled")
         return
     # Coinbase Advanced Trade WS subscribe format
-    payload = {"type": "subscribe", "channels": [{"name": "ticker", "product_ids": WS_PRODUCTS}]}
+    payload = {"type": "subscribe", "channel": "ticker", "product_ids": WS_PRODUCTS}
     backoff = 1
     while True:
         try:
@@ -366,3 +366,83 @@ def price(product_id: str = Query(..., alias="product_id")):
     stale = (time.time() - ts) > WS_STALE_SEC
     t_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
     return {"product_id": product_id, "price": rec["price"], "ts": t_iso, "stale": stale}
+
+# === MINIMAL ADDITION: GET /order/{order_id} (fills/status summary) ===
+
+@app.get("/order/{order_id}")
+def get_order(order_id: str):
+    """
+    Return a minimal summary for an order:
+      - status (if available from fills payload)
+      - filled_size (sum of fill sizes)
+      - average_filled_price (size-weighted)
+    Notes:
+      * Uses the official SDK's fills method(s) and is robust to naming differences.
+      * If no fills are found, returns zeros and status 'UNKNOWN'.
+    """
+    try:
+        # Try available fills methods on the SDK
+        methods = [name for name in ("get_fills", "list_fills") if hasattr(client, name)]
+        fills: List[Dict[str, Any]] = []
+        last_err: Optional[Exception] = None
+
+        for m in methods:
+            try:
+                resp = getattr(client, m)(order_id=order_id)
+                data = resp.to_dict() if hasattr(resp, "to_dict") else resp
+                arr = None
+                if isinstance(data, dict):
+                    # Common shapes: {"fills":[...]} or {"data":[...]} or {"results":[...]}
+                    arr = data.get("fills") or data.get("data") or data.get("results")
+                if isinstance(arr, list):
+                    fills = arr
+                    break
+            except Exception as e:
+                last_err = e
+                continue
+
+        # If no fills were returned, report UNKNOWN with zeros
+        if not fills:
+            return {
+                "order_id": order_id,
+                "status": "UNKNOWN",
+                "filled_size": "0",
+                "average_filled_price": "0"
+            }
+
+        total_qty = Decimal("0")
+        total_notional = Decimal("0")
+        status = "UNKNOWN"
+
+        for f in fills:
+            # Accept multiple possible field names defensively
+            size_str = str(f.get("size") or f.get("filled_size") or "0")
+            price_str = str(f.get("price") or f.get("average_filled_price") or "0")
+            try:
+                size = Decimal(size_str)
+            except Exception:
+                size = Decimal("0")
+            try:
+                price = Decimal(price_str)
+            except Exception:
+                price = Decimal("0")
+
+            total_qty += size
+            total_notional += (size * price)
+
+            st = f.get("order_status") or f.get("status")
+            if isinstance(st, str) and st:
+                status = st
+
+        avg_price = (total_notional / total_qty) if total_qty > 0 else Decimal("0")
+
+        return {
+            "order_id": order_id,
+            "status": status,
+            "filled_size": format(total_qty, "f"),
+            "average_filled_price": format(avg_price, "f"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))

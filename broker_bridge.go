@@ -179,9 +179,10 @@ func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, si
 	// Minimal update: send side and quote_size to unified /order/market endpoint.
 	u := bb.base + "/order/market"
 	body := map[string]any{
-		"product_id": product,
-		"side":       strings.ToUpper(string(side)),
-		"quote_size": fmt.Sprintf("%.2f", quoteUSD),
+		"product_id":      product,
+		"side":            strings.ToUpper(string(side)),
+		"quote_size":      fmt.Sprintf("%.2f", quoteUSD),
+		"client_order_id": uuid.New().String(), // minimal addition: dedupe-safe ID for retries
 	}
 	bs, _ := json.Marshal(body)
 
@@ -205,10 +206,10 @@ func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, si
 
 	// Try to parse a normalized bridge response first (legacy support).
 	var norm struct {
-		OrderID     string `json:"order_id"`
-		AvgPrice    string `json:"avg_price"`
-		FilledBase  string `json:"filled_base"`
-		QuoteSpent  string `json:"quote_spent"`
+		OrderID    string `json:"order_id"`
+		AvgPrice   string `json:"avg_price"`
+		FilledBase string `json:"filled_base"`
+		QuoteSpent string `json:"quote_spent"`
 	}
 	if err := json.Unmarshal(b, &norm); err == nil && (norm.OrderID != "" || norm.AvgPrice != "" || norm.FilledBase != "" || norm.QuoteSpent != "") {
 		price, _ := strconv.ParseFloat(norm.AvgPrice, 64)

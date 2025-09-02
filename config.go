@@ -32,6 +32,7 @@ type Config struct {
 	Port      int
 	BridgeURL string // e.g., http://127.0.0.1:8787
 	MaxHistoryCandle int
+	StateFile        string // NEW: path to persist bot state (configurable via env)
 }
 
 // loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
@@ -52,6 +53,7 @@ func loadConfigFromEnv() Config {
 		Port:            getEnvInt("PORT", 8080),
 		BridgeURL:       getEnv("BRIDGE_URL", "http://127.0.0.1:8787"),
 		MaxHistoryCandle: getEnvInt("MAX_HISTORY_CANDLES", 5000),
+		StateFile:        getEnv("STATE_FILE", "/opt/coinbase/state/bot_state.json"), // NEW
 	}
 }
 

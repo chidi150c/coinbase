@@ -13,8 +13,8 @@ import (
 )
 
 type AIMicroModel struct {
-	W []float64 // weights
-	B float64   // bias
+	W []float64 `json:"W"` // weights
+	B float64   `json:"B"` // bias
 }
 
 func newModel() *AIMicroModel {
@@ -93,10 +93,10 @@ func buildDataset(c []Candle) ([][]float64, []float64) {
 // ExtendedLogit is an optional, regularized logistic model used when the
 // extended path is enabled. Baseline behavior remains unchanged.
 type ExtendedLogit struct {
-	W       []float64
-	B       float64
-	L2      float64
-	FeatDim int
+	W       []float64 `json:"W"`
+	B       float64   `json:"B"`
+	L2      float64   `json:"L2"`
+	FeatDim int       `json:"FeatDim"`
 }
 
 func NewExtendedLogit(featDim int) *ExtendedLogit {
@@ -200,5 +200,3 @@ func (m *ExtendedLogit) FitMiniBatch(feats [][]float64, labels []float64, lr flo
 }
 
 // ---- Minimal additions to support decide() extended-branch wiring ----
-
-

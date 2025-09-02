@@ -1091,10 +1091,9 @@ docker compose logs -f bot | grep -E "Starting | \\[SAFETY\\]"
 
 docker compose logs -f bot | grep -E "Starting|\\[SAFETY\\]|LIVE ORDER|EXIT|CIRCUIT_BREAKER|step err"
 
-# You want to see a line like:
+# watch metrics
 
-Starting coinbase-bridge — product=BTC-USD dry_run=false
-[SAFETY] LONG_ONLY=true | ORDER_MIN_USD=5.00 | RISK_PER_TRADE_PCT=0.25 | MAX_DAILY_LOSS_PCT=1.00 | TAKE_PROFIT
+watch -n 1 "docker compose exec -T bot sh -lc \"curl -sS http://localhost:8080/metrics | grep -E '^(bot_equity_usd|bot_decisions_total|bot_orders_total|bot_trades_total)' || true\""
 
 # 6) Force a recreate of ONLY the bot (re-reads env_file)
 cd ~/coinbase/monitoring
@@ -1504,7 +1503,7 @@ Your bot likely loads from /opt/coinbase/env/bot.env (since I saw sed edits earl
 
 If you want to log the parsed values as the bot sees them, you can sprinkle a one-liner in main.go or live.go after config load:
 
-log.Printf("[CONFIG] USE_TICK_PRICE=%v TICK_INTERVAL_SEC=%d CANDLE_RESYNC_SEC=%d WALK_FORWARD_MIN=%d TAKE_PROFIT_PCT=%.2f STOP_LOSS_PCT=%.2f",
+log.Printf("[CONFIG] USE_TICK_PRICE=%v TICK_INT ERVAL_SEC=%d CANDLE_RESYNC_SEC=%d WALK_FORWARD_MIN=%d TAKE_PROFIT_PCT=%.2f STOP_LOSS_PCT=%.2f",
     getEnvBool("USE_TICK_PRICE", false),
     getEnvInt("TICK_INTERVAL_SEC", 1),
     getEnvInt("CANDLE_RESYNC_SEC", 60),
@@ -1518,3 +1517,50 @@ That way every restart prints the effective values into your logs.
 ⚡ I’d recommend method 1 first (docker compose exec bot env | grep ...) to verify if what’s set inside the container matches your bot.env.
 
 👉 Do you want me to add that [CONFIG] debug block permanently into main.go so every startup shows exactly what thresholds and tunables are being used?
+================================
+
+cp /opt/coinbase/state/bot_state.json /opt/coinbase/state/bot_state.json.bak.$(date +%F-%H%M)
+
+==============================================================
+Manual Trading
+
+docker compose -f ~/coinbase/monitoring/docker-compose.yml exec bridge \
+  sh -lc 'curl -s -X POST http://localhost:8787/order/market \
+    -H "Content-Type: application/json" \
+    -d '\''{"product_id":"BTC-USD","side":"BUY","quote_size":"5.00"}'\'' ' \
+  | tee order_response.json | jq .
+
+====================================
+chidi@Dynamo:~/coinbase/monitoring$ docker compose -f ~/coinbase/monitoring/docker-compose.yml exec bridge \
+  sh -lc 'curl -s -X POST http://localhost:8787/order/market \
+    -H "Content-Type: application/json" \
+    -d '\''{"product_id":"BTC-USD","side":"BUY","quote_size":"5.00"}'\'' ' | tee order.json | jq .
+
+OID=$(jq -r '.order_id // .success_response.order_id' order.json)
+docker compose -f ~/coinbase/monitoring/docker-compose.yml exec bridge \
+  curl -s http://localhost:8787/order/$OID | jq .
+{
+  "success": true,
+  "success_response": {
+    "order_id": "34b0bfa5-daab-463f-b9da-074af867af34",
+    "product_id": "BTC-USD",
+    "side": "BUY",
+    "client_order_id": "cd029765f32144949be501bb2b2bac4d",
+    "attached_order_id": ""
+  },
+  "order_configuration": {
+    "market_market_ioc": {
+      "quote_size": "5.00",
+      "rfq_enabled": false,
+      "rfq_disabled": false,
+      "reduce_only": false
+    }
+  }
+}
+{
+  "order_id": "34b0bfa5-daab-463f-b9da-074af867af34",
+  "status": "UNKNOWN",
+  "filled_size": "4.9596880743",
+  "average_filled_price": "108932.31"
+}
+chidi@Dynamo:~/coinbase/monitoring$ 

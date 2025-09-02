@@ -7,6 +7,7 @@ services:
     volumes:
       - ..:/app
       - /opt/coinbase/env:/opt/coinbase/env:ro 
+      - /opt/coinbase/state:/opt/coinbase/state
     env_file:
       - /opt/coinbase/env/bot.env
     command: ["/usr/local/go/bin/go","run",".","-live","-interval","1"]
@@ -87,6 +88,7 @@ services:
 volumes:
   monitoring_prometheus_data:
   monitoring_grafana_data:
+  coinbase_state:
 
 networks:
   monitoring_network:

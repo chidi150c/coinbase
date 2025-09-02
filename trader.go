@@ -172,13 +172,16 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 	if lot.Side == SideSell {
 		closeSide = SideBuy
 	}
-	base := lot.SizeBase
-	quote := base * price
+	baseRequested := lot.SizeBase
+	quote := baseRequested * price
 
 	// unlock for I/O
 	t.mu.Unlock()
+	var placed *PlacedOrder
 	if !t.cfg.DryRun {
-		if _, err := t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote); err != nil {
+		var err error
+		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote)
+		if err != nil {
 			if t.cfg.Extended().UseDirectSlack {
 				postSlack(fmt.Sprintf("ERR step: %v", err))
 			}
@@ -188,16 +191,38 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 	}
 	// re-lock
 	t.mu.Lock()
-	// refresh price snapshot (best-effort)
-	price = c[len(c)-1].Close
 
-	pl := (price - lot.OpenPrice) * base
-	if lot.Side == SideSell {
-		pl = (lot.OpenPrice - price) * base
+	// --- MINIMAL CHANGE: use actual filled size/price if available ---
+	priceExec := c[len(c)-1].Close
+	baseFilled := baseRequested
+	if placed != nil {
+		if placed.Price > 0 {
+			priceExec = placed.Price
+		}
+		if placed.BaseSize > 0 {
+			baseFilled = placed.BaseSize
+		}
+		// Log WARN on partial fill (filled < requested) with a small tolerance.
+		const tol = 1e-9
+		if baseFilled+tol < baseRequested {
+			log.Printf("[WARN] partial fill (exit): requested_base=%.8f filled_base=%.8f (%.2f%%)",
+				baseRequested, baseFilled, 100.0*(baseFilled/baseRequested))
+		}
+	}
+	// refresh price snapshot (best-effort) if no execution price was available
+	if placed == nil || placed.Price <= 0 {
+		priceExec = c[len(c)-1].Close
 	}
 
-	// --- NEW: apply exit fee ---
-	exitFee := quote * (t.cfg.FeeRatePct / 100.0)
+	// compute P/L using actual fill size and execution price
+	pl := (priceExec - lot.OpenPrice) * baseFilled
+	if lot.Side == SideSell {
+		pl = (lot.OpenPrice - priceExec) * baseFilled
+	}
+
+	// --- NEW: apply exit fee based on actual filled notional ---
+	quoteExec := baseFilled * priceExec
+	exitFee := quoteExec * (t.cfg.FeeRatePct / 100.0)
 	pl -= lot.EntryFee // subtract entry fee recorded
 	pl -= exitFee      // subtract exit fee now
 
@@ -216,7 +241,7 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 	t.aggregateOpen()
 
 	msg := fmt.Sprintf("EXIT %s at %.2f P/L=%.2f (fees=%.4f)",
-		c[len(c)-1].Time.Format(time.RFC3339), price, pl, lot.EntryFee+exitFee)
+		c[len(c)-1].Time.Format(time.RFC3339), priceExec, pl, lot.EntryFee+exitFee)
 	if t.cfg.Extended().UseDirectSlack {
 		postSlack(msg)
 	}
