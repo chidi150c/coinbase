@@ -54,6 +54,10 @@ type BotState struct {
 	MdlExt         *ExtendedLogit
 	WalkForwardMin int
 	LastFit        time.Time
+
+	// NEW: persist pyramiding anchor across restarts (independent of lots)
+	PyramidAnchorPrice float64
+	PyramidAnchorTime  time.Time
 }
 
 type Trader struct {
@@ -76,6 +80,13 @@ type Trader struct {
 
 	// NEW: track last model fit time for walk-forward
 	lastFit time.Time
+
+	// NEW: index of the designated runner lot (-1 if none). Not persisted; derived on load.
+	runnerIdx int
+
+	// NEW: independent pyramiding anchor (stable reference, not tied to latest scalp)
+	pyramidAnchorPrice float64
+	pyramidAnchorTime  time.Time
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -86,12 +97,17 @@ func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
 		equityUSD:  cfg.USDEquity,
 		dailyStart: midnightUTC(time.Now().UTC()),
 		stateFile:  cfg.StateFile,
+		runnerIdx:  -1,
 	}
 	// Try to load state if exists
 	if err := t.loadState(); err == nil {
 		log.Printf("[INFO] trader state restored from %s", t.stateFile)
 	} else {
 		log.Printf("[INFO] no prior state restored: %v", err)
+	}
+	// If state has existing lots but no runner assigned (fresh field), default runner to the oldest or 0.
+	if t.runnerIdx == -1 && len(t.lots) > 0 {
+		t.runnerIdx = 0
 	}
 	return t
 }
@@ -146,6 +162,18 @@ func pyramidMinAdversePct() float64 {
 	return getEnvFloat("PYRAMID_MIN_ADVERSE_PCT", 0.0) // 0 = no adverse-move requirement
 }
 
+// Cap concurrent lots (no new env key; keep internal default).
+func maxConcurrentLots() int {
+	return 3
+}
+
+// Runner tuning (internal, no new env keys): runner takes profit farther, same stop by default.
+const runnerTPMult = 2.0
+const runnerStopMult = 1.0
+
+// Minimal "runner gap" guard (avoid adding too close to/high above runner entry)
+const runnerMinGapPct = 0.001 // 0.10%
+
 // latestEntry returns the most recent long lot entry price, or 0 if none.
 func (t *Trader) latestEntry() float64 {
 	if len(t.lots) == 0 {
@@ -162,6 +190,36 @@ func (t *Trader) aggregateOpen() {
 	}
 	// keep last lot as representative for legacy checks
 	t.pos = t.lots[len(t.lots)-1]
+}
+
+// applyRunnerTargets adjusts stop/take for the designated runner lot.
+func (t *Trader) applyRunnerTargets(p *Position) {
+	if p == nil {
+		return
+	}
+	op := p.OpenPrice
+	if p.Side == SideBuy {
+		p.Stop = op * (1.0 - (t.cfg.StopLossPct*runnerStopMult)/100.0)
+		p.Take = op * (1.0 + (t.cfg.TakeProfitPct*runnerTPMult)/100.0)
+	} else {
+		p.Stop = op * (1.0 + (t.cfg.StopLossPct*runnerStopMult)/100.0)
+		p.Take = op * (1.0 - (t.cfg.TakeProfitPct*runnerTPMult)/100.0)
+	}
+}
+
+// maybeUpdatePyramidAnchor lowers (for BUY) or raises (for SELL) the anchor; never moves it against-adverse.
+func (t *Trader) maybeUpdatePyramidAnchor(side OrderSide, refPrice float64, now time.Time) {
+	if side == SideBuy {
+		if t.pyramidAnchorPrice == 0 || refPrice < t.pyramidAnchorPrice {
+			t.pyramidAnchorPrice = refPrice
+			t.pyramidAnchorTime = now
+		}
+	} else {
+		if t.pyramidAnchorPrice == 0 || refPrice > t.pyramidAnchorPrice {
+			t.pyramidAnchorPrice = refPrice
+			t.pyramidAnchorTime = now
+		}
+	}
 }
 
 // closeLotAtIndex closes a single lot at idx (assumes mutex held), performing I/O unlocked.
@@ -243,8 +301,27 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 		mtxTrades.WithLabelValues("loss").Inc()
 	}
 
+	// Track if we removed the runner and adjust runnerIdx accordingly after removal.
+	removedWasRunner := (idx == t.runnerIdx)
+
 	// remove lot idx
 	t.lots = append(t.lots[:idx], t.lots[idx+1:]...)
+
+	// shift runnerIdx if needed
+	if t.runnerIdx >= 0 {
+		if idx < t.runnerIdx {
+			t.runnerIdx-- // slice shifted left
+		} else if idx == t.runnerIdx {
+			// runner removed; promote the NEWEST remaining lot (if any) to runner
+			if len(t.lots) > 0 {
+				t.runnerIdx = len(t.lots) - 1
+				t.applyRunnerTargets(t.lots[t.runnerIdx])
+			} else {
+				t.runnerIdx = -1
+			}
+		}
+	}
+
 	t.aggregateOpen()
 
 	msg := fmt.Sprintf("EXIT %s at %.2f P/L=%.2f (fees=%.4f)",
@@ -254,6 +331,8 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 	}
 	// persist new state
 	_ = t.saveState()
+
+	_ = removedWasRunner // variable kept to emphasize the runner path; no extra logs.
 	return msg, nil
 }
 
@@ -349,10 +428,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		return fmt.Sprintf("FLAT [%s]", d.Reason), nil
 	}
 
+	// Respect a hard cap on concurrent lots (runner + scalps). If at cap, do not add.
+	if len(t.lots) >= maxConcurrentLots() {
+		t.mu.Unlock()
+		log.Printf("[DEBUG] lot cap reached (%d); HOLD", maxConcurrentLots())
+		return "HOLD", nil
+	}
+
 	// Determine if we are opening first lot or attempting a pyramid add.
 	isAdd := len(t.lots) > 0 && allowPyramiding() && d.Signal == Buy
 
-	// Gating for pyramiding adds — NOW MANDATORY: spacing + adverse move.
+	// Gating for pyramiding adds — spacing + adverse move + independent anchor + runner gap.
 	if isAdd {
 		// 1) Spacing: always enforce (s=0 means no wait; set >0 to require time gap)
 		s := pyramidMinSeconds()
@@ -362,17 +448,51 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			return "HOLD", nil
 		}
 
-		// 2) Adverse move vs last entry: always enforce
-		//    (pct=0 means price must be <= last entry; set >0 for a stricter drop)
+		// 2) Adverse move gates: last-entry gate and independent anchor gate
 		pct := pyramidMinAdversePct()
 		last := t.latestEntry()
+		lastGate := last
+		anchorGate := t.pyramidAnchorPrice
+
+		// Convert to adverse thresholds (for BUY: require drop of pct)
 		if last > 0 {
-			minDrop := last * (1.0 - pct/100.0)
-			if !(price <= minDrop) {
-				t.mu.Unlock()
-				log.Printf("[DEBUG] pyramid: blocked by adverse%%; price=%.2f last=%.2f need<=%.2f (%.3f%%)",
-					price, last, minDrop, pct)
-				return "HOLD", nil
+			lastGate = last * (1.0 - pct/100.0)
+		}
+		if t.pyramidAnchorPrice > 0 {
+			anchorGate = t.pyramidAnchorPrice * (1.0 - pct/100.0)
+		} else {
+			anchorGate = lastGate // fallback if no anchor set yet
+		}
+
+		// Combined gate: require price ≤ max(anchorGate, lastGate) for BUY
+		combinedGate := lastGate
+		if anchorGate > combinedGate {
+			combinedGate = anchorGate
+		}
+		if !(price <= combinedGate) {
+			t.mu.Unlock()
+			log.Printf("[DEBUG] pyramid: blocked by anchor/last gates; price=%.2f combined_gate<=%.2f last_gate=%.2f anchor_gate=%.2f pct=%.3f",
+				price, combinedGate, lastGate, anchorGate, pct)
+			return "HOLD", nil
+		}
+
+		// 3) Minimal runner gap guard: don't stack too close to the runner's entry
+		if t.runnerIdx >= 0 && t.runnerIdx < len(t.lots) {
+			runner := t.lots[t.runnerIdx]
+			if runner.Side == SideBuy {
+				minPrice := runner.OpenPrice * (1.0 - runnerMinGapPct)
+				if !(price <= minPrice) {
+					t.mu.Unlock()
+					log.Printf("[DEBUG] pyramid: blocked by runner gap; price=%.2f need<=%.2f (gap=%.3f%%)", price, minPrice, runnerMinGapPct*100.0)
+					return "HOLD", nil
+				}
+			} else {
+				maxPrice := runner.OpenPrice * (1.0 + runnerMinGapPct)
+				if !(price >= maxPrice) {
+					t.mu.Unlock()
+					log.Printf("[DEBUG] pyramid: blocked by runner gap; price=%.2f need>=%.2f (gap=%.3f%%)", price, maxPrice, runnerMinGapPct*100.0)
+					return "HOLD", nil
+				}
 			}
 		}
 	}
@@ -389,13 +509,26 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 	base := quote / price
 
-	// Stops/takes
+	// Stops/takes (baseline for scalps)
 	stop := price * (1.0 - t.cfg.StopLossPct/100.0)
 	take := price * (1.0 + t.cfg.TakeProfitPct/100.0)
 	side := d.SignalToSide()
 	if side == SideSell {
 		stop = price * (1.0 + t.cfg.StopLossPct/100.0)
 		take = price * (1.0 - t.cfg.TakeProfitPct/100.0)
+	}
+
+	// Decide if this new entry will be the runner (only when there is no existing runner).
+	willBeRunner := (t.runnerIdx == -1 && len(t.lots) == 0)
+	if willBeRunner {
+		// Stretch runner targets without introducing new env keys.
+		if side == SideBuy {
+			stop = price * (1.0 - (t.cfg.StopLossPct*runnerStopMult)/100.0)
+			take = price * (1.0 + (t.cfg.TakeProfitPct*runnerTPMult)/100.0)
+		} else {
+			stop = price * (1.0 + (t.cfg.StopLossPct*runnerStopMult)/100.0)
+			take = price * (1.0 - (t.cfg.TakeProfitPct*runnerTPMult)/100.0)
+		}
 	}
 
 	// --- apply entry fee (preliminary; may be replaced by broker-provided commission below) ---
@@ -478,16 +611,28 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 	t.lots = append(t.lots, newLot)
 	t.lastAdd = now
+
+	// Assign/designate runner if none exists yet; otherwise this is a scalp.
+	if t.runnerIdx == -1 {
+		t.runnerIdx = len(t.lots) - 1 // the just-added lot
+		// Ensure runner's targets are applied to the stored lot (mirrors local stop/take).
+		t.applyRunnerTargets(t.lots[t.runnerIdx])
+	}
+
+	// NEW: maintain an independent anchor that ratchets in the adverse direction only.
+	// Set on first entry or improve if current open price offers a better (lower for BUY) anchor.
+	t.maybeUpdatePyramidAnchor(side, newLot.OpenPrice, now)
+
 	t.aggregateOpen()
 
 	msg := ""
 	if t.cfg.DryRun {
 		mtxOrders.WithLabelValues("paper", string(side)).Inc()
 		msg = fmt.Sprintf("PAPER %s quote=%.2f base=%.6f stop=%.2f take=%.2f fee=%.4f [%s]",
-			d.Signal, actualQuote, baseToUse, stop, take, entryFee, d.Reason)
+			d.Signal, actualQuote, baseToUse, newLot.Stop, newLot.Take, entryFee, d.Reason)
 	} else {
 		msg = fmt.Sprintf("[LIVE ORDER] %s quote=%.2f stop=%.2f take=%.2f fee=%.4f [%s]",
-			d.Signal, actualQuote, stop, take, entryFee, d.Reason)
+			d.Signal, actualQuote, newLot.Stop, newLot.Take, entryFee, d.Reason)
 	}
 	if t.cfg.Extended().UseDirectSlack {
 		postSlack(msg)
@@ -518,14 +663,16 @@ func (t *Trader) saveState() error {
 		return nil
 	}
 	state := BotState{
-		EquityUSD:      t.equityUSD,
-		DailyStart:     t.dailyStart,
-		DailyPnL:       t.dailyPnL,
-		Lots:           t.lots,
-		Model:          t.model,
-		MdlExt:         t.mdlExt,
-		WalkForwardMin: t.cfg.Extended().WalkForwardMin,
-		LastFit:        t.lastFit,
+		EquityUSD:          t.equityUSD,
+		DailyStart:         t.dailyStart,
+		DailyPnL:           t.dailyPnL,
+		Lots:               t.lots,
+		Model:              t.model,
+		MdlExt:             t.mdlExt,
+		WalkForwardMin:     t.cfg.Extended().WalkForwardMin,
+		LastFit:            t.lastFit,
+		PyramidAnchorPrice: t.pyramidAnchorPrice,
+		PyramidAnchorTime:  t.pyramidAnchorTime,
 	}
 	bs, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -563,7 +710,16 @@ func (t *Trader) loadState() error {
 	if !st.LastFit.IsZero() {
 		t.lastFit = st.LastFit
 	}
+	// Restore independent pyramiding anchor (if present)
+	if st.PyramidAnchorPrice != 0 {
+		t.pyramidAnchorPrice = st.PyramidAnchorPrice
+		t.pyramidAnchorTime = st.PyramidAnchorTime
+	}
 	t.aggregateOpen()
+	// Re-derive runnerIdx if not set (old state files won't carry it).
+	if t.runnerIdx == -1 && len(t.lots) > 0 {
+		t.runnerIdx = 0
+	}
 	return nil
 }
 
