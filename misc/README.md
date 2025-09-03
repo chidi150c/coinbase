@@ -1518,8 +1518,15 @@ That way every restart prints the effective values into your logs.
 
 👉 Do you want me to add that [CONFIG] debug block permanently into main.go so every startup shows exactly what thresholds and tunables are being used?
 ================================
+# backing up database or backup DB
+sudo cp /opt/coinbase/state/bot_state.json /opt/coinbase/state/bot_state.json.bak.$(date +%F-%H%M)
 
-cp /opt/coinbase/state/bot_state.json /opt/coinbase/state/bot_state.json.bak.$(date +%F-%H%M)
+# (optional) see your backups
+ls -lt /opt/coinbase/state/bot_state.json.bak.*
+
+# restore the newest backup over the live file
+LATEST=$(ls -1t /opt/coinbase/state/bot_state.json.bak.* | head -n1)
+sudo cp -a "$LATEST" /opt/coinbase/state/bot_state.json
 
 ==============================================================
 Manual Trading
@@ -1564,3 +1571,6 @@ docker compose -f ~/coinbase/monitoring/docker-compose.yml exec bridge \
   "average_filled_price": "108932.31"
 }
 chidi@Dynamo:~/coinbase/monitoring$ 
+============================================================
+docker compose -f ~/coinbase/monitoring/docker-compose.yml logs -f --tail=200 bot \
+  | egrep "LIVE ORDER|\[WARN\] partial fill"

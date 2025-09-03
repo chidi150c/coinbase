@@ -220,9 +220,16 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 		pl = (lot.OpenPrice - priceExec) * baseFilled
 	}
 
-	// --- NEW: apply exit fee based on actual filled notional ---
+	// apply exit fee; prefer broker-provided commission if present ---
 	quoteExec := baseFilled * priceExec
 	exitFee := quoteExec * (t.cfg.FeeRatePct / 100.0)
+	if placed != nil {
+		if placed.CommissionUSD > 0 {
+			exitFee = placed.CommissionUSD
+		} else {
+			log.Printf("[WARN] commission missing (exit); falling back to FEE_RATE_PCT=%.4f%%", t.cfg.FeeRatePct)
+		}
+	}
 	pl -= lot.EntryFee // subtract entry fee recorded
 	pl -= exitFee      // subtract exit fee now
 
@@ -391,7 +398,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		take = price * (1.0 - t.cfg.TakeProfitPct/100.0)
 	}
 
-	// --- apply entry fee ---
+	// --- apply entry fee (preliminary; may be replaced by broker-provided commission below) ---
 	entryFee := quote * (t.cfg.FeeRatePct / 100.0)
 	if t.cfg.DryRun {
 		t.equityUSD -= entryFee
@@ -442,8 +449,18 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		}
 	}
 
-	// Recompute entry fee from actualQuote (keeps behavior identical otherwise).
-	entryFee = actualQuote * (t.cfg.FeeRatePct / 100.0)
+	// Prefer broker-provided commission for entry if present; otherwise fallback to FEE_RATE_PCT.
+	if placed != nil {
+		if placed.CommissionUSD > 0 {
+			entryFee = placed.CommissionUSD
+		} else {
+			log.Printf("[WARN] commission missing (entry); falling back to FEE_RATE_PCT=%.4f%%", t.cfg.FeeRatePct)
+			entryFee = actualQuote * (t.cfg.FeeRatePct / 100.0)
+		}
+	} else {
+		// DryRun path keeps previously computed entryFee and adjusts by delta as before.
+	}
+
 	if t.cfg.DryRun {
 		// already deducted above for DryRun using quote; adjust to the actualQuote delta
 		delta := (actualQuote - quote) * (t.cfg.FeeRatePct / 100.0)

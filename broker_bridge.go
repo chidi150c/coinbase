@@ -8,9 +8,9 @@
 //   • PlaceMarketQuote: POST /order/market {product_id, side, quote_size}
 //
 // Minimal update in this version:
-// After placing a market order, immediately call GET /order/{order_id}
+// After placing a market order, poll GET /order/{order_id} (micro-retry)
 // and populate filled fields (filled_size, average_filled_price) into the
-// returned PlacedOrder. If the enrichment call fails, fall back to the prior
+// returned PlacedOrder. If enrichment fails or times out, fall back to prior
 // behavior (returning an order ID with zeroed fills/notional).
 
 package main
@@ -216,22 +216,37 @@ func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, si
 		base, _ := strconv.ParseFloat(norm.FilledBase, 64)
 		quote, _ := strconv.ParseFloat(norm.QuoteSpent, 64)
 
-		// Enrich via GET /order/{order_id} if we can (minimal change; ignore errors).
-		enrichPrice, enrichBase, _ := bb.tryFetchOrderFill(ctx, norm.OrderID)
-		if enrichBase > 0 && enrichPrice > 0 {
-			price = enrichPrice
-			base = enrichBase
-			quote = price * base
+		// Micro-retry enrichment: poll /order/{order_id} briefly for fills (and commission).
+		id := firstNonEmpty(norm.OrderID, uuid.New().String())
+		commission := 0.0
+		const attempts = 6
+		const sleepDur = 250 * time.Millisecond
+		for i := 0; i < attempts; i++ {
+			if ctx.Err() != nil {
+				break
+			}
+			if p, b, c, err := bb.tryFetchOrderFill(ctx, id); err == nil && b > 0 && p > 0 {
+				price, base = p, b
+				quote = price * base
+				commission = c
+				break
+			}
+			select {
+			case <-ctx.Done():
+				i = attempts // exit loop on cancellation
+			case <-time.After(sleepDur):
+			}
 		}
 
 		return &PlacedOrder{
-			ID:         firstNonEmpty(norm.OrderID, uuid.New().String()),
-			ProductID:  product,
-			Side:       side,
-			Price:      price,
-			BaseSize:   base,
-			QuoteSpent: quote,
-			CreateTime: time.Now().UTC(),
+			ID:            id,
+			ProductID:     product,
+			Side:          side,
+			Price:         price,
+			BaseSize:      base,
+			QuoteSpent:    quote,
+			CommissionUSD: commission,
+			CreateTime:    time.Now().UTC(),
 		}, nil
 	}
 
@@ -253,21 +268,40 @@ func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, si
 		id = uuid.New().String()
 	}
 
-	// Minimal addition: immediately query /order/{order_id} to obtain fills.
-	price, base, _ := bb.tryFetchOrderFill(ctx, id)
+	// Micro-retry enrichment: poll /order/{order_id} briefly for fills (and commission).
+	price, base := 0.0, 0.0
 	quote := 0.0
-	if price > 0 && base > 0 {
-		quote = price * base
+	commission := 0.0
+	{
+		const attempts = 6
+		const sleepDur = 250 * time.Millisecond
+		for i := 0; i < attempts; i++ {
+			if ctx.Err() != nil {
+				break
+			}
+			if p, b, c, err := bb.tryFetchOrderFill(ctx, id); err == nil && b > 0 && p > 0 {
+				price, base = p, b
+				quote = price * base
+				commission = c
+				break
+			}
+			select {
+			case <-ctx.Done():
+				i = attempts
+			case <-time.After(sleepDur):
+			}
+		}
 	}
 
 	return &PlacedOrder{
-		ID:         id,
-		ProductID:  product,
-		Side:       side,
-		Price:      price,
-		BaseSize:   base,
-		QuoteSpent: quote,
-		CreateTime: time.Now().UTC(),
+		ID:            id,
+		ProductID:     product,
+		Side:          side,
+		Price:         price,
+		BaseSize:      base,
+		QuoteSpent:    quote,
+		CommissionUSD: commission,
+		CreateTime:    time.Now().UTC(),
 	}, nil
 }
 
@@ -282,28 +316,28 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// tryFetchOrderFill calls GET /order/{order_id} and returns (avgPrice, filledBase, err).
+// tryFetchOrderFill calls GET /order/{order_id} and returns (avgPrice, filledBase, commissionUSD, err).
 // This is a best-effort enrichment; errors are swallowed by the caller for minimal impact.
-func (bb *BridgeBroker) tryFetchOrderFill(ctx context.Context, orderID string) (avgPrice float64, filledBase float64, err error) {
+func (bb *BridgeBroker) tryFetchOrderFill(ctx context.Context, orderID string) (avgPrice float64, filledBase float64, commissionUSD float64, err error) {
 	if strings.TrimSpace(orderID) == "" {
-		return 0, 0, fmt.Errorf("empty order id")
+		return 0, 0, 0, fmt.Errorf("empty order id")
 	}
 	u := fmt.Sprintf("%s/order/%s", bb.base, url.PathEscape(orderID))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	req.Header.Set("User-Agent", "coinbot/bridge")
 
 	res, err := bb.hc.Do(req)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode >= 300 {
 		b, _ := io.ReadAll(res.Body)
-		return 0, 0, fmt.Errorf("order fetch %d: %s", res.StatusCode, string(b))
+		return 0, 0, 0, fmt.Errorf("order fetch %d: %s", res.StatusCode, string(b))
 	}
 
 	var out struct {
@@ -311,12 +345,14 @@ func (bb *BridgeBroker) tryFetchOrderFill(ctx context.Context, orderID string) (
 		Status             string `json:"status"`
 		FilledSize         string `json:"filled_size"`
 		AverageFilledPrice string `json:"average_filled_price"`
+		CommissionTotalUSD string `json:"commission_total_usd"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 
 	fp, _ := strconv.ParseFloat(strings.TrimSpace(out.AverageFilledPrice), 64)
 	fs, _ := strconv.ParseFloat(strings.TrimSpace(out.FilledSize), 64)
-	return fp, fs, nil
+	cu, _ := strconv.ParseFloat(strings.TrimSpace(out.CommissionTotalUSD), 64)
+	return fp, fs, cu, nil
 }

@@ -1,3 +1,4 @@
+# File: app.py
 import os
 import json
 from pathlib import Path
@@ -374,8 +375,9 @@ def get_order(order_id: str):
     """
     Return a minimal summary for an order:
       - status (if available from fills payload)
-      - filled_size (sum of fill sizes)
+      - filled_size (sum of fill sizes, **BASE units**)
       - average_filled_price (size-weighted)
+      - commission_total_usd (sum of fills[].commission)
     Notes:
       * Uses the official SDK's fills method(s) and is robust to naming differences.
       * If no fills are found, returns zeros and status 'UNKNOWN'.
@@ -407,40 +409,61 @@ def get_order(order_id: str):
                 "order_id": order_id,
                 "status": "UNKNOWN",
                 "filled_size": "0",
-                "average_filled_price": "0"
+                "average_filled_price": "0",
+                "commission_total_usd": "0"
             }
 
-        total_qty = Decimal("0")
+        total_base = Decimal("0")
         total_notional = Decimal("0")
+        total_commission = Decimal("0")
         status = "UNKNOWN"
 
         for f in fills:
-            # Accept multiple possible field names defensively
-            size_str = str(f.get("size") or f.get("filled_size") or "0")
+            # price
             price_str = str(f.get("price") or f.get("average_filled_price") or "0")
-            try:
-                size = Decimal(size_str)
-            except Exception:
-                size = Decimal("0")
             try:
                 price = Decimal(price_str)
             except Exception:
                 price = Decimal("0")
 
-            total_qty += size
-            total_notional += (size * price)
+            # size may be base or quote; Coinbase provides a size_in_quote flag
+            size_str = str(f.get("size") or f.get("filled_size") or "0")
+            try:
+                size = Decimal(size_str)
+            except Exception:
+                size = Decimal("0")
+
+            # commission (USD)
+            commission_str = str(f.get("commission") or "0")
+            try:
+                commission = Decimal(commission_str)
+            except Exception:
+                commission = Decimal("0")
+            total_commission += commission
+
+            size_in_quote = bool(f.get("size_in_quote"))
+            if size_in_quote:
+                base = (size / price) if price > 0 else Decimal("0")
+                notional = size
+            else:
+                base = size
+                notional = size * price
+
+            total_base += base
+            total_notional += notional
 
             st = f.get("order_status") or f.get("status")
             if isinstance(st, str) and st:
                 status = st
 
-        avg_price = (total_notional / total_qty) if total_qty > 0 else Decimal("0")
+        avg_price = (total_notional / total_base) if total_base > 0 else Decimal("0")
 
         return {
             "order_id": order_id,
             "status": status,
-            "filled_size": format(total_qty, "f"),
+            "filled_size": format(total_base, "f"),              # BASE units
             "average_filled_price": format(avg_price, "f"),
+            "commission_total_usd": format(total_commission, "f"),
         }
     except HTTPException:
         raise

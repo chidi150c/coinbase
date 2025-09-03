@@ -26,13 +26,14 @@ const (
 
 // PlacedOrder is a normalized view of a filled/placed market order.
 type PlacedOrder struct {
-	ID         string
-	ProductID  string
-	Side       OrderSide
-	Price      float64 // average/assumed execution price
-	BaseSize   float64 // filled base (e.g., BTC)
-	QuoteSpent float64 // spent quote (e.g., USD)
-	CreateTime time.Time
+	ID             string
+	ProductID      string
+	Side           OrderSide
+	Price          float64 // average/assumed execution price
+	BaseSize       float64 // filled base (e.g., BTC)
+	QuoteSpent     float64 // spent quote (e.g., USD)
+	CommissionUSD  float64 // total commission in quote currency (USD)
+	CreateTime     time.Time
 }
 
 // Broker is the minimal surface the bot needs to operate.
