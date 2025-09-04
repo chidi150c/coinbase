@@ -93,3 +93,8 @@ func (c *Config) Extended() ExtendedToggles {
 		UseDirectSlack: getEnv("SLACK_WEBHOOK", "") != "",
 	}
 }
+
+// --- NEW (minimal, optional): trailing environment accessors ---
+// Safe defaults ensure no behavior change unless the envs are set.
+func (c *Config) TrailActivatePct() float64 { return getEnvFloat("TRAIL_ACTIVATE_PCT", 1.2) }
+func (c *Config) TrailDistancePct() float64 { return getEnvFloat("TRAIL_DISTANCE_PCT", 0.6) }

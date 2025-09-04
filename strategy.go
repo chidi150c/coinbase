@@ -107,12 +107,18 @@ func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 		}
 	}
 
-	// Regime filter
-	smaFast := SMA(c, 10)
-	smaSlow := SMA(c, 30)
-	filterOK := !math.IsNaN(smaFast[i]) && !math.IsNaN(smaSlow[i]) && smaFast[i] > smaSlow[i]
+    // Regime filter (Coinbase EMA): fast = EMA(close,4), slow = EMA(close,8)
+	cl := make([]float64, len(c))
+	for k := range c {
+		cl[k] = c[k].Close
+	}
+	ema4 := EMA(cl, 4)
+	ema8 := EMA(cl, 8)
+	fast := ema4[i]
+	slow := ema8[i]
+	filterOK := !math.IsNaN(fast) && !math.IsNaN(slow) && fast > slow
 
-	reason := fmt.Sprintf("pUp=%.3f, ma10=%.2f vs ma30=%.2f", pUp, smaFast[i], smaSlow[i])
+	reason := fmt.Sprintf("pUp=%.3f, ema4=%.2f vs ema8=%.2f", pUp, fast, slow)
 
 	// BUY if pUp clears threshold and (optionally) MA filter
 	if pUp > buyThreshold && (!useMAFilter || filterOK) {
@@ -124,7 +130,7 @@ func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 	//log.Printf("[DEBUG] Decision=Sell, pUp=%.3f, buyThresh=%.3f, sellThresh=%.3f, filterOK=%v", pUp, buyThreshold, sellThreshold, filterOK)
 		return Decision{Signal: Sell, Confidence: 1 - pUp, Reason: reason}
 	}
-	//log.Printf("[DEBUG] Decision=Flat, pUp=%.3f, buyThresh=%.3f, sellThresh=%.3f, filterOK=%v", pUp, buyThreshold, sellThreshold, filterOK)
+	log.Printf("[DEBUG] ema4x9=%.2f ema8x9=%.2f filterOK=%v", fast, slow, filterOK)
 	return Decision{Signal: Flat, Confidence: 0.5, Reason: reason}
 }
 

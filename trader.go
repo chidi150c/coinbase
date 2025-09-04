@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"sync"
@@ -171,6 +172,10 @@ func scalpTPDecayMode() string    { return getEnv("SCALP_TP_DEC_MODE", "linear")
 func scalpTPDecPct() float64      { return getEnvFloat("SCALP_TP_DEC_PCT", 0.0) }      // % points
 func scalpTPDecayFactor() float64 { return getEnvFloat("SCALP_TP_DECAY_FACTOR", 1.0) } // multiplicative
 func scalpTPMinPct() float64      { return getEnvFloat("SCALP_TP_MIN_PCT", 0.0) }      // floor
+
+// --- NEW: Option A – time-based exponential decay knobs (0 disables) ---
+func pyramidDecayLambda() float64  { return getEnvFloat("PYRAMID_DECAY_LAMBDA", 0.0) }  // per-minute
+func pyramidDecayMinPct() float64  { return getEnvFloat("PYRAMID_DECAY_MIN_PCT", 0.0) } // floor
 
 // Cap concurrent lots (env-tunable). Default is effectively "no cap".
 func maxConcurrentLots() int {
@@ -537,7 +542,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// Determine if we are opening first lot or attempting a pyramid add.
 	isAdd := len(t.lots) > 0 && allowPyramiding() && d.Signal == Buy
 
-	// Gating for pyramiding adds — spacing + adverse move + independent anchor + runner gap.
+	// Gating for pyramiding adds — spacing + adverse move (with optional time-decay).
 	if isAdd {
 		// 1) Spacing: always enforce (s=0 means no wait; set >0 to require time gap)
 		s := pyramidMinSeconds()
@@ -547,20 +552,36 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			return "HOLD", nil
 		}
 
-		// 2) Adverse move gate: ONLY vs last entry (anchor removed)
-		pct := pyramidMinAdversePct()
-		
+		// 2) Adverse move gate: ONLY vs last entry, with optional time-based exponential decay.
+		basePct := pyramidMinAdversePct()
+		effPct := basePct
+		lambda := pyramidDecayLambda()
+		if lambda > 0 {
+			var minutes float64
+			if !t.lastAdd.IsZero() {
+				minutes = now.Sub(t.lastAdd).Minutes()
+			} else {
+				minutes = 0 // first add since start → no decay yet
+			}
+			decayed := basePct * math.Exp(-lambda*minutes)
+			floor := pyramidDecayMinPct()
+			if decayed < floor {
+				decayed = floor
+			}
+			effPct = decayed
+		}
+
 		last := t.latestEntry()
 		if last > 0 {
-			lastGate := last * (1.0 - pct/100.0) // BUY: require drop of pct from last entry
+			lastGate := last * (1.0 - effPct/100.0) // BUY: require drop of effPct from last entry
 			if !(price <= lastGate) {
 				t.mu.Unlock()
 				log.Printf("[DEBUG] pyramid: blocked by last gate; price=%.2f last_gate<=%.2f pct=%.3f",
-					price, lastGate, pct)
+					price, lastGate, effPct)
 				return "HOLD", nil
 			}
 		}
-	// (runner-gap guard removed)
+		// (runner-gap guard removed)
 	}
 	// Sizing (risk % of current equity, with optional volatility adjust already supported).
 	riskPct := t.cfg.RiskPerTradePct

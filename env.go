@@ -94,7 +94,17 @@ func loadBotEnv() {
 		"TICK_INTERVAL_SEC":            {},
 		"CANDLE_RESYNC_SEC":            {},
 		"DAILY_BREAKER_MARK_TO_MARKET": {},
-		"FEE_RATE_PCT": {},
+		"FEE_RATE_PCT":                 {},
+		"MAX_CONCURRENT_LOTS":          {},
+		"STATE_FILE":                   {},
+		// ---- NEW: optional trailing knobs (safe defaults elsewhere if absent) ----
+		"TRAIL_ACTIVATE_PCT":    {},
+		"TRAIL_DISTANCE_PCT":    {},
+		"SCALP_TP_DECAY_ENABLE": {},
+		"SCALP_TP_DEC_MODE":     {},
+		"SCALP_TP_DEC_PCT":      {},
+		"SCALP_TP_DECAY_FACTOR": {},
+		"SCALP_TP_MIN_PCT":      {},
 	}
 
 	s := bufio.NewScanner(f)

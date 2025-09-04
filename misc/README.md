@@ -1574,3 +1574,128 @@ chidi@Dynamo:~/coinbase/monitoring$
 ============================================================
 docker compose -f ~/coinbase/monitoring/docker-compose.yml logs -f --tail=200 bot \
   | egrep "LIVE ORDER|\[WARN\] partial fill"
+  
+============================================================
+
+What to expect in behavior
+
+First open lot = the runner. It uses your normal SL, a stretched TP (internally doubled), and now a trailing stop:
+
+When price ≥ OpenPrice * (1 + TRAIL_ACTIVATE_PCT/100), trailing turns on.
+
+The trail’s stop follows the best price by TRAIL_DISTANCE_PCT.
+
+If price falls back to the trailing stop, the runner exits via the normal market-close path.
+
+Later adds (while open) are scalps; unchanged TP/SL logic (no trailing on them).
+
+If the runner exits first, the newest remaining lot is auto-promoted to runner; its trailing fields are reset and will activate once thresholds are met.
+
+Adds are still gated by spacing + adverse move + the independent anchor and the small runner-gap guard you asked for.
+
+==============================================================
+Here’s what that debug line is telling you, field by field, and why the add was blocked:
+
+[DEBUG] pyramid: blocked by anchor/last gates; 
+price=114742.12 
+combined_gate<=113224.11 
+last_gate=113224.11 
+anchor_gate=110823.58 
+pct=1.500
+
+What each number means
+
+price=114742.12
+The current market price (last close/tick the bot is using).
+
+pct=1.500
+Your PYRAMID_MIN_ADVERSE_PCT is 1.5%. Adds are only allowed after at least a 1.5% pullback from the gate(s).
+
+last_gate=113224.11
+This is computed from the most recent entry price (lastEntry) pushed down by 1.5%:
+last_gate = lastEntry × (1 - 0.015)
+So lastEntry ≈ 113224.11 / 0.985 ≈ 114.95k.
+
+anchor_gate=110823.58
+This is computed from your independent pyramiding anchor (pyramidAnchorPrice) pushed down by 1.5%:
+anchor_gate = anchor × (1 - 0.015)
+So anchor ≈ 110823.58 / 0.985 ≈ ~112.5k.
+(Anchor only ratchets in the adverse direction for a BUY—i.e., it can move lower, but not higher.)
+
+combined_gate<=113224.11
+We require price ≤ max(last_gate, anchor_gate) for a BUY.
+Since max(113224.11, 110823.58) = 113224.11, the combined gate is 113,224.11.
+
+Why the add was blocked
+
+Because the current price (114,742.12) is above the combined gate (113,224.11), it hasn’t pulled back enough.
+Put differently, from your latest entry (~114.95k), price has only dipped to 114.74k (≈0.18% pullback), but you require ≥1.5%. So no add yet.
+
+(The log message is specifically the anchor/last-gate check. The spacing guard and runner-gap guard are additional checks that could also block, but they aren’t what triggered here.)
+
+Quick formulas (BUY)
+
+last_gate = lastEntry × (1 - PYRAMID_MIN_ADVERSE_PCT/100)
+
+anchor_gate = anchor × (1 - PYRAMID_MIN_ADVERSE_PCT/100)
+
+combined_gate = max(last_gate, anchor_gate)
+
+Allow add only if price ≤ combined_gate.
+
+How to “tune” this behavior
+
+Allow adds sooner: lower PYRAMID_MIN_ADVERSE_PCT (e.g., from 1.5 → 0.8 or 0.5).
+That raises both gates and makes combined_gate easier to reach.
+
+Let the anchor help more: the anchor only ratchets down (for BUY). After a bigger dip, it’ll sit lower and can become the controlling gate during later rallies. If you want the anchor to be more permissive, you could reset it when flat (already happens), or set it manually by script when you truly want a new baseline.
+
+Keep adds “not too close” to the runner: the runner-gap guard is separate, but keep in mind loosening adverse% too much could cause adds to cluster near the runner.
+
+If you paste another similar line later, you can decode it the same way: compute the implied lastEntry and anchor from their gates by dividing by (1 - pct/100), then check how far the real-time price is from the combined_gate.
+
+You said:
+what is add?
+ChatGPT said:
+
+An add = a pyramiding add-on entry.
+
+In this bot, it means: while you already have an open position (the “runner” and possibly some scalps), the bot opens another small lot in the same direction to scale into strength/volatility—but only if strict gates are satisfied.
+
+Key points:
+
+Not the first entry—it’s an additional lot placed after you’re already long (or short).
+
+Rule-gated to avoid chasing:
+
+Spacing gate: must wait ≥ PYRAMID_MIN_SECONDS_BETWEEN since the last add.
+
+Adverse-move gate: price must have pulled back at least PYRAMID_MIN_ADVERSE_PCT from a gate price.
+
+Independent anchor gate: uses a stable pyramidAnchorPrice so adds don’t “jitter” off the newest scalp.
+
+Last-entry gate: respects the most recent entry too.
+
+Runner gap guard: don’t stack adds too close to the runner’s entry.
+
+Lot cap: never exceed the max concurrent lots (default 3).
+
+Sizing: still determined by your RISK_PER_TRADE_PCT (bounded by ORDER_MIN_USD), so adds increase exposure in controlled increments.
+
+Behavior: the runner stays longer (with trailing logic); adds are short-lived scalps with fixed TP/SL.
+
+So when you see logs like “pyramid: blocked by …” that’s the bot deciding not to place an add yet because one of those gates wasn’t met.
+===================================================
+With your current code, the runner doesn’t exit at the base TAKE_PROFIT_PCT (e.g., 1.5%). It uses that number only to derive a farther static TP:
+
+Runner TP: runnerTP = 2 × TAKE_PROFIT_PCT (so ~3.0% if TP=1.5%)
+
+Runner SL: same as normal (STOP_LOSS_PCT)
+
+Runner trailing: arms when price reaches TRAIL_ACTIVATE_PCT (your env knob), then exits on a pullback of TRAIL_DISTANCE_PCT
+
+Meanwhile, scalp lots still use the base TAKE_PROFIT_PCT (e.g., 1.5%) as their fixed take-profit.
+
+So the runner can exit by:
+
+trailing (once armed), 2) its stretched TP (~2× TP), or 3) stop-loss—whichever happens first.
