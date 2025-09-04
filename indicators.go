@@ -228,3 +228,49 @@ func RollingStd(vals []float64, n int) []float64 {
 	}
 	return out
 }
+
+// EMAOnSeries computes EMA over an arbitrary series (no candles needed).
+// Returns a slice of same length (NaNs for early warm-up where appropriate).
+func EMAOnSeries(x []float64, period int) []float64 {
+	n := len(x)
+	out := make([]float64, n)
+	if n == 0 || period <= 1 {
+		for i := range out {
+			out[i] = x[i]
+		}
+		return out
+	}
+	alpha := 2.0 / (float64(period) + 1.0)
+
+	// seed with first non-NaN value
+	j := 0
+	for j < n && math.IsNaN(x[j]) {
+		out[j] = math.NaN()
+		j++
+	}
+	if j < n {
+		out[j] = x[j]
+		j++
+	}
+	for ; j < n; j++ {
+		prev := out[j-1]
+		if math.IsNaN(prev) {
+			out[j] = x[j]
+			continue
+		}
+		out[j] = alpha*x[j] + (1.0-alpha)*prev
+	}
+	return out
+}
+
+// EMA2OnCloses does EMA( EMA(close, p1), p2 )
+func EMA2OnCloses(c []Candle, p1, p2 int) []float64 {
+	n := len(c)
+	cl := make([]float64, n)
+	for i := range c {
+		cl[i] = c[i].Close
+	}
+	e1 := EMAOnSeries(cl, p1)
+	return EMAOnSeries(e1, p2)
+}
+

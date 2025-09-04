@@ -42,6 +42,11 @@ type Position struct {
 	OpenTime  time.Time
 	// --- NEW: record entry fee for later P/L adjustment ---
 	EntryFee float64
+
+	// --- NEW (runner-only trailing fields; used only when this lot is the runner) ---
+	TrailActive bool    // becomes true after TRAIL_ACTIVATE_PCT threshold
+	TrailPeak   float64 // best favorable price since activation (peak for long; trough for short)
+	TrailStop   float64 // current trailing stop level derived from TrailPeak and TRAIL_DISTANCE_PCT
 }
 
 // BotState is the persistent snapshot of trader state.
@@ -64,9 +69,9 @@ type Trader struct {
 	cfg        Config
 	broker     Broker
 	model      *AIMicroModel
-	pos        *Position        // kept for backward compatibility with earlier logic
-	lots       []*Position      // NEW: multiple lots when pyramiding is enabled
-	lastAdd    time.Time        // NEW: last time a pyramid add was placed
+	pos        *Position   // kept for backward compatibility with earlier logic
+	lots       []*Position // NEW: multiple lots when pyramiding is enabled
+	lastAdd    time.Time   // NEW: last time a pyramid add was placed
 	dailyStart time.Time
 	dailyPnL   float64
 	mu         sync.Mutex
@@ -161,18 +166,35 @@ func pyramidMinSeconds() int {
 func pyramidMinAdversePct() float64 {
 	return getEnvFloat("PYRAMID_MIN_ADVERSE_PCT", 0.0) // 0 = no adverse-move requirement
 }
+func scalpTPDecayEnabled() bool   { return getEnvBool("SCALP_TP_DECAY_ENABLE", false) }
+func scalpTPDecayMode() string    { return getEnv("SCALP_TP_DEC_MODE", "linear") }
+func scalpTPDecPct() float64      { return getEnvFloat("SCALP_TP_DEC_PCT", 0.0) }      // % points
+func scalpTPDecayFactor() float64 { return getEnvFloat("SCALP_TP_DECAY_FACTOR", 1.0) } // multiplicative
+func scalpTPMinPct() float64      { return getEnvFloat("SCALP_TP_MIN_PCT", 0.0) }      // floor
 
-// Cap concurrent lots (no new env key; keep internal default).
+// Cap concurrent lots (env-tunable). Default is effectively "no cap".
 func maxConcurrentLots() int {
-	return 3
+	n := getEnvInt("MAX_CONCURRENT_LOTS", 1_000_000)
+	if n < 1 {
+		n = 1_000_000 // safety: never block adds due to bad input
+	}
+	return n
 }
 
 // Runner tuning (internal, no new env keys): runner takes profit farther, same stop by default.
 const runnerTPMult = 2.0
 const runnerStopMult = 1.0
 
-// Minimal "runner gap" guard (avoid adding too close to/high above runner entry)
-const runnerMinGapPct = 0.001 // 0.10%
+// Minimal "runner gap" guard (disabled)
+const runnerMinGapPct = 0.0
+
+// --- NEW: runner-only trailing env tunables (0 disables) ---
+func trailActivatePct() float64 {
+	return getEnvFloat("TRAIL_ACTIVATE_PCT", 0.0)
+}
+func trailDistancePct() float64 {
+	return getEnvFloat("TRAIL_DISTANCE_PCT", 0.0)
+}
 
 // latestEntry returns the most recent long lot entry price, or 0 if none.
 func (t *Trader) latestEntry() float64 {
@@ -220,6 +242,60 @@ func (t *Trader) maybeUpdatePyramidAnchor(side OrderSide, refPrice float64, now 
 			t.pyramidAnchorTime = now
 		}
 	}
+}
+
+// --- NEW: runner trailing updater (no-ops if env not set or lot not runner).
+// Returns (shouldExit, newTrailStopIfAny).
+func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64) {
+	if lot == nil {
+		return false, 0
+	}
+	act := trailActivatePct()
+	dist := trailDistancePct()
+	if act <= 0 || dist <= 0 {
+		return false, 0
+	}
+
+	switch lot.Side {
+	case SideBuy:
+		activateAt := lot.OpenPrice * (1.0 + act/100.0)
+		if !lot.TrailActive {
+			if price >= activateAt {
+				lot.TrailActive = true
+				lot.TrailPeak = price
+				lot.TrailStop = price * (1.0 - dist/100.0)
+			}
+		} else {
+			if price > lot.TrailPeak {
+				lot.TrailPeak = price
+				ts := lot.TrailPeak * (1.0 - dist/100.0)
+				if ts > lot.TrailStop {
+					lot.TrailStop = ts
+				}
+			}
+			if price <= lot.TrailStop && lot.TrailStop > 0 {
+				return true, lot.TrailStop
+			}
+		}
+	case SideSell:
+		activateAt := lot.OpenPrice * (1.0 - act/100.0)
+		if !lot.TrailActive {
+			if price <= activateAt {
+				lot.TrailActive = true
+				lot.TrailPeak = price // trough for short
+				lot.TrailStop = price * (1.0 + dist/100.0)
+			}
+		} else {
+			if price < lot.TrailPeak {
+				lot.TrailPeak = price
+				lot.TrailStop = lot.TrailPeak * (1.0 + dist/100.0)
+			}
+			if price >= lot.TrailStop && lot.TrailStop > 0 {
+				return true, lot.TrailStop
+			}
+		}
+	}
+	return false, lot.TrailStop
 }
 
 // closeLotAtIndex closes a single lot at idx (assumes mutex held), performing I/O unlocked.
@@ -315,7 +391,13 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 			// runner removed; promote the NEWEST remaining lot (if any) to runner
 			if len(t.lots) > 0 {
 				t.runnerIdx = len(t.lots) - 1
-				t.applyRunnerTargets(t.lots[t.runnerIdx])
+				// reset trailing fields for the newly promoted runner
+				nr := t.lots[t.runnerIdx]
+				nr.TrailActive = false
+				nr.TrailPeak = nr.OpenPrice
+				nr.TrailStop = 0
+				// also re-apply runner targets (keeps existing behavior)
+				t.applyRunnerTargets(nr)
 			} else {
 				t.runnerIdx = -1
 			}
@@ -332,7 +414,7 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 	// persist new state
 	_ = t.saveState()
 
-	_ = removedWasRunner // variable kept to emphasize the runner path; no extra logs.
+	_ = removedWasRunner // kept to emphasize runner path; no extra logs.
 	return msg, nil
 }
 
@@ -367,6 +449,23 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		nearestTake := 0.0
 		for i := 0; i < len(t.lots); {
 			lot := t.lots[i]
+
+			// --- NEW: runner-only trailing exit check (wired alongside TP/SL) ---
+			if i == t.runnerIdx {
+				if trigger, tstop := t.updateRunnerTrail(lot, price); trigger {
+					// reflect trailing level for visibility in debug/Slack
+					lot.Stop = tstop
+					msg, err := t.closeLotAtIndex(ctx, c, i)
+					if err != nil {
+						t.mu.Unlock()
+						return "", err
+					}
+					// closeLotAtIndex removed index i; continue without i++
+					t.mu.Unlock()
+					return msg, nil
+				}
+			}
+
 			trigger := false
 			if lot.Side == SideBuy && (price <= lot.Stop || price >= lot.Take) {
 				trigger = true
@@ -407,7 +506,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	d := decide(c, t.model, t.mdlExt)
-	log.Printf("[DEBUG] Lots=%d, Decision=%s Reason=%s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v", len(t.lots), d.Signal, d.Reason, buyThreshold, sellThreshold, t.cfg.LongOnly)
+	log.Printf("[DEBUG] Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v", len(t.lots), d.Signal, d.Reason, buyThreshold, sellThreshold, t.cfg.LongOnly)
 
 	// Ignore discretionary SELL signals while lots are open; exits are TP/SL only.
 	if len(t.lots) > 0 && d.Signal == Sell {
@@ -448,53 +547,20 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			return "HOLD", nil
 		}
 
-		// 2) Adverse move gates: last-entry gate and independent anchor gate
+		// 2) Adverse move gate: ONLY vs last entry (anchor removed)
 		pct := pyramidMinAdversePct()
+		
 		last := t.latestEntry()
-		lastGate := last
-		anchorGate := t.pyramidAnchorPrice
-
-		// Convert to adverse thresholds (for BUY: require drop of pct)
 		if last > 0 {
-			lastGate = last * (1.0 - pct/100.0)
-		}
-		if t.pyramidAnchorPrice > 0 {
-			anchorGate = t.pyramidAnchorPrice * (1.0 - pct/100.0)
-		} else {
-			anchorGate = lastGate // fallback if no anchor set yet
-		}
-
-		// Combined gate: require price ≤ max(anchorGate, lastGate) for BUY
-		combinedGate := lastGate
-		if anchorGate > combinedGate {
-			combinedGate = anchorGate
-		}
-		if !(price <= combinedGate) {
-			t.mu.Unlock()
-			log.Printf("[DEBUG] pyramid: blocked by anchor/last gates; price=%.2f combined_gate<=%.2f last_gate=%.2f anchor_gate=%.2f pct=%.3f",
-				price, combinedGate, lastGate, anchorGate, pct)
-			return "HOLD", nil
-		}
-
-		// 3) Minimal runner gap guard: don't stack too close to the runner's entry
-		if t.runnerIdx >= 0 && t.runnerIdx < len(t.lots) {
-			runner := t.lots[t.runnerIdx]
-			if runner.Side == SideBuy {
-				minPrice := runner.OpenPrice * (1.0 - runnerMinGapPct)
-				if !(price <= minPrice) {
-					t.mu.Unlock()
-					log.Printf("[DEBUG] pyramid: blocked by runner gap; price=%.2f need<=%.2f (gap=%.3f%%)", price, minPrice, runnerMinGapPct*100.0)
-					return "HOLD", nil
-				}
-			} else {
-				maxPrice := runner.OpenPrice * (1.0 + runnerMinGapPct)
-				if !(price >= maxPrice) {
-					t.mu.Unlock()
-					log.Printf("[DEBUG] pyramid: blocked by runner gap; price=%.2f need>=%.2f (gap=%.3f%%)", price, maxPrice, runnerMinGapPct*100.0)
-					return "HOLD", nil
-				}
+			lastGate := last * (1.0 - pct/100.0) // BUY: require drop of pct from last entry
+			if !(price <= lastGate) {
+				t.mu.Unlock()
+				log.Printf("[DEBUG] pyramid: blocked by last gate; price=%.2f last_gate<=%.2f pct=%.3f",
+					price, lastGate, pct)
+				return "HOLD", nil
 			}
 		}
+	// (runner-gap guard removed)
 	}
 	// Sizing (risk % of current equity, with optional volatility adjust already supported).
 	riskPct := t.cfg.RiskPerTradePct
@@ -529,6 +595,48 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			stop = price * (1.0 + (t.cfg.StopLossPct*runnerStopMult)/100.0)
 			take = price * (1.0 - (t.cfg.TakeProfitPct*runnerTPMult)/100.0)
 		}
+	} else if scalpTPDecayEnabled() {
+		// This is a scalp add: compute k = number of existing scalps
+		k := len(t.lots)
+		if t.runnerIdx >= 0 && t.runnerIdx < len(t.lots) {
+			k = len(t.lots) - 1 // exclude the runner from the scalp index
+		}
+		baseTP := t.cfg.TakeProfitPct
+		tpPct := baseTP
+
+		switch scalpTPDecayMode() {
+		case "exp", "exponential":
+			// geometric decay: baseTP * factor^k, floored
+			f := scalpTPDecayFactor()
+			if f <= 0 {
+				f = 1.0
+			}
+			factorPow := 1.0
+			for i := 0; i < k; i++ {
+				factorPow *= f
+			}
+			tpPct = baseTP * factorPow
+		default:
+			// linear: baseTP - k * decPct, floored
+			dec := scalpTPDecPct()
+			tpPct = baseTP - float64(k)*dec
+		}
+
+		minTP := scalpTPMinPct()
+		if tpPct < minTP {
+			tpPct = minTP
+		}
+
+		// apply the (possibly reduced) TP for the scalp only
+		if side == SideBuy {
+			take = price * (1.0 + tpPct/100.0)
+		} else {
+			take = price * (1.0 - tpPct/100.0)
+		}
+
+		// >>> DEBUG LOG <<<
+		log.Printf("[DEBUG] scalp tp decay: k=%d mode=%s baseTP=%.3f%% tpPct=%.3f%% minTP=%.3f%% take=%.2f",
+			k, scalpTPDecayMode(), t.cfg.TakeProfitPct, tpPct, minTP, take)
 	}
 
 	// --- apply entry fee (preliminary; may be replaced by broker-provided commission below) ---
@@ -608,20 +716,22 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		Take:      take,
 		OpenTime:  now,
 		EntryFee:  entryFee,
+		// trailing fields default zero/false; they’ll be initialized if this becomes runner
 	}
 	t.lots = append(t.lots, newLot)
 	t.lastAdd = now
 
 	// Assign/designate runner if none exists yet; otherwise this is a scalp.
 	if t.runnerIdx == -1 {
-		t.runnerIdx = len(t.lots) - 1 // the just-added lot
-		// Ensure runner's targets are applied to the stored lot (mirrors local stop/take).
-		t.applyRunnerTargets(t.lots[t.runnerIdx])
+		t.runnerIdx = len(t.lots) - 1 // the just-added lot is runner
+		// Initialize runner trailing baseline
+		r := t.lots[t.runnerIdx]
+		r.TrailActive = false
+		r.TrailPeak = r.OpenPrice
+		r.TrailStop = 0
+		// Ensure runner's stretched targets are applied (keeps baseline behavior for runner).
+		t.applyRunnerTargets(r)
 	}
-
-	// NEW: maintain an independent anchor that ratchets in the adverse direction only.
-	// Set on first entry or improve if current open price offers a better (lower for BUY) anchor.
-	t.maybeUpdatePyramidAnchor(side, newLot.OpenPrice, now)
 
 	t.aggregateOpen()
 
@@ -719,6 +829,11 @@ func (t *Trader) loadState() error {
 	// Re-derive runnerIdx if not set (old state files won't carry it).
 	if t.runnerIdx == -1 && len(t.lots) > 0 {
 		t.runnerIdx = 0
+		// Initialize trailing baseline for current runner if not already set
+		r := t.lots[t.runnerIdx]
+		if r.TrailPeak == 0 {
+			r.TrailPeak = r.OpenPrice
+		}
 	}
 	return nil
 }
