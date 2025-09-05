@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Verify formatting
+        run: go fmt ./...
+
+      - name: Static analysis
+        run: go vet ./...
+
+      - name: Build binary
+        run: go build -o coinbase-bot ./...
+
+      # IMPORTANT: run the package, not a single file
+      # Replace flags if your main.go uses different ones for backtesting
+      - name: Run backtest in DRY_RUN
+        env:
+          BACKTEST_SLEEP_MS: "0"
+        run: |
+          go run . -backtest -csv data/BTC-USD.csv
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coinbase-bot-linux-amd64
+          path: coinbase-bot
