@@ -418,7 +418,13 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// Acquire lock (no defer): we will release it around network calls.
 	t.mu.Lock()
 
+	// Use wall clock as authoritative "now" for pyramiding timings; fall back for zero candle time.
+	wallNow := time.Now().UTC()
+
 	now := c[len(c)-1].Time
+	if now.IsZero() {
+		now = wallNow
+	}
 	t.updateDaily(now)
 
 	// Keep paper broker price in sync with the latest close so paper fills are realistic.
@@ -542,6 +548,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		elapsedMin := 0.0
 		if lambda > 0 {
 			if !t.lastAdd.IsZero() {
+				// Use wall clock elapsed minutes since last add (independent of candle timestamps).
 				elapsedMin = time.Since(t.lastAdd).Minutes()
 			}
 			decayed := basePct * math.Exp(-lambda*elapsedMin)
@@ -721,7 +728,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		// trailing fields default zero/false; they’ll be initialized if this becomes runner
 	}
 	t.lots = append(t.lots, newLot)
-	t.lastAdd = now
+	// Use wall clock for lastAdd to drive spacing/decay even if candle time is zero.
+	t.lastAdd = wallNow
 
 	// Assign/designate runner if none exists yet; otherwise this is a scalp.
 	if t.runnerIdx == -1 {
@@ -879,4 +887,4 @@ func volRiskFactor(c []Candle) float64 {
 		return 1.0
 	}
 }
-}} with only the necessary minimal changes to implement {{replace use of candle timestamps with wall-clock time for pyramiding decay (elapsedMin) and lastAdd updates, and fall back to wallNow when candle time is zero}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{replace use of candle timestamps with wall-clock time for pyramiding decay (elapsedMin) and lastAdd updates, and fall back to wallNow when candle time is zero}}. Return the complete file, copy-paste ready.
+}} with only the necessary minimal changes to implement {{replace pyramiding decay elapsed_min computation to use time.Since(lastAdd) with fallback to oldest lot OpenTime or dailyStart, and set lastAdd to time.Now().UTC() when appending a new lot}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{replace pyramiding decay elapsed_min computation to use time.Since(lastAdd) with fallback to oldest lot OpenTime or dailyStart, and set lastAdd to time.Now().UTC() when appending a new lot}}. Return the complete file, copy-paste ready.

@@ -418,7 +418,13 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// Acquire lock (no defer): we will release it around network calls.
 	t.mu.Lock()
 
+	// Use wall clock as authoritative "now" for pyramiding timings; fall back for zero candle time.
+	wallNow := time.Now().UTC()
+
 	now := c[len(c)-1].Time
+	if now.IsZero() {
+		now = wallNow
+	}
 	t.updateDaily(now)
 
 	// Keep paper broker price in sync with the latest close so paper fills are realistic.
@@ -542,7 +548,23 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		elapsedMin := 0.0
 		if lambda > 0 {
 			if !t.lastAdd.IsZero() {
+				// Use wall clock elapsed minutes since last add (independent of candle timestamps).
 				elapsedMin = time.Since(t.lastAdd).Minutes()
+			} else {
+				// Fallback: use oldest lot OpenTime, else dailyStart.
+				anchor := t.dailyStart
+				if len(t.lots) > 0 {
+					oldest := t.lots[0].OpenTime
+					for _, l := range t.lots {
+						if !l.OpenTime.IsZero() && (oldest.IsZero() || l.OpenTime.Before(oldest)) {
+							oldest = l.OpenTime
+						}
+					}
+					if !oldest.IsZero() {
+						anchor = oldest
+					}
+				}
+				elapsedMin = time.Since(anchor).Minutes()
 			}
 			decayed := basePct * math.Exp(-lambda*elapsedMin)
 			floor := pyramidDecayMinPct()
@@ -721,7 +743,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		// trailing fields default zero/false; they’ll be initialized if this becomes runner
 	}
 	t.lots = append(t.lots, newLot)
-	t.lastAdd = now
+	// Use wall clock for lastAdd to drive spacing/decay even if candle time is zero.
+	t.lastAdd = wallNow
 
 	// Assign/designate runner if none exists yet; otherwise this is a scalp.
 	if t.runnerIdx == -1 {
