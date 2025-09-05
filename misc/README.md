@@ -1699,3 +1699,183 @@ Meanwhile, scalp lots still use the base TAKE_PROFIT_PCT (e.g., 1.5%) as their f
 So the runner can exit by:
 
 trailing (once armed), 2) its stretched TP (~2× TP), or 3) stop-loss—whichever happens first.
+===================================================================
+
+Thanks for the env dump—super clear. With those exact values:
+
+PYRAMID_MIN_ADVERSE_PCT=1.5
+
+PYRAMID_DECAY_LAMBDA=0.0
+
+PYRAMID_DECAY_MIN_PCT=0.0
+
+What this means right now
+
+Decay is OFF. Because PYRAMID_DECAY_LAMBDA=0.0, the adverse requirement never decays with time.
+
+Your effective adverse (effPct) stays fixed at 1.5% forever (minutes don’t matter).
+
+For a BUY add, the gate is always:
+
+lastGate
+=
+lastEntry
+×
+(
+1
+−
+0.015
+)
+lastGate=lastEntry×(1−0.015)
+
+Example: if the last add/entry was at $110,000, the next add only triggers when price ≤ $108,350.
+
+If you want time-based decay
+
+Flip it on by setting:
+
+PYRAMID_DECAY_LAMBDA to something > 0 (per-minute rate; e.g. 0.02)
+
+(Optional) PYRAMID_DECAY_MIN_PCT to a floor (e.g. 0.80)
+
+Then the effective adverse becomes:
+
+effPct
+(
+𝑡
+)
+=
+max
+⁡
+(
+PYRAMID_DECAY_MIN_PCT
+,
+  
+1.5
+⋅
+𝑒
+−
+𝜆
+𝑡
+)
+effPct(t)=max(PYRAMID_DECAY_MIN_PCT,1.5⋅e
+−λt
+)
+
+where 
+𝑡
+t is minutes since the last add.
+
+Cheat sheet if you pick λ=0.02:
+
+Half-life ≈ 34.7 min (requirement halves every ~35 minutes)
+
+15 min → ~1.11%
+
+30 min → ~0.82%
+
+45 min → ~0.61%
+
+60 min → ~0.45% (or the floor if you set one)
+
+Want me to suggest λ and a sensible floor that fit your volatility and how frequently you want to pyramid?
+=================================================================================
+
+Nice — with those exact envs:
+
+PYRAMID_MIN_ADVERSE_PCT=1.5
+
+PYRAMID_DECAY_LAMBDA=0.02 (per minute)
+
+PYRAMID_DECAY_MIN_PCT=0.4
+
+you’ve turned time-based decay ON for the add-gate.
+
+What the gate does now
+
+For BUY adds, the effective adverse requirement is:
+
+effPct(𝑡)=max(0.4,  1.5⋅𝑒−0.02⋅𝑡)%effPct(t)=max(0.4,1.5⋅e−0.02⋅t)%
+where 𝑡t is minutes since the last add (t := ow - lastAdd).
+
+At entry (t=0): effPct = 1.50%
+
+It decays exponentially with a half-life ≈ 34.7 min(ln⁡2/0.02)(ln2/0.02)
+
+It hits your floor 0.40% at ~66.1 min and ever goes lower.
+
+Quick table (rounded):
+
+Minutes since last add	effPct
+0	1.50%
+10	1.23%
+20	1.01%
+30	0.82%
+40	0.67%
+50	0.55%
+60	0.45%
+66+	0.40% (floor)
+
+Gate price for next BUY add is:
+
+lastGate
+(
+𝑡
+)
+=
+lastEntry
+×
+(
+1
+−
+effPct
+(
+𝑡
+)
+/
+100
+)
+lastGate(t)=lastEntry×(1−effPct(t)/100)
+
+Example (lastEntry = $110,000):
+
+t=0 → 1.50% drop → $108,350
+
+t=30 → 0.823% → $109,094.7
+
+t=60 → 0.452% → $109,503.0
+
+t≥66 → 0.40% → $109,560.0
+
+How to verify at runtime
+
+You already have the debug we wired in. Look for lines like:
+
+[DEBUG] pyramid: blocked by last gate; price=... last_gate<=... base_pct=1.500 eff_pct=0.823 λ=0.0200 elapsed_min=30.0
+
+
+This shows:
+
+base_pct = your PYRAMID_MIN_ADVERSE_PCT
+
+eff_pct = decayed value actually used
+
+λ and elapsed_min = your decay inputs
+
+Notes with your current env
+
+PYRAMID_MIN_SECONDS_BETWEEN=0: you allow back-to-back adds as soon as price ≤ gate (no spacing throttle).
+
+MAX_CONCURRENT_LOTS=20: effectively plenty of headroom to stack.
+
+Trailing (TRAIL_*) still applies runner-only; scalps exit via fixed TP/SL (with your scalp TP decay enabled: SCALP_TP_DECAY_ENABLE=true, mode exp, factor 0.9802, floor 1.55%).
+
+If you want a slightly faster/slower decay feel, tweak λ:
+
+Faster: 0.03 (half-life ~23.1 min)
+
+Slower: 0.01 (half-life ~69.3 min)
+
+But what you set now (λ=0.02, floor 0.4%) is a solid, sane baseline.
+=================================================================
+

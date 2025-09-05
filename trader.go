@@ -60,10 +60,6 @@ type BotState struct {
 	MdlExt         *ExtendedLogit
 	WalkForwardMin int
 	LastFit        time.Time
-
-	// NEW: persist pyramiding anchor across restarts (independent of lots)
-	PyramidAnchorPrice float64
-	PyramidAnchorTime  time.Time
 }
 
 type Trader struct {
@@ -174,8 +170,8 @@ func scalpTPDecayFactor() float64 { return getEnvFloat("SCALP_TP_DECAY_FACTOR", 
 func scalpTPMinPct() float64      { return getEnvFloat("SCALP_TP_MIN_PCT", 0.0) }      // floor
 
 // --- NEW: Option A – time-based exponential decay knobs (0 disables) ---
-func pyramidDecayLambda() float64  { return getEnvFloat("PYRAMID_DECAY_LAMBDA", 0.0) }  // per-minute
-func pyramidDecayMinPct() float64  { return getEnvFloat("PYRAMID_DECAY_MIN_PCT", 0.0) } // floor
+func pyramidDecayLambda() float64 { return getEnvFloat("PYRAMID_DECAY_LAMBDA", 0.0) }  // per-minute
+func pyramidDecayMinPct() float64 { return getEnvFloat("PYRAMID_DECAY_MIN_PCT", 0.0) } // floor
 
 // Cap concurrent lots (env-tunable). Default is effectively "no cap".
 func maxConcurrentLots() int {
@@ -231,21 +227,6 @@ func (t *Trader) applyRunnerTargets(p *Position) {
 	} else {
 		p.Stop = op * (1.0 + (t.cfg.StopLossPct*runnerStopMult)/100.0)
 		p.Take = op * (1.0 - (t.cfg.TakeProfitPct*runnerTPMult)/100.0)
-	}
-}
-
-// maybeUpdatePyramidAnchor lowers (for BUY) or raises (for SELL) the anchor; never moves it against-adverse.
-func (t *Trader) maybeUpdatePyramidAnchor(side OrderSide, refPrice float64, now time.Time) {
-	if side == SideBuy {
-		if t.pyramidAnchorPrice == 0 || refPrice < t.pyramidAnchorPrice {
-			t.pyramidAnchorPrice = refPrice
-			t.pyramidAnchorTime = now
-		}
-	} else {
-		if t.pyramidAnchorPrice == 0 || refPrice > t.pyramidAnchorPrice {
-			t.pyramidAnchorPrice = refPrice
-			t.pyramidAnchorTime = now
-		}
 	}
 }
 
@@ -324,6 +305,8 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 			if t.cfg.Extended().UseDirectSlack {
 				postSlack(fmt.Sprintf("ERR step: %v", err))
 			}
+			// Re-lock before returning so caller's Unlock matches.
+			t.mu.Lock()
 			return "", fmt.Errorf("close order failed: %w", err)
 		}
 		mtxOrders.WithLabelValues("live", string(closeSide)).Inc()
@@ -556,14 +539,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		basePct := pyramidMinAdversePct()
 		effPct := basePct
 		lambda := pyramidDecayLambda()
+		elapsedMin := 0.0
 		if lambda > 0 {
-			var minutes float64
 			if !t.lastAdd.IsZero() {
-				minutes = now.Sub(t.lastAdd).Minutes()
-			} else {
-				minutes = 0 // first add since start → no decay yet
+				elapsedMin = time.Since(t.lastAdd).Minutes()
 			}
-			decayed := basePct * math.Exp(-lambda*minutes)
+			decayed := basePct * math.Exp(-lambda*elapsedMin)
 			floor := pyramidDecayMinPct()
 			if decayed < floor {
 				decayed = floor
@@ -576,8 +557,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			lastGate := last * (1.0 - effPct/100.0) // BUY: require drop of effPct from last entry
 			if !(price <= lastGate) {
 				t.mu.Unlock()
-				log.Printf("[DEBUG] pyramid: blocked by last gate; price=%.2f last_gate<=%.2f pct=%.3f",
-					price, lastGate, effPct)
+				log.Printf("[DEBUG] pyramid: blocked by last gate; price=%.2f last_gate<=%.2f base_pct=%.3f eff_pct=%.3f λ=%.4f elapsed_min=%.1f",
+					+price, lastGate, basePct, effPct, lambda, elapsedMin)
 				return "HOLD", nil
 			}
 		}
@@ -794,16 +775,14 @@ func (t *Trader) saveState() error {
 		return nil
 	}
 	state := BotState{
-		EquityUSD:          t.equityUSD,
-		DailyStart:         t.dailyStart,
-		DailyPnL:           t.dailyPnL,
-		Lots:               t.lots,
-		Model:              t.model,
-		MdlExt:             t.mdlExt,
-		WalkForwardMin:     t.cfg.Extended().WalkForwardMin,
-		LastFit:            t.lastFit,
-		PyramidAnchorPrice: t.pyramidAnchorPrice,
-		PyramidAnchorTime:  t.pyramidAnchorTime,
+		EquityUSD:      t.equityUSD,
+		DailyStart:     t.dailyStart,
+		DailyPnL:       t.dailyPnL,
+		Lots:           t.lots,
+		Model:          t.model,
+		MdlExt:         t.mdlExt,
+		WalkForwardMin: t.cfg.Extended().WalkForwardMin,
+		LastFit:        t.lastFit,
 	}
 	bs, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -841,11 +820,7 @@ func (t *Trader) loadState() error {
 	if !st.LastFit.IsZero() {
 		t.lastFit = st.LastFit
 	}
-	// Restore independent pyramiding anchor (if present)
-	if st.PyramidAnchorPrice != 0 {
-		t.pyramidAnchorPrice = st.PyramidAnchorPrice
-		t.pyramidAnchorTime = st.PyramidAnchorTime
-	}
+
 	t.aggregateOpen()
 	// Re-derive runnerIdx if not set (old state files won't carry it).
 	if t.runnerIdx == -1 && len(t.lots) > 0 {

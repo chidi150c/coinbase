@@ -90,6 +90,9 @@ func loadBotEnv() {
 		"ALLOW_PYRAMIDING":             {},
 		"PYRAMID_MIN_SECONDS_BETWEEN":  {},
 		"PYRAMID_MIN_ADVERSE_PCT":      {},
+		// ---- NEW: time-based exponential decay (Option A) ----
+		"PYRAMID_DECAY_LAMBDA":         {}, // per-minute decay rate
+		"PYRAMID_DECAY_MIN_PCT":        {}, // floor for adverse % after decay
 		"USE_TICK_PRICE":               {},
 		"TICK_INTERVAL_SEC":            {},
 		"CANDLE_RESYNC_SEC":            {},
