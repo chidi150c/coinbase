@@ -139,7 +139,6 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *AIM
 	// (Phase-7 opt-in) Train extended head if enabled (no behavior change unless other files use it)
 	trader.mdlExt = trainExtendedIfEnabled(trader.cfg, train)
 
-
 	// Force paper for backtest accounting
 	trader.cfg.DryRun = true
 

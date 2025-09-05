@@ -1,6 +1,6 @@
 You are joining an existing Coinbase Advanced Trade bot project. Invariant baseline (must remain stable and NOT be re-generated):
 
-<..Replace this with your specification here...>
+[...]
 
 Operating rules:
 
@@ -12,7 +12,7 @@ Preserve all public behavior, flags, routes, metrics names, env keys, and file p
 
 How to respond:
 
-Provide a brief Plan.
+Provide a brief Plan for: [***Next Phase Plan***]
 
 1) For each item in the plan, first output a single-sentence CHANGE_DESCRIPTION:
    - Format: verb + what is being changed + how/with what.
