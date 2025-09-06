@@ -5,11 +5,10 @@ on:
     workflows: ["Build & Push Images"]
     types: [completed]
     branches: ["main"]
-  workflow_dispatch: {}  # manual button
 
 jobs:
   deploy:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     concurrency:
       group: prod-deploy
@@ -27,48 +26,40 @@ jobs:
       - name: Add host to known_hosts
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
-        run: ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+        run: |
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
 
       - name: Deploy (git sync, pull & up)
         env:
           SSH_HOST:  ${{ secrets.SSH_HOST }}
           SSH_USER:  ${{ secrets.SSH_USER }}
-          DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}         # /home/chidi/coinbase/monitoring
-          GHCR_USER: ${{ github.repository_owner }}
-          GHCR_PAT:  ${{ secrets.GHCR_PAT }}         # optional; needed only if GHCR packages are private
+          DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}  # e.g. /home/chidi/coinbase/monitoring
           REPO_URL:  https://github.com/${{ github.repository }}.git
+          GHCR_USER: ${{ github.repository_owner }}
+          GHCR_PAT:  ${{ secrets.GHCR_PAT }}  # only needed if GHCR packages are private
         run: |
           ssh -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" bash -s -- "$DEPLOY_DIR" "$REPO_URL" "$GHCR_USER" "$GHCR_PAT" <<'EOF'
           set -euo pipefail
           DEPLOY_DIR="${1:-/home/chidi/coinbase/monitoring}"
-          REPO_URL="${2}"
-          GHCR_USER="${3:-}"
-          GHCR_PAT="${4:-}"
-          REPO_DIR="$(dirname "$DEPLOY_DIR")"   # /home/chidi/coinbase
+          REPO_URL="$2"
+          GHCR_USER="${3:-}"; GHCR_PAT="${4:-}"
+          REPO_DIR="$(dirname "$DEPLOY_DIR")"
 
-          # Ensure repo matches origin/main so docker-compose.yml updates (GHCR images, etc.)
           if [ ! -d "$REPO_DIR/.git" ]; then
             mkdir -p "$REPO_DIR"
             git clone "$REPO_URL" "$REPO_DIR"
           else
+            git -C "$REPO_DIR" remote set-url origin "$REPO_URL"
             git -C "$REPO_DIR" fetch --all
             git -C "$REPO_DIR" reset --hard origin/main
           fi
 
-          # If GHCR is private, login before pulling
+          # login to GHCR if private
           if [ -n "$GHCR_PAT" ]; then
             echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
           fi
 
           cd "$DEPLOY_DIR"
-          echo "Compose images in use:"
-          grep -n '^ *image:' docker-compose.yml || true
-
-          # Pull latest tags and force-recreate so new images go live immediately
-          docker compose pull
-          docker compose up -d --force-recreate
+          docker compose up -d --pull=always --force-recreate
           docker image prune -f
-
-          echo "Active images:"
-          docker compose images
           EOF
