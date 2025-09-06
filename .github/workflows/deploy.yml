@@ -5,7 +5,6 @@ on:
     workflows: ["Build & Push Images"]
     types: [completed]
     branches: ["main"]
-    workflow_dispatch: {}
 
 jobs:
   deploy:
@@ -30,71 +29,29 @@ jobs:
         run: |
           ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
 
-      - name: Deploy (git sync, pull & up)
+      - name: Deploy (git sync + compose rollout)
         env:
           SSH_HOST:  ${{ secrets.SSH_HOST }}
           SSH_USER:  ${{ secrets.SSH_USER }}
-          DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}  # e.g. /home/chidi/coinbase/monitoring
+          DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}   # e.g. /home/chidi/coinbase/monitoring
           REPO_URL:  https://github.com/${{ github.repository }}.git
-          GHCR_USER: ${{ github.repository_owner }}
-          GHCR_PAT:  ${{ secrets.GHCR_PAT }}  # only if GHCR is private
-          GIT_SHA:   ${{ github.sha }}
         run: |
-          ssh -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" bash -s -- "$DEPLOY_DIR" "$REPO_URL" "$GHCR_USER" "$GHCR_PAT" "$GIT_SHA" <<'EOF'
-          set -xeuo pipefail
-
+          ssh -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" bash -s -- "$DEPLOY_DIR" "$REPO_URL" <<'EOF'
+          set -euo pipefail
           DEPLOY_DIR="${1:-/home/chidi/coinbase/monitoring}"
           REPO_URL="$2"
-          GHCR_USER="${3:-}"
-          GHCR_PAT="${4:-}"
-          GIT_SHA="${5:-unknown}"
-
           REPO_DIR="$(dirname "$DEPLOY_DIR")"
-
-          echo "== VM: $(hostname)  whoami=$(whoami)  date=$(date -u +'%F %T UTC') =="
-          echo "== Using DEPLOY_DIR=$DEPLOY_DIR ; REPO_DIR=$REPO_DIR =="
 
           if [ ! -d "$REPO_DIR/.git" ]; then
             mkdir -p "$REPO_DIR"
             git clone "$REPO_URL" "$REPO_DIR"
-          fi
-
-          echo "== Before sync: HEAD on VM =="
-          git -C "$REPO_DIR" rev-parse --short HEAD || true
-
-          git -C "$REPO_DIR" remote set-url origin "$REPO_URL"
-          git -C "$REPO_DIR" fetch --all
-          git -C "$REPO_DIR" reset --hard origin/main
-
-          echo "== After sync: HEAD on VM =="
-          git -C "$REPO_DIR" rev-parse --short HEAD
-
-          # Optional GHCR login (only if private)
-          if [ -n "$GHCR_PAT" ]; then
-            echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          else
+            git -C "$REPO_DIR" remote set-url origin "$REPO_URL"
+            git -C "$REPO_DIR" fetch --all
+            git -C "$REPO_DIR" reset --hard origin/main
           fi
 
           cd "$DEPLOY_DIR"
-          echo "== Compose images before =="
-          docker compose images || true
-
-          # If you add monitoring/docker-compose.prod.yml in repo, include it automatically
-          COMPOSE_ARGS="-f docker-compose.yml"
-          if [ -f docker-compose.prod.yml ]; then
-            COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.yml"
-          fi
-
-          # Rollout (always pull & recreate)
-          docker compose $COMPOSE_ARGS up -d --pull=always --force-recreate
-
-          echo "== Compose images after =="
-          docker compose images || true
-          echo "== Compose ps =="
-          docker compose ps || true
-
-          # Write a marker so you can see what was deployed from VM
-          date -u +'%F %T UTC' > verify.txt
-          echo "sha=$GIT_SHA" >> verify.txt
-          echo "host=$(hostname)" >> verify.txt
-          cat verify.txt
+          docker compose up -d --pull=always --force-recreate
+          docker image prune -f
           EOF
