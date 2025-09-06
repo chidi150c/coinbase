@@ -1,0 +1,46 @@
+name: Deploy to Linode
+
+on:
+  workflow_run:
+    workflows: ["Build & Push Images"]
+    types: [completed]
+    branches: ["main"]
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    # prevent overlapping prod deploys
+    concurrency:
+      group: prod-deploy
+      cancel-in-progress: false
+
+    steps:
+      - name: Prepare SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf "%s" "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Add host to known_hosts
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy (pull & up)
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+        run: |
+          ssh -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" <<'EOF'
+          set -euo pipefail
+          cd "${DEPLOY_DIR:-/home/chidi/coinbase/monitoring}"
+          docker compose pull
+          docker compose up -d
+          docker image prune -f
+          EOF

@@ -1,0 +1,87 @@
+# ---- VCS / CI ----
+.git
+.gitignore
+.github/
+
+# ---- OS / Editors ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.fleet/
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+
+# ---- Logs & PIDs ----
+*.log
+bot.log
+nohup.out
+*.pid
+
+# ---- Secrets & Env (keep example) ----
+.env
+.env.*
+!.env.example
+*.envrc
+.python-version
+
+# ---- Certificates / keys ----
+*.pem
+*.key
+*.crt
+*.p12
+*.der
+*.jks
+*.keystore
+
+# ---- Go build artifacts ----
+/bot
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.test
+cover.out
+coverage/
+profile.out
+cpu.pprof
+mem.pprof
+block.pprof
+mutex.pprof
+build/
+dist/
+out/
+bin/
+tmp/
+
+# ---- Python (FastAPI sidecar) ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+.venv/
+venv/
+env/
+.cache/
+.pytest_cache/
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Data / scratch ----
+runs/
+tmp/
+*.sqlite*
+*.db
+*.csv.tmp
+*.json.tmp
+monitoring/grafana-data/
+
+# ---- Docker / local overrides ----
+docker-compose.override.yml
+*.local.yml
