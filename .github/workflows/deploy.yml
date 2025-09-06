@@ -40,11 +40,15 @@ jobs:
         run: |
           ssh -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" bash -s -- "$DEPLOY_DIR" "$REPO_URL" "$GHCR_USER" "$GHCR_PAT" <<'EOF'
           set -euo pipefail
+
           DEPLOY_DIR="${1:-/home/chidi/coinbase/monitoring}"
           REPO_URL="$2"
-          GHCR_USER="${3:-}"; GHCR_PAT="${4:-}"
+          GHCR_USER="${3:-}"
+          GHCR_PAT="${4:-}"
+
           REPO_DIR="$(dirname "$DEPLOY_DIR")"
 
+          # Ensure repo present & on main
           if [ ! -d "$REPO_DIR/.git" ]; then
             mkdir -p "$REPO_DIR"
             git clone "$REPO_URL" "$REPO_DIR"
@@ -54,12 +58,20 @@ jobs:
             git -C "$REPO_DIR" reset --hard origin/main
           fi
 
-          # login to GHCR if private
+          # Optional login to GHCR (for private packages)
           if [ -n "$GHCR_PAT" ]; then
             echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
           fi
 
           cd "$DEPLOY_DIR"
-          docker compose up -d --pull=always --force-recreate
+
+          # If a repo-managed prod override exists, use it alongside the base compose file.
+          COMPOSE_ARGS="-f docker-compose.yml"
+          if [ -f docker-compose.prod.yml ]; then
+            COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.prod.yml"
+          fi
+
+          # Rollout
+          docker compose $COMPOSE_ARGS up -d --pull=always --force-recreate
           docker image prune -f
           EOF

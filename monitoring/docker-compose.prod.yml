@@ -1,0 +1,7 @@
+services:
+  bot:
+    healthcheck:
+      test: ["NONE"]
+  bridge:
+    healthcheck:
+      test: ["NONE"]
