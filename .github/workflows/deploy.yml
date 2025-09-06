@@ -5,13 +5,12 @@ on:
     workflows: ["Build & Push Images"]
     types: [completed]
     branches: ["main"]
+  workflow_dispatch: {}  # allow manual runs
 
 jobs:
   deploy:
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-
-    # prevent overlapping prod deploys
     concurrency:
       group: prod-deploy
       cancel-in-progress: false
@@ -28,18 +27,28 @@ jobs:
       - name: Add host to known_hosts
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
-        run: |
-          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+        run: ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
 
       - name: Deploy (pull & up)
         env:
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_USER: ${{ secrets.SSH_USER }}
-          DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+          SSH_HOST:  ${{ secrets.SSH_HOST }}
+          SSH_USER:  ${{ secrets.SSH_USER }}
+          DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}            # e.g. /home/chidi/coinbase/monitoring
+          GHCR_USER: ${{ github.repository_owner }}     # used only if GHCR_PAT is set
+          GHCR_PAT:  ${{ secrets.GHCR_PAT }}            # optional; set if GHCR packages are private
         run: |
-          ssh -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" <<'EOF'
+          ssh -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" bash -s -- "$DEPLOY_DIR" "$GHCR_USER" "$GHCR_PAT" <<'EOF'
           set -euo pipefail
-          cd "${DEPLOY_DIR:-/home/chidi/coinbase/monitoring}"
+          DEPLOY_DIR="${1:-/home/chidi/coinbase/monitoring}"
+          GHCR_USER="${2:-}"
+          GHCR_PAT="${3:-}"
+
+          # If a PAT is provided (private GHCR), log in before pulling
+          if [ -n "$GHCR_PAT" ]; then
+            echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          fi
+
+          cd "$DEPLOY_DIR"
           docker compose pull
           docker compose up -d
           docker image prune -f
