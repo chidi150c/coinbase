@@ -2,19 +2,21 @@ version: "3.9"
 
 services:
   bot:
-    image: golang:1.23
-    working_dir: /app
+    image: ghcr.io/chidi150c/coinbase-bot:latest
+    command: ["-live", "-interval", "1"]
     volumes:
-      - ..:/app
-      - /opt/coinbase/env:/opt/coinbase/env:ro 
+      - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
     env_file:
       - /opt/coinbase/env/bot.env
-    command: ["/usr/local/go/bin/go","run",".","-live","-interval","1"]
-    #command: /usr/local/go/bin/go run . -backtest /app/data/BTC-USD.csv -interval 1
     restart: unless-stopped
     expose:
       - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
     logging:
       driver: "json-file"
       options:
@@ -25,20 +27,17 @@ services:
         aliases: [bot, coinbase-bot]
 
   bridge:
-    build:
-      context: ../bridge
-      dockerfile: Dockerfile
-    image: coinbase-bridge:curl
-    working_dir: /app/bridge
-    volumes:
-      - ../bridge:/app/bridge:ro
-      - /opt/coinbase/env:/opt/coinbase/env:ro 
+    image: ghcr.io/chidi150c/coinbase-bridge:latest
     env_file:
       - /opt/coinbase/env/bridge.env
-    # use CMD from Dockerfile (no inline command override)
     expose:
       - "8787"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8787/health >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
     logging:
       driver: "json-file"
       options:

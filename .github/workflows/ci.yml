@@ -1,43 +1,32 @@
-# FILE: .github/workflows/ci.yml
 name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["**"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["**"]
 
 jobs:
-  build-test:
+  go-ci:
+    name: Go vet & test
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Go
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
-
-      - name: go fmt
-        run: go fmt ./...
-
-      - name: go vet
-        run: go vet ./...
-
-      - name: Build (root main package)
-        run: go build -o coinbase-bot .
-
-      # DRY_RUN is enforced inside backtest.go; no live trading occurs.
-      - name: Run backtest (DRY_RUN)
-        env:
-          BACKTEST_SLEEP_MS: "0"
-        run: |
-          go run . -backtest data/BTC-USD.csv
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+          go-version: "1.23.x"
+      - name: Cache Go modules
+        uses: actions/cache@v4
         with:
-          name: coinbase-bot
-          path: coinbase-bot
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -count=1 ./...

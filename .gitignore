@@ -5,6 +5,10 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+.fleet/
+*~
+*.orig
+*.rej
 
 # ---- Logs & PIDs ----
 *.log
@@ -17,6 +21,7 @@ nohup.out
 .env.*
 !.env.example
 *.envrc
+.python-version
 
 # Certificates / keys (sidecar PEM lives in .env but be safe)
 *.pem
@@ -28,6 +33,7 @@ nohup.out
 *.keystore
 
 # ---- Go build artifacts ----
+/bot
 *.exe
 *.dll
 *.so
@@ -36,6 +42,11 @@ nohup.out
 *.test
 cover.out
 coverage/
+profile.out
+cpu.pprof
+mem.pprof
+block.pprof
+mutex.pprof
 build/
 dist/
 out/
@@ -54,6 +65,8 @@ env/
 .cache/
 .pytest_cache/
 htmlcov/
+.mypy_cache/
+.ruff_cache/
 
 # ---- Data / scratch ----
 runs/
@@ -62,6 +75,7 @@ tmp/
 *.db
 *.csv.tmp
 *.json.tmp
+monitoring/grafana-data/
 
 # ---- Docker / local overrides (if any) ----
 docker-compose.override.yml

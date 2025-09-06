@@ -28,6 +28,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -676,10 +677,20 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		var err error
 		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
 		if err != nil {
-			if t.cfg.Extended().UseDirectSlack {
-				postSlack(fmt.Sprintf("ERR step: %v", err))
+			// Retry once with ORDER_MIN_USD on insufficient-funds style failures.
+			e := strings.ToLower(err.Error())
+			if quote > t.cfg.OrderMinUSD && (strings.Contains(e, "insufficient") || strings.Contains(e, "funds") || strings.Contains(e, "400")) {
+				log.Printf("[WARN] open order %.2f USD failed (%v); retrying with ORDER_MIN_USD=%.2f", quote, err, t.cfg.OrderMinUSD)
+				quote = t.cfg.OrderMinUSD
+				base = quote / price
+				placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
 			}
-			return "", err
+			if err != nil {
+				if t.cfg.Extended().UseDirectSlack {
+					postSlack(fmt.Sprintf("ERR step: %v", err))
+				}
+				return "", err
+			}
 		}
 		mtxOrders.WithLabelValues("live", string(side)).Inc()
 		mtxTrades.WithLabelValues("open").Inc()
