@@ -5,6 +5,7 @@ on:
     workflows: ["Build & Push Images"]
     types: [completed]
     branches: ["main"]
+    workflow_dispatch: {}
 
 jobs:
   deploy:
