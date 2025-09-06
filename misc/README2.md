@@ -39,4 +39,33 @@ Kill-switch:
 
 docker compose stop bot
 or set DRY_RUN=true and restart
+===============================================
+
+
+# Always run from the VM
+set -euo pipefail
+cd /home/chidi/coinbase
+git fetch --all && git reset --hard origin/main
+cd monitoring
+docker compose up -d --pull=always --force-recreate
+docker image prune -f
+
+# Container statuses
+docker compose ps
+
+# Images used (bot/bridge should be from GHCR)
+docker compose images | grep ghcr.io
+
+# In-network health check for the bot
+docker run --rm --network=monitoring_monitoring_network curlimages/curl:8.8.0 \
+  curl -fsS http://bot:8080/healthz && echo "bot OK"
+
+# bot
+docker image inspect ghcr.io/chidi150c/coinbase-bot:latest \
+  --format '{{ index .Config.Labels "org.opencontainers.image.revision"}}  {{.Id}}'
+
+# bridge
+docker image inspect ghcr.io/chidi150c/coinbase-bridge:latest \
+  --format '{{ index .Config.Labels "org.opencontainers.image.revision"}}  {{.Id}}'
+
 

@@ -45,6 +45,11 @@ services:
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
       - monitoring_prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d          
+      - --storage.tsdb.retention.size=2GB          
     restart: unless-stopped
     networks: [monitoring_network]
 
