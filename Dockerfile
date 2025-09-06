@@ -1,23 +1,27 @@
-# ---- builder ----
+# ---- build stage ----
 FROM golang:1.23 AS builder
 WORKDIR /src
 
-# Prime module cache
+# Speed up caching
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy the rest and build static binary
+# Copy the rest
 COPY . .
-ENV CGO_ENABLED=0
-RUN go build -o /out/bot ./
 
-# ---- runner ----
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates wget && adduser -D -g '' appuser
-USER appuser
+# Build static binary
+ARG CGO_ENABLED=0
+ARG GOOS=linux
+ARG GOARCH=amd64
+RUN CGO_ENABLED=${CGO_ENABLED} GOOS=${GOOS} GOARCH=${GOARCH} \
+    go build -ldflags="-s -w" -o /out/bot .
+
+# ---- runtime stage ----
+# use distroless static (tiny) – no shell inside
+FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
 COPY --from=builder /out/bot /app/bot
-
+USER nonroot:nonroot
 EXPOSE 8080
 ENTRYPOINT ["/app/bot"]
-# Flags (e.g., -live -interval 1) are provided by docker-compose
+CMD ["-live","-interval","1"]
