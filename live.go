@@ -24,9 +24,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
+	"sort"
 )
 
 // runLive executes the real-time loop with cadence intervalSec (seconds).
@@ -34,7 +34,6 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 	if intervalSec <= 0 {
 		intervalSec = 60
 	}
-	intervalSec = intervalSec / 2
 	log.Printf("Starting %s — product=%s dry_run=%v",
 		trader.broker.Name(), trader.cfg.ProductID, trader.cfg.DryRun)
 
@@ -43,6 +42,13 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 		trader.cfg.LongOnly, trader.cfg.OrderMinUSD, trader.cfg.RiskPerTradePct,
 		trader.cfg.MaxDailyLossPct, trader.cfg.TakeProfitPct, trader.cfg.StopLossPct, trader.cfg.MaxHistoryCandles)
 
+	// --- NEW: give the bridge a moment to come up (prevents connection refused at boot) ---
+	if trader.cfg.BridgeURL != "" {
+		if !waitBridgeHealthy(trader.cfg.BridgeURL, 90*time.Second) {
+			log.Printf("[BOOT] bridge health not ready after 90s; proceeding with warmup anyway")
+		}
+	}
+
 	// Warmup candles (paged backfill to MaxHistoryCandles with fallback to single fetch)
 	var history []Candle
 	target := trader.cfg.MaxHistoryCandles
@@ -50,14 +56,21 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 		target = 6000
 	}
 	if trader.cfg.BridgeURL != "" {
-		if hs, err := fetchHistoryPaged(trader.cfg.BridgeURL, trader.cfg.ProductID, trader.cfg.Granularity, 350, target); err == nil && len(hs) > 0 {
-			history = hs
-			log.Printf("[BOOT] history=%d (paged to %d target)", len(history), target)
-		} else if err != nil {
-			log.Printf("[BOOT] paged warmup error: %v", err)
+		// Small retry loop to handle racey startup of the bridge
+		const tries = 10
+		for i := 0; i < tries && len(history) == 0; i++ {
+			if hs, err := fetchHistoryPaged(trader.cfg.BridgeURL, trader.cfg.ProductID, trader.cfg.Granularity, 300, target); err == nil && len(hs) > 0 {
+				history = hs
+				log.Printf("[BOOT] history=%d (paged to %d target)", len(history), target)
+				break
+			} else if err != nil {
+				log.Printf("[BOOT] paged warmup error: %v", err)
+				time.Sleep(3 * time.Second)
+			}
 		}
 	}
 	if len(history) == 0 {
+		// Fallback single fetch from the broker
 		if cs, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 350); err == nil && len(cs) > 0 {
 			history = cs
 		} else if err != nil {
@@ -123,7 +136,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				// Periodic candle resync
 				if time.Since(lastCandleSync) >= time.Duration(candleResync)*time.Second {
 					if latestSlice, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 1); err == nil && len(latestSlice) > 0 {
-						log.Printf("[DEBUG] Limit10Candle = %v", latestSlice)
+						log.Printf("[DEBUG] Limit1Candle = %v", latestSlice)
 						latest := latestSlice[len(latestSlice)-1]
 						// Fallback: if broker didn’t set candle.Time, stamp it with now()
 						if latest.Time.IsZero() {
@@ -144,7 +157,8 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 					}
 				}
 
-				// Always poll /price each tick
+				//((((((((((*****candule nudging ****))))))))))
+				// Always poll /price each tick 
 				ctxPx, cancelPx := context.WithTimeout(ctx, 2*time.Second)
 				if px, stale, err := fetchBridgePrice(ctxPx, trader.cfg.BridgeURL, trader.cfg.ProductID); err == nil && !stale && px > 0 {
 					applyTickToLastCandle(history, px)
@@ -433,70 +447,42 @@ type candleJSON struct {
 // fetchHistoryPaged pulls up to want candles from the bridge, paging backward by time.
 // Accepts either a bare JSON array or {"candles":[...]} response forms.
 func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want int) ([]Candle, error) {
-	// Match working backfill behavior: cap to 300
-	if pageLimit <= 0 || pageLimit > 300 {
-		pageLimit = 300
+	if pageLimit <= 0 || pageLimit > 350 {
+		pageLimit = 350
 	}
 	if want <= 0 {
 		want = 5000
 	}
 	secPer := granularitySeconds(granularity)
 	if secPer <= 0 {
+		// Fallback to single page via broker is handled by caller if this returns empty
 		return nil, fmt.Errorf("unsupported granularity: %s", granularity)
 	}
 
-	// back off a bit so we don't fetch an in-progress candle
-	end := time.Now().UTC().Add(-20 * time.Second)
-
+	end := time.Now().UTC().Add(-20 * time.Second) // slight pad to avoid edge filtering
 	out := make([]Candle, 0, want+1024)
 	seen := make(map[int64]struct{})
 
 	for len(out) < want {
-		start := end.Add(-time.Duration((pageLimit+5)*int(secPer)) * time.Second)
+		start := end.Add(-time.Duration((pageLimit+5)*secPer) * time.Second)
 		u := fmt.Sprintf("%s/candles?product_id=%s&granularity=%s&limit=%d&start=%d&end=%d",
 			strings.TrimRight(bridgeURL, "/"), productID, granularity, pageLimit, start.Unix(), end.Unix())
 
-		ctxReq, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		req, err := http.NewRequestWithContext(ctxReq, "GET", u, nil)
+		resp, err := http.Get(u)
 		if err != nil {
-			cancel()
-			// if we already have some data, stop paging gracefully
-			if len(out) > 0 {
-				break
-			}
-			return nil, err
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			cancel()
-			if len(out) > 0 {
-				break
-			}
 			return nil, err
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			b, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			cancel()
-			// stop paging and keep what we have (avoid hard failing on 401/403/429 mid-run)
-			log.Printf("[BOOT] bridge /candles non-2xx %d (stopping paging): %s", resp.StatusCode, string(b))
-			if len(out) > 0 {
-				break
-			}
 			return nil, fmt.Errorf("bridge /candles %d: %s", resp.StatusCode, string(b))
 		}
-
 		var raw any
 		if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 			resp.Body.Close()
-			cancel()
-			if len(out) > 0 {
-				break
-			}
 			return nil, err
 		}
 		resp.Body.Close()
-		cancel()
 
 		rows := normalizeCandles(raw)
 		if len(rows) == 0 {
@@ -531,9 +517,6 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 		if len(rows) < pageLimit {
 			break
 		}
-
-		// small pause to avoid upstream auth/nonce quirks
-		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Sort ascending and cap to 'want'
@@ -543,7 +526,6 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 	}
 	return out, nil
 }
-
 
 func normalizeCandles(raw any) []candleJSON {
 	switch v := raw.(type) {
@@ -610,4 +592,24 @@ func granularitySeconds(g string) int {
 	default:
 		return 0
 	}
+}
+
+// ---- NEW: simple /health poller to avoid initial connection-refused ----
+func waitBridgeHealthy(bridgeURL string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	url := strings.TrimRight(bridgeURL, "/") + "/health"
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(url)
+		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			return true
+		}
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return false
 }

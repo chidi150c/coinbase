@@ -102,6 +102,7 @@ func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 		if mdl != nil {
 			// ComputePUpextended logs a debug line when features/model exist.
 			pUp = ComputePUpextended(c, mdl)
+			log.Printf("[DEBUG] extended mode computed pUp")
 		} else {
 			log.Printf("[DEBUG] extended mode requested but no mdlExt present; using micro-model pUp")
 		}
@@ -118,7 +119,7 @@ func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 	slow := ema8[i]
 	filterOK := !math.IsNaN(fast) && !math.IsNaN(slow) && fast > slow
 
-	reason := fmt.Sprintf("pUp=%.3f, ema4=%.2f vs ema8=%.2f", pUp, fast, slow)
+	reason := fmt.Sprintf("pUp=%.5f, ema4=%.2f vs ema8=%.2f", pUp, fast, slow)
 
 	// BUY if pUp clears threshold and (optionally) MA filter
 	if pUp > buyThreshold && (!useMAFilter || filterOK) {
