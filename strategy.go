@@ -178,7 +178,14 @@ func BuildExtendedFeatures(c []Candle, train bool) ([][]float64, []float64) {
 
 	feats := [][]float64{}
 	var labels []float64
-	for i := 26; i < len(c)-1; i++ {
+
+	// --- change: include the last (nudged) candle for inference ---
+	start := 26
+	end := len(c) - 1
+	if !train {
+		end = len(c) // inference path includes c[len(c)-1]
+	}
+	for i := start; i < end; i++ {
 		ret1 := (c[i].Close - c[i-1].Close) / (c[i-1].Close + 1e-12)
 		ret5 := (c[i].Close - c[i-5].Close) / (c[i-5].Close + 1e-12)
 		volPct := std20[i] / (c[i].Close + 1e-12)
