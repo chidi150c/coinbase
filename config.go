@@ -25,35 +25,35 @@ type Config struct {
 	TakeProfitPct   float64
 	StopLossPct     float64
 	OrderMinUSD     float64
-	LongOnly        bool // prevent SELL entries when flat on spot
-	FeeRatePct float64 // new: % fee applied on entry/exit trades
+	LongOnly        bool   // prevent SELL entries when flat on spot
+	FeeRatePct      float64 // new: % fee applied on entry/exit trades
 
 	// Ops
-	Port      int
-	BridgeURL string // e.g., http://127.0.0.1:8787
-	MaxHistoryCandle int
-	StateFile        string // NEW: path to persist bot state (configurable via env)
+	Port               int
+	BridgeURL          string // e.g., http://127.0.0.1:8787
+	MaxHistoryCandles  int    // plural: loaded from MAX_HISTORY_CANDLES
+	StateFile          string // NEW: path to persist bot state (configurable via env)
 }
 
 // loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
 // and returns a Config with sane defaults if keys are missing.
 func loadConfigFromEnv() Config {
 	return Config{
-		ProductID:       getEnv("PRODUCT_ID", "BTC-USD"),
-		Granularity:     getEnv("GRANULARITY", "ONE_MINUTE"),
-		DryRun:          getEnvBool("DRY_RUN", true),
-		MaxDailyLossPct: getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
-		RiskPerTradePct: getEnvFloat("RISK_PER_TRADE_PCT", 0.25),
-		USDEquity:       getEnvFloat("USD_EQUITY", 1000.0),
-		TakeProfitPct:   getEnvFloat("TAKE_PROFIT_PCT", 0.8),
-		StopLossPct:     getEnvFloat("STOP_LOSS_PCT", 0.4),
-		OrderMinUSD:     getEnvFloat("ORDER_MIN_USD", 5.00),
-		LongOnly:        getEnvBool("LONG_ONLY", true),
-		FeeRatePct:      getEnvFloat("FEE_RATE_PCT", 0.3), // new
-		Port:            getEnvInt("PORT", 8080),
-		BridgeURL:       getEnv("BRIDGE_URL", "http://127.0.0.1:8787"),
-		MaxHistoryCandle: getEnvInt("MAX_HISTORY_CANDLES", 5000),
-		StateFile:        getEnv("STATE_FILE", "/opt/coinbase/state/bot_state.json"), // NEW
+		ProductID:         getEnv("PRODUCT_ID", "BTC-USD"),
+		Granularity:       getEnv("GRANULARITY", "ONE_MINUTE"),
+		DryRun:            getEnvBool("DRY_RUN", true),
+		MaxDailyLossPct:   getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
+		RiskPerTradePct:   getEnvFloat("RISK_PER_TRADE_PCT", 0.25),
+		USDEquity:         getEnvFloat("USD_EQUITY", 1000.0),
+		TakeProfitPct:     getEnvFloat("TAKE_PROFIT_PCT", 0.8),
+		StopLossPct:       getEnvFloat("STOP_LOSS_PCT", 0.4),
+		OrderMinUSD:       getEnvFloat("ORDER_MIN_USD", 5.00),
+		LongOnly:          getEnvBool("LONG_ONLY", true),
+		FeeRatePct:        getEnvFloat("FEE_RATE_PCT", 0.3), // new
+		Port:              getEnvInt("PORT", 8080),
+		BridgeURL:         getEnv("BRIDGE_URL", "http://127.0.0.1:8787"),
+		MaxHistoryCandles: getEnvInt("MAX_HISTORY_CANDLES", 5000),
+		StateFile:         getEnv("STATE_FILE", "/opt/coinbase/state/bot_state.json"), // NEW
 	}
 }
 

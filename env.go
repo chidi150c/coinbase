@@ -108,6 +108,8 @@ func loadBotEnv() {
 		"SCALP_TP_DEC_PCT":      {},
 		"SCALP_TP_DECAY_FACTOR": {},
 		"SCALP_TP_MIN_PCT":      {},
+		// ---- NEW: ensure history depth is available to config/bootstrap ----
+		"MAX_HISTORY_CANDLES": {}, // used by cfg.MaxHistoryCandles
 	}
 
 	s := bufio.NewScanner(f)

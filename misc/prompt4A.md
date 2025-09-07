@@ -46,36 +46,195 @@ Coinbase Advanced Trade Bot (Go) + Bridge (FastAPI) + Monitoring Stack
 │   ├── grafana/
 │   ├── grafana-data/
 │   └── prometheus/
+│       └── prometheus.yml
 └── verify.txt
 
 
+Integrated details (current truth):
+
+The repository also contains:
+
+Root Dockerfile (builds the bot binary at /app/bot using a distroless final stage).
+
+.dockerignore
+
+Makefile
+
+.github/workflows/ci.yml, .github/workflows/docker.yml, .github/workflows/deploy.yml
+
+We sometimes create a local, not committed monitoring/docker-compose.override.yml on the VM only (e.g., to temporarily disable healthchecks). This file is not part of the baseline.
+
+2) Runtime directories on the VM (outside the repo)
+
+/opt/coinbase/env/ — holds bot.env and bridge.env (mounted read-only).
+
+/opt/coinbase/state/ — holds persisted bot state.
+
+Persisted state file (env-configured):
+STATE_FILE=/opt/coinbase/state/bot_state.json
+
 Integrated details (from Text B):
+/opt/coinbase/state/bot_state.json — persisted bot state file (path set by STATE_FILE) used by trader.go.
 
-/opt/coinbase/state/bot_state.json — persisted bot state file (path set by STATE_FILE) used by trader.go (see §4).
+3) Services & Networking (~/coinbase/monitoring/docker-compose.yml)
 
-trader.go defines:
+bot
 
-Position state (open price/side/size/stop/take/fees/trailing)
+Image: ghcr.io/<owner>/coinbase-bot:latest
 
-Trader orchestration (config, broker, model, equity/PnL, persisted state)
+Command: ["-live","-interval","1"] (image entrypoint is /app/bot)
 
-The synchronized step() loop for OPEN/HOLD/EXIT
+Volumes:
 
-Pyramiding (adds), per-add scalp TP decay, and a “runner” lot with optional trailing
+/opt/coinbase/env:/opt/coinbase/env:ro
 
-Runtime logs include [TICK] and [DEBUG] lines; broker interface includes PlaceMarketQuote(...); PaperBroker supported.
+/opt/coinbase/state:/opt/coinbase/state
 
-Optional:
+Env file: /opt/coinbase/env/bot.env
 
-USE_TICK_PRICE=true (live tick nudging)
+Expose: 8080
 
-Pyramiding: ALLOW_PYRAMIDING, PYRAMID_MIN_SECONDS_BETWEEN, PYRAMID_MIN_ADVERSE_PCT
+Restart: unless-stopped
 
-# === Trading target ===
+Healthcheck (when enabled): wget -qO- http://localhost:8080/healthz >/dev/null 2>&1 || exit 1
+
+Logging: json-file (max-size=10m, max-file=5)
+
+Networks: monitoring_network with aliases [bot, coinbase-bot]
+
+bridge
+
+Image: ghcr.io/<owner>/coinbase-bridge:latest
+
+Env file: /opt/coinbase/env/bridge.env
+
+Expose: 8787
+
+Restart: unless-stopped
+
+Healthcheck (when enabled): wget -qO- http://localhost:8787/health >/dev/null 2>&1 || exit 1
+
+Networks: monitoring_network with alias bridge
+
+prometheus
+
+Image: prom/prometheus:latest
+
+Ports: 9090:9090
+
+Volumes:
+
+./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+
+monitoring_prometheus_data:/prometheus
+
+Restart: unless-stopped
+
+Flag present: --storage.tsdb.retention.size=2GB
+
+alertmanager
+
+Image: prom/alertmanager:latest
+
+Ports: 9093:9093
+
+Volumes: ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+
+Restart: unless-stopped
+
+grafana
+
+Image: grafana/grafana:latest
+
+Ports: 3000:3000
+
+Environment:
+
+GF_SECURITY_ADMIN_USER=admin
+
+GF_SECURITY_ADMIN_PASSWORD=admin
+
+Volumes: monitoring_grafana_data:/var/lib/grafana
+
+Depends on: prometheus, bot, bridge
+
+Networks
+
+Single: monitoring_network (bridge driver)
+
+Volumes
+
+monitoring_prometheus_data
+
+monitoring_grafana_data
+
+Prometheus config (monitoring/prometheus/prometheus.yml):
+
+global:
+  scrape_interval: 15s
+rule_files:
+  - /etc/prometheus/rules.yml
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+  - job_name: "coinbase-bot"
+    static_configs:
+      - targets: ["bot:8080"]
+
+
+Integrated details (from Text A):
+Ports remain: bot :8080, bridge :8787. Prometheus scrapes bot at http://bot:8080/metrics.
+
+4) Go Bot (core)
+Files & roles
+
+env.go — loads whitelisted env keys into config.
+
+config.go — Config with all trading knobs; extended toggles; fee config.
+
+metrics.go — Prometheus exposition and counters/gauges on :8080/metrics.
+
+trader.go — in-memory state + synchronized step() loop; pyramiding; runner trailing; fees & PnL; persistence to STATE_FILE; daily breaker; partial-fill & commission handling.
+
+broker.go / broker_bridge.go — broker interface and Bridge-backed implementation (PlaceMarketQuote(...)); PaperBroker supported.
+
+live.go — live loop with tick nudging via bridge.
+
+backtest.go — CSV backtest (1m candles), train/test split, warmup pacing, model fit.
+
+strategy.go / model.go / indicators.go — BUY/SELL thresholds and model heads (baseline/extended); SMA/RSI/ZScore.
+
+HTTP surfaces (bot)
+
+:8080/healthz
+
+:8080/metrics (Prometheus)
+
+Metrics (names)
+
+bot_orders_total{mode,side}
+
+bot_decisions_total{signal}
+
+bot_trades_total{result=open|win|loss}
+
+bot_equity_usd
+
+bot_model_mode{mode}
+
+bot_vol_risk_factor
+
+bot_walk_forward_fits_total
+
+Trading config (env keys; exact names)
+# === Trading target / cadence ===
 PRODUCT_ID=BTC-USD
 GRANULARITY=ONE_MINUTE
-
-# === Execution cadence (ticks vs candles) ===
 USE_TICK_PRICE=true
 TICK_INTERVAL_SEC=1
 CANDLE_RESYNC_SEC=60
@@ -97,7 +256,7 @@ PYRAMID_MIN_SECONDS_BETWEEN=0
 MAX_CONCURRENT_LOTS=20
 PYRAMID_DECAY_MIN_PCT=0.4
 
-# --- optional: per-add TP decay for scalp lots (OFF by default) ---
+# --- optional: per-add TP decay for scalp lots ---
 SCALP_TP_DECAY_ENABLE=true
 SCALP_TP_DEC_MODE=exp
 SCALP_TP_DEC_PCT=0.20
@@ -130,436 +289,176 @@ VOL_RISK_ADJUST=true
 DAILY_BREAKER_MARK_TO_MARKET=true
 # SLACK_WEBHOOK=https://hooks.slack.com/services/XXX/YYY/ZZZ
 
+Behavior (invariants)
 
-Notes (integration):
+Synchronized step() uses latest candle/tick; if candle time is zero, uses time.Now().UTC() for daily accounting.
 
-/opt/coinbase/env/bridge.env
-# === Coinbase API ===
+Long-only guard: discretionary SELL entries ignored while lots are open; exits by TP/SL/runner trailing.
+
+Sizing: quote = max(ORDER_MIN_USD, (RISK_PER_TRADE_PCT/100)*equityUSD); base = quote/price.
+
+Pyramiding: spacing via PYRAMID_MIN_SECONDS_BETWEEN; adverse move vs last entry with time-decay eff = basePct * exp(-PYRAMID_DECAY_LAMBDA * minutes_since_lastAdd) floored at PYRAMID_DECAY_MIN_PCT; cap MAX_CONCURRENT_LOTS.
+
+Runner: first lot becomes runner (TP stretched ×2, SL baseline); other lots are scalps with optional per-add TP decay (linear or exponential) floored at SCALP_TP_MIN_PCT.
+
+Trailing (runner): activates at TRAIL_ACTIVATE_PCT, trails by TRAIL_DISTANCE_PCT. On runner close, newest remaining lot is promoted and its trailing fields reset.
+
+Fees & PnL: prefers broker-provided Price, BaseSize, CommissionUSD; warns on partial fills; subtracts entry + exit fees.
+
+Daily breaker: MAX_DAILY_LOSS_PCT enforced.
+
+Persistence: atomic save to STATE_FILE (.tmp then rename).
+
+New live-order feature (insufficient funds fallback)
+
+In trader.go open-order path, if PlaceMarketQuote(...) fails with “insufficient funds” (case-insensitive match on insufficient/fund or relevant status), the bot logs:
+
+[WARN] open order %.2f USD failed (%v); retrying with ORDER_MIN_USD=%.2f
+
+
+…then retries once using quote = ORDER_MIN_USD. On second failure it returns the error.
+
+5) Python Bridge (FastAPI) — bridge/app.py
+
+Runtime: uvicorn app:app --host 0.0.0.0 --port 8787
+Endpoints:
+
+GET /health
+
+GET /accounts?limit=
+
+GET /product/{product_id}
+
+GET /candles?granularity&limit&product_id (limit ≤ 350)
+
+GET /price?product_id= (uses latest WS tick or marks stale)
+
+POST /orders/market_buy
+
+POST /order/market (BUY/SELL by quote size)
+
+WebSocket (optional): subscribes to Advanced Trade WS; caches _last_ticks by product.
+
+Bridge env (/opt/coinbase/env/bridge.env):
+
 COINBASE_API_KEY_NAME=organizations/.../apiKeys/...
 COINBASE_API_PRIVATE_KEY=-----BEGIN EC PRIVATE KEY-----\n...\n-----END EC PRIVATE KEY-----\n
 COINBASE_API_BASE=https://api.coinbase.com
-
-# === Bridge runtime ===
 PORT=8787
-
-
-Optional WS toggles:
-
+# Optional WS
 COINBASE_WS_ENABLE=true
-
 COINBASE_WS_PRODUCTS=BTC-USD[,ETH-USD,...]
-
 COINBASE_WS_URL=wss://advanced-trade-ws.coinbase.com
-
 COINBASE_WS_STALE_SEC=10
 
-3) Services & Networking (~/coinbase/monitoring/docker-compose.yml)
-
-bot
-
-Image: golang:1.23
-
-Working dir: /app
-
-Volumes:
-
-..:/app
-
-/opt/coinbase/env:/opt/coinbase/env:ro
-
-Env file: /opt/coinbase/env/bot.env
-
-Command: /usr/local/go/bin/go run . -live -interval 1
-
-Expose: 8080
-
-Restart: unless-stopped
-
-Logging: json-file (max-size=10m, max-file=5)
-
-Networks: alias bot, coinbase-bot
-
-bridge
-
-Image: built from ../bridge/Dockerfile (coinbase-bridge:curl)
-
-Working dir: /app/bridge
-
-Volumes:
-
-../bridge:/app/bridge:ro
-
-/opt/coinbase/env:/opt/coinbase/env:ro
-
-Env file: /opt/coinbase/env/bridge.env
-
-Expose: 8787
-
-Restart: unless-stopped
-
-Networks: alias bridge
-
-prometheus
-
-Image: prom/prometheus:latest
-
-Ports: 9090:9090
-
-Volumes:
-
-./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-
-monitoring_prometheus_data:/prometheus
-
-Restart: unless-stopped
-
-alertmanager
-
-Image: prom/alertmanager:latest
-
-Ports: 9093:9093
-
-Volumes:
-
-./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
-
-grafana
-
-Image: grafana/grafana:latest
-
-Ports: 3000:3000
-
-Env:
-
-GF_SECURITY_ADMIN_USER=admin
-
-GF_SECURITY_ADMIN_PASSWORD=admin
-
-Volumes: monitoring_grafana_data:/var/lib/grafana
-
-Depends on: prometheus, bot, bridge
-
-Networks
-
-Single: monitoring_network (bridge driver)
-
-Volumes
-
-monitoring_prometheus_data
-
-monitoring_grafana_data
-
-Integrated details (from Text B):
-
-Ports remain: bot :8080, bridge :8787.
+6) Metrics & Monitoring
 
 Prometheus scrapes bot at http://bot:8080/metrics.
 
-4) Go Bot (core)
+Grafana (admin/admin) visualizes equity curve, trades, MA overlays, breaker status, PnL/daily changes, volatility factor.
 
-env.go → loadBotEnv() only loads whitelisted keys.
+Alertmanager integrates with Slack; alerts on downtime, “0-decisions” windows, equity drops.
 
-config.go → Config struct (all trading knobs), extended toggles, FeeRatePct, MaxHistoryCandle (legacy naming; runtime uses MAX_HISTORY_CANDLES).
+7) Container Images (GHCR)
 
-indicators.go → SMA, RSI, ZScore.
+Bot: ghcr.io/${{ github.repository_owner }}/coinbase-bot:latest and :${{ github.sha }}
 
-model.go → logistic model baseline/extended.
+Bridge: ghcr.io/${{ github.repository_owner }}/coinbase-bridge:latest and :${{ github.sha }}
 
-strategy.go → thresholds (BUY/SELL), optional MA filter.
+Root Dockerfile (bot)
 
-metrics.go → Prometheus exposition at :8080/metrics.
+Builds statically-linked Go binary at /app/bot; distroless final image; entrypoint /app/bot.
 
-Core trading loop & behavior (integrated augmentations)
+bridge/Dockerfile
 
-trader.go:
+FastAPI + Uvicorn; CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8787"].
 
-State & data structures
+8) CI/CD (GitHub Actions)
 
-Position
+.github/workflows/ci.yml — “Go vet & test”
 
-OpenPrice float64, Side OrderSide, SizeBase float64, Stop float64, Take float64, OpenTime time.Time
+on: push to main
 
-EntryFee float64 (recorded at open; deducted at close)
+Steps: checkout → setup Go → cache modules → go vet ./... → go test -count=1 ./...
 
-Runner-only trailing: TrailActive bool, TrailPeak float64, TrailStop float64
+.github/workflows/docker.yml — “Build & Push Images”
 
-BotState (persisted)
+on: push to main
 
-EquityUSD float64, DailyStart time.Time, DailyPnL float64, Lots []*Position
+Login to GHCR with built-in ${{ secrets.GITHUB_TOKEN }}
 
-Model *AIMicroModel, MdlExt *ExtendedLogit, WalkForwardMin int, LastFit time.Time
+Build & push both images (bot & bridge) to ghcr.io with tags :latest and :${{ github.sha }} (platform linux/amd64)
 
-Trader (selected)
+.github/workflows/deploy.yml — “Deploy to Linode”
 
-cfg Config, broker Broker, model *AIMicroModel
+on: workflow_run of “Build & Push Images” (only on main, only if success)
 
-lots []*Position, pos *Position (legacy representative), lastAdd time.Time
+Secrets required:
 
-dailyStart time.Time, dailyPnL float64, equityUSD float64
+SSH_PRIVATE_KEY (matches a public key in /home/chidi/.ssh/authorized_keys on the VM)
 
-mdlExt *ExtendedLogit, stateFile string, lastFit time.Time, runnerIdx int
+SSH_HOST (e.g., 172.236.14.121)
 
-pyramidAnchorPrice float64, pyramidAnchorTime time.Time
+SSH_USER (e.g., chidi)
 
-Synchronized tick (step())
+Variables:
 
-Uses latest candles/ticks; if candle time is zero, falls back to time.Now().UTC() for daily bookkeeping.
+DEPLOY_DIR (e.g., /home/chidi/coinbase/monitoring)
 
-Keeps PaperBroker price mirror synced with latest close for realistic paper fills.
+Remote rollout script (exact):
 
-Decision via decide(...) (baseline or extended head). Metrics incremented via mtxDecisions{buy|sell|flat}.
+Ensure clone at /home/chidi/coinbase (remote set to HTTPS); if absent, git clone.
 
-Long-only: discretionary SELL signals ignored while lots are open; exits are TP/SL (or runner trailing) only.
+git fetch --all && git reset --hard origin/main to sync code.
 
-Opening positions & pyramiding adds
+cd "$DEPLOY_DIR" and docker compose up -d --pull=always --force-recreate.
 
-Sizing: quote = max(ORDER_MIN_USD, (RISK_PER_TRADE_PCT/100)*equity), base = quote/price.
+docker image prune -f.
 
-Baseline TP/SL from TAKE_PROFIT_PCT/STOP_LOSS_PCT.
+9) Dev & Ops Runbook (VM)
 
-Runner: the very first lot when flat becomes runner; TP stretched 2× (runnerTPMult=2.0), SL 1×.
+Validate compose
 
-Scalp TP decay (if SCALP_TP_DECAY_ENABLE=true):
+docker compose -f /home/chidi/coinbase/monitoring/docker-compose.yml config >/dev/null && echo "compose OK"
 
-exp: tpPct = TAKE_PROFIT_PCT * (SCALP_TP_DECAY_FACTOR^k), floored at SCALP_TP_MIN_PCT.
 
-linear: tpPct = TAKE_PROFIT_PCT - k*SCALP_TP_DEC_PCT, floored at SCALP_TP_MIN_PCT.
+Bring up stack
 
-k excludes the runner (number of existing scalps).
+cd /home/chidi/coinbase/monitoring
+docker compose up -d --pull=always --force-recreate
 
-Pyramiding gates
 
-Spacing: time.Since(lastAdd) >= PYRAMID_MIN_SECONDS_BETWEEN.
+In-network health checks
 
-Adverse with time-decay:
+docker run --rm --network=monitoring_monitoring_network curlimages/curl:8.8.0 \
+  curl -fsS http://bot:8080/healthz && echo "bot OK"
 
-Base adverse: PYRAMID_MIN_ADVERSE_PCT vs the last entry price.
+docker run --rm --network=monitoring_monitoring_network curlimages/curl:8.8.0 \
+  curl -fsS http://bridge:8787/health && echo "bridge OK"
 
-Decay: effPct = basePct * exp(-PYRAMID_DECAY_LAMBDA * elapsed_min), floored at PYRAMID_DECAY_MIN_PCT.
 
-elapsed_min source (authoritative): time.Since(lastAdd).Minutes().
+Prometheus flags (confirm retention)
 
-If lastAdd is zero: seed from oldest open lot’s OpenTime, else from dailyStart.
+docker inspect monitoring-prometheus-1 --format '{{json .Config.Cmd}}' | jq -r .
 
-BUY add gate: price <= last_entry * (1 - effPct/100).
+10) Backtest (backtest.go)
 
-lastAdd update: set to time.Now().UTC() whenever a new lot is appended (drives both spacing and decay).
+Loads data/BTC-USD.csv (1m candles; ~5000–6000+ supported).
 
-Cap: MAX_CONCURRENT_LOTS enforced.
+Train/test split (70/30 default; configurable), warmup 50.
 
-Runner trailing (optional)
+Pacing via BACKTEST_SLEEP_MS.
 
-Activates once price reaches TRAIL_ACTIVATE_PCT profit.
+Uses same metric updates as live mode; DRY_RUN disables live order placement.
 
-Maintains trailing stop at TRAIL_DISTANCE_PCT; triggers EXIT when crossed.
+Runtime configuration uses MAX_HISTORY_CANDLES for historical window sizing.
 
-EXITs
+11) State, Logs, Safety
 
-On TP/SL or trailing trigger, place market close via PlaceMarketQuote.
+STATE_FILE=/opt/coinbase/state/bot_state.json must be writable via the bind mount.
 
-PnL computed with actual execution when available (Price, BaseSize), subtracting EntryFee (recorded on open) and exit fee.
+Logs include [TICK] and [DEBUG] lines; circuit breaker via MAX_DAILY_LOSS_PCT.
 
-Fees prefer broker CommissionUSD; fallback to FEE_RATE_PCT if missing.
+Spot-only LONG mode: LONG_ONLY=true.
 
-Metrics: mtxTrades{win|loss} on close; mtxOrders{mode=live|paper, side} on submit.
-
-Equity & persistence
-
-Equity reflected in mtxPnL via SetEquityUSD.
-
-State persisted to STATE_FILE after changes (/opt/coinbase/state/bot_state.json).
-
-Daily reset at UTC midnight; DAILY_BREAKER_MARK_TO_MARKET=true (ops-level mark-to-market behavior) supported.
-
-Concurrency
-
-Mutex protects in-memory state; network I/O (orders, broker calls) occurs with the mutex released to avoid stalls.
-
-Safety
-
-MAX_DAILY_LOSS_PCT circuit breaker (enforced at loop level).
-
-LONG_ONLY=true blocks SELL entries on spot.
-
-ORDER_MIN_USD floor maintained.
-
-Metrics (names referenced in code)
-
-bot_decisions_total{signal} (via mtxDecisions.WithLabelValues("buy"|"sell"|"flat").Inc())
-
-bot_orders_total{mode,side} (via mtxOrders.WithLabelValues("live"|"paper", side).Inc())
-
-bot_trades_total{result=open|win|loss} (on open/close)
-
-bot_equity_usd (via mtxPnL.Set(...))
-
-bot_model_mode{mode}
-
-bot_vol_risk_factor (via SetVolRiskFactorMetric(...))
-
-bot_walk_forward_fits_total
-
-Phase-7 changes (already implemented, authoritative)
-
-Pyramiding decay timing: uses wall-clock since last add
-elapsed_min = time.Since(lastAdd).Minutes() with floor at PYRAMID_DECAY_MIN_PCT using PYRAMID_DECAY_LAMBDA.
-Fallback seed when lastAdd is zero: oldest lot’s OpenTime, else dailyStart.
-lastAdd is set to time.Now().UTC() when appending a new lot.
-
-Candle-time fallback: when the latest candle timestamp is zero, use time.Now().UTC() for daily bookkeeping.
-
-Fill-aware, fee-aware PnL: prefers Price, BaseSize, and CommissionUSD from broker; logs partial fills; subtracts entry + exit fees.
-
-Runner management: first lot becomes runner (stretched TP 2×, SL 1×). On runner close, newest remaining lot is promoted and its trailing fields reset.
-
-5) Backtest (backtest.go)
-
-Loads CSV (data/BTC-USD.csv)
-
-Supports ~6000 1m candles (can extend to 5000–6000+)
-
-Splits into train/test (70/30 default; configurable)
-
-Warmup: 50
-
-Backtest pacing via BACKTEST_SLEEP_MS
-
-Model fit across expanded history
-
-DRY_RUN disables live order placement
-
-Metrics update identically to live mode
-
-Integration note: current runtime configuration uses MAX_HISTORY_CANDLES (plural) for historical window sizing.
-
-6) Python Bridge (FastAPI) — bridge/app.py
-
-Endpoints:
-
-/health
-
-/accounts?limit=
-
-/product/{product_id}
-
-/candles?granularity&limit&product_id (limit ≤ 350)
-
-/orders/market_buy
-
-/order/market (BUY/SELL by quote size)
-
-/price?product_id=
-
-WebSocket:
-
-Updates _last_ticks for products if enabled.
-
-/price returns latest tick or stale.
-
-7) Metrics & Monitoring
-
-Prometheus scrapes bot: 8080/metrics.
-
-Metrics:
-
-bot_orders_total{mode,side}
-
-bot_decisions_total{signal}
-
-bot_equity_usd
-
-bot_model_mode{mode}
-
-bot_vol_risk_factor
-
-bot_walk_forward_fits_total
-
-bot_trades_total{result=open|win|loss}
-
-Grafana dashboard:
-
-Equity curve, trades, MA overlays
-
-Circuit breaker status
-
-PnL/daily changes
-
-Volatility factor
-
-Alertmanager:
-
-Slack integration
-
-Alerts on downtime, 0-decisions, equity drop.
-
-8) HTTP Surfaces
-
-Bot (8080):
-
-/healthz
-
-/metrics
-
-Bridge (8787):
-
-/health
-
-/accounts
-
-/product/{id}
-
-/candles
-
-/price
-
-/orders/market_buy
-
-/order/market
-
-Verification Needed (to lock this spec as invariant)
-
-Please paste the following so I can cross-check paths, ports, metrics, and wiring against the repo and runtime:
-
-Repo layout
-
-git ls-files
-
-tree -a -L 2 from the repo root
-
-Build/runtime wiring
-
-go.mod and (if present) go.sum
-
-The main entrypoint file(s), e.g., cmd/*/main.go or main.go
-
-monitoring/docker-compose.yml (already referenced, paste the file)
-
-Any Dockerfile(s) (root and bridge/)
-
-Any Kubernetes manifests or systemd units, if applicable
-
-Any Makefile or run scripts (make help, ./run.sh, etc.)
-
-Config & env
-
-The exact deployed /opt/coinbase/env/bot.env (you already pasted this; confirm it’s the file mounted at runtime)
-
-/opt/coinbase/env/bridge.env
-
-Any additional env files or secrets referenced by your orchestrator
-
-Broker/model/metrics code
-
-Files that define the Broker interface and PaperBroker
-
-The decide(...) implementation and model config (baseline/extended, ExtendedLogit)
-
-The metrics definitions for mtxPnL, mtxOrders, mtxTrades, mtxDecisions, and SetVolRiskFactorMetric
-
-The HTTP server code that binds PORT=8080 (routes/health/metrics)
-
-State & logs
-
-Confirmation that /opt/coinbase/state/bot_state.json is writable (container volume or host path)
-
-A short live log snippet showing startup and a few ticks
+ORDER_MIN_USD enforced as absolute floor on quote sizing.

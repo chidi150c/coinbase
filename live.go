@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sort"
 )
 
 // runLive executes the real-time loop with cadence intervalSec (seconds).
@@ -40,14 +41,28 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 	// Safety banner for operators (no behavior change)
 	log.Printf("[SAFETY] LONG_ONLY=%v | ORDER_MIN_USD=%.2f | RISK_PER_TRADE_PCT=%.2f | MAX_DAILY_LOSS_PCT=%.2f | TAKE_PROFIT_PCT=%.2f | STOP_LOSS_PCT=%.2f | MAX_HISTORY_CANDLES=%d",
 		trader.cfg.LongOnly, trader.cfg.OrderMinUSD, trader.cfg.RiskPerTradePct,
-		trader.cfg.MaxDailyLossPct, trader.cfg.TakeProfitPct, trader.cfg.StopLossPct, trader.cfg.MaxHistoryCandle)
+		trader.cfg.MaxDailyLossPct, trader.cfg.TakeProfitPct, trader.cfg.StopLossPct, trader.cfg.MaxHistoryCandles)
 
-	// Warmup candles
+	// Warmup candles (paged backfill to MaxHistoryCandles with fallback to single fetch)
 	var history []Candle
-	if cs, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 350); err == nil && len(cs) > 0 {
-		history = cs
-	} else if err != nil {
-		log.Printf("warmup GetRecentCandles error: %v", err)
+	target := trader.cfg.MaxHistoryCandles
+	if target <= 0 {
+		target = 6000
+	}
+	if trader.cfg.BridgeURL != "" {
+		if hs, err := fetchHistoryPaged(trader.cfg.BridgeURL, trader.cfg.ProductID, trader.cfg.Granularity, 350, target); err == nil && len(hs) > 0 {
+			history = hs
+			log.Printf("[BOOT] history=%d (paged to %d target)", len(history), target)
+		} else if err != nil {
+			log.Printf("[BOOT] paged warmup error: %v", err)
+		}
+	}
+	if len(history) == 0 {
+		if cs, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 350); err == nil && len(cs) > 0 {
+			history = cs
+		} else if err != nil {
+			log.Printf("warmup GetRecentCandles error: %v", err)
+		}
 	}
 	if len(history) == 0 {
 		log.Fatalf("warmup failed: no candles returned")
@@ -119,8 +134,8 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 						} else {
 							history[len(history)-1] = latest
 						}
-						if len(history) > trader.cfg.MaxHistoryCandle {
-							history = history[len(history)-trader.cfg.MaxHistoryCandle:]
+						if len(history) > trader.cfg.MaxHistoryCandles {
+							history = history[len(history)-trader.cfg.MaxHistoryCandles:]
 						}
 						lastCandleSync = time.Now().UTC()
 						log.Printf("[SYNC] latest=%s history_last=%s len=%d", latest.Time, history[len(history)-1].Time, len(history))
@@ -200,8 +215,8 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				} else {
 					history[len(history)-1] = latest
 				}
-				if len(history) > trader.cfg.MaxHistoryCandle {
-					history = history[len(history)-trader.cfg.MaxHistoryCandle:]
+				if len(history) > trader.cfg.MaxHistoryCandles {
+					history = history[len(history)-trader.cfg.MaxHistoryCandles:]
 				}
 
 				lastRefit, trader.mdlExt = maybeWalkForwardRefit(trader.cfg, trader.mdlExt, history, lastRefit)
@@ -402,4 +417,169 @@ func applyTickToLastCandle(history []Candle, lastPrice float64) {
 	}
 	c.Close = lastPrice
 	history[i] = c
+}
+
+// ---- Paged history bootstrap (bridge /candles) ----
+
+type candleJSON struct {
+	Start  string `json:"start"`
+	Open   string `json:"open"`
+	High   string `json:"high"`
+	Low    string `json:"low"`
+	Close  string `json:"close"`
+	Volume string `json:"volume"`
+}
+
+// fetchHistoryPaged pulls up to want candles from the bridge, paging backward by time.
+// Accepts either a bare JSON array or {"candles":[...]} response forms.
+func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want int) ([]Candle, error) {
+	if pageLimit <= 0 || pageLimit > 350 {
+		pageLimit = 350
+	}
+	if want <= 0 {
+		want = 5000
+	}
+	secPer := granularitySeconds(granularity)
+	if secPer <= 0 {
+		// Fallback to single page via broker is handled by caller if this returns empty
+		return nil, fmt.Errorf("unsupported granularity: %s", granularity)
+	}
+
+	end := time.Now().UTC()
+	out := make([]Candle, 0, want+1024)
+	seen := make(map[int64]struct{})
+
+	for len(out) < want {
+		start := end.Add(-time.Duration((pageLimit+5)*int(secPer)) * time.Second)
+		u := fmt.Sprintf("%s/candles?product_id=%s&granularity=%s&limit=%d&start=%d&end=%d",
+			strings.TrimRight(bridgeURL, "/"), productID, granularity, pageLimit, start.Unix(), end.Unix())
+
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, fmt.Errorf("bridge /candles %d: %s", resp.StatusCode, string(b))
+		}
+		var raw any
+		if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
+		resp.Body.Close()
+
+		rows := normalizeCandles(raw)
+		if len(rows) == 0 {
+			break
+		}
+
+		for _, r := range rows {
+			ts, _ := strconv.ParseInt(strings.TrimSpace(r.Start), 10, 64)
+			if ts == 0 {
+				continue
+			}
+			if _, ok := seen[ts]; ok {
+				continue
+			}
+			seen[ts] = struct{}{}
+			o, _ := strconv.ParseFloat(r.Open, 64)
+			h, _ := strconv.ParseFloat(r.High, 64)
+			l, _ := strconv.ParseFloat(r.Low, 64)
+			c, _ := strconv.ParseFloat(r.Close, 64)
+			v, _ := strconv.ParseFloat(r.Volume, 64)
+			out = append(out, Candle{
+				Time:   time.Unix(ts, 0).UTC(),
+				Open:   o,
+				High:   h,
+				Low:    l,
+				Close:  c,
+				Volume: v,
+			})
+		}
+
+		end = start
+		if len(rows) < pageLimit {
+			break
+		}
+	}
+
+	// Sort ascending and cap to 'want'
+	sort.Slice(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
+	if len(out) > want {
+		out = out[len(out)-want:]
+	}
+	return out, nil
+}
+
+func normalizeCandles(raw any) []candleJSON {
+	switch v := raw.(type) {
+	case []any:
+		return toCandleJSON(v)
+	case map[string]any:
+		if c, ok := v["candles"]; ok {
+			if arr, ok := c.([]any); ok {
+				return toCandleJSON(arr)
+			}
+		}
+	}
+	return nil
+}
+
+func toCandleJSON(arr []any) []candleJSON {
+	out := make([]candleJSON, 0, len(arr))
+	for _, it := range arr {
+		if m, ok := it.(map[string]any); ok {
+			out = append(out, candleJSON{
+				Start:  asStr(m["start"]),
+				Open:   asStr(m["open"]),
+				High:   asStr(m["high"]),
+				Low:    asStr(m["low"]),
+				Close:  asStr(m["close"]),
+				Volume: asStr(m["volume"]),
+			})
+		}
+	}
+	return out
+}
+
+func asStr(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	default:
+		return ""
+	}
+}
+
+func granularitySeconds(g string) int {
+	switch strings.ToUpper(strings.TrimSpace(g)) {
+	case "ONE_MINUTE":
+		return 60
+	case "FIVE_MINUTE":
+		return 5 * 60
+	case "FIFTEEN_MINUTE":
+		return 15 * 60
+	case "THIRTY_MINUTE":
+		return 30 * 60
+	case "ONE_HOUR":
+		return 60 * 60
+	case "TWO_HOUR":
+		return 2 * 60 * 60
+	case "FOUR_HOUR":
+		return 4 * 60 * 60
+	case "SIX_HOUR":
+		return 6 * 60 * 60
+	case "ONE_DAY":
+		return 24 * 60 * 60
+	default:
+		return 0
+	}
 }

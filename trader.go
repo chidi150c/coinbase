@@ -428,6 +428,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 	t.updateDaily(now)
 
+	// --- NEW: walk-forward (re)fit guard hook (no-op other than the guard) ---
+	// Any refit logic must first check shouldRefit(len(c)).
+	// This preserves restored weights when history is thin.
+	_ = t.shouldRefit(len(c)) // intentionally unused here (guard only)
+
 	// Keep paper broker price in sync with the latest close so paper fills are realistic.
 	if pb, ok := t.broker.(*PaperBroker); ok {
 		if len(c) > 0 {
@@ -912,4 +917,24 @@ func volRiskFactor(c []Candle) float64 {
 	default:
 		return 1.0
 	}
+}
+
+// ---- Refit guard (minimal, internal) ----
+
+// shouldRefit returns true only when we *allow* a model (re)fit:
+//   1) len(history) >= cfg.MaxHistoryCandles, and
+//   2) optional walk-forward cadence satisfied (cfg.Extended().WalkForwardMin).
+// This is a guard only; it performs no fitting and emits no logs/metrics.
+func (t *Trader) shouldRefit(historyLen int) bool {
+	if historyLen < t.cfg.MaxHistoryCandles {
+		return false
+	}
+	min := t.cfg.Extended().WalkForwardMin
+	if min <= 0 {
+		return true
+	}
+	if t.lastFit.IsZero() {
+		return true
+	}
+	return time.Since(t.lastFit) >= time.Duration(min)*time.Minute
 }
