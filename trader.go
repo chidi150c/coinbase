@@ -543,7 +543,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		s := pyramidMinSeconds()
 		if time.Since(t.lastAdd) < time.Duration(s)*time.Second {
 			t.mu.Unlock()
-			log.Printf("[DEBUG] pyramid: blocked by spacing; since_last=%v need>=%ds", time.Since(t.lastAdd), s)
+			log.Printf("[DEBUG] pyramid: blocked by spacing; since_last=%vhours need>=%ds", time.Since(t.lastAdd) / 60.0, s)
 			return "HOLD", nil
 		}
 
@@ -585,8 +585,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			lastGate := last * (1.0 - effPct/100.0) // BUY: require drop of effPct from last entry
 			if !(price <= lastGate) {
 				t.mu.Unlock()
-				log.Printf("[DEBUG] pyramid: blocked by last gate; price=%.2f last_gate<=%.2f base_pct=%.3f eff_pct=%.3f λ=%.4f elapsed_min=%.1f",
-					+price, lastGate, basePct, effPct, lambda, elapsedMin)
+				elapsedHr := elapsedMin/60.0
+				log.Printf("[DEBUG] pyramid: blocked by last gate; price=%.2f last_gate<=%.2f base_pct=%.3f eff_pct=%.3f λ=%.4f elapsed_Hr=%.1fhours",
+					+price, lastGate, basePct, effPct, lambda, elapsedHr)
 				return "HOLD", nil
 			}
 		}
