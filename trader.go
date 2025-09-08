@@ -90,6 +90,11 @@ type Trader struct {
 	// NEW: independent pyramiding anchor (stable reference, not tied to latest scalp)
 	pyramidAnchorPrice float64
 	pyramidAnchorTime  time.Time
+
+	// --- NEW: adverse gate helpers (since last add) ---
+	winLow      float64 // lowest price seen since lastAdd
+	latchedGate float64 // latched adverse gate once threshold time is reached; reset on new add
+
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -315,6 +320,19 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 	// re-lock
 	t.mu.Lock()
 
+	// --- NEW: check if the lot being closed is the most recent add (newest OpenTime) ---
+	wasNewest := true
+	refOpen := lot.OpenTime
+	for j := range t.lots {
+		if j == idx {
+			continue
+		}
+		if !t.lots[j].OpenTime.IsZero() && t.lots[j].OpenTime.After(refOpen) {
+			wasNewest = false
+			break
+		}
+	}
+
 	// --- MINIMAL CHANGE: use actual filled size/price if available ---
 	priceExec := c[len(c)-1].Close
 	baseFilled := baseRequested
@@ -391,6 +409,32 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 				t.runnerIdx = -1
 			}
 		}
+	}
+
+	// --- NEW: if the closed lot was the most recent add, re-anchor pyramiding timers/state ---
+	if wasNewest {
+		if len(t.lots) > 0 {
+			// Find the next-newest surviving lot by OpenTime.
+			newest := t.lots[0]
+			for _, l := range t.lots {
+				if l.OpenTime.After(newest.OpenTime) {
+					newest = l
+				}
+			}
+			// Re-anchor lastAdd to the next-newest lot's OpenTime.
+			t.lastAdd = newest.OpenTime
+			// Reset adverse tracking and latch so winLow tracking restarts from this anchor.
+			t.winLow = newest.OpenPrice
+			t.latchedGate = 0
+		} else {
+			// No lots left: fall back to dailyStart as a conservative anchor.
+			t.lastAdd = t.dailyStart
+			// Reset winLow/latch to neutral.
+			t.winLow = 0
+			t.latchedGate = 0
+		}
+		// NOTE: If you prefer strict spacing semantics on re-anchor, alternatively:
+		//   t.lastAdd = time.Now().UTC()
 	}
 
 	t.aggregateOpen()
@@ -517,6 +561,13 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	price := c[len(c)-1].Close
 
+	// --- NEW: track lowest price since last add (for future gating) ---
+	if !t.lastAdd.IsZero() {
+		if t.winLow == 0 || price < t.winLow {
+			t.winLow = price
+		}
+	}
+
 	// Long-only veto for SELL when flat; unchanged behavior.
 	if d.Signal == Sell && t.cfg.LongOnly {
 		t.mu.Unlock()
@@ -543,7 +594,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		s := pyramidMinSeconds()
 		if time.Since(t.lastAdd) < time.Duration(s)*time.Second {
 			t.mu.Unlock()
-			log.Printf("[DEBUG] pyramid: blocked by spacing; since_last=%vhours need>=%ds", time.Since(t.lastAdd) / 60.0, s)
+			hrs := time.Since(t.lastAdd).Hours()
+			log.Printf("[DEBUG] pyramid: blocked by spacing; since_last=%vHours need>=%ds", fmt.Sprintf("%.1f", hrs), s)
 			return "HOLD", nil
 		}
 
@@ -580,13 +632,36 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			effPct = decayed
 		}
 
+		// Compute floor time (minutes) at which effPct reaches the floor; used for latching decision.
+		tFloorMin := 0.0
+		if lambda > 0 {
+			floor := pyramidDecayMinPct()
+			if basePct > floor && floor > 0 {
+				tFloorMin = math.Log(basePct/floor) / lambda
+			}
+		}
+
 		last := t.latestEntry()
 		if last > 0 {
-			lastGate := last * (1.0 - effPct/100.0) // BUY: require drop of effPct from last entry
+			// Default adverse gate vs last entry with time-decayed effPct.
+			lastGate := last * (1.0 - effPct/100.0)
+
+			// After sufficient time, switch to winLow and latch it until next add.
+			if tFloorMin > 0 && elapsedMin >= 2*tFloorMin {
+				if t.latchedGate == 0 {
+					latch := t.winLow
+					if latch <= 0 {
+						latch = lastGate
+					}
+					t.latchedGate = latch
+				}
+				lastGate = t.latchedGate
+			}
+
 			if !(price <= lastGate) {
 				t.mu.Unlock()
-				elapsedHr := elapsedMin/60.0
-				log.Printf("[DEBUG] pyramid: blocked by last gate; price=%.2f last_gate<=%.2f base_pct=%.3f eff_pct=%.3f λ=%.4f elapsed_Hr=%.1fhours",
+				elapsedHr := elapsedMin / 60.0
+				log.Printf("[DEBUG] pyramid: blocked by last gate; price=%.2f last_gate<=%.2f base_pct=%.3f eff_pct=%.3f λ=%.4f elapsed_Hours=%.1f",
 					+price, lastGate, basePct, effPct, lambda, elapsedHr)
 				return "HOLD", nil
 			}
@@ -762,6 +837,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	t.lots = append(t.lots, newLot)
 	// Use wall clock for lastAdd to drive spacing/decay even if candle time is zero.
 	t.lastAdd = wallNow
+	// Reset adverse tracking for the new add.
+	t.winLow = priceToUse
+	t.latchedGate = 0
 
 	// Assign/designate runner if none exists yet; otherwise this is a scalp.
 	if t.runnerIdx == -1 {
@@ -824,7 +902,7 @@ func (t *Trader) saveState() error {
 		WalkForwardMin: t.cfg.Extended().WalkForwardMin,
 		LastFit:        t.lastFit,
 	}
-	bs, err := json.MarshalIndent(state, "", "  ")
+	bs, err := json.MarshalIndent(state, "", " ")
 	if err != nil {
 		return err
 	}
@@ -922,9 +1000,9 @@ func volRiskFactor(c []Candle) float64 {
 
 // ---- Refit guard (minimal, internal) ----
 
-// shouldRefit returns true only when we *allow* a model (re)fit:
-//   1) len(history) >= cfg.MaxHistoryCandles, and
-//   2) optional walk-forward cadence satisfied (cfg.Extended().WalkForwardMin).
+// shouldRefit returns true only when we allow a model (re)fit:
+// 1) len(history) >= cfg.MaxHistoryCandles, and
+// 2) optional walk-forward cadence satisfied (cfg.Extended().WalkForwardMin).
 // This is a guard only; it performs no fitting and emits no logs/metrics.
 func (t *Trader) shouldRefit(historyLen int) bool {
 	if historyLen < t.cfg.MaxHistoryCandles {
