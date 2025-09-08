@@ -414,27 +414,17 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 	// --- NEW: if the closed lot was the most recent add, re-anchor pyramiding timers/state ---
 	if wasNewest {
 		if len(t.lots) > 0 {
-			// Find the next-newest surviving lot by OpenTime.
-			newest := t.lots[0]
-			for _, l := range t.lots {
-				if l.OpenTime.After(newest.OpenTime) {
-					newest = l
-				}
-			}
-			// Re-anchor lastAdd to the next-newest lot's OpenTime.
-			t.lastAdd = newest.OpenTime
-			// Reset adverse tracking and latch so winLow tracking restarts from this anchor.
-			t.winLow = newest.OpenPrice
+			// Reset adverse tracking and latch so winLow tracking restarts at elapsed_min >= t_floor_min.
+			// pyramid decay resumes
+			t.lastAdd = time.Now().UTC()
+			t.winLow = 0
 			t.latchedGate = 0
 		} else {
 			// No lots left: fall back to dailyStart as a conservative anchor.
 			t.lastAdd = t.dailyStart
-			// Reset winLow/latch to neutral.
 			t.winLow = 0
 			t.latchedGate = 0
 		}
-		// NOTE: If you prefer strict spacing semantics on re-anchor, alternatively:
-		//   t.lastAdd = time.Now().UTC()
 	}
 
 	t.aggregateOpen()
@@ -600,73 +590,79 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		}
 
 		// 2) Adverse move gate: ONLY vs last entry, with optional time-based exponential decay.
-		basePct := pyramidMinAdversePct()
-		effPct := basePct
-		lambda := pyramidDecayLambda()
-		elapsedMin := 0.0
-		if lambda > 0 {
-			if !t.lastAdd.IsZero() {
-				// Use wall clock elapsed minutes since last add (independent of candle timestamps).
-				elapsedMin = time.Since(t.lastAdd).Minutes()
-			} else {
-				// Fallback: use oldest lot OpenTime, else dailyStart.
-				anchor := t.dailyStart
-				if len(t.lots) > 0 {
-					oldest := t.lots[0].OpenTime
-					for _, l := range t.lots {
-						if !l.OpenTime.IsZero() && (oldest.IsZero() || l.OpenTime.Before(oldest)) {
-							oldest = l.OpenTime
-						}
-					}
-					if !oldest.IsZero() {
-						anchor = oldest
-					}
-				}
-				elapsedMin = time.Since(anchor).Minutes()
-			}
-			decayed := basePct * math.Exp(-lambda*elapsedMin)
-			floor := pyramidDecayMinPct()
-			if decayed < floor {
-				decayed = floor
-			}
-			effPct = decayed
-		}
+        basePct := pyramidMinAdversePct()
+        effPct := basePct
+        lambda := pyramidDecayLambda()
+        floor := pyramidDecayMinPct()
+        elapsedMin := 0.0
+        if lambda > 0 {
+            if !t.lastAdd.IsZero() {
+                // Use wall clock elapsed minutes since last add (independent of candle timestamps).
+                elapsedMin = time.Since(t.lastAdd).Minutes()
+            } else {
+                // Fallback: use oldest lot OpenTime, else dailyStart.
+                anchor := t.dailyStart
+                if len(t.lots) > 0 {
+                    oldest := t.lots[0].OpenTime
+                    for _, l := range t.lots {
+                        if !l.OpenTime.IsZero() && (oldest.IsZero() || l.OpenTime.Before(oldest)) {
+                            oldest = l.OpenTime
+                        }
+                    }
+                    if !oldest.IsZero() {
+                        anchor = oldest
+                    }
+                }
+                elapsedMin = time.Since(anchor).Minutes()
+            }
+            // Exponential decay (floored)
+            decayed := basePct * math.Exp(-lambda*elapsedMin)
+            if decayed < floor {
+                decayed = floor
+            }
+            effPct = decayed
+        }
 
-		// Compute floor time (minutes) at which effPct reaches the floor; used for latching decision.
-		tFloorMin := 0.0
-		if lambda > 0 {
-			floor := pyramidDecayMinPct()
-			if basePct > floor && floor > 0 {
-				tFloorMin = math.Log(basePct/floor) / lambda
-			}
-		}
+        // Time (in minutes) to hit the floor once (t_floor_min); use for winLow start and latch thresholds.
+        tFloorMin := 0.0
+        if lambda > 0 && basePct > floor {
+            tFloorMin = math.Log(basePct/floor) / lambda
+        }
 
-		last := t.latestEntry()
-		if last > 0 {
-			// Default adverse gate vs last entry with time-decayed effPct.
-			lastGate := last * (1.0 - effPct/100.0)
+        last := t.latestEntry()
+        if last > 0 {
+            // Start tracking winLow ONLY after we reach t_floor_min.
+            if elapsedMin >= tFloorMin {
+                if t.winLow == 0 || price < t.winLow {
+                    t.winLow = price
+                }
+            } else {
+                // Before t_floor_min, do not accumulate winLow.
+                t.winLow = 0
+            }
 
-			// After sufficient time, switch to winLow and latch it until next add.
-			if tFloorMin > 0 && elapsedMin >= 2*tFloorMin {
-				if t.latchedGate == 0 {
-					latch := t.winLow
-					if latch <= 0 {
-						latch = lastGate
-					}
-					t.latchedGate = latch
-				}
-				lastGate = t.latchedGate
-			}
+            // Latch to the current winLow after we reach 2 * t_floor_min (one-way until next add/anchor reset).
+            if t.latchedGate == 0 && elapsedMin >= 2.0*tFloorMin && t.winLow > 0 {
+                t.latchedGate = t.winLow
+            }
 
-			if !(price <= lastGate) {
-				t.mu.Unlock()
-				elapsedHr := elapsedMin / 60.0
-				log.Printf("[DEBUG] pyramid: blocked by last gate; price=%.2f last_gate<=%.2f base_pct=%.3f eff_pct=%.3f λ=%.4f elapsed_Hours=%.1f",
-					+price, lastGate, basePct, effPct, lambda, elapsedHr)
-				return "HOLD", nil
-			}
-		}
-		// (runner-gap guard removed)
+            // Determine the active gate:
+            // - Before latch: baseline last*(1-effPct/100)
+            // - After latch: use the fixed latchedGate (the winLow when latch occurred)
+            gatePrice := last * (1.0 - effPct/100.0)
+            if t.latchedGate > 0 {
+                gatePrice = t.latchedGate
+            }
+
+            if !(price <= gatePrice) {
+                t.mu.Unlock()
+                elapsedHr := elapsedMin / 60.0
+                log.Printf("[DEBUG] pyramid: blocked by last gate; price=%.2f last_gate<=%.2f base_pct=%.3f eff_pct=%.3f λ=%.4f elapsed_Hours=%.1f",
+                    +price, gatePrice, basePct, effPct, lambda, elapsedHr)
+                return "HOLD", nil
+            }
+        }
+        // (runner-gap guard removed)
 	}
 	// Sizing (risk % of current equity, with optional volatility adjust already supported).
 	riskPct := t.cfg.RiskPerTradePct

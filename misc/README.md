@@ -1879,3 +1879,48 @@ Slower: 0.01 (half-life ~69.3 min)
 But what you set now (λ=0.02, floor 0.4%) is a solid, sane baseline.
 =================================================================
 
+Short answer: it “adverses” against the latest surviving entry price at first, and later against the recorded lowest price (winLow) once we latch.
+
+Here’s the exact logic your code now follows:
+
+Phase A (before latch):
+Anchor = lastEntry (the newest surviving lot’s OpenPrice).
+Gate = lastEntry * (1 - effPct/100) where effPct = basePct * exp(-λ * elapsed_min) floored at PYRAMID_DECAY_MIN_PCT.
+Condition to allow an add: price <= gate.
+
+We start tracking winLow once elapsed_min ≥ t_floor_min (your decay half-life time), but we’re still gating on lastEntry in this phase.
+
+Phase B (latched): when elapsed_min ≥ 2 * t_floor_min, we latch the gate to the current winLow (lowest price seen since lastAdd, at the moment of latching).
+After that, Gate = latchedGate = winLow_at_latch_time (a fixed price level).
+Condition to allow an add: price <= latchedGate.
+latchedGate does not move again until the next add resets the timers.
+
+When the newest lot exits (the last add got closed):
+We reset pyramiding timing and tracking so the cycle restarts:
+lastAdd = time.Now().UTC(), winLow = 0, latchedGate = 0.
+That means we go back to adversing vs lastEntry (with fresh decay) until we reach t_floor_min (start tracking winLow) and then 2*t_floor_min (latch again).
+
+So, practically:
+
+Early on, the “required adverse” is a % drop from the last entry price (decaying over time).
+
+After enough time (≥ 2× t_floor_min), the requirement becomes “revisit (or break) the lowest price seen since the last add”—because the gate is latched to that winLow price level.
+
+You said:
+lowest price seen since lastAdd - t_floor_min
+ChatGPT said:
+Thought for 9s
+
+Got it — we’ll define it exactly like this:
+
+Let t_floor_min = ln(PYRAMID_MIN_ADVERSE_PCT / PYRAMID_DECAY_MIN_PCT) / PYRAMID_DECAY_LAMBDA.
+
+After an add at time lastAdd, we ignore the first t_floor_min minutes.
+
+We start tracking winLow from lastAdd + t_floor_min onward (i.e., “lowest price seen since lastAdd − t_floor_min” as you phrased it).
+
+When elapsed_min ≥ 2 * t_floor_min, we latch the gate to the current winLow (the minimum over the window [lastAdd + t_floor_min, now]) and keep using that fixed latchedGate until the next add.
+
+So the window for winLow is:
+from lastAdd + t_floor_min to the moment we latch (and then it stops updating once latched).
+
