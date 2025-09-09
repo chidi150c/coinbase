@@ -590,38 +590,26 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		}
 
 		// 2) Adverse move gate: ONLY vs last entry, with optional time-based exponential decay.
-        basePct := pyramidMinAdversePct()
-        effPct := basePct
-        lambda := pyramidDecayLambda()
-        floor := pyramidDecayMinPct()
-        elapsedMin := 0.0
-        if lambda > 0 {
-            if !t.lastAdd.IsZero() {
-                // Use wall clock elapsed minutes since last add (independent of candle timestamps).
-                elapsedMin = time.Since(t.lastAdd).Minutes()
-            } else {
-                // Fallback: use oldest lot OpenTime, else dailyStart.
-                anchor := t.dailyStart
-                if len(t.lots) > 0 {
-                    oldest := t.lots[0].OpenTime
-                    for _, l := range t.lots {
-                        if !l.OpenTime.IsZero() && (oldest.IsZero() || l.OpenTime.Before(oldest)) {
-                            oldest = l.OpenTime
-                        }
-                    }
-                    if !oldest.IsZero() {
-                        anchor = oldest
-                    }
-                }
-                elapsedMin = time.Since(anchor).Minutes()
-            }
-            // Exponential decay (floored)
-            decayed := basePct * math.Exp(-lambda*elapsedMin)
-            if decayed < floor {
-                decayed = floor
-            }
-            effPct = decayed
-        }
+		basePct := pyramidMinAdversePct()
+		effPct := basePct
+		lambda := pyramidDecayLambda()
+		floor := pyramidDecayMinPct()
+			elapsedMin := 0.0
+		if lambda > 0 {
+			if !t.lastAdd.IsZero() {
+				// Use wall clock elapsed minutes since the most recent add
+				elapsedMin = time.Since(t.lastAdd).Minutes()
+			} else {
+				// Post-restart warmup: do not backdate elapsed_min; wait for a new add
+				// to establish lastAdd before decay/latching can progress.
+				elapsedMin = 0.0
+			}
+			decayed := basePct * math.Exp(-lambda*elapsedMin)
+			if decayed < floor {
+				decayed = floor
+			}
+			effPct = decayed
+		}
 
         // Time (in minutes) to hit the floor once (t_floor_min); use for winLow start and latch thresholds.
         tFloorMin := 0.0
