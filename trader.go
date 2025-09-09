@@ -411,20 +411,15 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 		}
 	}
 
-	// --- NEW: if the closed lot was the most recent add, re-anchor pyramiding timers/state ---
+	// --- if the closed lot was the most recent add, re-anchor pyramiding timers/state ---
 	if wasNewest {
-		if len(t.lots) > 0 {
-			// Reset adverse tracking and latch so winLow tracking restarts at elapsed_min >= t_floor_min.
-			// pyramid decay resumes
-			t.lastAdd = time.Now().UTC()
-			t.winLow = 0
-			t.latchedGate = 0
-		} else {
-			// No lots left: fall back to dailyStart as a conservative anchor.
-			t.lastAdd = t.dailyStart
-			t.winLow = 0
-			t.latchedGate = 0
-		}
+		// If any lots remain, restart the decay clock from now to avoid instant latch.
+		// If none remain, also set now; next add will proceed normally.
+		t.lastAdd = time.Now().UTC()
+		// Reset adverse tracking; winLow will start accumulating after t_floor_min,
+		// and latching can only occur after 2*t_floor_min from this new anchor.
+		t.winLow = 0
+		t.latchedGate = 0
 	}
 
 	t.aggregateOpen()
@@ -933,6 +928,16 @@ func (t *Trader) loadState() error {
 			r.TrailPeak = r.OpenPrice
 		}
 	}
+
+	// --- Restart warmup for pyramiding decay/adverse tracking ---
+	// If we restored with open lots but have no lastAdd, seed the decay clock to "now"
+	// and reset winLow/latch so they rebuild over real time (prevents instant latch/BUY).
+	if len(t.lots) > 0 && t.lastAdd.IsZero() {
+		t.lastAdd = time.Now().UTC()
+		t.winLow = 0
+		t.latchedGate = 0
+	}
+
 	return nil
 }
 
