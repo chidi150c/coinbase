@@ -640,8 +640,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
             if !(price <= gatePrice) {
                 t.mu.Unlock()
                 elapsedHr := elapsedMin / 60.0
-                log.Printf("[DEBUG] pyramid: blocked by last gate; price=%.2f last_gate<=%.2f base_pct=%.3f eff_pct=%.3f λ=%.4f elapsed_Hours=%.1f",
-                    +price, gatePrice, basePct, effPct, lambda, elapsedHr)
+                log.Printf("[DEBUG] pyramid: blocked by last gate; price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
+                    +price, gatePrice, t.winLow, effPct, basePct, elapsedHr)
                 return "HOLD", nil
             }
         }
