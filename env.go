@@ -109,8 +109,15 @@ func loadBotEnv() {
 		"SCALP_TP_DECAY_FACTOR": {},
 		"SCALP_TP_MIN_PCT":      {},
 		// ---- NEW: ensure history depth is available to config/bootstrap ----
-		"MAX_HISTORY_CANDLES":    {}, // used by cfg.MaxHistoryCandles
-		"REQUIRE_BASE_FOR_SHORT": {}, "PAPER_BASE_BALANCE": {}, "BASE_ASSET": {}, "BASE_STEP": {},
+		"MAX_HISTORY_CANDLES":    {},
+		// ---- Spot safety and paper balances/steps ----
+		"REQUIRE_BASE_FOR_SHORT": {},
+		"PAPER_BASE_BALANCE":     {},
+		"BASE_ASSET":             {},
+		"BASE_STEP":              {},
+		// ---- NEW: paper quote balance and quote step (backtest/paper) ----
+		"PAPER_QUOTE_BALANCE": {},
+		"QUOTE_STEP":          {},
 	}
 
 	s := bufio.NewScanner(f)

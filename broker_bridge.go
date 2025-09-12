@@ -113,12 +113,12 @@ func (bb *BridgeBroker) GetRecentCandles(ctx context.Context, product, granulari
 
 	// Bridge returns normalized rows with string/number fields; parse defensively.
 	type row struct {
-		Time   string      `json:"time"`
-		Open   any         `json:"open"`
-		High   any         `json:"high"`
-		Low    any         `json:"low"`
-		Close  any         `json:"close"`
-		Volume any         `json:"volume"`
+		Time   any `json:"time"`
+		Open   any `json:"open"`
+		High   any `json:"high"`
+		Low    any `json:"low"`
+		Close  any `json:"close"`
+		Volume any `json:"volume"`
 	}
 	var rows []row
 	if err := json.NewDecoder(res.Body).Decode(&rows); err != nil {
@@ -136,16 +136,22 @@ func (bb *BridgeBroker) GetRecentCandles(ctx context.Context, product, granulari
 			return 0
 		}
 	}
-	parseT := func(s string) time.Time {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			return time.Time{}
-		}
-		// Try RFC3339 first, then unix seconds
-		if ts, err := time.Parse(time.RFC3339, s); err == nil {
-			return ts.UTC()
-		}
-		if sec, err := strconv.ParseInt(s, 10, 64); err == nil {
+	parseT := func(v any) time.Time {
+		switch t := v.(type) {
+		case string:
+			s := strings.TrimSpace(t)
+			if s == "" {
+				return time.Time{}
+			}
+			// Try RFC3339 first, then unix seconds
+			if ts, err := time.Parse(time.RFC3339, s); err == nil {
+				return ts.UTC()
+			}
+			if sec, err := strconv.ParseInt(s, 10, 64); err == nil {
+				return time.Unix(sec, 0).UTC()
+			}
+		case float64:
+			sec := int64(t)
 			return time.Unix(sec, 0).UTC()
 		}
 		return time.Time{}
@@ -303,6 +309,14 @@ func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, si
 		CommissionUSD: commission,
 		CreateTime:    time.Now().UTC(),
 	}, nil
+}
+
+// --- optional balance surfaces (best-effort) ---
+
+// GetAvailableQuote is an optional surface; if the Python bridge does not expose
+// a quote-balance endpoint, return a clear error so the caller can log-and-hold.
+func (bb *BridgeBroker) GetAvailableQuote(ctx context.Context, product string) (asset string, available float64, step float64, err error) {
+	return "", 0, 0, fmt.Errorf("GetAvailableQuote not implemented by %s", bb.Name())
 }
 
 // --- small helpers local to this file ---
