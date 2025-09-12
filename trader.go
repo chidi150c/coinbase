@@ -738,6 +738,19 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		// Use the floored base for the order by updating quote
 		quote = neededBase * price
 		base = neededBase
+
+		// Ensure SELL meets exchange min funds and step rules
+		if quote < t.cfg.OrderMinUSD {
+			quote = t.cfg.OrderMinUSD
+			base = quote / price
+			if step > 0 {
+				b := math.Floor(base/step) * step
+				if b > 0 {
+					base = b
+					quote = base * price
+				}
+			}
+		}
 	}
 
 	// Stops/takes (baseline for scalps)
@@ -1012,6 +1025,7 @@ func (t *Trader) loadState() error {
 		// Initialize trailing baseline for current runner if not already set
 		r := t.lots[t.runnerIdx]
 		if r.TrailPeak == 0 {
+			// Initialize baseline to current open price if peak is unset.
 			r.TrailPeak = r.OpenPrice
 		}
 	}
