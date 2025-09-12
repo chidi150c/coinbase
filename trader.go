@@ -107,11 +107,20 @@ func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
 		stateFile:  cfg.StateFile,
 		runnerIdx:  -1,
 	}
-	// Try to load state if exists
-	if err := t.loadState(); err == nil {
-		log.Printf("[INFO] trader state restored from %s", t.stateFile)
+
+	// Persistence guard: backtests set PERSIST_STATE=false
+	persist := getEnvBool("PERSIST_STATE", true)
+	if !persist {
+		// Disable persistence hard by clearing the path.
+		t.stateFile = ""
+		log.Printf("[INFO] persistence disabled (PERSIST_STATE=false); starting fresh state")
 	} else {
-		log.Printf("[INFO] no prior state restored: %v", err)
+		// Try to load state if enabled
+		if err := t.loadState(); err == nil {
+			log.Printf("[INFO] trader state restored from %s", t.stateFile)
+		} else {
+			log.Printf("[INFO] no prior state restored: %v", err)
+		}
 	}
 	// If state has existing lots but no runner assigned (fresh field), default runner to the oldest or 0.
 	if t.runnerIdx == -1 && len(t.lots) > 0 {
@@ -134,7 +143,7 @@ func (t *Trader) SetEquityUSD(v float64) {
 
 	// update the metric with same naming style
 	mtxPnL.Set(v)
-	// persist new state
+	// persist new state (no-op if disabled)
 	_ = t.saveState()
 }
 
@@ -188,6 +197,11 @@ func maxConcurrentLots() int {
 	return n
 }
 
+// Spot SELL guard and paper overrides
+func requireBaseForShort() bool { return getEnvBool("REQUIRE_BASE_FOR_SHORT", true) }
+func paperBaseBalance() float64 { return getEnvFloat("PAPER_BASE_BALANCE", 0.0) }
+func baseAssetOverride() string { return getEnv("BASE_ASSET", "") }
+func baseStepOverride() float64 { return getEnvFloat("BASE_STEP", 0.0) } // 0 => unknown
 // Runner tuning (internal, no new env keys): runner takes profit farther, same stop by default.
 const runnerTPMult = 2.0
 const runnerStopMult = 1.0
@@ -291,7 +305,8 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 }
 
 // closeLotAtIndex closes a single lot at idx (assumes mutex held), performing I/O unlocked.
-func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (string, error) {
+// exitReason is a short label for logs: "take_profit" | "stop_loss" | "trailing_stop" (or other).
+func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitReason string) (string, error) {
 	price := c[len(c)-1].Close
 	lot := t.lots[idx]
 	closeSide := SideSell
@@ -423,9 +438,9 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int) (stri
 	}
 
 	t.aggregateOpen()
-
-	msg := fmt.Sprintf("EXIT %s at %.2f P/L=%.2f (fees=%.4f)",
-		c[len(c)-1].Time.Format(time.RFC3339), priceExec, pl, lot.EntryFee+exitFee)
+	// Include reason in message for operator visibility
+	msg := fmt.Sprintf("EXIT %s at %.2f reason=%s P/L=%.2f (fees=%.4f)",
+		c[len(c)-1].Time.Format(time.RFC3339), priceExec, exitReason, pl, lot.EntryFee+exitFee)
 	if t.cfg.Extended().UseDirectSlack {
 		postSlack(msg)
 	}
@@ -484,7 +499,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if trigger, tstop := t.updateRunnerTrail(lot, price); trigger {
 					// reflect trailing level for visibility in debug/Slack
 					lot.Stop = tstop
-					msg, err := t.closeLotAtIndex(ctx, c, i)
+					msg, err := t.closeLotAtIndex(ctx, c, i, "trailing_stop")
 					if err != nil {
 						t.mu.Unlock()
 						return "", err
@@ -496,14 +511,25 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			}
 
 			trigger := false
+			exitReason := ""
 			if lot.Side == SideBuy && (price <= lot.Stop || price >= lot.Take) {
 				trigger = true
+				if price <= lot.Stop {
+					exitReason = "stop_loss"
+				} else {
+					exitReason = "take_profit"
+				}
 			}
 			if lot.Side == SideSell && (price >= lot.Stop || price <= lot.Take) {
 				trigger = true
+				if price >= lot.Stop {
+					exitReason = "stop_loss"
+				} else {
+					exitReason = "take_profit"
+				}
 			}
 			if trigger {
-				msg, err := t.closeLotAtIndex(ctx, c, i)
+				msg, err := t.closeLotAtIndex(ctx, c, i, exitReason)
 				if err != nil {
 					t.mu.Unlock()
 					return "", err
@@ -538,10 +564,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	log.Printf("[DEBUG] Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v", len(t.lots), d.Signal, d.Reason, buyThreshold, sellThreshold, t.cfg.LongOnly)
 
 	// Ignore discretionary SELL signals while lots are open; exits are TP/SL only.
-	if len(t.lots) > 0 && d.Signal == Sell {
-		t.mu.Unlock()
-		return "HOLD", nil
-	}
+	// if len(t.lots) > 0 && d.Signal == Sell {
+	// 	t.mu.Unlock()
+	// 	return "HOLD", nil
+	// }
+
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
 
 	price := c[len(c)-1].Close
@@ -563,7 +590,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		return fmt.Sprintf("FLAT [%s]", d.Reason), nil
 	}
 
-	// Respect a hard cap on concurrent lots (runner + scalps). If at cap, do not add.
+	// Respect lot cap (both sides)
 	if len(t.lots) >= maxConcurrentLots() {
 		t.mu.Unlock()
 		log.Printf("[DEBUG] lot cap reached (%d); HOLD", maxConcurrentLots())
@@ -589,7 +616,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		effPct := basePct
 		lambda := pyramidDecayLambda()
 		floor := pyramidDecayMinPct()
-			elapsedMin := 0.0
+		elapsedMin := 0.0
 		if lambda > 0 {
 			if !t.lastAdd.IsZero() {
 				// Use wall clock elapsed minutes since the most recent add
@@ -606,46 +633,46 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			effPct = decayed
 		}
 
-        // Time (in minutes) to hit the floor once (t_floor_min); use for winLow start and latch thresholds.
-        tFloorMin := 0.0
-        if lambda > 0 && basePct > floor {
-            tFloorMin = math.Log(basePct/floor) / lambda
-        }
+		// Time (in minutes) to hit the floor once (t_floor_min); use for winLow start and latch thresholds.
+		tFloorMin := 0.0
+		if lambda > 0 && basePct > floor {
+			tFloorMin = math.Log(basePct/floor) / lambda
+		}
 
-        last := t.latestEntry()
-        if last > 0 {
-            // Start tracking winLow ONLY after we reach t_floor_min.
-            if elapsedMin >= tFloorMin {
-                if t.winLow == 0 || price < t.winLow {
-                    t.winLow = price
-                }
-            } else {
-                // Before t_floor_min, do not accumulate winLow.
-                t.winLow = 0
-            }
+		last := t.latestEntry()
+		if last > 0 {
+			// Start tracking winLow ONLY after we reach t_floor_min.
+			if elapsedMin >= tFloorMin {
+				if t.winLow == 0 || price < t.winLow {
+					t.winLow = price
+				}
+			} else {
+				// Before t_floor_min, do not accumulate winLow.
+				t.winLow = 0
+			}
 
-            // Latch to the current winLow after we reach 2 * t_floor_min (one-way until next add/anchor reset).
-            if t.latchedGate == 0 && elapsedMin >= 2.0*tFloorMin && t.winLow > 0 {
-                t.latchedGate = t.winLow
-            }
+			// Latch to the current winLow after we reach 2 * t_floor_min (one-way until next add/anchor reset).
+			if t.latchedGate == 0 && elapsedMin >= 2.0*tFloorMin && t.winLow > 0 {
+				t.latchedGate = t.winLow
+			}
 
-            // Determine the active gate:
-            // - Before latch: baseline last*(1-effPct/100)
-            // - After latch: use the fixed latchedGate (the winLow when latch occurred)
-            gatePrice := last * (1.0 - effPct/100.0)
-            if t.latchedGate > 0 {
-                gatePrice = t.latchedGate
-            }
+			// Determine the active gate:
+			// - Before latch: baseline last*(1-effPct/100)
+			// - After latch: use the fixed latchedGate (the winLow when latch occurred)
+			gatePrice := last * (1.0 - effPct/100.0)
+			if t.latchedGate > 0 {
+				gatePrice = t.latchedGate
+			}
 
-            if !(price <= gatePrice) {
-                t.mu.Unlock()
-                elapsedHr := elapsedMin / 60.0
-                log.Printf("[DEBUG] pyramid: blocked by last gate; price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
-                    +price, gatePrice, t.winLow, effPct, basePct, elapsedHr)
-                return "HOLD", nil
-            }
-        }
-        // (runner-gap guard removed)
+			if !(price <= gatePrice) {
+				t.mu.Unlock()
+				elapsedHr := elapsedMin / 60.0
+				log.Printf("[DEBUG] pyramid: blocked by last gate; price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
+					+price, gatePrice, t.winLow, effPct, basePct, elapsedHr)
+				return "HOLD", nil
+			}
+		}
+		// (runner-gap guard removed)
 	}
 	// Sizing (risk % of current equity, with optional volatility adjust already supported).
 	riskPct := t.cfg.RiskPerTradePct
@@ -659,11 +686,63 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		quote = t.cfg.OrderMinUSD
 	}
 	base := quote / price
+	side := d.SignalToSide()
+
+	// If SELL, require spare base inventory (spot safe)
+	if side == SideSell && requireBaseForShort() {
+		// Sum reserved base for long lots
+		var reservedLong float64
+		for _, lot := range t.lots {
+			if lot.Side == SideBuy {
+				reservedLong += lot.SizeBase
+			}
+		}
+
+		// Try live balance via BalanceReader, else fall back to paper/env
+		var availBase, step float64
+		if t.cfg.DryRun {
+			availBase = paperBaseBalance()
+			step = baseStepOverride()
+		} else if br, ok := t.broker.(interface {
+			GetAvailableBase(context.Context, string) (string, float64, float64, error)
+		}); ok {
+			_, availBase, step, _ = br.GetAvailableBase(ctx, t.cfg.ProductID)
+			if step <= 0 {
+				step = baseStepOverride()
+			}
+		} else {
+			// No live balance surface; fall back to env
+			availBase = paperBaseBalance()
+			step = baseStepOverride()
+		}
+
+		// Floor the *needed* base to step (if known) and cap by spare availability
+		neededBase := base
+		if step > 0 {
+			n := math.Floor(neededBase/step) * step
+			if n > 0 {
+				neededBase = n
+			}
+		}
+		spare := availBase - reservedLong
+		if spare < 0 {
+			spare = 0
+		}
+		if spare+1e-12 < neededBase {
+			t.mu.Unlock()
+			log.Printf("[DEBUG] SELL blocked: need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
+				neededBase, spare, availBase, reservedLong, step)
+			return "HOLD", nil
+		}
+
+		// Use the floored base for the order by updating quote
+		quote = neededBase * price
+		base = neededBase
+	}
 
 	// Stops/takes (baseline for scalps)
 	stop := price * (1.0 - t.cfg.StopLossPct/100.0)
 	take := price * (1.0 + t.cfg.TakeProfitPct/100.0)
-	side := d.SignalToSide()
 	if side == SideSell {
 		stop = price * (1.0 + t.cfg.StopLossPct/100.0)
 		take = price * (1.0 - t.cfg.TakeProfitPct/100.0)
@@ -868,7 +947,7 @@ func signalLabel(s Signal) string {
 // ---- Persistence helpers ----
 
 func (t *Trader) saveState() error {
-	if t.stateFile == "" {
+	if t.stateFile == "" || !getEnvBool("PERSIST_STATE", true) {
 		return nil
 	}
 	state := BotState{
@@ -893,7 +972,7 @@ func (t *Trader) saveState() error {
 }
 
 func (t *Trader) loadState() error {
-	if t.stateFile == "" {
+	if t.stateFile == "" || !getEnvBool("PERSIST_STATE", true) {
 		return fmt.Errorf("no state file configured")
 	}
 	bs, err := os.ReadFile(t.stateFile)
@@ -904,7 +983,15 @@ func (t *Trader) loadState() error {
 	if err := json.Unmarshal(bs, &st); err != nil {
 		return err
 	}
-	t.equityUSD = st.EquityUSD
+	// Prefer configured/live equity rather than stale persisted equity when:
+	//  - running in DRY_RUN / backtest, or
+	//  - live-equity mode is enabled (we will rebase from Bridge when available).
+	// This prevents negative/old EquityUSD from leaking into runs that don't want it.
+	if !(t.cfg.DryRun || t.cfg.UseLiveEquity()) {
+		t.equityUSD = st.EquityUSD
+	} else {
+		// keep t.equityUSD as initialized from cfg.USDEquity; live rebase will adjust later
+	}
 	t.dailyStart = st.DailyStart
 	t.dailyPnL = st.DailyPnL
 	t.lots = st.Lots

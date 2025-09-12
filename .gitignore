@@ -79,4 +79,5 @@ monitoring/grafana-data/
 
 # ---- Docker / local overrides (if any) ----
 docker-compose.override.yml
+docker-compose.override.yml-
 *.local.yml

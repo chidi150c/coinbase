@@ -87,9 +87,9 @@ func loadBotEnv() {
 		"STOP_LOSS_PCT": {}, "ORDER_MIN_USD": {}, "LONG_ONLY": {}, "PORT": {}, "BRIDGE_URL": {},
 		"BUY_THRESHOLD": {}, "SELL_THRESHOLD": {}, "USE_MA_FILTER": {}, "BACKTEST_SLEEP_MS": {},
 		// ---- new, opt-in pyramiding/env-driven toggles ----
-		"ALLOW_PYRAMIDING":             {},
-		"PYRAMID_MIN_SECONDS_BETWEEN":  {},
-		"PYRAMID_MIN_ADVERSE_PCT":      {},
+		"ALLOW_PYRAMIDING":            {},
+		"PYRAMID_MIN_SECONDS_BETWEEN": {},
+		"PYRAMID_MIN_ADVERSE_PCT":     {},
 		// ---- NEW: time-based exponential decay (Option A) ----
 		"PYRAMID_DECAY_LAMBDA":         {}, // per-minute decay rate
 		"PYRAMID_DECAY_MIN_PCT":        {}, // floor for adverse % after decay
@@ -109,7 +109,8 @@ func loadBotEnv() {
 		"SCALP_TP_DECAY_FACTOR": {},
 		"SCALP_TP_MIN_PCT":      {},
 		// ---- NEW: ensure history depth is available to config/bootstrap ----
-		"MAX_HISTORY_CANDLES": {}, // used by cfg.MaxHistoryCandles
+		"MAX_HISTORY_CANDLES":    {}, // used by cfg.MaxHistoryCandles
+		"REQUIRE_BASE_FOR_SHORT": {}, "PAPER_BASE_BALANCE": {}, "BASE_ASSET": {}, "BASE_STEP": {},
 	}
 
 	s := bufio.NewScanner(f)
