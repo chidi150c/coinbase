@@ -12,6 +12,11 @@
 // and populate filled fields (filled_size, average_filled_price) into the
 // returned PlacedOrder. If enrichment fails or times out, fall back to prior
 // behavior (returning an order ID with zeroed fills/notional).
+//
+// NEW (balances, no fallback):
+// GetAvailableBase/GetAvailableQuote call /balance/base or /balance/quote
+// (bridge-normalized shape: {"asset","available","step"} as strings). If the
+// endpoint fails or returns invalid JSON, the process logs a fatal error and exits.
 
 package main
 
@@ -21,6 +26,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -82,179 +88,60 @@ func (bb *BridgeBroker) GetNowPrice(ctx context.Context, product string) (float6
 	return strconv.ParseFloat(out.Price, 64)
 }
 
-// --- BALANCES (NEW) ---
+// --- BALANCES (NO FALLBACK) ---
 
-// REPLACE your current GetAvailableBase with this:
 func (bb *BridgeBroker) GetAvailableBase(ctx context.Context, product string) (string, float64, float64, error) {
-	// 1) /product -> base asset + base_increment
-	uProd := fmt.Sprintf("%s/product/%s", bb.base, url.PathEscape(product))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uProd, nil)
-	if err != nil {
-		return "", 0, 0, fmt.Errorf("GetAvailableBase newrequest product: %w (url=%s)", err, uProd)
-	}
-	req.Header.Set("User-Agent", "coinbot/bridge")
-	res, err := bb.hc.Do(req)
-	if err != nil {
-		return "", 0, 0, fmt.Errorf("GetAvailableBase do product: %w", err)
-	}
-	defer res.Body.Close()
-	if res.StatusCode >= 300 {
-		b, _ := io.ReadAll(res.Body)
-		return "", 0, 0, fmt.Errorf("GetAvailableBase product %d: %s", res.StatusCode, string(b))
-	}
-	var prod map[string]any
-	if err := json.NewDecoder(res.Body).Decode(&prod); err != nil {
-		return "", 0, 0, fmt.Errorf("GetAvailableBase decode product: %w", err)
-	}
-	base := firstNonEmpty(
-		fmt.Sprintf("%v", prod["base_currency"]),
-		fmt.Sprintf("%v", prod["base_currency_id"]),
-		fmt.Sprintf("%v", prod["base"]),
-		fmt.Sprintf("%v", prod["base_display_symbol"]),
-	)
-	if strings.TrimSpace(base) == "" {
-		return "", 0, 0, fmt.Errorf("GetAvailableBase: missing base asset in product payload")
-	}
-	stepStr := firstNonEmpty(
-		fmt.Sprintf("%v", prod["base_increment"]),
-		fmt.Sprintf("%v", prod["base_min_size"]),
-	)
-	step, _ := strconv.ParseFloat(strings.TrimSpace(stepStr), 64)
-
-	// 2) /accounts -> sum available for that asset
-	uAcct := fmt.Sprintf("%s/accounts?limit=%d", bb.base, 200)
-	req2, err := http.NewRequestWithContext(ctx, http.MethodGet, uAcct, nil)
-	if err != nil {
-		return strings.TrimSpace(base), 0, step, fmt.Errorf("GetAvailableBase newrequest accounts: %w (url=%s)", err, uAcct)
-	}
-	req2.Header.Set("User-Agent", "coinbot/bridge")
-	res2, err := bb.hc.Do(req2)
-	if err != nil {
-		return strings.TrimSpace(base), 0, step, fmt.Errorf("GetAvailableBase do accounts: %w", err)
-	}
-	defer res2.Body.Close()
-	if res2.StatusCode >= 300 {
-		b, _ := io.ReadAll(res2.Body)
-		return strings.TrimSpace(base), 0, step, fmt.Errorf("GetAvailableBase accounts %d: %s", res2.StatusCode, string(b))
-	}
-	var obj map[string]any
-	if err := json.NewDecoder(res2.Body).Decode(&obj); err != nil {
-		return strings.TrimSpace(base), 0, step, fmt.Errorf("GetAvailableBase decode accounts: %w", err)
-	}
-	acctsRaw := obj["accounts"]
-	if acctsRaw == nil {
-		if arr, ok := any(obj).([]any); ok {
-			acctsRaw = arr
-		}
-	}
-	arr, ok := acctsRaw.([]any)
+	asset, avail, step, ok := bb.tryBalanceEndpoint(ctx, "/balance/base", product)
 	if !ok {
-		return strings.TrimSpace(base), 0, step, fmt.Errorf("GetAvailableBase: accounts payload not an array")
+		log.Fatalf("GetAvailableBase: failed calling %s/balance/base?product_id=%s", bb.base, product)
+		// unreachable after Fatalf, but return to satisfy compiler
+		return "", 0, 0, fmt.Errorf("fatal: GetAvailableBase failed")
 	}
-	sum := 0.0
-	for _, it := range arr {
-		m, ok := it.(map[string]any)
-		if !ok {
-			continue
-		}
-		ab, _ := m["available_balance"].(map[string]any)
-		ccy := strings.TrimSpace(fmt.Sprintf("%v", ab["currency"]))
-		if ccy != strings.TrimSpace(base) {
-			continue
-		}
-		valStr := strings.TrimSpace(fmt.Sprintf("%v", ab["value"]))
-		if v, errp := strconv.ParseFloat(valStr, 64); errp == nil {
-			sum += v
-		}
-	}
-	return strings.TrimSpace(base), sum, step, nil
+	return asset, avail, step, nil
 }
 
-// REPLACE your current GetAvailableQuote with this:
 func (bb *BridgeBroker) GetAvailableQuote(ctx context.Context, product string) (string, float64, float64, error) {
-	// 1) /product -> quote asset + quote_increment
-	uProd := fmt.Sprintf("%s/product/%s", bb.base, url.PathEscape(product))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uProd, nil)
+	asset, avail, step, ok := bb.tryBalanceEndpoint(ctx, "/balance/quote", product)
+	if !ok {
+		log.Fatalf("GetAvailableQuote: failed calling %s/balance/quote?product_id=%s", bb.base, product)
+		// unreachable after Fatalf, but return to satisfy compiler
+		return "", 0, 0, fmt.Errorf("fatal: GetAvailableQuote failed")
+	}
+	return asset, avail, step, nil
+}
+
+// tryBalanceEndpoint hits /balance/base or /balance/quote and parses {"asset","available","step"}.
+func (bb *BridgeBroker) tryBalanceEndpoint(ctx context.Context, path string, product string) (asset string, available float64, step float64, ok bool) {
+	u := fmt.Sprintf("%s%s?product_id=%s", bb.base, path, url.QueryEscape(product))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("GetAvailableQuote newrequest product: %w (url=%s)", err, uProd)
+		return "", 0, 0, false
 	}
 	req.Header.Set("User-Agent", "coinbot/bridge")
+
 	res, err := bb.hc.Do(req)
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("GetAvailableQuote do product: %w", err)
+		return "", 0, 0, false
 	}
 	defer res.Body.Close()
 	if res.StatusCode >= 300 {
-		b, _ := io.ReadAll(res.Body)
-		return "", 0, 0, fmt.Errorf("GetAvailableQuote product %d: %s", res.StatusCode, string(b))
+		return "", 0, 0, false
 	}
-	var prod map[string]any
-	if err := json.NewDecoder(res.Body).Decode(&prod); err != nil {
-		return "", 0, 0, fmt.Errorf("GetAvailableQuote decode product: %w", err)
+	var out struct {
+		Asset     string `json:"asset"`
+		Available string `json:"available"`
+		Step      string `json:"step"`
 	}
-	quote := firstNonEmpty(
-		fmt.Sprintf("%v", prod["quote_currency"]),
-		fmt.Sprintf("%v", prod["quote_currency_id"]),
-		fmt.Sprintf("%v", prod["quote"]),
-		fmt.Sprintf("%v", prod["quote_display_symbol"]),
-	)
-	if strings.TrimSpace(quote) == "" {
-		return "", 0, 0, fmt.Errorf("GetAvailableQuote: missing quote asset in product payload")
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		return "", 0, 0, false
 	}
-	stepStr := firstNonEmpty(
-		fmt.Sprintf("%v", prod["quote_increment"]),
-	)
-	step, _ := strconv.ParseFloat(strings.TrimSpace(stepStr), 64)
-
-	// 2) /accounts -> sum available for that asset
-	uAcct := fmt.Sprintf("%s/accounts?limit=%d", bb.base, 200)
-	req2, err := http.NewRequestWithContext(ctx, http.MethodGet, uAcct, nil)
-	if err != nil {
-		return strings.TrimSpace(quote), 0, step, fmt.Errorf("GetAvailableQuote newrequest accounts: %w (url=%s)", err, uAcct)
+	if strings.TrimSpace(out.Asset) == "" {
+		return "", 0, 0, false
 	}
-	req2.Header.Set("User-Agent", "coinbot/bridge")
-	res2, err := bb.hc.Do(req2)
-	if err != nil {
-		return strings.TrimSpace(quote), 0, step, fmt.Errorf("GetAvailableQuote do accounts: %w", err)
-	}
-	defer res2.Body.Close()
-	if res2.StatusCode >= 300 {
-		b, _ := io.ReadAll(res2.Body)
-		return strings.TrimSpace(quote), 0, step, fmt.Errorf("GetAvailableQuote accounts %d: %s", res2.StatusCode, string(b))
-	}
-	var obj map[string]any
-	if err := json.NewDecoder(res2.Body).Decode(&obj); err != nil {
-		return strings.TrimSpace(quote), 0, step, fmt.Errorf("GetAvailableQuote decode accounts: %w", err)
-	}
-	acctsRaw := obj["accounts"]
-	if acctsRaw == nil {
-		if arr, ok := any(obj).([]any); ok {
-			acctsRaw = arr
-		}
-	}
-	arr, ok := acctsRaw.([]any)
-	if !ok {
-		return strings.TrimSpace(quote), 0, step, fmt.Errorf("GetAvailableQuote: accounts payload not an array")
-	}
-	sum := 0.0
-	for _, it := range arr {
-		m, ok := it.(map[string]any)
-		if !ok {
-			continue
-		}
-		ab, _ := m["available_balance"].(map[string]any)
-		ccy := strings.TrimSpace(fmt.Sprintf("%v", ab["currency"]))
-		if ccy != strings.TrimSpace(quote) {
-			continue
-		}
-		valStr := strings.TrimSpace(fmt.Sprintf("%v", ab["value"]))
-		if v, errp := strconv.ParseFloat(valStr, 64); errp == nil {
-			sum += v
-		}
-	}
-	return strings.TrimSpace(quote), sum, step, nil
+	avail, _ := strconv.ParseFloat(strings.TrimSpace(out.Available), 64)
+	st, _ := strconv.ParseFloat(strings.TrimSpace(out.Step), 64)
+	return strings.TrimSpace(out.Asset), avail, st, true
 }
-
 
 // --- Candles ---
 

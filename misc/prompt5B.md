@@ -12,7 +12,7 @@ Preserve all public behavior, flags, routes, metrics names, env keys, and file p
 
 How to respond:
 
-Provide a brief Plan for: [***Next Phase Plan***]
+Provide a brief Plan for: [***Add /balance/base and /balance/quote endpoints to app.py that call client.get_product for base/quote symbols and increments and scan client.get_accounts(...).accounts[].available_balance.{currency,value} to return {"asset","available","step"}.***]
 
 1) For each item in the plan, first output a single-sentence CHANGE_DESCRIPTION:
    - Format: verb + what is being changed + how/with what.
@@ -48,3 +48,5 @@ Plan item: “fix startup equity spike in live.go.”
    - Safety callout (no risk to live trading; behavior is deferred until balances are available).
    - Revert instructions (restore previous lines X–Y to set equity immediately).
    - Runbook (commands to rebuild/restart and how to verify via /metrics and logs).
+
+Secondly, Pause and verify required inputs. If ANY input is missing, ask me to provide it before writing code. - Examples of required inputs: - Source files: e.g., “paste current live.go / trader.go / strategy.go / model.go / metrics.go / config.go / env.go / backtest.go / broker*.go / bridge/app.py / monitoring/docker-compose.yml”. - Env/config values: e.g., “what Slack webhook URL?”, “what Docker base image?”, “list current /opt/coinbase/env/bot.env and bridge.env”. - External URLs/IDs (API keys should never be pasted in clear; ask me to confirm they are already configured). - Never guess; explicitly request missing files or settings.
