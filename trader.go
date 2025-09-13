@@ -92,8 +92,12 @@ type Trader struct {
 	pyramidAnchorTime  time.Time
 
 	// --- NEW: adverse gate helpers (since last add) ---
-	winLow      float64 // lowest price seen since lastAdd
+	// BUY path trackers:
+	winLow      float64 // lowest price seen since lastAdd (BUY adverse tracking)
 	latchedGate float64 // latched adverse gate once threshold time is reached; reset on new add
+	// SELL path trackers (NEW):
+	winHigh           float64 // highest price seen since lastAdd (SELL adverse tracking)
+	latchedGateShort  float64 // latched adverse gate for SELL once threshold time is reached; reset on new add
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -435,10 +439,12 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 		// If any lots remain, restart the decay clock from now to avoid instant latch.
 		// If none remain, also set now; next add will proceed normally.
 		t.lastAdd = time.Now().UTC()
-		// Reset adverse tracking; winLow will start accumulating after t_floor_min,
+		// Reset adverse tracking; winLow/winHigh will start accumulating after t_floor_min,
 		// and latching can only occur after 2*t_floor_min from this new anchor.
 		t.winLow = 0
 		t.latchedGate = 0
+		t.winHigh = 0
+		t.latchedGateShort = 0
 	}
 
 	t.aggregateOpen()
@@ -577,10 +583,13 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	price := c[len(c)-1].Close
 
-	// --- NEW: track lowest price since last add (for future gating) ---
+	// --- NEW: track lowest price since last add (BUY path) and highest price (SELL path) ---
 	if !t.lastAdd.IsZero() {
 		if t.winLow == 0 || price < t.winLow {
 			t.winLow = price
+		}
+		if t.winHigh == 0 || price > t.winHigh {
+			t.winHigh = price
 		}
 	}
 
@@ -602,7 +611,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	// Determine if we are opening first lot or attempting a pyramid add.
-	isAdd := len(t.lots) > 0 && allowPyramiding() && d.Signal == Buy
+	// --- CHANGED: enable SELL pyramiding symmetry ---
+	isAdd := len(t.lots) > 0 && allowPyramiding() && (d.Signal == Buy || d.Signal == Sell)
 
 	// Gating for pyramiding adds — spacing + adverse move (with optional time-decay).
 	if isAdd {
@@ -615,7 +625,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			return "HOLD", nil
 		}
 
-		// 2) Adverse move gate: ONLY vs last entry, with optional time-based exponential decay.
+		// 2) Adverse move gate with optional time-based exponential decay.
 		basePct := pyramidMinAdversePct()
 		effPct := basePct
 		lambda := pyramidDecayLambda()
@@ -623,11 +633,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		elapsedMin := 0.0
 		if lambda > 0 {
 			if !t.lastAdd.IsZero() {
-				// Use wall clock elapsed minutes since the most recent add
 				elapsedMin = time.Since(t.lastAdd).Minutes()
 			} else {
-				// Post-restart warmup: do not backdate elapsed_min; wait for a new add
-				// to establish lastAdd before decay/latching can progress.
 				elapsedMin = 0.0
 			}
 			decayed := basePct * math.Exp(-lambda*elapsedMin)
@@ -637,7 +644,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			effPct = decayed
 		}
 
-		// Time (in minutes) to hit the floor once (t_floor_min); use for winLow start and latch thresholds.
+		// Time (in minutes) to hit the floor once (t_floor_min); used for winLow/winHigh start and latching thresholds.
 		tFloorMin := 0.0
 		if lambda > 0 && basePct > floor {
 			tFloorMin = math.Log(basePct/floor) / lambda
@@ -645,39 +652,61 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 		last := t.latestEntry()
 		if last > 0 {
-			// Start tracking winLow ONLY after we reach t_floor_min.
-			if elapsedMin >= tFloorMin {
-				if t.winLow == 0 || price < t.winLow {
-					t.winLow = price
+			if d.Signal == Buy {
+				// BUY adverse tracker: start/maintain winLow after t_floor_min
+				if elapsedMin >= tFloorMin {
+					if t.winLow == 0 || price < t.winLow {
+						t.winLow = price
+					}
+				} else {
+					t.winLow = 0
 				}
-			} else {
-				// Before t_floor_min, do not accumulate winLow.
-				t.winLow = 0
-			}
-
-			// Latch to the current winLow after we reach 2 * t_floor_min (one-way until next add/anchor reset).
-			if t.latchedGate == 0 && elapsedMin >= 2.0*tFloorMin && t.winLow > 0 {
-				t.latchedGate = t.winLow
-			}
-
-			// Determine the active gate:
-			// - Before latch: baseline last*(1-effPct/100)
-			// - After latch: use the fixed latchedGate (the winLow when latch occurred)
-			gatePrice := last * (1.0 - effPct/100.0)
-			if t.latchedGate > 0 {
-				gatePrice = t.latchedGate
-			}
-
-			if !(price <= gatePrice) {
-				t.mu.Unlock()
-				elapsedHr := elapsedMin / 60.0
-				log.Printf("[DEBUG] pyramid: blocked by last gate; price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
-					+price, gatePrice, t.winLow, effPct, basePct, elapsedHr)
-				return "HOLD", nil
+				// latch at 2*t_floor_min
+				if t.latchedGate == 0 && elapsedMin >= 2.0*tFloorMin && t.winLow > 0 {
+					t.latchedGate = t.winLow
+				}
+				// baseline gate: last * (1 - effPct); latched replaces baseline
+				gatePrice := last * (1.0 - effPct/100.0)
+				if t.latchedGate > 0 {
+					gatePrice = t.latchedGate
+				}
+				if !(price <= gatePrice) {
+					t.mu.Unlock()
+					elapsedHr := elapsedMin / 60.0
+					log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
+						price, gatePrice, t.winLow, effPct, basePct, elapsedHr)
+					return "HOLD", nil
+				}
+			} else { // d.Signal == Sell
+				// SELL adverse tracker: start/maintain winHigh after t_floor_min
+				if elapsedMin >= tFloorMin {
+					if t.winHigh == 0 || price > t.winHigh {
+						t.winHigh = price
+					}
+				} else {
+					t.winHigh = 0
+				}
+				// latch at 2*t_floor_min
+				if t.latchedGateShort == 0 && elapsedMin >= 2.0*tFloorMin && t.winHigh > 0 {
+					t.latchedGateShort = t.winHigh
+				}
+				// baseline gate: last * (1 + effPct); latched replaces baseline
+				gatePrice := last * (1.0 + effPct/100.0)
+				if t.latchedGateShort > 0 {
+					gatePrice = t.latchedGateShort
+				}
+				if !(price >= gatePrice) {
+					t.mu.Unlock()
+					elapsedHr := elapsedMin / 60.0
+					log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
+						price, gatePrice, t.winHigh, effPct, basePct, elapsedHr)
+					return "HOLD", nil
+				}
 			}
 		}
 		// (runner-gap guard removed)
 	}
+
 	// Sizing (risk % of current equity, with optional volatility adjust already supported).
 	riskPct := t.cfg.RiskPerTradePct
 	if t.cfg.Extended().VolRiskAdjust {
@@ -983,6 +1012,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// Reset adverse tracking for the new add.
 	t.winLow = priceToUse
 	t.latchedGate = 0
+	t.winHigh = priceToUse
+	t.latchedGateShort = 0
 
 	// Assign/designate runner if none exists yet; otherwise this is a scalp.
 	if t.runnerIdx == -1 {
@@ -1104,11 +1135,13 @@ func (t *Trader) loadState() error {
 
 	// --- Restart warmup for pyramiding decay/adverse tracking ---
 	// If we restored with open lots but have no lastAdd, seed the decay clock to "now"
-	// and reset winLow/latch so they rebuild over real time (prevents instant latch/BUY).
+	// and reset winLow/winHigh and latches so they rebuild over real time (prevents instant latch).
 	if len(t.lots) > 0 && t.lastAdd.IsZero() {
 		t.lastAdd = time.Now().UTC()
 		t.winLow = 0
 		t.latchedGate = 0
+		t.winHigh = 0
+		t.latchedGateShort = 0
 	}
 
 	return nil
