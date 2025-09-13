@@ -203,7 +203,7 @@ func paperBaseBalance() float64 { return getEnvFloat("PAPER_BASE_BALANCE", 0.0) 
 func baseAssetOverride() string { return getEnv("BASE_ASSET", "") }
 func baseStepOverride() float64 { return getEnvFloat("BASE_STEP", 0.0) } // 0 => unknown
 
-// --- NEW: quote-balance paper overrides (backtest) ---
+// --- NEW: backtest-only quote balance helpers (BUY gating symmetry) ---
 func paperQuoteBalance() float64 { return getEnvFloat("PAPER_QUOTE_BALANCE", 0.0) }
 func quoteStepOverride() float64 { return getEnvFloat("QUOTE_STEP", 0.0) } // 0 => unknown
 
@@ -693,6 +693,84 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	base := quote / price
 	side := d.SignalToSide()
 
+	// --- NEW: BUY gating (require spare quote after reserving open shorts) ---
+	if side == SideBuy {
+		// Reserve quote needed to close all existing short lots at current price.
+		var reservedShortQuote float64
+		for _, lot := range t.lots {
+			if lot.Side == SideSell {
+				reservedShortQuote += lot.SizeBase * price
+			}
+		}
+
+		// Determine available quote and quote step.
+		var availQuote, qstep float64
+		if t.cfg.DryRun {
+			availQuote = paperQuoteBalance()
+			qstep = quoteStepOverride()
+		} else if br, ok := t.broker.(interface {
+			GetAvailableQuote(context.Context, string) (string, float64, float64, error)
+		}); ok {
+			sym, aq, qs, err := br.GetAvailableQuote(ctx, t.cfg.ProductID)
+			if err != nil || strings.TrimSpace(sym) == "" {
+				t.mu.Unlock()
+				log.Fatalf("BUY blocked: GetAvailableQuote failed in live mode: %v", err)
+			}
+			availQuote = aq
+			qstep = qs
+			if qstep <= 0 {
+				ov := quoteStepOverride()
+				if ov <= 0 {
+					t.mu.Unlock()
+					log.Fatalf("BUY blocked: missing QUOTE_STEP (no broker step and no QUOTE_STEP override)")
+				}
+				qstep = ov
+			}
+		} else {
+			t.mu.Unlock()
+			log.Fatalf("BUY blocked: broker %s does not provide GetAvailableQuote for live quote-balance enforcement", t.broker.Name())
+		}
+
+		// Floor the needed quote to step (if known).
+		neededQuote := quote
+		if qstep > 0 {
+			n := math.Floor(neededQuote/qstep) * qstep
+			if n > 0 {
+				neededQuote = n
+			}
+		}
+
+		spare := availQuote - reservedShortQuote
+		if spare < 0 {
+			spare = 0
+		}
+		if spare+1e-9 < neededQuote {
+			t.mu.Unlock()
+			log.Printf("[DEBUG] BUY blocked: need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
+				neededQuote, spare, availQuote, reservedShortQuote, qstep)
+			return "HOLD", nil
+		}
+
+		// Enforce exchange minimum notional after snapping, then snap UP to step to keep >= min; re-check spare.
+		if neededQuote < t.cfg.OrderMinUSD {
+			neededQuote = t.cfg.OrderMinUSD
+			if qstep > 0 {
+				steps := math.Ceil(neededQuote / qstep)
+				neededQuote = steps * qstep
+			}
+			if spare+1e-9 < neededQuote {
+				t.mu.Unlock()
+				log.Printf("[DEBUG] BUY blocked: need=%.2f quote (min), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
+					neededQuote, spare, availQuote, reservedShortQuote, qstep)
+				return "HOLD", nil
+			}
+		}
+
+		// Use the final neededQuote; recompute base.
+		quote = neededQuote
+		base = quote / price
+	}
+
 	// If SELL, require spare base inventory (spot safe)
 	if side == SideSell && requireBaseForShort() {
 		// Sum reserved base for long lots
@@ -703,7 +781,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			}
 		}
 
-		// Try live balance via BalanceReader, else fall back to paper/env
+		// Try live balance via BalanceReader, else backtest env (live must not fallback)
 		var availBase, step float64
 		if t.cfg.DryRun {
 			availBase = paperBaseBalance()
@@ -711,14 +789,24 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		} else if br, ok := t.broker.(interface {
 			GetAvailableBase(context.Context, string) (string, float64, float64, error)
 		}); ok {
-			_, availBase, step, _ = br.GetAvailableBase(ctx, t.cfg.ProductID)
+			sym, ab, stp, err := br.GetAvailableBase(ctx, t.cfg.ProductID)
+			if err != nil || strings.TrimSpace(sym) == "" {
+				t.mu.Unlock()
+				log.Fatalf("SELL blocked: GetAvailableBase failed in live mode: %v", err)
+			}
+			availBase = ab
+			step = stp
 			if step <= 0 {
-				step = baseStepOverride()
+				ov := baseStepOverride()
+				if ov <= 0 {
+					t.mu.Unlock()
+					log.Fatalf("SELL blocked: missing BASE_STEP (no broker step and no BASE_STEP override)")
+				}
+				step = ov
 			}
 		} else {
-			// No live balance surface; fall back to env
-			availBase = paperBaseBalance()
-			step = baseStepOverride()
+			t.mu.Unlock()
+			log.Fatalf("SELL blocked: broker %s does not provide GetAvailableBase for live base-balance enforcement", t.broker.Name())
 		}
 
 		// Floor the *needed* base to step (if known) and cap by spare availability
@@ -756,70 +844,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 			}
 		}
-	}
-
-	// --- NEW: If BUY, require spare quote inventory (spot-safe symmetry) ---
-	if side == SideBuy {
-		// Reserve quote to be able to close any open shorts (SELL lots) at current mark.
-		var reservedShortQuote float64
-		for _, lot := range t.lots {
-			if lot.Side == SideSell {
-				reservedShortQuote += lot.SizeBase * price
-			}
-		}
-
-		// Obtain available quote: live via optional broker, else paper/env in DryRun.
-		var availQuote, qStep float64
-		if t.cfg.DryRun {
-			availQuote = paperQuoteBalance()
-			qStep = quoteStepOverride()
-		} else if br, ok := t.broker.(interface {
-			GetAvailableQuote(context.Context, string) (string, float64, float64, error)
-		}); ok {
-			_, availQuote, qStep, _ = br.GetAvailableQuote(ctx, t.cfg.ProductID)
-			if qStep <= 0 {
-				qStep = quoteStepOverride()
-			}
-		} else {
-			// Live but no quote surface: block per requirement.
-			t.mu.Unlock()
-			log.Printf("[DEBUG] BUY blocked: broker lacks GetAvailableQuote; cannot verify quote balance")
-			return "HOLD", nil
-		}
-
-		// Floor needed quote to step (if known), enforce min funds, and compare with spare.
-		neededQuote := quote
-		if qStep > 0 {
-			n := math.Floor(neededQuote/qStep) * qStep
-			if n > 0 {
-				neededQuote = n
-			}
-		}
-		if neededQuote < t.cfg.OrderMinUSD {
-			neededQuote = t.cfg.OrderMinUSD
-			// Ensure it aligns to step if known
-			if qStep > 0 {
-				n := math.Ceil(neededQuote/qStep) * qStep
-				if n > 0 {
-					neededQuote = n
-				}
-			}
-		}
-
-		spareQuote := availQuote - reservedShortQuote
-		if spareQuote < 0 {
-			spareQuote = 0
-		}
-		if spareQuote+1e-9 < neededQuote {
-			t.mu.Unlock()
-			log.Printf("[DEBUG] BUY blocked: need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.2f, step=%.2f)",
-				neededQuote, spareQuote, availQuote, reservedShortQuote, qStep)
-			return "HOLD", nil
-		}
-
-		// Use the adjusted/floored needed quote and recompute base.
-		quote = neededQuote
-		base = quote / price
 	}
 
 	// Stops/takes (baseline for scalps)

@@ -1,4 +1,3 @@
-# File: app.py
 import os
 import json
 from pathlib import Path
@@ -467,5 +466,68 @@ def get_order(order_id: str):
         }
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# === NEW: balances for base/quote (strings: asset, available, step) ===
+
+def _product_meta(product_id: str) -> Dict[str, str]:
+    p = client.get_product(product_id)
+    if hasattr(p, "to_dict"):
+        p = p.to_dict()
+    base = str(p.get("base_currency") or p.get("base_asset") or "")
+    quote = str(p.get("quote_currency") or p.get("quote_asset") or "")
+    base_inc = str(p.get("base_increment") or "0")
+    quote_inc = str(p.get("quote_increment") or "0")
+    return {"base": base, "quote": quote, "base_inc": base_inc, "quote_inc": quote_inc}
+
+def _find_available(asset: str) -> str:
+    # Return available balance as string (e.g., "0.12345678"); "0" if not found.
+    # Use a reasonably large page size; page if cursor exists (best-effort).
+    try:
+        out_val = "0"
+        cursor = None
+        for _ in range(5):  # up to 5 pages
+            resp = client.get_accounts(limit=250, cursor=cursor) if cursor else client.get_accounts(limit=250)
+            data = resp.to_dict() if hasattr(resp, "to_dict") else resp
+            accounts = data.get("accounts") or data.get("data") or []
+            for a in accounts:
+                cur = str(a.get("currency") or a.get("currency_symbol") or a.get("name") or "")
+                if cur.upper() == asset.upper():
+                    ab = a.get("available_balance") or {}
+                    val = str(ab.get("value") or a.get("available_balance_value") or a.get("available") or "0")
+                    # normalize common Decimal-like strings
+                    out_val = str(Decimal(val))
+                    return out_val
+            cursor = data.get("cursor") or data.get("next_cursor")
+            if not cursor:
+                break
+        return out_val
+    except Exception:
+        return "0"
+
+@app.get("/balance/base")
+def balance_base(product_id: str = Query(..., description="e.g., BTC-USD")):
+    try:
+        meta = _product_meta(product_id)
+        asset = meta["base"] or ""
+        step = meta["base_inc"] or "0"
+        if not asset:
+            raise RuntimeError("Unknown base asset for product")
+        available = _find_available(asset)
+        return {"asset": asset, "available": available, "step": step}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/balance/quote")
+def balance_quote(product_id: str = Query(..., description="e.g., BTC-USD")):
+    try:
+        meta = _product_meta(product_id)
+        asset = meta["quote"] or ""
+        step = meta["quote_inc"] or "0"
+        if not asset:
+            raise RuntimeError("Unknown quote asset for product")
+        available = _find_available(asset)
+        return {"asset": asset, "available": available, "step": step}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
