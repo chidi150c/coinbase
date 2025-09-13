@@ -28,6 +28,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -123,6 +124,14 @@ func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
 			log.Printf("[INFO] trader state restored from %s", t.stateFile)
 		} else {
 			log.Printf("[INFO] no prior state restored: %v", err)
+			// >>> FAIL-FAST (requested): if live (not DryRun) and persistence is expected,
+			// and the state path isn't a mounted/writable volume, abort with a clear message.
+			if !t.cfg.DryRun && shouldFatalNoStateMount(t.stateFile) {
+				log.Fatalf("[FATAL] persistence required but state path is not a mounted volume or not writable: STATE_FILE=%s ; "+
+					"mount /opt/coinbase/state into the container and ensure it's writable. "+
+					"Example docker-compose:\n  volumes:\n    - /opt/coinbase/state:/opt/coinbase/state",
+					t.stateFile)
+			}
 		}
 	}
 	// If state has existing lots but no runner assigned (fresh field), default runner to the oldest or 0.
@@ -1211,4 +1220,63 @@ func (t *Trader) shouldRefit(historyLen int) bool {
 		return true
 	}
 	return time.Since(t.lastFit) >= time.Duration(min)*time.Minute
+}
+
+// ---- Fail-fast helpers (startup state mount check) ----
+
+// shouldFatalNoStateMount returns true when we expect persistence but the state file's
+// parent directory is not a mounted volume or not writable. This prevents accidental
+// flat-boot trading after CI/CD restarts when the host volume isn't mounted.
+func shouldFatalNoStateMount(stateFile string) bool {
+	stateFile = strings.TrimSpace(stateFile)
+	if stateFile == "" {
+		return false
+	}
+	dir := filepath.Dir(stateFile)
+
+	// If the file already exists, don't fatal — persistence is working.
+	if _, err := os.Stat(stateFile); err == nil {
+		return false
+	}
+
+	// Ensure parent directory exists and is a directory.
+	fi, err := os.Stat(dir)
+	if err != nil || !fi.IsDir() {
+		return true
+	}
+
+	// Ensure directory is writable.
+	if f, err := os.CreateTemp(dir, "wtest-*.tmp"); err == nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+	} else {
+		return true
+	}
+
+	// Ensure it's actually a mount point (host volume), not a container tmp dir.
+	isMount, err := isMounted(dir)
+	if err == nil && !isMount {
+		return true
+	}
+	return false
+}
+
+// isMounted checks /proc/self/mountinfo to see if dir is a mount point.
+func isMounted(dir string) (bool, error) {
+	bs, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return false, err
+	}
+	dir = filepath.Clean(dir)
+	for _, ln := range strings.Split(string(bs), "\n") {
+		parts := strings.Split(ln, " ")
+		if len(parts) < 5 {
+			continue
+		}
+		mp := filepath.Clean(parts[4]) // mount point field
+		if mp == dir {
+			return true, nil
+		}
+	}
+	return false, nil
 }

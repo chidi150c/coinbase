@@ -149,4 +149,29 @@ docker compose logs bot | awk -F'reason=| P/L=' '/ EXIT /{
 } END{for(k in c) printf "%s %d\n", k, c[k]}'
 
 
+====================================================
+# 1) Show any exit lines and reasons
+docker compose logs --no-log-prefix --since "3h" bot | grep -E "^EXIT " -n
+
+# 2) Show decisions & trailing events around that window
+docker compose logs --no-log-prefix --since "3h" bot | grep -E "\[DEBUG\] (nearest stop|scalp tp decay|Lots=|pyramid:|partial fill|commission missing|\[LIVE ORDER\]|PAPER |reason=trailing_stop)" -n
+
+# 3) If we logged state restore (to confirm lots were restored)
+docker compose logs --no-log-prefix --since "6h" bot | grep -E "trader state restored|no prior state restored|persistence disabled" -n
+
+===============================================
+# Option C — Grab the first EXIT and show ~40 lines of context around it
+# 1) Save a slice so we can index it
+docker compose logs --no-log-prefix --since "8h" bot > /tmp/bot.log
+
+# 2) Find the line number of the first EXIT
+FIRST=$(grep -n -E "^EXIT " /tmp/bot.log | head -n 1 | cut -d: -f1)
+
+# 3) Print ~20 lines before and after that first EXIT
+START=$((FIRST-20)); [ "$START" -lt 1 ] && START=1
+END=$((FIRST+20))
+sed -n "${START},${END}p" /tmp/bot.log
+
+
+
 
