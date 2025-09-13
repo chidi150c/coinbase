@@ -733,7 +733,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		}
 		if spare+spareEps < neededQuote {
 			t.mu.Unlock()
-			log.Printf("[DEBUG] BUY blocked: need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
+			log.Printf("[DEBUG] GATE BUY: need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 				neededQuote, spare, availQuote, reservedShortQuote, qstep)
 			return "HOLD", nil
 		}
@@ -747,7 +747,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			}
 			if spare+spareEps < neededQuote {
 				t.mu.Unlock()
-				log.Printf("[DEBUG] BUY blocked: need=%.2f quote (min), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
+				log.Printf("[DEBUG] GATE BUY: need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 					neededQuote, spare, availQuote, reservedShortQuote, qstep)
 				return "HOLD", nil
 			}
@@ -795,7 +795,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		}
 		if spare+spareEps < neededBase {
 			t.mu.Unlock()
-			log.Printf("[DEBUG] SELL blocked: need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
+			log.Printf("[DEBUG] GATE SELL: need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
 				neededBase, spare, availBase, reservedLong, step)
 			return "HOLD", nil
 		}
@@ -818,7 +818,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			// >>> Symmetry: re-check spare after min-notional snap <<<
 			if spare+spareEps < base {
 				t.mu.Unlock()
-				log.Printf("[DEBUG] SELL blocked: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
+				log.Printf("[DEBUG] GATE SELL: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
 					base, spare, availBase, reservedLong, step)
 				return "HOLD", nil
 			}
