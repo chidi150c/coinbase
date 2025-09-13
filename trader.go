@@ -158,6 +158,7 @@ func (t *Trader) SetEquityUSD(v float64) {
 	// persist new state (no-op if disabled)
 	if err := t.saveState(); err != nil {
 		log.Printf("[WARN] saveState: %v", err)
+		
 	}
 }
 
