@@ -156,7 +156,9 @@ func (t *Trader) SetEquityUSD(v float64) {
 	// update the metric with same naming style
 	mtxPnL.Set(v)
 	// persist new state (no-op if disabled)
-	_ = t.saveState()
+	if err := t.saveState(); err != nil {
+		log.Printf("[WARN] saveState: %v", err)
+	}
 }
 
 // NEW (minimal): allow live loop to inject/refresh the optional extended model.
@@ -175,7 +177,9 @@ func (t *Trader) updateDaily(date time.Time) {
 	if midnightUTC(date) != t.dailyStart {
 		t.dailyStart = midnightUTC(date)
 		t.dailyPnL = 0
-		_ = t.saveState()
+		if err := t.saveState(); err != nil {
+			log.Printf("[WARN] saveState: %v", err)
+		}
 	}
 }
 
@@ -464,7 +468,9 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 		postSlack(msg)
 	}
 	// persist new state
-	_ = t.saveState()
+	if err := t.saveState(); err != nil {
+		log.Printf("[WARN] saveState: %v", err)
+	}
 
 	_ = removedWasRunner // kept to emphasize runner path; no extra logs.
 	return msg, nil
@@ -1051,7 +1057,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		postSlack(msg)
 	}
 	// persist new state
-	_ = t.saveState()
+	if err := t.saveState(); err != nil {
+		log.Printf("[WARN] saveState: %v", err)
+	}
 	t.mu.Unlock()
 	return msg, nil
 }
