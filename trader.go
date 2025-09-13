@@ -94,7 +94,6 @@ type Trader struct {
 	// --- NEW: adverse gate helpers (since last add) ---
 	winLow      float64 // lowest price seen since lastAdd
 	latchedGate float64 // latched adverse gate once threshold time is reached; reset on new add
-
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -693,7 +692,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	base := quote / price
 	side := d.SignalToSide()
 
-	// --- NEW: BUY gating (require spare quote after reserving open shorts) ---
+	// Unified epsilon for spare checks
+	const spareEps = 1e-9
+
+	// --- BUY gating (require spare quote after reserving open shorts) ---
 	if side == SideBuy {
 		// Reserve quote needed to close all existing short lots at current price.
 		var reservedShortQuote float64
@@ -703,35 +705,20 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			}
 		}
 
-		// Determine available quote and quote step.
-		var availQuote, qstep float64
-		if t.cfg.DryRun {
-			availQuote = paperQuoteBalance()
-			qstep = quoteStepOverride()
-		} else if br, ok := t.broker.(interface {
-			GetAvailableQuote(context.Context, string) (string, float64, float64, error)
-		}); ok {
-			sym, aq, qs, err := br.GetAvailableQuote(ctx, t.cfg.ProductID)
-			if err != nil || strings.TrimSpace(sym) == "" {
-				t.mu.Unlock()
-				log.Fatalf("BUY blocked: GetAvailableQuote failed in live mode: %v", err)
-			}
-			availQuote = aq
-			qstep = qs
-			if qstep <= 0 {
-				ov := quoteStepOverride()
-				if ov <= 0 {
-					t.mu.Unlock()
-					log.Fatalf("BUY blocked: missing QUOTE_STEP (no broker step and no QUOTE_STEP override)")
-				}
-				qstep = ov
-			}
-		} else {
+		// Ask broker for quote balance/step (uniform: live & DryRun).
+		sym, aq, qs, err := t.broker.GetAvailableQuote(ctx, t.cfg.ProductID)
+		if err != nil || strings.TrimSpace(sym) == "" {
 			t.mu.Unlock()
-			log.Fatalf("BUY blocked: broker %s does not provide GetAvailableQuote for live quote-balance enforcement", t.broker.Name())
+			log.Fatalf("BUY blocked: GetAvailableQuote failed: %v", err)
+		}
+		availQuote := aq
+		qstep := qs
+		if qstep <= 0 {
+			t.mu.Unlock()
+			log.Fatalf("BUY blocked: missing/invalid QUOTE step for %s (step=%.8f)", t.cfg.ProductID, qstep)
 		}
 
-		// Floor the needed quote to step (if known).
+		// Floor the needed quote to step.
 		neededQuote := quote
 		if qstep > 0 {
 			n := math.Floor(neededQuote/qstep) * qstep
@@ -744,7 +731,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		if spare < 0 {
 			spare = 0
 		}
-		if spare+1e-9 < neededQuote {
+		if spare+spareEps < neededQuote {
 			t.mu.Unlock()
 			log.Printf("[DEBUG] BUY blocked: need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 				neededQuote, spare, availQuote, reservedShortQuote, qstep)
@@ -758,7 +745,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				steps := math.Ceil(neededQuote / qstep)
 				neededQuote = steps * qstep
 			}
-			if spare+1e-9 < neededQuote {
+			if spare+spareEps < neededQuote {
 				t.mu.Unlock()
 				log.Printf("[DEBUG] BUY blocked: need=%.2f quote (min), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 					neededQuote, spare, availQuote, reservedShortQuote, qstep)
@@ -781,32 +768,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			}
 		}
 
-		// Try live balance via BalanceReader, else backtest env (live must not fallback)
-		var availBase, step float64
-		if t.cfg.DryRun {
-			availBase = paperBaseBalance()
-			step = baseStepOverride()
-		} else if br, ok := t.broker.(interface {
-			GetAvailableBase(context.Context, string) (string, float64, float64, error)
-		}); ok {
-			sym, ab, stp, err := br.GetAvailableBase(ctx, t.cfg.ProductID)
-			if err != nil || strings.TrimSpace(sym) == "" {
-				t.mu.Unlock()
-				log.Fatalf("SELL blocked: GetAvailableBase failed in live mode: %v", err)
-			}
-			availBase = ab
-			step = stp
-			if step <= 0 {
-				ov := baseStepOverride()
-				if ov <= 0 {
-					t.mu.Unlock()
-					log.Fatalf("SELL blocked: missing BASE_STEP (no broker step and no BASE_STEP override)")
-				}
-				step = ov
-			}
-		} else {
+		// Ask broker for base balance/step (uniform: live & DryRun).
+		sym, ab, stp, err := t.broker.GetAvailableBase(ctx, t.cfg.ProductID)
+		if err != nil || strings.TrimSpace(sym) == "" {
 			t.mu.Unlock()
-			log.Fatalf("SELL blocked: broker %s does not provide GetAvailableBase for live base-balance enforcement", t.broker.Name())
+			log.Fatalf("SELL blocked: GetAvailableBase failed: %v", err)
+		}
+		availBase := ab
+		step := stp
+		if step <= 0 {
+			t.mu.Unlock()
+			log.Fatalf("SELL blocked: missing/invalid BASE step for %s (step=%.8f)", t.cfg.ProductID, step)
 		}
 
 		// Floor the *needed* base to step (if known) and cap by spare availability
@@ -821,7 +793,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		if spare < 0 {
 			spare = 0
 		}
-		if spare+1e-12 < neededBase {
+		if spare+spareEps < neededBase {
 			t.mu.Unlock()
 			log.Printf("[DEBUG] SELL blocked: need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
 				neededBase, spare, availBase, reservedLong, step)
@@ -832,7 +804,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		quote = neededBase * price
 		base = neededBase
 
-		// Ensure SELL meets exchange min funds and step rules
+		// Ensure SELL meets exchange min funds and step rules (and re-check spare symmetry)
 		if quote < t.cfg.OrderMinUSD {
 			quote = t.cfg.OrderMinUSD
 			base = quote / price
@@ -842,6 +814,13 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					base = b
 					quote = base * price
 				}
+			}
+			// >>> Symmetry: re-check spare after min-notional snap <<<
+			if spare+spareEps < base {
+				t.mu.Unlock()
+				log.Printf("[DEBUG] SELL blocked: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
+					base, spare, availBase, reservedLong, step)
+				return "HOLD", nil
 			}
 		}
 	}

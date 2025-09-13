@@ -93,7 +93,7 @@ func (bb *BridgeBroker) GetNowPrice(ctx context.Context, product string) (float6
 func (bb *BridgeBroker) GetAvailableBase(ctx context.Context, product string) (string, float64, float64, error) {
 	asset, avail, step, ok := bb.tryBalanceEndpoint(ctx, "/balance/base", product)
 	if !ok {
-		log.Fatalf("GetAvailableBase: failed calling %s/balance/base?product_id=%s", bb.base, product)
+		log.Printf("GetAvailableBase: failed calling %s/balance/base?product_id=%s", bb.base, product)
 		// unreachable after Fatalf, but return to satisfy compiler
 		return "", 0, 0, fmt.Errorf("fatal: GetAvailableBase failed")
 	}
@@ -103,10 +103,9 @@ func (bb *BridgeBroker) GetAvailableBase(ctx context.Context, product string) (s
 func (bb *BridgeBroker) GetAvailableQuote(ctx context.Context, product string) (string, float64, float64, error) {
 	asset, avail, step, ok := bb.tryBalanceEndpoint(ctx, "/balance/quote", product)
 	if !ok {
-		log.Fatalf("GetAvailableQuote: failed calling %s/balance/quote?product_id=%s", bb.base, product)
-		// unreachable after Fatalf, but return to satisfy compiler
+		log.Printf("GetAvailableQuote: failed calling %s/balance/quote?product_id=%s", bb.base, product)
 		return "", 0, 0, fmt.Errorf("fatal: GetAvailableQuote failed")
-	}
+	}   
 	return asset, avail, step, nil
 }
 

@@ -1,7 +1,5 @@
 You are joining an existing Coinbase Advanced Trade bot project. Invariant baseline (must remain stable and NOT be re-generated):
 
-[...]
-
 Operating rules:
 
 Do NOT rewrite, reformat, or re-emit existing files unless explicitly instructed.
@@ -49,4 +47,4 @@ Plan item: “fix startup equity spike in live.go.”
    - Revert instructions (restore previous lines X–Y to set equity immediately).
    - Runbook (commands to rebuild/restart and how to verify via /metrics and logs).
 
-Secondly, Pause and verify required inputs. If ANY input is missing, ask me to provide it before writing code. - Examples of required inputs: - Source files: e.g., “paste current live.go / trader.go / strategy.go / model.go / metrics.go / config.go / env.go / backtest.go / broker*.go / bridge/app.py / monitoring/docker-compose.yml”. - Env/config values: e.g., “what Slack webhook URL?”, “what Docker base image?”, “list current /opt/coinbase/env/bot.env and bridge.env”. - External URLs/IDs (API keys should never be pasted in clear; ask me to confirm they are already configured). - Never guess; explicitly request missing files or settings.
+Note: Pause and verify required inputs. If ANY input is missing, ask me to provide it before writing code. - Examples of required inputs: - Source files: e.g., “paste current live.go / trader.go / strategy.go / model.go / metrics.go / config.go / env.go / backtest.go / broker*.go / bridge/app.py / monitoring/docker-compose.yml”. - Env/config values: e.g., “what Slack webhook URL?”, “what Docker base image?”, “list current /opt/coinbase/env/bot.env and bridge.env”. - External URLs/IDs (API keys should never be pasted in clear; ask me to confirm they are already configured). - Never guess; explicitly request missing files or settings.

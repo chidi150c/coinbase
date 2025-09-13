@@ -10,11 +10,14 @@
 //   • GetNowPrice(ctx, product) (float64, error)
 //   • PlaceMarketQuote(ctx, product, side, quoteUSD) (*PlacedOrder, error)
 //   • GetRecentCandles(...) ([]Candle, error)  // unsupported in paper mode
+//   • GetAvailableBase(...) (string, float64, float64, error)   // env-based
+//   • GetAvailableQuote(...) (string, float64, float64, error)  // env-based
 package main
 
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -61,4 +64,36 @@ func (p *PaperBroker) PlaceMarketQuote(ctx context.Context, product string, side
 // GetRecentCandles is not supported in paper mode; use the bridge for market data.
 func (p *PaperBroker) GetRecentCandles(ctx context.Context, product string, granularity string, limit int) ([]Candle, error) {
 	return nil, errors.New("paper broker has no candles (use bridge or CSV)")
+}
+
+// GetAvailableBase returns env-driven paper balances for the base asset.
+// - asset: parsed from product "BASE-QUOTE" (fallback to BASE_ASSET env if parsing fails)
+// - available: PAPER_BASE_BALANCE
+// - step: BASE_STEP
+func (p *PaperBroker) GetAvailableBase(ctx context.Context, product string) (asset string, available float64, step float64, err error) {
+	base, _ := parseProductSymbols(product)
+	if strings.TrimSpace(base) == "" {
+		base = strings.TrimSpace(baseAssetOverride()) // fallback for paper
+	}
+	return base, paperBaseBalance(), baseStepOverride(), nil
+}
+
+// GetAvailableQuote returns env-driven paper balances for the quote asset.
+// - asset: parsed from product "BASE-QUOTE"
+// - available: PAPER_QUOTE_BALANCE
+// - step: QUOTE_STEP
+func (p *PaperBroker) GetAvailableQuote(ctx context.Context, product string) (asset string, available float64, step float64, err error) {
+	_, quote := parseProductSymbols(product)
+	return quote, paperQuoteBalance(), quoteStepOverride(), nil
+}
+
+// parseProductSymbols splits a product like "BTC-USD" into ("BTC", "USD").
+func parseProductSymbols(product string) (base string, quote string) {
+	product = strings.TrimSpace(product)
+	parts := strings.Split(product, "-")
+	if len(parts) >= 2 {
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	}
+	// unknown format
+	return "", ""
 }
