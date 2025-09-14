@@ -124,9 +124,9 @@ func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 	buyMASignal := false
 	sellMASignal := false
 	if !math.IsNaN(fast) && !math.IsNaN(slow) && !math.IsNaN(fast3rd) && !math.IsNaN(slow3rd){
-		HighPeak := (slow3rd > fast3rd) && (slow2rd-fast2rd > slow3rd-fast3rd) && (slow-fast < slow2rd-fast2rd) && (slow > fast)
+		HighPeak := (slow3rd < fast3rd) && (slow2rd-fast2rd > slow3rd-fast3rd) && (slow-fast < slow2rd-fast2rd) && (slow < fast)
 		PriceDownGoingUp := (slow > fast) && (slow-fast < slow3rd-fast3rd) && (slow3rd > fast3rd)
-		LowBottom := (fast3rd > slow3rd) && (fast2rd-slow2rd > fast3rd-slow3rd) && (fast-slow > fast2rd-slow2rd) && (fast > slow)
+		LowBottom := (fast3rd < slow3rd) && (fast2rd-slow2rd > fast3rd-slow3rd) && (fast-slow < fast2rd-slow2rd) && (fast < slow)
 		PriceUpGoingDown := (fast > slow) && (fast-slow < fast3rd-slow3rd) && (fast3rd > slow3rd)
 
 		if LowBottom {
