@@ -11,12 +11,6 @@ Health checks:
 docker compose exec bot sh -lc 'curl -s http://localhost:8080/healthz'
 docker compose exec bot sh -lc 'curl -s http://bridge:8787/health'
 
-
-Metrics check:
-
-docker compose exec bot sh -lc 'curl -s http://localhost:8080/metrics | egrep "bot_equity_usd|bot_decisions_total|bot_orders_total"'
-
-
 Backfill CSV:
 
 docker compose run --rm bot go run /app/tools/backfill_bridge_paged.go \
@@ -171,7 +165,39 @@ FIRST=$(grep -n -E "^EXIT " /tmp/bot.log | head -n 1 | cut -d: -f1)
 START=$((FIRST-20)); [ "$START" -lt 1 ] && START=1
 END=$((FIRST+20))
 sed -n "${START},${END}p" /tmp/bot.log
+=======================================
+# Here are a few super-practical ways to see what the bot is doing right now:
+
+# 1) Live feed (orders/exits/decisions)
+# Follow orders and exits only (clean view)
+docker compose logs -f --no-log-prefix bot \
+| grep -E '\[LIVE ORDER\]|^EXIT |^PAPER |Decision='
+
+# 2) Snapshot current open lots (size/side/targets)
+jq '{lots: [.Lots[] | {side: .Side, base: .SizeBase, open: .OpenPrice, stop: .Stop, take: .Take, opened: .OpenTime} ],
+     count: (.Lots|length)}' /opt/coinbase/state/bot_state.json
+
+# 3) Quick Prometheus pulses
+# Orders in the last 15m (live only), by side:
+curl -sG 'http://localhost:9090/api/v1/query' \
+  --data-urlencode 'query=sum by (side) (rate(bot_orders_total{mode="live"}[15m]))'
 
 
+# Trades in the last 6h (wins vs losses):
+curl -sG 'http://localhost:9090/api/v1/query' \
+  --data-urlencode 'query=sum by (result) (increase(bot_trades_total[6h]))'
 
 
+# Win rate (last 6h):
+curl -sG 'http://localhost:9090/api/v1/query' \
+  --data-urlencode 'query=sum(increase(bot_trades_total{result="win"}[6h])) / sum(increase(bot_trades_total[6h]))'
+
+
+# Decision mix (last 15m):
+curl -sG 'http://localhost:9090/api/v1/query' \
+  --data-urlencode 'query=sum by (signal) (increase(bot_decisions_total[15m]))'
+
+
+# Latest equity:
+curl -sG 'http://localhost:9090/api/v1/query' \
+  --data-urlencode 'query=bot_equity_usd'

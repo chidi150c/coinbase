@@ -102,7 +102,7 @@ func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 		if mdl != nil {
 			// ComputePUpextended logs a debug line when features/model exist.
 			pUp = ComputePUpextended(c, mdl)
-			log.Printf("[DEBUG] extended mode computed pUp")
+			log.Printf("[DEBUG] extended mode computed pUp=%.5f", pUp)
 		} else {
 			log.Printf("[DEBUG] extended mode requested but no mdlExt present; using micro-model pUp")
 		}
@@ -117,21 +117,45 @@ func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 	ema8 := EMA(cl, 8)
 	fast := ema4[i]
 	slow := ema8[i]
-	filterOK := !math.IsNaN(fast) && !math.IsNaN(slow) && fast > slow
+	fast2rd := ema4[i-2]
+	slow2rd := ema8[i-2]
+	fast3rd := ema4[i-3]
+	slow3rd := ema8[i-3]
+	buyMASignal := false
+	sellMASignal := false
+	if !math.IsNaN(fast) && !math.IsNaN(slow) && !math.IsNaN(fast3rd) && !math.IsNaN(slow3rd){
+		HighPeak := (slow3rd > fast3rd) && (slow2rd-fast2rd > slow3rd-fast3rd) && (slow-fast < slow2rd-fast2rd) && (slow > fast)
+		PriceDownGoingUp := (slow > fast) && (slow-fast < slow3rd-fast3rd) && (slow3rd > fast3rd)
+		LowBottom := (fast3rd > slow3rd) && (fast2rd-slow2rd > fast3rd-slow3rd) && (fast-slow > fast2rd-slow2rd) && (fast > slow)
+		PriceUpGoingDown := (fast > slow) && (fast-slow < fast3rd-slow3rd) && (fast3rd > slow3rd)
 
-	reason := fmt.Sprintf("pUp=%.5f, ema4=%.2f vs ema8=%.2f", pUp, fast, slow)
+		if LowBottom {
+			buyMASignal = true
+			log.Printf("[DEBUG] MA Signalled LowBottom: BUY: HighPeak: %v, PriceDownGoingUp: %v, LowBottom: %v, PriceUpGoingDown: %v", HighPeak, PriceDownGoingUp, LowBottom, PriceUpGoingDown)
+		} else if HighPeak {
+			sellMASignal = true
+			log.Printf("[DEBUG] MA Signalled HighPeak: SELL: HighPeak: %v, PriceDownGoingUp: %v, LowBottom: %v, PriceUpGoingDown: %v", HighPeak, PriceDownGoingUp, LowBottom, PriceUpGoingDown)
+		} else if PriceDownGoingUp {
+			buyMASignal = true
+			log.Printf("[DEBUG] MA Signalled PriceDownGoingUp: BUY: HighPeak: %v, PriceDownGoingUp: %v, LowBottom: %v, PriceUpGoingDown: %v", HighPeak, PriceDownGoingUp, LowBottom, PriceUpGoingDown)
+		} else if PriceUpGoingDown {
+			sellMASignal = true
+			log.Printf("[DEBUG] MA Signalled PriceUpGoingDown: SELL: HighPeak: %v, PriceDownGoingUp: %v, LowBottom: %v, PriceUpGoingDown: %v", HighPeak, PriceDownGoingUp, LowBottom, PriceUpGoingDown)
+		}
+	}
+
+	reason := fmt.Sprintf("pUp=%.5f, ema4=%.2f vs ema8=%.2f, ema4_3rd=%.2f vs ema8_3rd=%.2f", pUp, fast, slow, fast3rd, slow3rd)
 
 	// BUY if pUp clears threshold and (optionally) MA filter
-	if pUp > buyThreshold && (!useMAFilter || filterOK) {
+	if pUp > buyThreshold && (!useMAFilter || buyMASignal) {
 	//log.Printf("[DEBUG] Decision=Buy, pUp=%.3f, buyThresh=%.3f, sellThresh=%.3f, filterOK=%v", pUp, buyThreshold, sellThreshold, filterOK)
 		return Decision{Signal: Buy, Confidence: pUp, Reason: reason}
 	}
 	// SELL if pUp below threshold and (optionally) MA filter is bearish
-	if pUp < sellThreshold && (!useMAFilter || !filterOK) {
+	if pUp < sellThreshold && (!useMAFilter || sellMASignal) {
 	//log.Printf("[DEBUG] Decision=Sell, pUp=%.3f, buyThresh=%.3f, sellThresh=%.3f, filterOK=%v", pUp, buyThreshold, sellThreshold, filterOK)
 		return Decision{Signal: Sell, Confidence: 1 - pUp, Reason: reason}
 	}
-	log.Printf("[DEBUG] ema4x9=%.2f ema8x9=%.2f filterOK=%v", fast, slow, filterOK)
 	return Decision{Signal: Flat, Confidence: 0.5, Reason: reason}
 }
 

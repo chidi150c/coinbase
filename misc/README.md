@@ -1924,46 +1924,12 @@ When elapsed_min ≥ 2 * t_floor_min, we latch the gate to the current winLow (t
 So the window for winLow is:
 from lastAdd + t_floor_min to the moment we latch (and then it stops updating once latched).
 
+============================================
+# Monitoring:
+watch -n 2 \
+'curl -sG http://localhost:9090/api/v1/query --data-urlencode \
+"query=sum by (mode,side) (rate(bot_orders_total[5m]))" \
+| jq -r '"'"'.data.result[] | [ .metric.mode // "-", .metric.side // "-", .value[1] ] | @tsv'"'"''
 
 
-2025/09/13 18:52:51 [TICK] px=115681.73 lastClose(before-step)=115681.73
-bot-1  | 2025/09/13 18:52:51 [DEBUG] nearest stop=-1040844.15 take=120044.03 across 2 lots
-bot-1  | 2025/09/13 18:52:51 [DEBUG] lastClose=115681.73 prevClose=115680.01
-bot-1  | 2025/09/13 18:52:51 [DEBUG] extended mode computed pUp
-bot-1  | 2025/09/13 18:52:51 [DEBUG] Lots=2, Decision=BUY Reason = pUp=0.53710, ema4=115675.51 vs ema8=115664.48, buyThresh=0.520, sellThresh=0.430, LongOnly=false
-bot-1  | 2025/09/13 18:52:51 [DEBUG] pyramid: blocked by last gate; price=115681.73 last_gate<=115006.23 win_low=115482.050 eff_pct=0.400 base_pct=1.500 elapsed_Hours=2.1
-bot-1  | 2025/09/13 18:52:51 HOLD
-bot-1  | 2025/09/13 18:52:53 [TICK] px=115675.21 lastClose(before-step)=115675.21
-bot-1  | 2025/09/13 18:52:53 [DEBUG] nearest stop=-1040844.15 take=120044.03 across 2 lots
-bot-1  | 2025/09/13 18:52:53 [DEBUG] lastClose=115675.21 prevClose=115680.01
-bot-1  | 2025/09/13 18:52:53 [DEBUG] extended mode computed pUp
-bot-1  | 2025/09/13 18:52:53 [DEBUG] Lots=2, Decision=BUY Reason = pUp=0.53427, ema4=115672.90 vs ema8=115663.03, buyThresh=0.520, sellThresh=0.430, LongOnly=false
-bot-1  | 2025/09/13 18:52:53 [DEBUG] pyramid: blocked by last gate; price=115675.21 last_gate<=115006.23 win_low=115482.050 eff_pct=0.400 base_pct=1.500 elapsed_Hours=2.1
-bot-1  | 2025/09/13 18:52:53 HOLD
-bot-1  | 2025/09/13 18:52:54 [TICK] px=115677.58 lastClose(before-step)=115677.58
-bot-1  | 2025/09/13 18:52:54 [DEBUG] nearest stop=-1040844.15 take=120044.03 across 2 lots
-bot-1  | 2025/09/13 18:52:54 [DEBUG] lastClose=115677.58 prevClose=115680.01
-bot-1  | 2025/09/13 18:52:54 [DEBUG] extended mode computed pUp
-bot-1  | 2025/09/13 18:52:54 [DEBUG] Lots=2, Decision=BUY Reason = pUp=0.53521, ema4=115673.85 vs ema8=115663.56, buyThresh=0.520, sellThresh=0.430, LongOnly=false
-bot-1  | 2025/09/13 18:52:54 [DEBUG] pyramid: blocked by last gate; price=115677.58 last_gate<=115006.23 win_low=115482.050 eff_pct=0.400 base_pct=1.500 elapsed_Hours=2.1
-bot-1  | 2025/09/13 18:52:54 HOLD
-bot-1  | 2025/09/13 18:52:55 [TICK] px=115677.96 lastClose(before-step)=115677.96
-bot-1  | 2025/09/13 18:52:55 [DEBUG] nearest stop=-1040844.15 take=120044.03 across 2 lots
-bot-1  | 2025/09/13 18:52:55 [DEBUG] lastClose=115677.96 prevClose=115680.01
-bot-1  | 2025/09/13 18:52:55 [DEBUG] extended mode computed pUp
-bot-1  | 2025/09/13 18:52:55 [DEBUG] Lots=2, Decision=BUY Reason = pUp=0.53535, ema4=115674.00 vs ema8=115663.64, buyThresh=0.520, sellThresh=0.430, LongOnly=false
-bot-1  | 2025/09/13 18:52:55 [DEBUG] pyramid: blocked by last gate; price=115677.96 last_gate<=115006.23 win_low=115482.050 eff_pct=0.400 base_pct=1.500 elapsed_Hours=2.1
-bot-1  | 2025/09/13 18:52:55 HOLD
-bot-1  | 2025/09/13 18:52:56 [TICK] px=115677.97 lastClose(before-step)=115677.97
-bot-1  | 2025/09/13 18:52:56 [DEBUG] nearest stop=-1040844.15 take=120044.03 across 2 lots
-bot-1  | 2025/09/13 18:52:56 [DEBUG] lastClose=115677.97 prevClose=115680.01
-bot-1  | 2025/09/13 18:52:56 [DEBUG] extended mode computed pUp
-bot-1  | 2025/09/13 18:52:56 [DEBUG] Lots=2, Decision=BUY Reason = pUp=0.53536, ema4=115674.00 vs ema8=115663.64, buyThresh=0.520, sellThresh=0.430, LongOnly=false
-bot-1  | 2025/09/13 18:52:56 [DEBUG] pyramid: blocked by last gate; price=115677.97 last_gate<=115006.23 win_low=115482.050 eff_pct=0.400 base_pct=1.500 elapsed_Hours=2.1
-bot-1  | 2025/09/13 18:52:56 HOLD
-bot-1  | 2025/09/13 18:52:57 [TICK] px=115677.97 lastClose(before-step)=115677.97
-bot-1  | 2025/09/13 18:52:57 [DEBUG] nearest stop=-1040844.15 take=120044.03 across 2 lots
-bot-1  | 2025/09/13 18:52:57 [DEBUG] lastClose=115677.97 prevClose=115680.01
-bot-1  | 2025/09/13 18:52:57 [DEBUG] extended mode computed pUp
-bot-1  | 2025/09/13 18:52:57 [DEBUG] Lots=2, Decision=BUY Reason = pUp=0.53536, ema4=115674.00 vs ema8=115663.64, buyThresh=0.520, sellThresh=0.430, LongOnly=false
-bot-1  | 2025/09/13 18:52:57 [DEBUG] pyramid: blocked by last gate; price=115677.97 last_gate<=115006.23 win_low=115482.050 eff_pct=0.400 base_pct
+
