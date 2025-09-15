@@ -201,3 +201,17 @@ curl -sG 'http://localhost:9090/api/v1/query' \
 # Latest equity:
 curl -sG 'http://localhost:9090/api/v1/query' \
   --data-urlencode 'query=bot_equity_usd'
+
+
+====================================================
+docker compose logs -f --since "15m" bot | GREP_COLOR='01;32' grep --line-buffered -E --color=always "MA Signalled|Decision=(BUY|SELL)|$" | GREP_COLOR='01;31' grep --line-buffered -E --color=always "pyramid: blocked|GATE (BUY|SELL)|$"
+
+
+# Count by reason AND whether P/L >= 0 (win) or < 0 (loss)
+docker compose logs bot | awk -F'reason=| P/L=' '/ EXIT /{
+  split($2,a," "); r=a[1];
+  pl=$3+0;
+  res=(pl>=0?"win":"loss");
+  key=r"|"res; c[key]++
+} END{for(k in c) printf "%s %d\n", k, c[k]}'
+====================================================

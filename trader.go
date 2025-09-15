@@ -62,7 +62,13 @@ type BotState struct {
 	MdlExt         *ExtendedLogit
 	WalkForwardMin int
 	LastFit        time.Time
+	LastAdd           time.Time
+	WinLow            float64
+	LatchedGate       float64
+	WinHigh           float64
+	LatchedGateShort  float64
 }
+
 
 type Trader struct {
 	cfg        Config
@@ -1093,6 +1099,11 @@ func (t *Trader) saveState() error {
 		MdlExt:         t.mdlExt,
 		WalkForwardMin: t.cfg.Extended().WalkForwardMin,
 		LastFit:        t.lastFit,
+		LastAdd:          t.lastAdd,
+		WinLow:           t.winLow,
+		LatchedGate:      t.latchedGate,
+		WinHigh:          t.winHigh,
+		LatchedGateShort: t.latchedGateShort,
 	}
 	bs, err := json.MarshalIndent(state, "", " ")
 	if err != nil {
@@ -1151,9 +1162,16 @@ func (t *Trader) loadState() error {
 		}
 	}
 
+	// Restore pyramiding gate memory (if present in state file).
+	t.lastAdd          = st.LastAdd
+	t.winLow           = st.WinLow
+	t.latchedGate      = st.LatchedGate
+	t.winHigh          = st.WinHigh
+	t.latchedGateShort = st.LatchedGateShort
+
 	// --- Restart warmup for pyramiding decay/adverse tracking ---
 	// If we restored with open lots but have no lastAdd, seed the decay clock to "now"
-	// and reset winLow/winHigh and latches so they rebuild over real time (prevents instant latch).
+	// and reset adverse trackers/latches so they rebuild over real time (prevents instant latch).
 	if len(t.lots) > 0 && t.lastAdd.IsZero() {
 		t.lastAdd = time.Now().UTC()
 		t.winLow = 0
@@ -1161,7 +1179,6 @@ func (t *Trader) loadState() error {
 		t.winHigh = 0
 		t.latchedGateShort = 0
 	}
-
 	return nil
 }
 
