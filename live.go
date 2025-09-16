@@ -170,13 +170,12 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				lastRefit, trader.mdlExt = maybeWalkForwardRefit(trader.cfg, trader.mdlExt, history, lastRefit)
 
 				// Step trader
-				msg, err := trader.step(ctx, history)
+				_, err := trader.step(ctx, history)
 				if err != nil {
 					log.Printf("step err: %v", err)
 					time.Sleep(time.Duration(tickInterval) * time.Second)
 					continue
 				}
-				log.Printf("%s", msg)
 
 				// Per-tick live-equity refresh
 				if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun && trader.cfg.BridgeURL != "" {

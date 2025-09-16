@@ -90,7 +90,7 @@ func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 
 	// --- NEW: debug last/prev close before computing features
 	if i-1 >= 0 {
-		log.Printf("[DEBUG] lastClose=%.2f prevClose=%.2f", c[i].Close, c[i-1].Close)
+		//log.Printf("[DEBUG] lastClose=%.2f prevClose=%.2f", c[i].Close, c[i-1].Close)
 	}
 	// ---
 
@@ -109,7 +109,6 @@ func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 		if mdl != nil {
 			// ComputePUpextended logs a debug line when features/model exist.
 			pUp = ComputePUpextended(c, mdl)
-			log.Printf("[DEBUG] extended mode computed pUp=%.5f", pUp)
 		} else {
 			log.Printf("[DEBUG] extended mode requested but no mdlExt present; using micro-model pUp")
 		}
