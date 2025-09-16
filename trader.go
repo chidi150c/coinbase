@@ -29,7 +29,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -176,18 +175,6 @@ func (t *Trader) SetExtendedModel(m *ExtendedLogit) {
 	t.mu.Lock()
 	t.mdlExt = m
 	t.mu.Unlock()
-}
-
-// feeRatePctFor returns a broker-scoped fee rate override if present (e.g., BINANCE_FEE_RATE_PCT),
-// otherwise returns the provided fallback (Config.FeeRatePct). Value is a percentage (e.g., 0.10).
-func feeRatePctFor(b Broker, fallback float64) float64 {
-	key := strings.ToUpper(b.Name()) + "_FEE_RATE_PCT"
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
-		}
-	}
-	return fallback
 }
 
 func midnightUTC(ts time.Time) time.Time {
@@ -421,7 +408,7 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 
 	// apply exit fee; prefer broker-provided commission if present ---
 	quoteExec := baseFilled * priceExec
-	feeRate := feeRatePctFor(t.broker, t.cfg.FeeRatePct)
+	feeRate := t.cfg.FeeRatePct
 	exitFee := quoteExec * (feeRate / 100.0)
 	if placed != nil {
 		if placed.CommissionUSD > 0 {
@@ -972,7 +959,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	// --- apply entry fee (preliminary; may be replaced by broker-provided commission below) ---
-	feeRate := feeRatePctFor(t.broker, t.cfg.FeeRatePct)
+	feeRate := t.cfg.FeeRatePct
 	entryFee := quote * (feeRate / 100.0)
 	if t.cfg.DryRun {
 		t.equityUSD -= entryFee
