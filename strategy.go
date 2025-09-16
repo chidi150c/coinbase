@@ -60,6 +60,13 @@ type Decision struct {
 	Signal     Signal
 	Confidence float64
 	Reason     string
+
+	// NEW: carry raw pUp and MA regime flags for downstream gate-audit strings
+	PUp              float64
+	HighPeak         bool
+	PriceDownGoingUp bool
+	LowBottom        bool
+	PriceUpGoingDown bool
 }
 
 // SignalToSide converts the intent into a broker side.
@@ -77,7 +84,7 @@ func (d Decision) SignalToSide() OrderSide {
 // decide computes a trading decision from recent candles and the model.
 func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 	if len(c) < 40 {
-		return Decision{Signal: Flat, Confidence: 0, Reason: "not_enough_data"}
+		return Decision{Signal: Flat, Confidence: 0, Reason: "not_enough_data", PUp: 0.0}
 	}
 	i := len(c) - 1
 
@@ -108,7 +115,7 @@ func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 		}
 	}
 
-    // Regime filter (Coinbase EMA): fast = EMA(close,4), slow = EMA(close,8)
+	// Regime filter (Coinbase EMA): fast = EMA(close,4), slow = EMA(close,8)
 	cl := make([]float64, len(c))
 	for k := range c {
 		cl[k] = c[k].Close
@@ -123,11 +130,17 @@ func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 	slow3rd := ema8[i-3]
 	buyMASignal := false
 	sellMASignal := false
-	if !math.IsNaN(fast) && !math.IsNaN(slow) && !math.IsNaN(fast3rd) && !math.IsNaN(slow3rd){
-		HighPeak := (slow3rd < fast3rd) && (slow2rd-fast2rd > slow3rd-fast3rd) && (slow-fast < slow2rd-fast2rd) && (slow < fast)
-		PriceDownGoingUp := (slow > fast) && (slow-fast < slow3rd-fast3rd) && (slow3rd > fast3rd)
-		LowBottom := (fast3rd < slow3rd) && (fast2rd-slow2rd > fast3rd-slow3rd) && (fast-slow < fast2rd-slow2rd) && (fast < slow)
-		PriceUpGoingDown := (fast > slow) && (fast-slow < fast3rd-slow3rd) && (fast3rd > slow3rd)
+
+	HighPeak := false
+	PriceDownGoingUp := false
+	LowBottom := false
+	PriceUpGoingDown := false
+
+	if !math.IsNaN(fast) && !math.IsNaN(slow) && !math.IsNaN(fast3rd) && !math.IsNaN(slow3rd) {
+		HighPeak = (slow3rd < fast3rd) && (slow2rd-fast2rd > slow3rd-fast3rd) && (slow-fast < slow2rd-fast2rd) && (slow < fast)
+		PriceDownGoingUp = (slow > fast) && (slow-fast < slow3rd-fast3rd) && (slow3rd > fast3rd)
+		LowBottom = (fast3rd < slow3rd) && (fast2rd-slow2rd > fast3rd-slow3rd) && (fast-slow < fast2rd-slow2rd) && (fast < slow)
+		PriceUpGoingDown = (fast > slow) && (fast-slow < fast3rd-slow3rd) && (fast3rd > slow3rd)
 
 		if LowBottom {
 			buyMASignal = true
@@ -148,15 +161,31 @@ func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
 
 	// BUY if pUp clears threshold and (optionally) MA filter
 	if pUp > buyThreshold && (!useMAFilter || buyMASignal) {
-	//log.Printf("[DEBUG] Decision=Buy, pUp=%.3f, buyThresh=%.3f, sellThresh=%.3f, filterOK=%v", pUp, buyThreshold, sellThreshold, filterOK)
-		return Decision{Signal: Buy, Confidence: pUp, Reason: reason}
+		return Decision{
+			Signal:     Buy,
+			Confidence: pUp,
+			Reason:     reason,
+			PUp:        pUp,
+			HighPeak:   HighPeak, PriceDownGoingUp: PriceDownGoingUp, LowBottom: LowBottom, PriceUpGoingDown: PriceUpGoingDown,
+		}
 	}
 	// SELL if pUp below threshold and (optionally) MA filter is bearish
 	if pUp < sellThreshold && (!useMAFilter || sellMASignal) {
-	//log.Printf("[DEBUG] Decision=Sell, pUp=%.3f, buyThresh=%.3f, sellThresh=%.3f, filterOK=%v", pUp, buyThreshold, sellThreshold, filterOK)
-		return Decision{Signal: Sell, Confidence: 1 - pUp, Reason: reason}
+		return Decision{
+			Signal:     Sell,
+			Confidence: 1 - pUp,
+			Reason:     reason,
+			PUp:        pUp,
+			HighPeak:   HighPeak, PriceDownGoingUp: PriceDownGoingUp, LowBottom: LowBottom, PriceUpGoingDown: PriceUpGoingDown,
+		}
 	}
-	return Decision{Signal: Flat, Confidence: 0.5, Reason: reason}
+	return Decision{
+		Signal:     Flat,
+		Confidence: 0.5,
+		Reason:     reason,
+		PUp:        pUp,
+		HighPeak:   HighPeak, PriceDownGoingUp: PriceDownGoingUp, LowBottom: LowBottom, PriceUpGoingDown: PriceUpGoingDown,
+	}
 }
 
 // ---- Extended features + pUp helper (opt-in; baseline remains unchanged) ----

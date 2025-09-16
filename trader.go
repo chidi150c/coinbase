@@ -50,6 +50,9 @@ type Position struct {
 	TrailActive bool    // becomes true after TRAIL_ACTIVATE_PCT threshold
 	TrailPeak   float64 // best favorable price since activation (peak for long; trough for short)
 	TrailStop   float64 // current trailing stop level derived from TrailPeak and TRAIL_DISTANCE_PCT
+
+	// --- NEW: human-readable gates/why string captured at entry time ---
+	Reason string `json:"reason,omitempty"`
 }
 
 // BotState is the persistent snapshot of trader state.
@@ -68,7 +71,6 @@ type BotState struct {
 	WinHigh           float64
 	LatchedGateShort  float64
 }
-
 
 type Trader struct {
 	cfg        Config
@@ -469,8 +471,8 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 
 	t.aggregateOpen()
 	// Include reason in message for operator visibility
-	msg := fmt.Sprintf("EXIT %s at %.2f reason=%s P/L=%.2f (fees=%.4f)",
-		c[len(c)-1].Time.Format(time.RFC3339), priceExec, exitReason, pl, lot.EntryFee+exitFee)
+	msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
+		c[len(c)-1].Time.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, lot.EntryFee+exitFee)
 	if t.cfg.Extended().UseDirectSlack {
 		postSlack(msg)
 	}
@@ -636,6 +638,15 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --- CHANGED: enable SELL pyramiding symmetry ---
 	isAdd := len(t.lots) > 0 && allowPyramiding() && (d.Signal == Buy || d.Signal == Sell)
 
+	// --- NEW: variables to capture gate audit fields for the reason string (side-biased; no winLow) ---
+	var (
+		reasonGatePrice float64
+		reasonLatched   float64
+		reasonEffPct    float64
+		reasonBasePct   float64
+		reasonElapsedHr float64
+	)
+
 	// Gating for pyramiding adds — spacing + adverse move (with optional time-decay).
 	if isAdd {
 		// 1) Spacing: always enforce (s=0 means no wait; set >0 to require time gap)
@@ -666,7 +677,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			effPct = decayed
 		}
 
-		// Time (in minutes) to hit the floor once (t_floor_min); used for winLow/winHigh start and latching thresholds.
+		// Capture for reason string
+		reasonBasePct = basePct
+		reasonEffPct = effPct
+		reasonElapsedHr = elapsedMin / 60.0
+
+		// Time (in minutes) to hit the floor once (t_floor_min); used for latching thresholds.
 		tFloorMin := 0.0
 		if lambda > 0 && basePct > floor {
 			tFloorMin = math.Log(basePct/floor) / lambda
@@ -675,7 +691,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		last := t.latestEntry()
 		if last > 0 {
 			if d.Signal == Buy {
-				// BUY adverse tracker: start/maintain winLow after t_floor_min
+				// BUY adverse tracker
 				if elapsedMin >= tFloorMin {
 					if t.winLow == 0 || price < t.winLow {
 						t.winLow = price
@@ -692,15 +708,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if t.latchedGate > 0 {
 					gatePrice = t.latchedGate
 				}
+				reasonGatePrice = gatePrice
+				reasonLatched = t.latchedGate
+
 				if !(price <= gatePrice) {
 					t.mu.Unlock()
-					elapsedHr := elapsedMin / 60.0
 					log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
-						price, gatePrice, t.winLow, effPct, basePct, elapsedHr)
+						price, gatePrice, t.winLow, effPct, basePct, reasonElapsedHr)
 					return "HOLD", nil
 				}
-			} else { // d.Signal == Sell
-				// SELL adverse tracker: start/maintain winHigh after t_floor_min
+			} else { // SELL
+				// SELL adverse tracker
 				if elapsedMin >= tFloorMin {
 					if t.winHigh == 0 || price > t.winHigh {
 						t.winHigh = price
@@ -708,7 +726,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				} else {
 					t.winHigh = 0
 				}
-				// latch at 2*t_floor_min
 				if t.latchedGateShort == 0 && elapsedMin >= 2.0*tFloorMin && t.winHigh > 0 {
 					t.latchedGateShort = t.winHigh
 				}
@@ -717,16 +734,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if t.latchedGateShort > 0 {
 					gatePrice = t.latchedGateShort
 				}
+				reasonGatePrice = gatePrice
+				reasonLatched = t.latchedGateShort
+
 				if !(price >= gatePrice) {
 					t.mu.Unlock()
-					elapsedHr := elapsedMin / 60.0
 					log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
-						price, gatePrice, t.winHigh, effPct, basePct, elapsedHr)
+						price, gatePrice, t.winHigh, effPct, basePct, reasonElapsedHr)
 					return "HOLD", nil
 				}
 			}
 		}
-		// (runner-gap guard removed)
 	}
 
 	// Sizing (risk % of current equity, with optional volatility adjust already supported).
@@ -1018,6 +1036,22 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		t.equityUSD -= delta
 	}
 
+	// --- NEW: side-biased Lot reason (without winLow) ---
+	var gatesReason string
+	if side == SideBuy {
+		gatesReason = fmt.Sprintf(
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|PriceDownGoingUp=%v|LowBottom=%v",
+			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr,
+			d.PriceDownGoingUp, d.LowBottom,
+		)
+	} else { // SideSell
+		gatesReason = fmt.Sprintf(
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|HighPeak=%v|PriceUpGoingDown=%v",
+			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr,
+			d.HighPeak, d.PriceUpGoingDown,
+		)
+	}
+
 	newLot := &Position{
 		OpenPrice: priceToUse,
 		Side:      side,
@@ -1026,6 +1060,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		Take:      take,
 		OpenTime:  now,
 		EntryFee:  entryFee,
+		Reason:    gatesReason, // side-biased; no winLow
 		// trailing fields default zero/false; they’ll be initialized if this becomes runner
 	}
 	t.lots = append(t.lots, newLot)
@@ -1054,11 +1089,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	msg := ""
 	if t.cfg.DryRun {
 		mtxOrders.WithLabelValues("paper", string(side)).Inc()
-		msg = fmt.Sprintf("PAPER %s quote=%.2f base=%.6f stop=%.2f take=%.2f fee=%.4f [%s]",
-			d.Signal, actualQuote, baseToUse, newLot.Stop, newLot.Take, entryFee, d.Reason)
+		msg = fmt.Sprintf("PAPER %s quote=%.2f base=%.6f stop=%.2f take=%.2f fee=%.4f reason=%s [%s]",
+			d.Signal, actualQuote, baseToUse, newLot.Stop, newLot.Take, entryFee, newLot.Reason, d.Reason)
 	} else {
-		msg = fmt.Sprintf("[LIVE ORDER] %s quote=%.2f stop=%.2f take=%.2f fee=%.4f [%s]",
-			d.Signal, actualQuote, newLot.Stop, newLot.Take, entryFee, d.Reason)
+		msg = fmt.Sprintf("[LIVE ORDER] %s quote=%.2f stop=%.2f take=%.2f fee=%.4f reason=%s [%s]",
+			d.Signal, actualQuote, newLot.Stop, newLot.Take, entryFee, newLot.Reason, d.Reason)
 	}
 	if t.cfg.Extended().UseDirectSlack {
 		postSlack(msg)
