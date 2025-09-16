@@ -86,20 +86,22 @@ func loadBotEnv() {
 		"RISK_PER_TRADE_PCT": {}, "USD_EQUITY": {}, "TAKE_PROFIT_PCT": {},
 		"STOP_LOSS_PCT": {}, "ORDER_MIN_USD": {}, "LONG_ONLY": {}, "PORT": {}, "BRIDGE_URL": {},
 		"BUY_THRESHOLD": {}, "SELL_THRESHOLD": {}, "USE_MA_FILTER": {}, "BACKTEST_SLEEP_MS": {},
+
 		// ---- new, opt-in pyramiding/env-driven toggles ----
 		"ALLOW_PYRAMIDING":            {},
 		"PYRAMID_MIN_SECONDS_BETWEEN": {},
 		"PYRAMID_MIN_ADVERSE_PCT":     {},
 		// ---- NEW: time-based exponential decay (Option A) ----
-		"PYRAMID_DECAY_LAMBDA":         {}, // per-minute decay rate
-		"PYRAMID_DECAY_MIN_PCT":        {}, // floor for adverse % after decay
-		"USE_TICK_PRICE":               {},
-		"TICK_INTERVAL_SEC":            {},
-		"CANDLE_RESYNC_SEC":            {},
+		"PYRAMID_DECAY_LAMBDA":  {}, // per-minute decay rate
+		"PYRAMID_DECAY_MIN_PCT": {}, // floor for adverse % after decay
+		"USE_TICK_PRICE":        {},
+		"TICK_INTERVAL_SEC":     {},
+		"CANDLE_RESYNC_SEC":     {},
 		"DAILY_BREAKER_MARK_TO_MARKET": {},
 		"FEE_RATE_PCT":                 {},
 		"MAX_CONCURRENT_LOTS":          {},
 		"STATE_FILE":                   {},
+
 		// ---- NEW: optional trailing knobs (safe defaults elsewhere if absent) ----
 		"TRAIL_ACTIVATE_PCT":    {},
 		"TRAIL_DISTANCE_PCT":    {},
@@ -108,8 +110,10 @@ func loadBotEnv() {
 		"SCALP_TP_DEC_PCT":      {},
 		"SCALP_TP_DECAY_FACTOR": {},
 		"SCALP_TP_MIN_PCT":      {},
+
 		// ---- NEW: ensure history depth is available to config/bootstrap ----
-		"MAX_HISTORY_CANDLES":    {},
+		"MAX_HISTORY_CANDLES": {},
+
 		// ---- Spot safety and paper balances/steps ----
 		"REQUIRE_BASE_FOR_SHORT": {},
 		"PAPER_BASE_BALANCE":     {},
@@ -118,6 +122,14 @@ func loadBotEnv() {
 		// ---- NEW: paper quote balance and quote step (backtest/paper) ----
 		"PAPER_QUOTE_BALANCE": {},
 		"QUOTE_STEP":          {},
+
+		// ---- NEW: broker selection + Binance live keys (optional) ----
+		"BROKER":                {}, // "binance" selects direct Binance broker; empty keeps current path
+		"BINANCE_API_KEY":       {},
+		"BINANCE_API_SECRET":    {},
+		"BINANCE_API_BASE":      {},  // default https://api.binance.com
+		"BINANCE_RECV_WINDOW_MS": {}, // default 5000
+		"BINANCE_USE_TESTNET":    {}, // ignored unless you opt-in
 	}
 
 	s := bufio.NewScanner(f)

@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -63,10 +64,15 @@ func main() {
 
 	// ---- Broker wiring ----
 	var broker Broker
-	if cfg.BridgeURL != "" {
-		broker = NewBridgeBroker(cfg.BridgeURL)
-	} else {
-		broker = NewPaperBroker()
+	switch strings.ToLower(getEnv("BROKER", "")) {
+	case "binance":
+		broker = NewBinanceBroker()
+	default:
+		if cfg.BridgeURL != "" {
+			broker = NewBridgeBroker(cfg.BridgeURL)
+		} else {
+			broker = NewPaperBroker()
+		}
 	}
 
 	model := newModel()
