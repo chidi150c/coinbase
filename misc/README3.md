@@ -22,4 +22,31 @@ ls -lh /opt/coinbase/state/backup | tail -n 5
 # Restore (when needed)
 gunzip -c /opt/coinbase/state/backup/bot_state.latest.json.gz > /opt/coinbase/state/bot_state.json
 docker compose restart bot
+====================================
+# To switch back to Coinbase via the bridge
+# replace existing broker line (or add it if missing)
+sudo sed -i 's/^BROKER=.*/BROKER=bridge/' /opt/coinbase/env/bot.env 
+docker compose up -d --force-recreate bot
+
+===========================================
+# Revert to Binance 
+# Change back:
+sudo sed -i 's/^BROKER=.*/BROKER=binance/' /opt/coinbase/env/bot.env
+docker compose up -d --force-recreate bot
+
+===========================================
+# To verify switching
+# confirm the env
+docker inspect $(docker compose ps -q bot) \
+  --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -E 'BRIDGE_URL|BROKER='
+
+# watch logs — you should no longer see Binance endpoints like /api/v3/order
+docker compose logs -f --since "2m" bot | grep -E 'LIVE ORDER|EXIT|Decision'
+
+# Verify Binance
+docker inspect "$(docker compose ps -q bot)" \
+  --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | grep -E '^BROKER=|^BINANCE_(API_KEY|API_SECRET|API_BASE|USE_TESTNET|RECV_WINDOW_MS)='
+
+
 

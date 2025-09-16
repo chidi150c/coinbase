@@ -7,6 +7,7 @@ services:
       - /opt/coinbase/state:/opt/coinbase/state
     env_file:
       - /opt/coinbase/env/bot.env
+      - /opt/coinbase/env/binance.env
     restart: unless-stopped
     expose:
       - "8080"
