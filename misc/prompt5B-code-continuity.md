@@ -10,7 +10,7 @@ Preserve all public behavior, flags, routes, metrics names, env keys, and file p
 
 How to respond:
 
-Provide a brief Plan for: [***Add /balance/base and /balance/quote endpoints to app.py that call client.get_product for base/quote symbols and increments and scan client.get_accounts(...).accounts[].available_balance.{currency,value} to return {"asset","available","step"}.***]
+Provide a brief Plan for: [***Esterblish MT5 trading proccesses of my project stated above for my linux VM in linode***]
 
 1) For each item in the plan, first output a single-sentence CHANGE_DESCRIPTION:
    - Format: verb + what is being changed + how/with what.

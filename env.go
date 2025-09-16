@@ -86,23 +86,23 @@ func loadBotEnv() {
 		"RISK_PER_TRADE_PCT": {}, "USD_EQUITY": {}, "TAKE_PROFIT_PCT": {},
 		"STOP_LOSS_PCT": {}, "ORDER_MIN_USD": {}, "LONG_ONLY": {}, "PORT": {}, "BRIDGE_URL": {},
 		"BUY_THRESHOLD": {}, "SELL_THRESHOLD": {}, "USE_MA_FILTER": {}, "BACKTEST_SLEEP_MS": {},
-
-		// ---- new, opt-in pyramiding/env-driven toggles ----
+		
+		// ---- pyramiding/env-driven knobs ----
 		"ALLOW_PYRAMIDING":            {},
 		"PYRAMID_MIN_SECONDS_BETWEEN": {},
 		"PYRAMID_MIN_ADVERSE_PCT":     {},
-		// ---- NEW: time-based exponential decay (Option A) ----
-		"PYRAMID_DECAY_LAMBDA":  {}, // per-minute decay rate
-		"PYRAMID_DECAY_MIN_PCT": {}, // floor for adverse % after decay
-		"USE_TICK_PRICE":        {},
-		"TICK_INTERVAL_SEC":     {},
-		"CANDLE_RESYNC_SEC":     {},
+		// time-based exponential decay
+		"PYRAMID_DECAY_LAMBDA":  {},
+		"PYRAMID_DECAY_MIN_PCT": {}, // tick/candle sync & risk
+		"USE_TICK_PRICE":            {},
+		"TICK_INTERVAL_SEC":         {},
+		"CANDLE_RESYNC_SEC":         {},
 		"DAILY_BREAKER_MARK_TO_MARKET": {},
 		"FEE_RATE_PCT":                 {},
 		"MAX_CONCURRENT_LOTS":          {},
 		"STATE_FILE":                   {},
 
-		// ---- NEW: optional trailing knobs (safe defaults elsewhere if absent) ----
+		// trailing & tp-decay (optional)
 		"TRAIL_ACTIVATE_PCT":    {},
 		"TRAIL_DISTANCE_PCT":    {},
 		"SCALP_TP_DECAY_ENABLE": {},
@@ -111,25 +111,25 @@ func loadBotEnv() {
 		"SCALP_TP_DECAY_FACTOR": {},
 		"SCALP_TP_MIN_PCT":      {},
 
-		// ---- NEW: ensure history depth is available to config/bootstrap ----
+		// history depth
 		"MAX_HISTORY_CANDLES": {},
 
-		// ---- Spot safety and paper balances/steps ----
+		// spot safety and paper balances/steps
 		"REQUIRE_BASE_FOR_SHORT": {},
 		"PAPER_BASE_BALANCE":     {},
 		"BASE_ASSET":             {},
 		"BASE_STEP":              {},
-		// ---- NEW: paper quote balance and quote step (backtest/paper) ----
-		"PAPER_QUOTE_BALANCE": {},
-		"QUOTE_STEP":          {},
+		"PAPER_QUOTE_BALANCE":    {},
+		"QUOTE_STEP":             {},
 
-		// ---- NEW: broker selection + Binance live keys (optional) ----
-		"BROKER":                {}, // "binance" selects direct Binance broker; empty keeps current path
-		"BINANCE_API_KEY":       {},
-		"BINANCE_API_SECRET":    {},
-		"BINANCE_API_BASE":      {},  // default https://api.binance.com
-		"BINANCE_RECV_WINDOW_MS": {}, // default 5000
-		"BINANCE_USE_TESTNET":    {}, // ignored unless you opt-in
+		// broker selection + Binance keys
+		"BROKER":                  {}, // "binance" selects direct Binance broker; empty keeps current path
+		"BINANCE_API_KEY":         {},
+		"BINANCE_API_SECRET":      {},
+		"BINANCE_API_BASE":        {},  // default https://api.binance.com
+		"BINANCE_RECV_WINDOW_MS":  {},  // default 5000
+		"BINANCE_USE_TESTNET":     {},  // ignored unless you opt-in
+		"BINANCE_FEE_RATE_PCT":    {},  // NEW: per-exchange fee override for binance
 	}
 
 	s := bufio.NewScanner(f)
@@ -146,8 +146,11 @@ func loadBotEnv() {
 			continue
 		}
 		key := strings.TrimSpace(line[:eq])
+		// Allow known keys OR any broker-scoped fee var (e.g., BINANCE_FEE_RATE_PCT, KRAKEN_FEE_RATE_PCT)
 		if _, ok := needed[key]; !ok {
-			continue
+			if !strings.HasSuffix(key, "_FEE_RATE_PCT") {
+				continue
+			}
 		}
 		val := strings.TrimSpace(line[eq+1:])
 		if len(val) >= 2 && ((val[0] == '"' && val[len(val)-1] == '"') || (val[0] == '\'' && val[len(val)-1] == '\'')) {
@@ -159,6 +162,9 @@ func loadBotEnv() {
 		if os.Getenv(key) == "" {
 			_ = os.Setenv(key, val)
 		}
+	}
+	if err := s.Err(); err != nil {
+		log.Printf("env: scan error: %v", err)
 	}
 	log.Printf("env: loaded %s", path)
 }

@@ -11,6 +11,8 @@
 //   cfg := loadConfigFromEnv()
 package main
 
+import "strings"
+
 // Config holds all runtime knobs for trading and operations.
 type Config struct {
 	// Trading target
@@ -25,20 +27,20 @@ type Config struct {
 	TakeProfitPct   float64
 	StopLossPct     float64
 	OrderMinUSD     float64
-	LongOnly        bool   // prevent SELL entries when flat on spot
-	FeeRatePct      float64 // new: % fee applied on entry/exit trades
+	LongOnly        bool    // prevent SELL entries when flat on spot
+	FeeRatePct      float64 // % fee applied on entry/exit trades
 
 	// Ops
-	Port               int
-	BridgeURL          string // e.g., http://127.0.0.1:8787
-	MaxHistoryCandles  int    // plural: loaded from MAX_HISTORY_CANDLES
-	StateFile          string // NEW: path to persist bot state (configurable via env)
+	Port              int
+	BridgeURL         string // e.g., http://127.0.0.1:8787
+	MaxHistoryCandles int    // plural: loaded from MAX_HISTORY_CANDLES
+	StateFile         string // path to persist bot state (configurable via env)
 }
 
 // loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
 // and returns a Config with sane defaults if keys are missing.
 func loadConfigFromEnv() Config {
-	return Config{
+	cfg := Config{
 		ProductID:         getEnv("PRODUCT_ID", "BTC-USD"),
 		Granularity:       getEnv("GRANULARITY", "ONE_MINUTE"),
 		DryRun:            getEnvBool("DRY_RUN", true),
@@ -49,12 +51,21 @@ func loadConfigFromEnv() Config {
 		StopLossPct:       getEnvFloat("STOP_LOSS_PCT", 0.4),
 		OrderMinUSD:       getEnvFloat("ORDER_MIN_USD", 5.00),
 		LongOnly:          getEnvBool("LONG_ONLY", true),
-		FeeRatePct:        getEnvFloat("FEE_RATE_PCT", 0.3), // new
+		FeeRatePct:        getEnvFloat("FEE_RATE_PCT", 0.3),
 		Port:              getEnvInt("PORT", 8080),
 		BridgeURL:         getEnv("BRIDGE_URL", "http://127.0.0.1:8787"),
 		MaxHistoryCandles: getEnvInt("MAX_HISTORY_CANDLES", 5000),
-		StateFile:         getEnv("STATE_FILE", "/opt/coinbase/state/bot_state.json"), // NEW
+		StateFile:         getEnv("STATE_FILE", "/opt/coinbase/state/bot_state.json"),
 	}
+
+	// Broker-scoped overrides (e.g., BINANCE_FEE_RATE_PCT, BINANCE_ORDER_MIN_USD)
+	broker := strings.ToUpper(strings.TrimSpace(getEnv("BROKER", "")))
+	if broker != "" {
+		cfg.FeeRatePct = getEnvFloat(broker+"_FEE_RATE_PCT", cfg.FeeRatePct)
+		cfg.OrderMinUSD = getEnvFloat(broker+"_ORDER_MIN_USD", cfg.OrderMinUSD)
+	}
+
+	return cfg
 }
 
 // UseLiveEquity returns true if live balances should rebase equity.

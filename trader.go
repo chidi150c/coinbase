@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -175,6 +176,18 @@ func (t *Trader) SetExtendedModel(m *ExtendedLogit) {
 	t.mu.Lock()
 	t.mdlExt = m
 	t.mu.Unlock()
+}
+
+// feeRatePctFor returns a broker-scoped fee rate override if present (e.g., BINANCE_FEE_RATE_PCT),
+// otherwise returns the provided fallback (Config.FeeRatePct). Value is a percentage (e.g., 0.10).
+func feeRatePctFor(b Broker, fallback float64) float64 {
+	key := strings.ToUpper(b.Name()) + "_FEE_RATE_PCT"
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return fallback
 }
 
 func midnightUTC(ts time.Time) time.Time {
@@ -408,12 +421,13 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 
 	// apply exit fee; prefer broker-provided commission if present ---
 	quoteExec := baseFilled * priceExec
-	exitFee := quoteExec * (t.cfg.FeeRatePct / 100.0)
+	feeRate := feeRatePctFor(t.broker, t.cfg.FeeRatePct)
+	exitFee := quoteExec * (feeRate / 100.0)
 	if placed != nil {
 		if placed.CommissionUSD > 0 {
 			exitFee = placed.CommissionUSD
 		} else {
-			log.Printf("[WARN] commission missing (exit); falling back to FEE_RATE_PCT=%.4f%%", t.cfg.FeeRatePct)
+			log.Printf("[WARN] commission missing (exit); falling back to FEE_RATE_PCT=%.4f%%", feeRate)
 		}
 	}
 	pl -= lot.EntryFee // subtract entry fee recorded
@@ -958,7 +972,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	// --- apply entry fee (preliminary; may be replaced by broker-provided commission below) ---
-	entryFee := quote * (t.cfg.FeeRatePct / 100.0)
+	feeRate := feeRatePctFor(t.broker, t.cfg.FeeRatePct)
+	entryFee := quote * (feeRate / 100.0)
 	if t.cfg.DryRun {
 		t.equityUSD -= entryFee
 	}
@@ -1023,8 +1038,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		if placed.CommissionUSD > 0 {
 			entryFee = placed.CommissionUSD
 		} else {
-			log.Printf("[WARN] commission missing (entry); falling back to FEE_RATE_PCT=%.4f%%", t.cfg.FeeRatePct)
-			entryFee = actualQuote * (t.cfg.FeeRatePct / 100.0)
+			log.Printf("[WARN] commission missing (entry); falling back to FEE_RATE_PCT=%.4f%%", feeRate)
+			entryFee = actualQuote * (feeRate / 100.0)
 		}
 	} else {
 		// DryRun path keeps previously computed entryFee and adjusts by delta as before.
@@ -1032,7 +1047,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	if t.cfg.DryRun {
 		// already deducted above for DryRun using quote; adjust to the actualQuote delta
-		delta := (actualQuote - quote) * (t.cfg.FeeRatePct / 100.0)
+		delta := (actualQuote - quote) * (feeRate / 100.0)
 		t.equityUSD -= delta
 	}
 

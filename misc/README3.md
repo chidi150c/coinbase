@@ -11,3 +11,15 @@ docker compose logs -f --since "15m" bot \
 | GREP_COLOR='01;36' grep --line-buffered -E --color=always 'pUp=|gatePrice=|latched=|effPct=|basePct=|elapsedHr=|HighPeak=|PriceDownGoingUp=|LowBottom=|PriceUpGoingDown=|$' \
 | GREP_COLOR='01;31' grep --line-buffered -E --color=always 'pyramid: blocked|GATE (BUY|SELL)|partial fill|commission missing|ERR step|$'
 
+==========================================
+
+# One-time backup service run
+sudo /usr/local/sbin/coinbase_state_backup.sh
+ls -lh /opt/coinbase/state/backup | tail -n 5
+
+=====================================
+
+# Restore (when needed)
+gunzip -c /opt/coinbase/state/backup/bot_state.latest.json.gz > /opt/coinbase/state/bot_state.json
+docker compose restart bot
+
