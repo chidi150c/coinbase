@@ -7,7 +7,7 @@ services:
       - /opt/coinbase/state:/opt/coinbase/state
     env_file:
       - /opt/coinbase/env/bot.env
-      - /opt/coinbase/env/binance.env
+      - /opt/coinbase/env/bot_coinbase.env    # <-- NEW: pin Coinbase broker/symbol/state
     restart: unless-stopped
     expose:
       - "8080"
@@ -21,6 +21,31 @@ services:
     networks:
       monitoring_network:
         aliases: [bot, coinbase-bot]
+
+  # NEW: second bot instance for Binance
+  bot_binance:
+    image: ghcr.io/chidi150c/coinbase-bot:latest
+    command: ["-live", "-interval", "1"]
+    volumes:
+      - /opt/coinbase/env:/opt/coinbase/env:ro
+      - /opt/coinbase/state:/opt/coinbase/state
+    env_file:
+      - /opt/coinbase/env/bot.env
+      - /opt/coinbase/env/binance.env         # holds BINANCE_API_KEY/SECRET
+      - /opt/coinbase/env/bot_binance.env     # broker/product/state overrides for Binance
+    restart: unless-stopped
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["NONE"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      monitoring_network:
+        aliases: [bot-binance]
 
   bridge:
     image: ghcr.io/chidi150c/coinbase-bridge:latest
@@ -49,8 +74,8 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
-      - --storage.tsdb.retention.time=15d          
-      - --storage.tsdb.retention.size=2GB          
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=2GB
     restart: unless-stopped
     networks: [monitoring_network]
 
