@@ -48,5 +48,32 @@ docker inspect "$(docker compose ps -q bot)" \
   --format '{{range .Config.Env}}{{println .}}{{end}}' \
   | grep -E '^BROKER=|^BINANCE_(API_KEY|API_SECRET|API_BASE|USE_TESTNET|RECV_WINDOW_MS)='
 
+===============================================
+
+docker compose up -d bot bot_binance
+
+# Coinbase: should show no Binance endpoints
+docker compose logs -f --since "1m" bot | grep -E '/api/v3|binance' || echo "OK: Coinbase-only"
+
+# Binance: watch for order/auth/time
+docker compose logs -f --since "2m" bot_binance | grep -E '/api/v3/order|-2014|-1021|LIVE ORDER|EXIT'
+
+
+===============================================
+
+ docker compose logs -f --since "15m" bot | GREP_COLOR='01;32' grep --line-buffered -E --color=always 'MA Signalled|Decision=(BUY|SELL)|LIVE ORDER|^PAPER|^EXIT|reason=|entry_reason=|$' | GREP_COLOR='01;36' grep --line-buffered -E --color=always 'pUp=|gatePrice=|latched=|effPct=|basePct=|elapsedHr=|HighPeak=|PriceDownGoingUp=|LowBottom=|PriceUpGoingDown=|$' | GREP_COLOR='01;31' grep --line-buffered -E --color=always 'pyramid: blocked|GATE (BUY|SELL)|partial fill|commission missing|ERR step|$'
+
+  docker compose logs -f --since "15m" bot_binance | GREP_COLOR='01;32' grep --line-buffered -E --color=always 'MA Signalled|Decision=(BUY|SELL)|LIVE ORDER|^PAPER|^EXIT|reason=|entry_reason=|$' | GREP_COLOR='01;36' grep --line-buffered -E --color=always 'pUp=|gatePrice=|latched=|effPct=|basePct=|elapsedHr=|HighPeak=|PriceDownGoingUp=|LowBottom=|PriceUpGoingDown=|$' | GREP_COLOR='01;31' grep --line-buffered -E --color=always 'pyramid: blocked|GATE (BUY|SELL)|partial fill|commission missing|ERR step|$'
+
+=====================================================
+  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# Show both; you already saw IPv6, grab IPv4 too:
+curl -6 -s https://ifconfig.me ; echo
+curl -4 -s https://ifconfig.me ; echo   # <-- whitelist this IPv4 on your Binance API key
+2600:3c13::2000:e7ff:fe3b:33b5
+172.236.14.121
+  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+=======================================================
+
 
 
