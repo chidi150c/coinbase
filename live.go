@@ -94,20 +94,28 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 	var lastRefit *time.Time
 
 	// Track if we've successfully rebased equity from live balances.
-	eqReady := !(trader.cfg.UseLiveEquity() && !trader.cfg.DryRun && trader.cfg.BridgeURL != "")
+	eqReady := !(trader.cfg.UseLiveEquity() && !trader.cfg.DryRun)
 
-	if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun && trader.cfg.BridgeURL != "" {
+	if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun {
 		ctxInit, cancelInit := context.WithTimeout(context.Background(), 5*time.Second)
-		if attempt := attemptLiveEquityRebase(ctxInit, trader.cfg, trader, history[len(history)-1].Close); attempt {
+		var attempt bool
+		if trader.cfg.BridgeURL != "" {
+			attempt = attemptLiveEquityRebase(ctxInit, trader.cfg, trader, history[len(history)-1].Close)
+		} else {
+			attempt = attemptLiveEquityRebaseBroker(ctxInit, trader, history[len(history)-1].Close)
+		}
+		if attempt {
 			eqReady = true
 		} else {
-			log.Printf("[EQUITY] waiting for bridge accounts (initial rebase pending)")
+			log.Printf("[EQUITY] waiting for accounts (initial rebase pending)")
 		}
 		cancelInit()
 	}
 
 	// --- Minimal addition: tick-driven vs candle-driven loop selection ---
-	useTick := getEnvBool("USE_TICK_PRICE", false) && trader.cfg.BridgeURL != ""
+	// Previously: getEnvBool("USE_TICK_PRICE", false) && BridgeURL != ""
+	// Now: allow tick loop for all brokers; bridge is optional.
+	useTick := getEnvBool("USE_TICK_PRICE", false)
 	tickInterval := getEnvInt("TICK_INTERVAL_SEC", 1)
 	if tickInterval <= 0 {
 		log.Fatalf("[Error] Env Var TICK_INTERVAL_SEC not set to be a positive value: TickInterval(%d) <= 0", tickInterval)
@@ -120,8 +128,6 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 
 	if useTick {
 		// Tick-driven loop with periodic candle resync
-		// ticker := time.NewTicker(time.Duration(tickInterval) * time.Second)
-		// defer ticker.Stop()
 		lastCandleSync := time.Now().UTC()
 
 		for {
@@ -157,10 +163,19 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 					}
 				}
 
-				//((((((((((*****candule nudging ****))))))))))
-				// Always poll /price each tick 
+				// Always poll a tick price each iteration
 				ctxPx, cancelPx := context.WithTimeout(ctx, 2*time.Second)
-				if px, stale, err := fetchBridgePrice(ctxPx, trader.cfg.BridgeURL, trader.cfg.ProductID); err == nil && !stale && px > 0 {
+				var px float64
+				var stale bool
+				var err error
+				if trader.cfg.BridgeURL != "" {
+					px, stale, err = fetchBridgePrice(ctxPx, trader.cfg.BridgeURL, trader.cfg.ProductID)
+				} else {
+					// Non-bridge: use the broker's spot price directly
+					px, err = trader.broker.GetNowPrice(ctxPx, trader.cfg.ProductID)
+					stale = false
+				}
+				if err == nil && !stale && px > 0 {
 					applyTickToLastCandle(history, px)
 					log.Printf("[TICK] px=%.2f lastClose(before-step)=%.2f", px, history[len(history)-1].Close)
 				}
@@ -170,7 +185,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				lastRefit, trader.mdlExt = maybeWalkForwardRefit(trader.cfg, trader.mdlExt, history, lastRefit)
 
 				// Step trader
-				_, err := trader.step(ctx, history)
+				_, err = trader.step(ctx, history)
 				if err != nil {
 					log.Printf("step err: %v", err)
 					time.Sleep(time.Duration(tickInterval) * time.Second)
@@ -178,9 +193,15 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				}
 
 				// Per-tick live-equity refresh
-				if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun && trader.cfg.BridgeURL != "" {
+				if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun {
 					ctxEq, cancelEq := context.WithTimeout(ctx, 5*time.Second)
-					if bal, err := fetchBridgeAccounts(ctxEq, trader.cfg.BridgeURL); err == nil {
+					var bal map[string]float64
+					if trader.cfg.BridgeURL != "" {
+						bal, err = fetchBridgeAccounts(ctxEq, trader.cfg.BridgeURL)
+					} else {
+						bal, err = fetchBrokerBalances(ctxEq, trader, trader.cfg.ProductID)
+					}
+					if err == nil {
 						base, quote := splitProductID(trader.cfg.ProductID)
 						eq := computeLiveEquity(bal, base, quote, history[len(history)-1].Close)
 						if eq > 0 {
@@ -190,17 +211,17 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 							trader.SetEquityUSD(eq)
 							eqReady = true
 						} else if !eqReady {
-							log.Printf("[EQUITY] waiting for bridge accounts (eq<=0)")
+							log.Printf("[EQUITY] waiting for accounts (eq<=0)")
 						}
 					} else if !eqReady {
-						log.Printf("[EQUITY] waiting for bridge accounts (error: %v)", err)
+						log.Printf("[EQUITY] waiting for accounts (error: %v)", err)
 					}
 					cancelEq()
 				}
 				if eqReady || trader.cfg.DryRun || !trader.cfg.UseLiveEquity() {
 					mtxPnL.Set(trader.EquityUSD())
 				} else {
-					log.Printf("[EQUITY] waiting for bridge accounts (metric withheld)")
+					log.Printf("[EQUITY] waiting for accounts (metric withheld)")
 				}
 
 				// Sleep before next iteration
@@ -241,9 +262,15 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				}
 				log.Printf("%s", msg)
 
-				if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun && trader.cfg.BridgeURL != "" {
+				if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun {
 					ctxEq, cancelEq := context.WithTimeout(ctx, 5*time.Second)
-					if bal, err := fetchBridgeAccounts(ctxEq, trader.cfg.BridgeURL); err == nil {
+					var bal map[string]float64
+					if trader.cfg.BridgeURL != "" {
+						bal, err = fetchBridgeAccounts(ctxEq, trader.cfg.BridgeURL)
+					} else {
+						bal, err = fetchBrokerBalances(ctxEq, trader, trader.cfg.ProductID)
+					}
+					if err == nil {
 						base, quote := splitProductID(trader.cfg.ProductID)
 						eq := computeLiveEquity(bal, base, quote, latest.Close)
 						if eq > 0 {
@@ -253,17 +280,17 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 							trader.SetEquityUSD(eq)
 							eqReady = true
 						} else if !eqReady {
-							log.Printf("[EQUITY] waiting for bridge accounts (eq<=0)")
+							log.Printf("[EQUITY] waiting for accounts (eq<=0)")
 						}
 					} else if !eqReady {
-						log.Printf("[EQUITY] waiting for bridge accounts (error: %v)", err)
+						log.Printf("[EQUITY] waiting for accounts (error: %v)", err)
 					}
 					cancelEq()
 				}
 				if eqReady || trader.cfg.DryRun || !trader.cfg.UseLiveEquity() {
 					mtxPnL.Set(trader.EquityUSD())
 				} else {
-					log.Printf("[EQUITY] waiting for bridge accounts (metric withheld)")
+					log.Printf("[EQUITY] waiting for accounts (metric withheld)")
 				}
 			}
 		}
@@ -361,6 +388,41 @@ func attemptLiveEquityRebase(ctx context.Context, cfg Config, trader *Trader, la
 		return true
 	}
 	return false
+}
+
+// --- NEW: Broker-based live-equity (no bridge required) ---
+
+func attemptLiveEquityRebaseBroker(ctx context.Context, trader *Trader, lastPrice float64) bool {
+	bal, err := fetchBrokerBalances(ctx, trader, trader.cfg.ProductID)
+	if err != nil {
+		return false
+	}
+	base, quote := splitProductID(trader.cfg.ProductID)
+	eq := computeLiveEquity(bal, base, quote, lastPrice)
+	if eq > 0 {
+		trader.SetEquityUSD(eq)
+		return true
+	}
+	return false
+}
+
+func fetchBrokerBalances(ctx context.Context, trader *Trader, productID string) (map[string]float64, error) {
+	baseAsset, baseAvail, _, err1 := trader.broker.GetAvailableBase(ctx, productID)
+	quoteAsset, quoteAvail, _, err2 := trader.broker.GetAvailableQuote(ctx, productID)
+	if err1 != nil && err2 != nil {
+		if err1 != nil {
+			return nil, err1
+		}
+		return nil, err2
+	}
+	out := make(map[string]float64, 2)
+	if baseAsset != "" {
+		out[strings.ToUpper(baseAsset)] = baseAvail
+	}
+	if quoteAsset != "" {
+		out[strings.ToUpper(quoteAsset)] = quoteAvail
+	}
+	return out, nil
 }
 
 // ---- Phase-7: walk-forward refit ----

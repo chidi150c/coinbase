@@ -59,7 +59,10 @@ func loadConfigFromEnv() Config {
 		MaxHistoryCandles: getEnvInt("MAX_HISTORY_CANDLES", 5000),
 		StateFile:         getEnv("STATE_FILE", "/opt/coinbase/state/bot_state.json"),
 	}
-
+	
+	if strings.ToLower(cfg.Broker) != "bridge" {
+		cfg.BridgeURL = ""
+	}
 	// Broker-scoped overrides (e.g., BINANCE_FEE_RATE_PCT, BINANCE_ORDER_MIN_USD,
 	// and now naturally HITBTC_FEE_RATE_PCT, HITBTC_ORDER_MIN_USD)
 	broker := strings.ToUpper(strings.TrimSpace(cfg.Broker))
