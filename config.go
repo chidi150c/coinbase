@@ -18,6 +18,7 @@ type Config struct {
 	// Trading target
 	ProductID   string // e.g., "BTC-USD"
 	Granularity string // e.g., "ONE_MINUTE"
+	Broker      string // e.g., "bridge" | "binance" | "hitbtc" (new)
 
 	// Safety
 	DryRun          bool
@@ -43,6 +44,7 @@ func loadConfigFromEnv() Config {
 	cfg := Config{
 		ProductID:         getEnv("PRODUCT_ID", "BTC-USD"),
 		Granularity:       getEnv("GRANULARITY", "ONE_MINUTE"),
+		Broker:            getEnv("BROKER", ""), // <--- NEW
 		DryRun:            getEnvBool("DRY_RUN", true),
 		MaxDailyLossPct:   getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
 		RiskPerTradePct:   getEnvFloat("RISK_PER_TRADE_PCT", 0.25),
@@ -58,8 +60,9 @@ func loadConfigFromEnv() Config {
 		StateFile:         getEnv("STATE_FILE", "/opt/coinbase/state/bot_state.json"),
 	}
 
-	// Broker-scoped overrides (e.g., BINANCE_FEE_RATE_PCT, BINANCE_ORDER_MIN_USD)
-	broker := strings.ToUpper(strings.TrimSpace(getEnv("BROKER", "")))
+	// Broker-scoped overrides (e.g., BINANCE_FEE_RATE_PCT, BINANCE_ORDER_MIN_USD,
+	// and now naturally HITBTC_FEE_RATE_PCT, HITBTC_ORDER_MIN_USD)
+	broker := strings.ToUpper(strings.TrimSpace(cfg.Broker))
 	if broker != "" {
 		cfg.FeeRatePct = getEnvFloat(broker+"_FEE_RATE_PCT", cfg.FeeRatePct)
 		cfg.OrderMinUSD = getEnvFloat(broker+"_ORDER_MIN_USD", cfg.OrderMinUSD)
