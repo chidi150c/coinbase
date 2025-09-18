@@ -16,9 +16,8 @@ import "strings"
 // Config holds all runtime knobs for trading and operations.
 type Config struct {
 	// Trading target
-	ProductID   string // e.g., "BTC-USD"
+	ProductID   string // e.g., "BTC-USD" or "BTCUSDT"
 	Granularity string // e.g., "ONE_MINUTE"
-	Broker      string // e.g., "bridge" | "binance" | "hitbtc" (new)
 
 	// Safety
 	DryRun          bool
@@ -33,9 +32,15 @@ type Config struct {
 
 	// Ops
 	Port              int
-	BridgeURL         string // e.g., http://127.0.0.1:8787
+	BridgeURL         string // e.g., http://127.0.0.1:8787 (only for the bridge/coinbase path)
 	MaxHistoryCandles int    // plural: loaded from MAX_HISTORY_CANDLES
 	StateFile         string // path to persist bot state (configurable via env)
+
+	// Loop & equity (now broker-overridable)
+	UseLiveEquityFlag bool
+	UseTickPrice      bool
+	TickIntervalSec   int
+	CandleResyncSec   int
 }
 
 // loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
@@ -44,7 +49,8 @@ func loadConfigFromEnv() Config {
 	cfg := Config{
 		ProductID:         getEnv("PRODUCT_ID", "BTC-USD"),
 		Granularity:       getEnv("GRANULARITY", "ONE_MINUTE"),
-		Broker:            getEnv("BROKER", ""), // <--- NEW
+
+		// Safety defaults
 		DryRun:            getEnvBool("DRY_RUN", true),
 		MaxDailyLossPct:   getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
 		RiskPerTradePct:   getEnvFloat("RISK_PER_TRADE_PCT", 0.25),
@@ -54,29 +60,41 @@ func loadConfigFromEnv() Config {
 		OrderMinUSD:       getEnvFloat("ORDER_MIN_USD", 5.00),
 		LongOnly:          getEnvBool("LONG_ONLY", true),
 		FeeRatePct:        getEnvFloat("FEE_RATE_PCT", 0.3),
+
+		// Ops defaults
 		Port:              getEnvInt("PORT", 8080),
-		BridgeURL:         getEnv("BRIDGE_URL", "http://127.0.0.1:8787"),
+		BridgeURL:         getEnv("BRIDGE_URL", ""), // leave empty by default so non-bridge brokers don't touch it
 		MaxHistoryCandles: getEnvInt("MAX_HISTORY_CANDLES", 5000),
 		StateFile:         getEnv("STATE_FILE", "/opt/coinbase/state/bot_state.json"),
+
+		// Loop & equity defaults (unprefixed fallbacks)
+		UseLiveEquityFlag: getEnvBool("USE_LIVE_EQUITY", false),
+		UseTickPrice:      getEnvBool("USE_TICK_PRICE", false),
+		TickIntervalSec:   getEnvInt("TICK_INTERVAL_SEC", 1),
+		CandleResyncSec:   getEnvInt("CANDLE_RESYNC_SEC", 60),
 	}
-	
-	if strings.ToLower(cfg.Broker) != "bridge" {
-		cfg.BridgeURL = ""
-	}
-	// Broker-scoped overrides (e.g., BINANCE_FEE_RATE_PCT, BINANCE_ORDER_MIN_USD,
-	// and now naturally HITBTC_FEE_RATE_PCT, HITBTC_ORDER_MIN_USD)
-	broker := strings.ToUpper(strings.TrimSpace(cfg.Broker))
+
+	// Broker-scoped overrides (e.g., BINANCE_*, HITBTC_*, BRIDGE_*)
+	broker := strings.ToUpper(strings.TrimSpace(getEnv("BROKER", "")))
 	if broker != "" {
 		cfg.FeeRatePct = getEnvFloat(broker+"_FEE_RATE_PCT", cfg.FeeRatePct)
 		cfg.OrderMinUSD = getEnvFloat(broker+"_ORDER_MIN_USD", cfg.OrderMinUSD)
+
+		// New per-broker overrides:
+		cfg.DryRun = getEnvBool(broker+"_DRY_RUN", cfg.DryRun)
+		cfg.UseLiveEquityFlag = getEnvBool(broker+"_USE_LIVE_EQUITY", cfg.UseLiveEquityFlag)
+		cfg.UseTickPrice = getEnvBool(broker+"_USE_TICK_PRICE", cfg.UseTickPrice)
+		cfg.TickIntervalSec = getEnvInt(broker+"_TICK_INTERVAL_SEC", cfg.TickIntervalSec)
+		cfg.CandleResyncSec = getEnvInt(broker+"_CANDLE_RESYNC_SEC", cfg.CandleResyncSec)
 	}
 
 	return cfg
 }
 
 // UseLiveEquity returns true if live balances should rebase equity.
+// (Kept as a method for backward compatibility.)
 func (c *Config) UseLiveEquity() bool {
-	return getEnvBool("USE_LIVE_EQUITY", false)
+	return c.UseLiveEquityFlag
 }
 
 // ---- Phase-7 toggles (append-only; no behavior changes unless envs set) ----
@@ -111,7 +129,6 @@ func (c *Config) Extended() ExtendedToggles {
 	}
 }
 
-// --- NEW (minimal, optional): trailing environment accessors ---
-// Safe defaults ensure no behavior change unless the envs are set.
+// --- trailing helpers preserved for compatibility ---
 func (c *Config) TrailActivatePct() float64 { return getEnvFloat("TRAIL_ACTIVATE_PCT", 1.2) }
 func (c *Config) TrailDistancePct() float64 { return getEnvFloat("TRAIL_DISTANCE_PCT", 0.6) }
