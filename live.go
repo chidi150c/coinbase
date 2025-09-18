@@ -2,16 +2,15 @@
 // Package main – Live loop, real-candle polling, and time helpers.
 //
 // runLive drives the trading loop in real time:
-//   • Warm up by fetching candles (paged from bridge if available; otherwise a large batch from the broker).
+//   • Warm up by fetching 350 recent candles from the bridge broker (if present) or the broker directly.
 //   • Fit the tiny ML model on warmup history.
 //   • Every intervalSec seconds, fetch the latest candle(s), update history,
 //     ask the Trader to step (which may OPEN/HOLD/EXIT), and update metrics.
 //
 // Notes:
-//   - We prefer real OHLCV from the /candles endpoint instead of synthesizing candles.
+//   - We prefer real OHLCV from the /candles endpoint instead of synthesizing candles when bridge is present.
 //   - History is capped to MaxHistoryCandles to keep memory/compute stable.
-//   - Tick mode nudges the last candle with a per-tick price feed.
-//   - Works with or without BRIDGE_URL; when absent, we fall back to broker calls.
+//   - The tiny indirection for monotonic time is here (monotonicNowSeconds).
 
 package main
 
@@ -25,9 +24,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
-	"sort"
 )
 
 // runLive executes the real-time loop with cadence intervalSec (seconds).
@@ -43,26 +42,20 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 		trader.cfg.LongOnly, trader.cfg.OrderMinUSD, trader.cfg.RiskPerTradePct,
 		trader.cfg.MaxDailyLossPct, trader.cfg.TakeProfitPct, trader.cfg.StopLossPct, trader.cfg.MaxHistoryCandles)
 
-	// --- Startup health-gate ---
+	// --- Health gate (bridge only). When no bridge, this is a no-op by design. ---
 	if trader.cfg.BridgeURL != "" {
 		if !waitBridgeHealthy(trader.cfg.BridgeURL, 90*time.Second) {
 			log.Printf("[BOOT] bridge health not ready after 90s; proceeding with warmup anyway")
 		}
-	} else {
-		if !waitBrokerHealthy(ctx, trader, 90*time.Second) {
-			log.Printf("[BOOT] broker health not ready after 90s; proceeding with warmup anyway")
-		}
 	}
 
-	// Warmup candles (paged backfill from bridge to MaxHistoryCandles; else large single fetch from broker)
+	// Warmup candles: prefer bridge paged history if configured; otherwise broker.
 	var history []Candle
 	target := trader.cfg.MaxHistoryCandles
 	if target <= 0 {
 		target = 6000
 	}
-
 	if trader.cfg.BridgeURL != "" {
-		// Small retry loop to handle racey startup of the bridge
 		const tries = 10
 		for i := 0; i < tries && len(history) == 0; i++ {
 			if hs, err := fetchHistoryPaged(trader.cfg.BridgeURL, trader.cfg.ProductID, trader.cfg.Granularity, 300, target); err == nil && len(hs) > 0 {
@@ -76,25 +69,11 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 		}
 	}
 	if len(history) == 0 {
-		// Broker warmup: try to request a large batch up to target (capped) in one call.
-		limitTry := target
-		if limitTry > 1000 { // conservative cap for typical exchange limits
-			limitTry = 1000
-		}
-		if limitTry < 350 {
-			limitTry = 350
-		}
-		if cs, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, limitTry); err == nil && len(cs) > 0 {
+		// Broker fallback (single page; per-exchange limit honored by implementation)
+		if cs, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 350); err == nil && len(cs) > 0 {
 			history = cs
-			log.Printf("[BOOT] history=%d (broker large batch, limit=%d)", len(history), limitTry)
 		} else if err != nil {
-			// Fallback to a smaller batch if the large one failed
-			if cs2, err2 := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 350); err2 == nil && len(cs2) > 0 {
-				history = cs2
-				log.Printf("[BOOT] history=%d (broker fallback, limit=350)", len(history))
-			} else {
-				log.Printf("warmup GetRecentCandles error: %v", err)
-			}
+			log.Printf("warmup GetRecentCandles error: %v", err)
 		}
 	}
 	if len(history) == 0 {
@@ -113,9 +92,10 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 	}
 	var lastRefit *time.Time
 
-	// Track if we've successfully rebased equity from live balances (metrics gate).
+	// Track if we've successfully rebased equity from live balances.
 	eqReady := !(trader.cfg.UseLiveEquity() && !trader.cfg.DryRun)
 
+	// Initial live-equity rebase: bridge if set, else broker balances.
 	if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun {
 		ctxInit, cancelInit := context.WithTimeout(context.Background(), 5*time.Second)
 		var attempt bool
@@ -132,17 +112,16 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 		cancelInit()
 	}
 
-	// --- Tick vs Candle loop selector (bridge optional) ---
-	useTick := getEnvBool("USE_TICK_PRICE", false)
-	tickInterval := getEnvInt("TICK_INTERVAL_SEC", 1)
+	// Tick vs candle loop (now broker-aware via cfg getters; bridge optional)
+	useTick := trader.cfg.UseTickPrice()
+	tickInterval := trader.cfg.TickIntervalSec()
 	if tickInterval <= 0 {
-		log.Fatalf("[Error] Env Var TICK_INTERVAL_SEC not set to be a positive value: TickInterval(%d) <= 0", tickInterval)
+		log.Fatalf("[Error] TickInterval(%d) <= 0", tickInterval)
 	}
-	candleResync := getEnvInt("CANDLE_RESYNC_SEC", 60)
+	candleResync := trader.cfg.CandleResyncSec()
 	if candleResync <= 0 {
 		candleResync = 60
 	}
-	// -------------------------------------------------------------------
 
 	if useTick {
 		// Tick-driven loop with periodic candle resync
@@ -154,14 +133,13 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				log.Println("shutdown")
 				return
 			default:
-				// Re-read tick interval each iteration (hot reload via env)
-				tickInterval := getEnvInt("TICK_INTERVAL_SEC", 1)
+				// Re-read tick interval each iteration to allow runtime tuning
+				tickInterval = trader.cfg.TickIntervalSec()
 
-				// Periodic candle resync from the broker
+				// Periodic candle resync (always via broker to avoid bridge dependency here)
 				if time.Since(lastCandleSync) >= time.Duration(candleResync)*time.Second {
 					if latestSlice, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 1); err == nil && len(latestSlice) > 0 {
 						latest := latestSlice[len(latestSlice)-1]
-						// Fallback: if broker didn’t set candle.Time, stamp with now()
 						if latest.Time.IsZero() {
 							latest.Time = time.Now().UTC()
 						}
@@ -176,11 +154,11 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 						lastCandleSync = time.Now().UTC()
 						log.Printf("[SYNC] latest=%s history_last=%s len=%d", latest.Time, history[len(history)-1].Time, len(history))
 					} else if err != nil {
-						log.Fatalf("[SYNC] Candle update failed: error: %v", err)
+						log.Fatalf("[SYNC] Candle update failed: %v", err)
 					}
 				}
 
-				// Per-tick price updates
+				// Per-tick price: bridge if present; else broker spot
 				ctxPx, cancelPx := context.WithTimeout(ctx, 2*time.Second)
 				var px float64
 				var stale bool
@@ -197,18 +175,17 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				}
 				cancelPx()
 
-				// Walk-forward refit (optional)
+				// (Optional) Walk-forward refit
 				lastRefit, trader.mdlExt = maybeWalkForwardRefit(trader.cfg, trader.mdlExt, history, lastRefit)
 
 				// Step trader
-				_, err = trader.step(ctx, history)
-				if err != nil {
+				if _, err = trader.step(ctx, history); err != nil {
 					log.Printf("step err: %v", err)
 					time.Sleep(time.Duration(tickInterval) * time.Second)
 					continue
 				}
 
-				// Live equity refresh (bridge or broker)
+				// Per-tick live-equity refresh
 				if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun {
 					ctxEq, cancelEq := context.WithTimeout(ctx, 5*time.Second)
 					var bal map[string]float64
@@ -234,7 +211,6 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 					}
 					cancelEq()
 				}
-				// Metrics readiness gate for equity
 				if eqReady || trader.cfg.DryRun || !trader.cfg.UseLiveEquity() {
 					mtxPnL.Set(trader.EquityUSD())
 				} else {
@@ -279,7 +255,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				}
 				log.Printf("%s", msg)
 
-				// Live equity refresh (bridge or broker)
+				// Per-candle live-equity refresh
 				if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun {
 					ctxEq, cancelEq := context.WithTimeout(ctx, 5*time.Second)
 					var bal map[string]float64
@@ -305,7 +281,6 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 					}
 					cancelEq()
 				}
-				// Metrics readiness gate for equity
 				if eqReady || trader.cfg.DryRun || !trader.cfg.UseLiveEquity() {
 					mtxPnL.Set(trader.EquityUSD())
 				} else {
@@ -387,11 +362,11 @@ func computeLiveEquity(bal map[string]float64, base, quote string, lastPrice flo
 
 func initLiveEquity(ctx context.Context, cfg Config, trader *Trader, lastPrice float64) {
 	if lastPrice <= 0 {
-		log.Printf("[EQUITY] waiting for accounts (last price unavailable)")
+		log.Printf("[EQUITY] waiting for bridge accounts (last price unavailable)")
 		return
 	}
 	if ok := attemptLiveEquityRebase(ctx, cfg, trader, lastPrice); !ok {
-		log.Printf("[EQUITY] waiting for accounts (initial rebase pending)")
+		log.Printf("[EQUITY] waiting for bridge accounts (initial rebase pending)")
 	}
 }
 
@@ -535,7 +510,6 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 	}
 	secPer := granularitySeconds(granularity)
 	if secPer <= 0 {
-		// Fallback to single page via broker is handled by caller if this returns empty
 		return nil, fmt.Errorf("unsupported granularity: %s", granularity)
 	}
 
@@ -689,29 +663,6 @@ func waitBridgeHealthy(bridgeURL string, timeout time.Duration) bool {
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 		}
-		time.Sleep(2 * time.Second)
-	}
-	return false
-}
-
-// ---- NEW: broker health gate (no bridge required) ----
-func waitBrokerHealthy(ctx context.Context, trader *Trader, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		ctx1, cancel1 := context.WithTimeout(ctx, 3*time.Second)
-		if px, err := trader.broker.GetNowPrice(ctx1, trader.cfg.ProductID); err == nil && px > 0 {
-			cancel1()
-			return true
-		}
-		cancel1()
-
-		ctx2, cancel2 := context.WithTimeout(ctx, 3*time.Second)
-		if cs, err := trader.broker.GetRecentCandles(ctx2, trader.cfg.ProductID, trader.cfg.Granularity, 1); err == nil && len(cs) > 0 {
-			cancel2()
-			return true
-		}
-		cancel2()
-
 		time.Sleep(2 * time.Second)
 	}
 	return false
