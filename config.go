@@ -11,7 +11,10 @@
 //   cfg := loadConfigFromEnv()
 package main
 
-import "strings"
+import (
+	"os"
+	"strings"
+)
 
 // Config holds all runtime knobs for trading and operations.
 type Config struct {
@@ -58,19 +61,51 @@ func loadConfigFromEnv() Config {
 		StateFile:         getEnv("STATE_FILE", "/opt/coinbase/state/bot_state.json"),
 	}
 
-	// Broker-scoped overrides (e.g., BINANCE_FEE_RATE_PCT, BINANCE_ORDER_MIN_USD)
+	// Broker-scoped overrides (e.g., BINANCE_*). If not present, keep existing values.
 	broker := strings.ToUpper(strings.TrimSpace(getEnv("BROKER", "")))
 	if broker != "" {
 		cfg.FeeRatePct = getEnvFloat(broker+"_FEE_RATE_PCT", cfg.FeeRatePct)
 		cfg.OrderMinUSD = getEnvFloat(broker+"_ORDER_MIN_USD", cfg.OrderMinUSD)
+		cfg.DryRun = getEnvBool(broker+"_DRY_RUN", cfg.DryRun)
 	}
 
 	return cfg
 }
 
+// helpers to check presence without changing defaults
+func hasEnv(key string) bool { return strings.TrimSpace(os.Getenv(key)) != "" }
+
 // UseLiveEquity returns true if live balances should rebase equity.
+// Per-broker override (e.g., BINANCE_USE_LIVE_EQUITY), falling back to global.
 func (c *Config) UseLiveEquity() bool {
+	b := strings.ToUpper(strings.TrimSpace(getEnv("BROKER", "")))
+	if b != "" {
+		return getEnvBool(b+"_USE_LIVE_EQUITY", getEnvBool("USE_LIVE_EQUITY", false))
+	}
 	return getEnvBool("USE_LIVE_EQUITY", false)
+}
+
+// Per-broker tick loop toggles (fallback to global if provided)
+func (c *Config) UseTickPrice() bool {
+	b := strings.ToUpper(strings.TrimSpace(getEnv("BROKER", "")))
+	if b != "" {
+		return getEnvBool(b+"_USE_TICK_PRICE", getEnvBool("USE_TICK_PRICE", false))
+	}
+	return getEnvBool("USE_TICK_PRICE", false)
+}
+func (c *Config) TickIntervalSec() int {
+	b := strings.ToUpper(strings.TrimSpace(getEnv("BROKER", "")))
+	if b != "" {
+		return getEnvInt(b+"_TICK_INTERVAL_SEC", getEnvInt("TICK_INTERVAL_SEC", 1))
+	}
+	return getEnvInt("TICK_INTERVAL_SEC", 1)
+}
+func (c *Config) CandleResyncSec() int {
+	b := strings.ToUpper(strings.TrimSpace(getEnv("BROKER", "")))
+	if b != "" {
+		return getEnvInt(b+"_CANDLE_RESYNC_SEC", getEnvInt("CANDLE_RESYNC_SEC", 60))
+	}
+	return getEnvInt("CANDLE_RESYNC_SEC", 60)
 }
 
 // ---- Phase-7 toggles (append-only; no behavior changes unless envs set) ----
