@@ -47,6 +47,30 @@ services:
       monitoring_network:
         aliases: [bot-binance]
 
+  bot_hitbtc:
+    image: ghcr.io/chidi150c/coinbase-bot:latest
+    command: ["-live", "-interval", "1"]
+    volumes:
+      - /opt/coinbase/env:/opt/coinbase/env:ro
+      - /opt/coinbase/state:/opt/coinbase/state
+    env_file:
+      - /opt/coinbase/env/bot.env
+      - /opt/coinbase/env/hitbtc.env          # HITBTC_API_KEY/SECRET, base URL, sandbox flag
+      - /opt/coinbase/env/bot_hitbtc.env      # broker/product/state overrides for HitBTC
+    restart: unless-stopped
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["NONE"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      monitoring_network:
+        aliases: [bot-hitbtc]
+
   bridge:
     image: ghcr.io/chidi150c/coinbase-bridge:latest
     env_file:

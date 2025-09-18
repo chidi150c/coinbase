@@ -165,13 +165,13 @@ func (b *HitBTCBroker) PlaceMarketQuote(ctx context.Context, product string, sid
 	}
 
 	return &PlacedOrder{
-		ID:            firstNonEmpty(resp.ClientOrderID, resp.ID.String()),
-		ProductID:     product,          // keep caller's product id shape
+		ID:            hbFirstNonEmpty(resp.ClientOrderID, resp.ID.String()),
+		ProductID:     product, // keep caller's product id shape
 		Side:          side,
 		Price:         price,            // approximate avg fill
 		BaseSize:      filledQty,        // filled base quantity
 		QuoteSpent:    price * filledQty, // approx (fees excluded)
-		CommissionUSD: 0,                // trading loop applies t.cfg.FeeRatePct
+		CommissionUSD: 0,                 // trading loop applies t.cfg.FeeRatePct
 		CreateTime:    time.Now(),
 	}, nil
 }
@@ -194,13 +194,13 @@ func (b *HitBTCBroker) GetRecentCandles(ctx context.Context, product string, gra
 	}
 
 	var arr []struct {
-		Timestamp    string `json:"timestamp"`
-		Open         string `json:"open"`
-		Close        string `json:"close"`
-		Min          string `json:"min"`
-		Max          string `json:"max"`
-		Volume       string `json:"volume"`
-		VolumeQuote  string `json:"volume_quote"`
+		Timestamp   string `json:"timestamp"`
+		Open        string `json:"open"`
+		Close       string `json:"close"`
+		Min         string `json:"min"`
+		Max         string `json:"max"`
+		Volume      string `json:"volume"`
+		VolumeQuote string `json:"volume_quote"`
 	}
 	if err := json.Unmarshal(data, &arr); err != nil {
 		return nil, fmt.Errorf("decode candles: %w", err)
@@ -226,7 +226,7 @@ func (b *HitBTCBroker) GetRecentCandles(ctx context.Context, product string, gra
 			Volume: vol,
 		})
 	}
-	// Ensure chronological ascending, most bots expect ascending.
+	// ascending chronological order
 	sort.Slice(candles, func(i, j int) bool { return candles[i].Time.Before(candles[j].Time) })
 	return candles, nil
 }
@@ -365,7 +365,7 @@ func (b *HitBTCBroker) fetchSpotBalances(ctx context.Context) (map[string]float6
 	return out, nil
 }
 
-// ---- small utils (file-local names to avoid collisions) ----
+// ---- small utils ----
 
 func hbNormalizeSymbol(product string) string {
 	p := strings.ToUpper(strings.TrimSpace(product))
@@ -405,7 +405,7 @@ func hbFloorStep(x, step float64) float64 {
 	return math.Floor(x/step) * step
 }
 
-func firstNonEmpty(a, b string) string {
+func hbFirstNonEmpty(a, b string) string {
 	if a != "" {
 		return a
 	}
