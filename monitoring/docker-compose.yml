@@ -1,4 +1,51 @@
 services:
+  bridge_hitbtc:
+    build:
+      context: ./bridge
+      dockerfile: Dockerfile.ws
+    container_name: bridge_hitbtc
+    environment:
+      EXCHANGE: "hitbtc"
+      SYMBOL: "BTCUSDT"
+      PORT: "8788"
+      STALE_MS: "3000"
+    networks:
+      - monitoring_network
+    restart: unless-stopped
+
+  bridge_binance:
+    build:
+      context: ./bridge
+      dockerfile: Dockerfile.ws
+    container_name: bridge_binance
+    environment:
+      EXCHANGE: "binance"
+      SYMBOL: "BTCUSDT"
+      PORT: "8789"
+      STALE_MS: "3000"
+    networks:
+      - monitoring_network
+    restart: unless-stopped
+
+  bridge:
+    image: ghcr.io/chidi150c/coinbase-bridge:latest
+    env_file:
+      - /opt/coinbase/env/bridge.env
+    expose:
+      - "8787"
+    restart: unless-stopped
+    healthcheck:
+      test: ["NONE"]   # image may not include wget/curl
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      monitoring_network:
+        aliases: [bridge]
+
+  
   bot:
     image: ghcr.io/chidi150c/coinbase-bot:latest
     command: ["-live", "-interval", "1"]
@@ -70,24 +117,6 @@ services:
     networks:
       monitoring_network:
         aliases: [bot-hitbtc]
-
-  bridge:
-    image: ghcr.io/chidi150c/coinbase-bridge:latest
-    env_file:
-      - /opt/coinbase/env/bridge.env
-    expose:
-      - "8787"
-    restart: unless-stopped
-    healthcheck:
-      test: ["NONE"]   # image may not include wget/curl
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "5"
-    networks:
-      monitoring_network:
-        aliases: [bridge]
 
   prometheus:
     image: prom/prometheus:latest
