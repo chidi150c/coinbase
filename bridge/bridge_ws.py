@@ -55,9 +55,7 @@ async def _ws_loop_binance():
     backoff = 1
     while True:
         try:
-            async with websockets.connect(
-                url, ping_interval=15, ping_timeout=15, max_queue=1024
-            ) as ws:
+            async with websockets.connect(url, ping_interval=15, ping_timeout=15, max_queue=1024) as ws:
                 backoff = 1
                 while True:
                     msg = await ws.recv()
@@ -67,13 +65,11 @@ async def _ws_loop_binance():
                     if b > 0 and a > 0:
                         mid = (a + b) / 2.0
                         ts = int(data.get("E") or _now_ms())
-                        last_price = mid
-                        last_ts_ms = ts
+                        last_price, last_ts_ms = mid, ts
                         _update_candle(mid, ts, 0.0)
         except Exception:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 15)
-
 
 def _split_symbol(sym: str) -> (str, str):
     """Guess BASE-QUOTE for HitBTC (common suffixes)."""
