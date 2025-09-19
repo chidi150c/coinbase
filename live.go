@@ -254,7 +254,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 					cancelEq()
 				}
 				// Metrics readiness gate for equity
-			if eqReady || trader.cfg.DryRun || !trader.cfg.UseLiveEquity() {
+				if eqReady || trader.cfg.DryRun || !trader.cfg.UseLiveEquity() {
 					mtxPnL.Set(trader.EquityUSD())
 				} else {
 					log.Printf("[EQUITY] waiting for accounts (metric withheld)")
@@ -493,8 +493,43 @@ func maybeWalkForwardRefit(cfg Config, mdl *ExtendedLogit, history []Candle, las
 type bridgePriceResp struct {
 	ProductID string  `json:"product_id"`
 	Price     float64 `json:"price"`
-	TS        any     `json:"ts"`   // was: string — accept number or string to avoid decode errors
+	TS        any     `json:"ts"`   // accept number/string timestamps
 	Stale     bool    `json:"stale"`
+}
+
+// parseBridgeTS converts a flexible bridge TS (number seconds/ms or string unix/RFC3339) into time.
+func parseBridgeTS(v any) (time.Time, bool) {
+	switch t := v.(type) {
+	case float64:
+		// Treat as unix seconds; if large, assume ms.
+		n := int64(t)
+		if n > 1e12 { // ms
+			return time.Unix(n/1000, 0).UTC(), true
+		}
+		if n > 0 {
+			return time.Unix(n, 0).UTC(), true
+		}
+	case string:
+		s := strings.TrimSpace(t)
+		if s == "" {
+			return time.Time{}, false
+		}
+		// Try numeric first
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			n := int64(f)
+			if n > 1e12 { // ms
+				return time.Unix(n/1000, 0).UTC(), true
+			}
+			if n > 0 {
+				return time.Unix(n, 0).UTC(), true
+			}
+		}
+		// Try RFC3339
+		if tt, err := time.Parse(time.RFC3339, s); err == nil {
+			return tt.UTC(), true
+		}
+	}
+	return time.Time{}, false
 }
 
 func fetchBridgePrice(ctx context.Context, bridgeURL, productID string) (float64, bool, error) {
@@ -516,7 +551,20 @@ func fetchBridgePrice(ctx context.Context, bridgeURL, productID string) (float64
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return 0, false, err
 	}
-	return payload.Price, payload.Stale, nil
+
+	// Adjust 'stale' based on TS age: treat ticks as fresh if TS is recent (≤3s).
+	stale := payload.Stale
+	if ts, ok := parseBridgeTS(payload.TS); ok {
+		age := time.Since(ts)
+		if age < 0 {
+			age = 0
+		}
+		if stale && age <= 3*time.Second {
+			stale = false
+		}
+	}
+
+	return payload.Price, stale, nil
 }
 
 func applyTickToLastCandle(history []Candle, lastPrice float64) {
