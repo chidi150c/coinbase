@@ -81,7 +81,90 @@ def _split_symbol(sym: str) -> (str, str):
     # fallback
     return s, "USDT"
 
+# --- replace your _ws_loop_hitbtc() with this minimal version ---
 async def _ws_loop_hitbtc():
+    """
+    HitBTC public WS: subscribe to *both* ticker/price/1s and ticker/1s.
+    Use last price 'c' when available; otherwise mid of best bid/ask from ticker/1s.
+    Endpoint: wss://api.hitbtc.com/api/3/ws/public
+    """
+    global last_price, last_ts_ms
+    url = "wss://api.hitbtc.com/api/3/ws/public"
+
+    subs = [
+        {
+            "method": "subscribe",
+            "ch": "ticker/price/1s",
+            "params": {"symbols": [SYMBOL]},
+            "id": 1,
+        },
+        {
+            "method": "subscribe",
+            "ch": "ticker/1s",
+            "params": {"symbols": [SYMBOL]},
+            "id": 2,
+        },
+    ]
+
+    backoff = 1
+    while True:
+        try:
+            # HitBTC pings every ~30s; websockets handles control frames
+            async with websockets.connect(
+                url, ping_interval=25, ping_timeout=25, max_queue=1024
+            ) as ws:
+                # subscribe to both feeds
+                for s in subs:
+                    await ws.send(json.dumps(s))
+                backoff = 1
+
+                while True:
+                    msg = await ws.recv()
+                    try:
+                        data = json.loads(msg)
+                    except Exception:
+                        continue
+
+                    if not isinstance(data, dict):
+                        continue
+
+                    ch = data.get("ch")
+                    d = data.get("data")
+                    if not d or ch not in ("ticker/price/1s", "ticker/1s"):
+                        continue
+
+                    payload = d.get(SYMBOL) or {}
+                    # prefer exchange-provided timestamp; fallback to now
+                    ts = int(payload.get("t") or _now_ms())
+
+                    # price source priority:
+                    # 1) 'c' from either channel (last price)
+                    # 2) mid of best a/b from ticker/1s when 'c' absent
+                    px = None
+                    c = payload.get("c")
+                    if c is not None:
+                        try:
+                            px = float(c)
+                        except Exception:
+                            px = None
+
+                    if px is None and ch == "ticker/1s":
+                        try:
+                            a = float(payload.get("a") or 0)
+                            b = float(payload.get("b") or 0)
+                            if a > 0 and b > 0:
+                                px = (a + b) / 2.0
+                        except Exception:
+                            px = None
+
+                    if px is not None and px > 0:
+                        last_price, last_ts_ms = px, ts
+                        _update_candle(px, ts, 0.0)
+
+        except Exception:
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 15)
+
     """
     HitBTC public WS: subscribe to multiple feeds and use whichever updates first:
       - orderbook/top/1000ms (mid = (bid+ask)/2)
