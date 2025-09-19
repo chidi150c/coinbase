@@ -493,7 +493,7 @@ func maybeWalkForwardRefit(cfg Config, mdl *ExtendedLogit, history []Candle, las
 type bridgePriceResp struct {
 	ProductID string  `json:"product_id"`
 	Price     float64 `json:"price"`
-	TS        string  `json:"ts"`
+	TS        any     `json:"ts"`   // was: string — accept number or string to avoid decode errors
 	Stale     bool    `json:"stale"`
 }
 

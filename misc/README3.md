@@ -77,6 +77,11 @@ curl -4 -s https://ifconfig.me ; echo   # <-- whitelist this IPv4 on your Binanc
 172.236.14.121
   xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 =======================================================
+# Reset both working tree and index to the last commit
+git restore --source=HEAD --staged --worktree .
+# or (older Git)
+git checkout -- .
+git reset --hard
 
 
 
