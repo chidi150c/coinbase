@@ -81,7 +81,6 @@ def _split_symbol(sym: str) -> (str, str):
     # fallback
     return s, "USDT"
 
-# --- replace your _ws_loop_hitbtc() with this minimal version ---
 async def _ws_loop_hitbtc():
     """
     HitBTC public WS: subscribe to *both* ticker/price/1s and ticker/1s.
@@ -160,105 +159,6 @@ async def _ws_loop_hitbtc():
                     if px is not None and px > 0:
                         last_price, last_ts_ms = px, ts
                         _update_candle(px, ts, 0.0)
-
-        except Exception:
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 15)
-
-    """
-    HitBTC public WS: subscribe to multiple feeds and use whichever updates first:
-      - orderbook/top/1000ms (mid = (bid+ask)/2)
-      - ticker/price/1s      (last price 'c')
-      - price/rate/1s        (converted rate for BASE→QUOTE)
-    Endpoint: wss://api.hitbtc.com/api/3/ws/public
-    """
-    global last_price, last_ts_ms
-    url = "wss://api.hitbtc.com/api/3/ws/public"
-    base, quote = _split_symbol(SYMBOL)
-
-    subs = [
-        {
-            "method": "subscribe",
-            "ch": "orderbook/top/1000ms",
-            "params": {"symbols": [SYMBOL]},
-            "id": 1,
-        },
-        {
-            "method": "subscribe",
-            "ch": "ticker/price/1s",
-            "params": {"symbols": [SYMBOL]},
-            "id": 2,
-        },
-        {
-            "method": "subscribe",
-            "ch": "price/rate/1s",
-            "params": {"currencies": [base], "target_currency": quote},
-            "id": 3,
-        },
-    ]
-
-    backoff = 1
-    while True:
-        try:
-            async with websockets.connect(url, ping_interval=25, ping_timeout=25, max_queue=1024) as ws:
-                for s in subs:
-                    await ws.send(json.dumps(s))
-                backoff = 1
-
-                while True:
-                    raw = await ws.recv()
-                    try:
-                        data = json.loads(raw)
-                    except Exception:
-                        continue
-
-                    ch = data.get("ch")
-
-                    # --- orderbook/top/1000ms: mid from bid/ask ---
-                    if ch == "orderbook/top/1000ms" and "data" in data:
-                        row = (data["data"] or {}).get(SYMBOL) or {}
-                        a = row.get("a"); b = row.get("b")
-                        if a is not None and b is not None:
-                            try:
-                                ask = float(a); bid = float(b)
-                                if ask > 0 and bid > 0:
-                                    mid = (ask + bid) / 2.0
-                                    ts = int(row.get("t") or _now_ms())  # ms
-                                    last_price, last_ts_ms = mid, ts
-                                    _update_candle(mid, ts, 0.0)
-                            except Exception:
-                                pass
-                        continue
-
-                    # --- ticker/price/1s: last 'c' ---
-                    if ch == "ticker/price/1s" and "data" in data:
-                        payload = (data["data"] or {}).get(SYMBOL) or {}
-                        c = payload.get("c"); t = payload.get("t")
-                        if c is not None:
-                            try:
-                                px = float(c)
-                                ts = int(t or _now_ms())
-                                last_price, last_ts_ms = px, ts
-                                _update_candle(px, ts, 0.0)
-                            except Exception:
-                                pass
-                        continue
-
-                    # --- price/rate/1s: data -> {BASE: { t, r }} ---
-                    if ch == "price/rate/1s" and "data" in data:
-                        cur = (data["data"] or {}).get(base) or {}
-                        r = cur.get("r"); t = cur.get("t")
-                        if r is not None:
-                            try:
-                                px = float(r)
-                                ts = int(t or _now_ms())
-                                last_price, last_ts_ms = px, ts
-                                _update_candle(px, ts, 0.0)
-                            except Exception:
-                                pass
-                        continue
-
-                    # ignore other responses (subscription acks, etc.)
 
         except Exception:
             await asyncio.sleep(backoff)
