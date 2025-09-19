@@ -77,23 +77,24 @@ async def _ws_loop_binance():
 
 async def _ws_loop_hitbtc():
     """
-    HitBTC public WS: subscribe to ticker/price/1s
+    HitBTC public WS: subscribe to orderbook/top/1000ms
     Endpoint: wss://api.hitbtc.com/api/3/ws/public
     Subscription:
       {
         "method":"subscribe",
-        "ch":"ticker/price/1s",
+        "ch":"orderbook/top/1000ms",
         "params":{"symbols":["BTCUSDT"]},
         "id":1
       }
     Data arrives as:
-      {"ch":"ticker/price/1s","data":{"BTCUSDT":{"t":..., "c":"<last>" , ...}}}
+      {"ch":"orderbook/top/1000ms","data":{"BTCUSDT":{"t":..., "a":"<ask>", "b":"<bid>", ...}}}
+    We publish mid = (bid+ask)/2.
     """
     global last_price, last_ts_ms
     url = "wss://api.hitbtc.com/api/3/ws/public"
     sub = {
         "method":"subscribe",
-        "ch":"ticker/price/1s",
+        "ch":"orderbook/top/1000ms",
         "params":{"symbols":[SYMBOL]},
         "id": 1
     }
@@ -105,26 +106,30 @@ async def _ws_loop_hitbtc():
                 backoff = 1
                 while True:
                     msg = await ws.recv()
-                    # HitBTC also sends ping frames; websockets handles control pings.
-                    # Data messages we care about:
                     try:
                         data = json.loads(msg)
                     except Exception:
                         continue
 
-                    # Successful subscription: {"result": {...}, "id":1}
-                    if "data" in data and data.get("ch") == "ticker/price/1s":
-                        payload = data["data"].get(SYMBOL) or {}
-                        c = payload.get("c")
-                        t = payload.get("t")  # ms
-                        if c is not None:
-                            try:
-                                px = float(c)
-                                ts = int(t or _now_ms())
-                                last_price, last_ts_ms = px, ts
-                                _update_candle(px, ts, 0.0)
-                            except Exception:
-                                pass
+                    # Successful subscription returns {"result":{...},"id":1}
+                    # Updates we want:
+                    # {"ch":"orderbook/top/1000ms","data":{"BTCUSDT":{"t":<ms>,"a":"...","A":"...","b":"...","B":"..."}}}
+                    if data.get("ch") == "orderbook/top/1000ms" and "data" in data:
+                        row = (data["data"] or {}).get(SYMBOL) or {}
+                        a = row.get("a")
+                        b = row.get("b")
+                        if a is None or b is None:
+                            continue
+                        try:
+                            ask = float(a)
+                            bid = float(b)
+                            if ask > 0 and bid > 0:
+                                mid = (ask + bid) / 2.0
+                                ts = int(row.get("t") or _now_ms())  # ms
+                                last_price, last_ts_ms = mid, ts
+                                _update_candle(mid, ts, 0.0)
+                        except Exception:
+                            pass
         except Exception:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 15)
