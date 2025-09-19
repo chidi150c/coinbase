@@ -11,15 +11,19 @@
 //   cfg := loadConfigFromEnv()
 package main
 
+// NOTE: All knobs here are now read from UNPREFIXED env keys. Broker-specific
+// API creds remain broker-prefixed (e.g., BINANCE_API_KEY/SECRET, HITBTC_API_KEY/SECRET)
+// and are consumed by the respective broker clients, not here.
+
 import "strings"
 
 // Config holds all runtime knobs for trading and operations.
 type Config struct {
 	// Trading target
-	ProductID   string // e.g., "BTC-USD"
+	ProductID   string // e.g., "BTC-USD" or "BTCUSDT"
 	Granularity string // e.g., "ONE_MINUTE"
 
-	// Safety
+	// Safety & sizing
 	DryRun          bool
 	MaxDailyLossPct float64
 	RiskPerTradePct float64
@@ -32,16 +36,16 @@ type Config struct {
 
 	// Ops
 	Port              int
-	BridgeURL         string // e.g., http://127.0.0.1:8787 (only for the bridge/coinbase path)
+	BridgeURL         string // optional: http://127.0.0.1:8787 (only when using the bridge)
 	MaxHistoryCandles int    // plural: loaded from MAX_HISTORY_CANDLES
-	StateFile         string // path to persist bot state (configurable via env)
+	StateFile         string // path to persist bot state
 
-	// Loop control (now broker-overridable)
+	// Loop control (unprefixed; universal)
 	UseTickPrice    bool // enable tick-driven loop
 	TickIntervalSec int  // per-tick cadence
 	CandleResyncSec int  // periodic candle resync in tick loop
 
-	// Live equity gating (now broker-overridable)
+	// Live equity gating (unprefixed; universal)
 	LiveEquity bool // if true, rebase & refresh equity from live balances
 }
 
@@ -51,6 +55,8 @@ func loadConfigFromEnv() Config {
 	cfg := Config{
 		ProductID:         getEnv("PRODUCT_ID", "BTC-USD"),
 		Granularity:       getEnv("GRANULARITY", "ONE_MINUTE"),
+
+		// Universal, unprefixed knobs
 		DryRun:            getEnvBool("DRY_RUN", true),
 		MaxDailyLossPct:   getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
 		RiskPerTradePct:   getEnvFloat("RISK_PER_TRADE_PCT", 0.25),
@@ -60,40 +66,55 @@ func loadConfigFromEnv() Config {
 		OrderMinUSD:       getEnvFloat("ORDER_MIN_USD", 5.00),
 		LongOnly:          getEnvBool("LONG_ONLY", true),
 		FeeRatePct:        getEnvFloat("FEE_RATE_PCT", 0.3),
+
 		Port:              getEnvInt("PORT", 8080),
 		BridgeURL:         getEnv("BRIDGE_URL", ""),
 		MaxHistoryCandles: getEnvInt("MAX_HISTORY_CANDLES", 5000),
 		StateFile:         getEnv("STATE_FILE", "/opt/coinbase/state/bot_state.json"),
 
-		// Defaults (can be overridden per-broker below)
+		// Loop control
 		UseTickPrice:    getEnvBool("USE_TICK_PRICE", false),
 		TickIntervalSec: getEnvInt("TICK_INTERVAL_SEC", 1),
 		CandleResyncSec: getEnvInt("CANDLE_RESYNC_SEC", 60),
-		LiveEquity:      getEnvBool("USE_LIVE_EQUITY", false),
+
+		// Live equity
+		LiveEquity: getEnvBool("USE_LIVE_EQUITY", false),
 	}
 
-	// Broker-scoped overrides (e.g., BINANCE_FEE_RATE_PCT, HITBTC_TICK_INTERVAL_SEC)
-	broker := strings.ToUpper(strings.TrimSpace(getEnv("BROKER", "")))
-	if broker != "" {
-		cfg.FeeRatePct = getEnvFloat(broker+"_FEE_RATE_PCT", cfg.FeeRatePct)
-		cfg.OrderMinUSD = getEnvFloat(broker+"_ORDER_MIN_USD", cfg.OrderMinUSD)
-		cfg.DryRun = getEnvBool(broker+"_DRY_RUN", cfg.DryRun)
-
-		// Per-broker loop controls
-		cfg.UseTickPrice = getEnvBool(broker+"_USE_TICK_PRICE", cfg.UseTickPrice)
-		cfg.TickIntervalSec = getEnvInt(broker+"_TICK_INTERVAL_SEC", cfg.TickIntervalSec)
-		cfg.CandleResyncSec = getEnvInt(broker+"_CANDLE_RESYNC_SEC", cfg.CandleResyncSec)
-
-		// Per-broker live-equity gate
-		cfg.LiveEquity = getEnvBool(broker+"_USE_LIVE_EQUITY", cfg.LiveEquity)
-	}
+	// Historical carry-over: if someone still sets BROKER=X, we may still
+	// want to validate it's present, but we no longer use it to select knobs.
+	_ = strings.TrimSpace(getEnv("BROKER", ""))
 
 	return cfg
 }
 
-// UseLiveEquity returns true if live balances should rebase equity.
+// ---- cfg helpers (getter methods) ----
+// These fetch from env at call-time (falling back to the struct's initial values).
+// This lets you tweak knobs live IF your process env is refreshed.
+
 func (c *Config) UseLiveEquity() bool {
-	return c.LiveEquity
+	return getEnvBool("USE_LIVE_EQUITY", c.LiveEquity)
+}
+
+func (c *Config) UseTick() bool {
+	return getEnvBool("USE_TICK_PRICE", c.UseTickPrice)
+}
+
+func (c *Config) TickInterval() int {
+	// Default to initial value; clamp to >=1
+	ti := getEnvInt("TICK_INTERVAL_SEC", c.TickIntervalSec)
+	if ti <= 0 {
+		ti = 1
+	}
+	return ti
+}
+
+func (c *Config) CandleResync() int {
+	cr := getEnvInt("CANDLE_RESYNC_SEC", c.CandleResyncSec)
+	if cr <= 0 {
+		cr = 60
+	}
+	return cr
 }
 
 // ---- Phase-7 toggles (append-only; no behavior changes unless envs set) ----
@@ -128,7 +149,6 @@ func (c *Config) Extended() ExtendedToggles {
 	}
 }
 
-// --- NEW (minimal, optional): trailing environment accessors ---
-// Safe defaults ensure no behavior change unless the envs are set.
+// --- trailing env accessors (unchanged; universal) ---
 func (c *Config) TrailActivatePct() float64 { return getEnvFloat("TRAIL_ACTIVATE_PCT", 1.2) }
 func (c *Config) TrailDistancePct() float64 { return getEnvFloat("TRAIL_DISTANCE_PCT", 0.6) }

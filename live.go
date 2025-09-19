@@ -4,8 +4,7 @@
 // runLive drives the trading loop in real time:
 //   • Warm up by fetching candles (paged from bridge if available; otherwise a large batch from the broker).
 //   • Fit the tiny ML model on warmup history.
-//   • Every intervalSec seconds, fetch the latest candle(s), update history,
-//     ask the Trader to step (which may OPEN/HOLD/EXIT), and update metrics.
+//   • On each cadence, update history, step the Trader, and update metrics.
 //
 // Notes:
 //   - We prefer real OHLCV from the /candles endpoint instead of synthesizing candles.
@@ -20,7 +19,6 @@ import (
 	"log"
 	"time"
 
-	// Minimal additions for live-equity support:
 	"encoding/json"
 	"fmt"
 	"io"
@@ -38,7 +36,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 	log.Printf("Starting %s — product=%s dry_run=%v",
 		trader.broker.Name(), trader.cfg.ProductID, trader.cfg.DryRun)
 
-	// Safety banner for operators (no behavior change)
+	// Safety banner
 	log.Printf("[SAFETY] LONG_ONLY=%v | ORDER_MIN_USD=%.2f | RISK_PER_TRADE_PCT=%.2f | MAX_DAILY_LOSS_PCT=%.2f | TAKE_PROFIT_PCT=%.2f | STOP_LOSS_PCT=%.2f | MAX_HISTORY_CANDLES=%d",
 		trader.cfg.LongOnly, trader.cfg.OrderMinUSD, trader.cfg.RiskPerTradePct,
 		trader.cfg.MaxDailyLossPct, trader.cfg.TakeProfitPct, trader.cfg.StopLossPct, trader.cfg.MaxHistoryCandles)
@@ -62,7 +60,6 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 	}
 
 	if trader.cfg.BridgeURL != "" {
-		// Small retry loop to handle racey startup of the bridge
 		const tries = 10
 		for i := 0; i < tries && len(history) == 0; i++ {
 			if hs, err := fetchHistoryPaged(trader.cfg.BridgeURL, trader.cfg.ProductID, trader.cfg.Granularity, 300, target); err == nil && len(hs) > 0 {
@@ -76,9 +73,8 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 		}
 	}
 	if len(history) == 0 {
-		// Broker warmup: try to request a large batch up to target (capped) in one call.
 		limitTry := target
-		if limitTry > 1000 { // conservative cap for typical exchange limits
+		if limitTry > 1000 {
 			limitTry = 1000
 		}
 		if limitTry < 350 {
@@ -88,7 +84,6 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 			history = cs
 			log.Printf("[BOOT] history=%d (broker large batch, limit=%d)", len(history), limitTry)
 		} else if err != nil {
-			// Fallback to a smaller batch if the large one failed
 			if cs2, err2 := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 350); err2 == nil && len(cs2) > 0 {
 				history = cs2
 				log.Printf("[BOOT] history=%d (broker fallback, limit=350)", len(history))
@@ -133,15 +128,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 	}
 
 	// --- Tick vs Candle loop selector (bridge optional) ---
-	useTick := getEnvBool("USE_TICK_PRICE", false)
-	tickInterval := getEnvInt("TICK_INTERVAL_SEC", 1)
-	if tickInterval <= 0 {
-		log.Fatalf("[Error] Env Var TICK_INTERVAL_SEC not set to be a positive value: TickInterval(%d) <= 0", tickInterval)
-	}
-	candleResync := getEnvInt("CANDLE_RESYNC_SEC", 60)
-	if candleResync <= 0 {
-		candleResync = 60
-	}
+	useTick := trader.cfg.UseTick()
 	// -------------------------------------------------------------------
 
 	if useTick {
@@ -154,14 +141,10 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				log.Println("shutdown")
 				return
 			default:
-				// Re-read tick interval each iteration (hot reload via env)
-				tickInterval := getEnvInt("TICK_INTERVAL_SEC", 1)
-
-				// Periodic candle resync from the broker
-				if time.Since(lastCandleSync) >= time.Duration(candleResync)*time.Second {
+				// Periodic candle resync from the broker (use getter for hot-ish reload)
+				if time.Since(lastCandleSync) >= time.Duration(trader.cfg.CandleResync())*time.Second {
 					if latestSlice, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 1); err == nil && len(latestSlice) > 0 {
 						latest := latestSlice[len(latestSlice)-1]
-						// Fallback: if broker didn’t set candle.Time, stamp with now()
 						if latest.Time.IsZero() {
 							latest.Time = time.Now().UTC()
 						}
@@ -180,7 +163,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 					}
 				}
 
-				// Per-tick price updates
+				// Per-tick price updates (bridge or broker)
 				ctxPx, cancelPx := context.WithTimeout(ctx, 2*time.Second)
 				var px float64
 				var stale bool
@@ -204,7 +187,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				_, err = trader.step(ctx, history)
 				if err != nil {
 					log.Printf("step err: %v", err)
-					time.Sleep(time.Duration(tickInterval) * time.Second)
+					time.Sleep(time.Duration(trader.cfg.TickInterval()) * time.Second)
 					continue
 				}
 
@@ -235,14 +218,14 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 					cancelEq()
 				}
 				// Metrics readiness gate for equity
-				if eqReady || trader.cfg.DryRun || !trader.cfg.UseLiveEquity() {
+			if eqReady || trader.cfg.DryRun || !trader.cfg.UseLiveEquity() {
 					mtxPnL.Set(trader.EquityUSD())
 				} else {
 					log.Printf("[EQUITY] waiting for accounts (metric withheld)")
 				}
 
-				// Sleep before next iteration
-				time.Sleep(time.Duration(tickInterval) * time.Second)
+				// Sleep before next iteration (use getter for hot-ish reload)
+				time.Sleep(time.Duration(trader.cfg.TickInterval()) * time.Second)
 			}
 		}
 	} else {
@@ -525,7 +508,6 @@ type candleJSON struct {
 }
 
 // fetchHistoryPaged pulls up to want candles from the bridge, paging backward by time.
-// Accepts either a bare JSON array or {"candles":[...]} response forms.
 func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want int) ([]Candle, error) {
 	if pageLimit <= 0 || pageLimit > 350 {
 		pageLimit = 350
@@ -535,11 +517,10 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 	}
 	secPer := granularitySeconds(granularity)
 	if secPer <= 0 {
-		// Fallback to single page via broker is handled by caller if this returns empty
 		return nil, fmt.Errorf("unsupported granularity: %s", granularity)
 	}
 
-	end := time.Now().UTC().Add(-20 * time.Second) // slight pad to avoid edge filtering
+	end := time.Now().UTC().Add(-20 * time.Second)
 	out := make([]Candle, 0, want+1024)
 	seen := make(map[int64]struct{})
 
@@ -599,7 +580,6 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 		}
 	}
 
-	// Sort ascending and cap to 'want'
 	sort.Slice(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
 	if len(out) > want {
 		out = out[len(out)-want:]
@@ -674,7 +654,7 @@ func granularitySeconds(g string) int {
 	}
 }
 
-// ---- NEW: simple /health poller to avoid initial connection-refused ----
+// ---- simple /health poller (bridge) ----
 func waitBridgeHealthy(bridgeURL string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	url := strings.TrimRight(bridgeURL, "/") + "/health"
@@ -694,7 +674,7 @@ func waitBridgeHealthy(bridgeURL string, timeout time.Duration) bool {
 	return false
 }
 
-// ---- NEW: broker health gate (no bridge required) ----
+// ---- broker health gate (no bridge required) ----
 func waitBrokerHealthy(ctx context.Context, trader *Trader, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
