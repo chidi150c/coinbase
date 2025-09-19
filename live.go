@@ -65,6 +65,8 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 			if hs, err := fetchHistoryPaged(trader.cfg.BridgeURL, trader.cfg.ProductID, trader.cfg.Granularity, 300, target); err == nil && len(hs) > 0 {
 				history = hs
 				log.Printf("[BOOT] history=%d (paged to %d target)", len(history), target)
+				// TODO: remove TRACE
+				log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
 				break
 			} else if err != nil {
 				log.Printf("[BOOT] paged warmup error: %v", err)
@@ -83,10 +85,14 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 		if cs, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, limitTry); err == nil && len(cs) > 0 {
 			history = cs
 			log.Printf("[BOOT] history=%d (broker large batch, limit=%d)", len(history), limitTry)
+			// TODO: remove TRACE
+			log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
 		} else if err != nil {
 			if cs2, err2 := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 350); err2 == nil && len(cs2) > 0 {
 				history = cs2
 				log.Printf("[BOOT] history=%d (broker fallback, limit=350)", len(history))
+				// TODO: remove TRACE
+				log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
 			} else {
 				log.Printf("warmup GetRecentCandles error: %v", err)
 			}
@@ -129,6 +135,8 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 
 	// --- Tick vs Candle loop selector (bridge optional) ---
 	useTick := trader.cfg.UseTick()
+	// TODO: remove TRACE
+	log.Printf("TRACE selector useTick=%v granularity=%s tick_interval=%d", useTick, trader.cfg.Granularity, trader.cfg.TickInterval())
 	// -------------------------------------------------------------------
 
 	if useTick {
@@ -157,6 +165,8 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 							history = history[len(history)-trader.cfg.MaxHistoryCandles:]
 						}
 						lastCandleSync = time.Now().UTC()
+						// TODO: remove TRACE
+						log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
 						log.Printf("[SYNC] latest=%s history_last=%s len=%d", latest.Time, history[len(history)-1].Time, len(history))
 					} else if err != nil {
 						log.Fatalf("[SYNC] Candle update failed: error: %v", err)
@@ -174,9 +184,35 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 					px, err = trader.broker.GetNowPrice(ctxPx, trader.cfg.ProductID)
 					stale = false
 				}
+				// TODO: remove TRACE
+				log.Printf("TRACE price_fetch px=%.8f stale=%v err=%v", px, stale, err)
+
+				// Gate traces (reason why [TICK] block may not run)
+				if err != nil {
+					// TODO: remove TRACE
+					log.Printf("TRACE gate:err err=%v", err)
+				} else if stale {
+					// TODO: remove TRACE
+					log.Printf("TRACE gate:stale px=%.8f", px)
+				} else if px <= 0 {
+					// TODO: remove TRACE
+					log.Printf("TRACE gate:px<=0 px=%.8f", px)
+				}
+
 				if err == nil && !stale && px > 0 {
+					// Defensive: ensure history non-empty before tick mutate
+					if len(history) == 0 {
+						// TODO: remove TRACE
+						log.Printf("TRACE gate:history_empty before applyTick")
+						cancelPx()
+						// Skip this iteration safely
+						time.Sleep(time.Duration(trader.cfg.TickInterval()) * time.Second)
+						continue
+					}
 					applyTickToLastCandle(history, px)
 					log.Printf("[TICK] px=%.2f lastClose(before-step)=%.2f", px, history[len(history)-1].Close)
+					// TODO: remove TRACE
+					log.Printf("TRACE TARGET [TICK] px=%.2f lastClose(before-step)=%.2f", px, history[len(history)-1].Close)
 				}
 				cancelPx()
 
@@ -252,6 +288,9 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				if len(history) > trader.cfg.MaxHistoryCandles {
 					history = history[len(history)-trader.cfg.MaxHistoryCandles:]
 				}
+
+				// TODO: remove TRACE
+				log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
 
 				lastRefit, trader.mdlExt = maybeWalkForwardRefit(trader.cfg, trader.mdlExt, history, lastRefit)
 
