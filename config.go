@@ -61,7 +61,7 @@ func loadConfigFromEnv() Config {
 		LongOnly:          getEnvBool("LONG_ONLY", true),
 		FeeRatePct:        getEnvFloat("FEE_RATE_PCT", 0.3),
 		Port:              getEnvInt("PORT", 8080),
-		BridgeURL:         getEnv("BRIDGE_URL", "http://127.0.0.1:8787"),
+		BridgeURL:         getEnv("BRIDGE_URL", ""),
 		MaxHistoryCandles: getEnvInt("MAX_HISTORY_CANDLES", 5000),
 		StateFile:         getEnv("STATE_FILE", "/opt/coinbase/state/bot_state.json"),
 
