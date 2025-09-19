@@ -47,79 +47,33 @@ def _update_candle(px: float, ts_ms: int, vol: float = 0.0) -> None:
 
 async def _ws_loop_binance():
     """
-    Binance WS (combined streams):
-      - <symbol>@trade       => last trade price (fastest)
-      - <symbol>@miniTicker  => 1s mini ticker close
-      - <symbol>@bookTicker  => bid/ask -> midprice fallback
-    We accept the freshest of these and update last_price/ts and M1 aggregator.
+    Binance: bookTicker midprice (bid+ask)/2
+    wss://stream.binance.com:9443/ws/<symbol_lower>@bookTicker
     """
     global last_price, last_ts_ms
-    sym = SYMBOL.lower()
-    streams = f"{sym}@trade/{sym}@miniTicker/{sym}@bookTicker"
-    url = f"wss://stream.binance.com:9443/stream?streams={streams}"
-
+    url = f"wss://stream.binance.com:9443/ws/{SYMBOL.lower()}@bookTicker"
     backoff = 1
     while True:
         try:
             async with websockets.connect(
-                url,
-                ping_interval=15,  # Binance pings ~20s; library will pong
-                ping_timeout=20,
-                max_queue=1024,
+                url, ping_interval=15, ping_timeout=15, max_queue=1024
             ) as ws:
                 backoff = 1
                 while True:
                     msg = await ws.recv()
-                    try:
-                        payload = json.loads(msg)
-                    except Exception:
-                        continue
-
-                    data = payload.get("data") or {}
-                    stream = (payload.get("stream") or "").lower()
-
-                    px: Optional[float] = None
-                    ts: Optional[int] = None
-
-                    if stream.endswith("@trade"):
-                        # fields: p (price), T (trade time), E (event time)
-                        p = data.get("p")
-                        if p is not None:
-                            try:
-                                px = float(p)
-                                ts = int(data.get("T") or data.get("E") or _now_ms())
-                            except Exception:
-                                px = None
-
-                    elif stream.endswith("@miniticker"):
-                        # fields: c (close), E (event time)
-                        c = data.get("c")
-                        if c is not None:
-                            try:
-                                px = float(c)
-                                ts = int(data.get("E") or _now_ms())
-                            except Exception:
-                                px = None
-
-                    elif stream.endswith("@bookticker"):
-                        # fields: b (best bid), a (best ask), E (event time)
-                        try:
-                            b = float(data.get("b") or 0)
-                            a = float(data.get("a") or 0)
-                            if b > 0 and a > 0:
-                                px = (a + b) / 2.0
-                                ts = int(data.get("E") or _now_ms())
-                        except Exception:
-                            px = None
-
-                    if px is not None and px > 0:
-                        last_price = px
-                        last_ts_ms = ts if ts is not None else _now_ms()
-                        _update_candle(px, last_ts_ms, 0.0)
-
+                    data = json.loads(msg)
+                    b = float(data.get("b") or 0)
+                    a = float(data.get("a") or 0)
+                    if b > 0 and a > 0:
+                        mid = (a + b) / 2.0
+                        ts = int(data.get("E") or _now_ms())
+                        last_price = mid
+                        last_ts_ms = ts
+                        _update_candle(mid, ts, 0.0)
         except Exception:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 15)
+
 
 def _split_symbol(sym: str) -> (str, str):
     """Guess BASE-QUOTE for HitBTC (common suffixes)."""
