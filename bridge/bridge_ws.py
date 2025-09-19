@@ -46,11 +46,9 @@ def _update_candle(px: float, ts_ms: int, vol: float = 0.0) -> None:
     _trim_old_candles()
 
 async def _ws_loop_binance():
-    """
-    Binance: bookTicker midprice (bid+ask)/2
-    wss://stream.binance.com:9443/ws/<symbol_lower>@bookTicker
-    """
     global last_price, last_ts_ms
+    # Binance: bookTicker midprice (bid+ask)/2
+    # wss://stream.binance.com:9443/ws/<symbol_lower>@bookTicker
     url = f"wss://stream.binance.com:9443/ws/{SYMBOL.lower()}@bookTicker"
     backoff = 1
     while True:
@@ -65,11 +63,13 @@ async def _ws_loop_binance():
                     if b > 0 and a > 0:
                         mid = (a + b) / 2.0
                         ts = int(data.get("E") or _now_ms())
-                        last_price, last_ts_ms = mid, ts
+                        last_price = mid
+                        last_ts_ms = ts
                         _update_candle(mid, ts, 0.0)
         except Exception:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 15)
+
 
 def _split_symbol(sym: str) -> (str, str):
     """Guess BASE-QUOTE for HitBTC (common suffixes)."""
