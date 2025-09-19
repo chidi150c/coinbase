@@ -45,8 +45,8 @@ services:
       monitoring_network:
         aliases: [bridge]
 
-  
-  bot:
+  bot_hitbtc:
+    depends_on: [bridge_hitbtc]
     image: ghcr.io/chidi150c/coinbase-bot:latest
     command: ["-live", "-interval", "1"]
     volumes:
@@ -54,12 +54,13 @@ services:
       - /opt/coinbase/state:/opt/coinbase/state
     env_file:
       - /opt/coinbase/env/bot.env
-      - /opt/coinbase/env/bot_coinbase.env    # <-- NEW: pin Coinbase broker/symbol/state
+      - /opt/coinbase/env/hitbtc.env          # HITBTC_API_KEY/SECRET, base URL, sandbox flag
+      - /opt/coinbase/env/bot_hitbtc.env      # broker/product/state overrides for HitBTC
     restart: unless-stopped
     expose:
       - "8080"
     healthcheck:
-      test: ["NONE"]   # distroless image: no shell/curl inside
+      test: ["NONE"]
     logging:
       driver: "json-file"
       options:
@@ -67,10 +68,12 @@ services:
         max-file: "5"
     networks:
       monitoring_network:
-        aliases: [bot, coinbase-bot]
+        aliases: [bot-hitbtc]
 
-  # NEW: second bot instance for Binance
+   # NEW: second bot instance for Binance
+  
   bot_binance:
+    depends_on: [bridge_binance]
     image: ghcr.io/chidi150c/coinbase-bot:latest
     command: ["-live", "-interval", "1"]
     volumes:
@@ -94,7 +97,7 @@ services:
       monitoring_network:
         aliases: [bot-binance]
 
-  bot_hitbtc:
+  bot:
     image: ghcr.io/chidi150c/coinbase-bot:latest
     command: ["-live", "-interval", "1"]
     volumes:
@@ -102,13 +105,12 @@ services:
       - /opt/coinbase/state:/opt/coinbase/state
     env_file:
       - /opt/coinbase/env/bot.env
-      - /opt/coinbase/env/hitbtc.env          # HITBTC_API_KEY/SECRET, base URL, sandbox flag
-      - /opt/coinbase/env/bot_hitbtc.env      # broker/product/state overrides for HitBTC
+      - /opt/coinbase/env/bot_coinbase.env    # <-- NEW: pin Coinbase broker/symbol/state
     restart: unless-stopped
     expose:
       - "8080"
     healthcheck:
-      test: ["NONE"]
+      test: ["NONE"]   # distroless image: no shell/curl inside
     logging:
       driver: "json-file"
       options:
@@ -116,7 +118,7 @@ services:
         max-file: "5"
     networks:
       monitoring_network:
-        aliases: [bot-hitbtc]
+        aliases: [bot, coinbase-bot]
 
   prometheus:
     image: prom/prometheus:latest
