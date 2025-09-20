@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 
 # FILE: bridge_binance/ws_binance.py
 # FastAPI app that mirrors Coinbase bridge endpoints/JSON using Binance WS/REST.
 import os, asyncio, json, time, hmac, hashlib, logging
@@ -202,16 +202,27 @@ def get_candles(product_id: str = Query(default=SYMBOL),
         return x * 1000 if x < 1_000_000_000_000 else x
     s_ms = _ms(start)
     e_ms = _ms(end)
+    only_limit = (s_ms is None and e_ms is None)
 
     # serve from memory only for 1-minute (that’s what WS updates)
-    rows: List[Dict[str,str]] = []
     if granularity.upper() == "ONE_MINUTE":
-        keys = sorted(k for k in candles.keys() if (s_ms is None or k >= s_ms) and (e_ms is None or k <= e_ms))
-        for k in keys[-limit:]:
-            o,h,l,c,v = candles[k]
-            rows.append({"start": str(k//1000), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
-        if rows:
-            return {"candles": rows}
+        if only_limit:
+            # latest N candles, array-of-arrays (warmup fix)
+            keys = sorted(candles.keys())[-limit:]
+            if keys:
+                out_arr = []
+                for k in keys:
+                    o,h,l,c,v = candles[k]
+                    out_arr.append([int(k//1000), float(l), float(h), float(o), float(c), float(v)])
+                return out_arr
+        else:
+            rows: List[Dict[str,str]] = []
+            keys = sorted(k for k in candles.keys() if (s_ms is None or k >= s_ms) and (e_ms is None or k <= e_ms))
+            for k in keys[-limit:]:
+                o,h,l,c,v = candles[k]
+                rows.append({"start": str(k//1000), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
+            if rows:
+                return {"candles": rows}
 
     # REST backfill (any granularity)
     sym = _normalize_symbol(product_id)
@@ -227,14 +238,18 @@ def get_candles(product_id: str = Query(default=SYMBOL),
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"binance klines error: {e}")
 
-    out = []
+    out: List[Dict[str,str]] = []
+    out_arr: List[List[float]] = []
     for r in data[-limit:]:
         try:
             ot = int(r[0])//1000
-            o,h,l,c,v = str(r[1]), str(r[2]), str(r[3]), str(r[4]), str(r[5])
+            o,h,l,c,v = float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])
         except Exception:
             continue
-        out.append({"start": str(ot), "open": o, "high": h, "low": l, "close": c, "volume": v})
+        # object row (existing behavior for start/end queries)
+        out.append({"start": str(ot), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
+        # array row (warmup fix for limit-only)
+        out_arr.append([int(ot), float(l), float(h), float(o), float(c), float(v)])
         # seed 1m cache when interval is 1m
         if interval == "1m":
             try:
@@ -243,6 +258,8 @@ def get_candles(product_id: str = Query(default=SYMBOL),
             except Exception:
                 pass
     log.info(f"[TRACE] REST klines fetched: symbol={sym} interval={interval} rows={len(out)}")
+    if only_limit:
+        return out_arr
     return {"candles": out}
 
 @app.get("/accounts")

@@ -165,16 +165,27 @@ def get_candles(product_id: str = Query(default=SYMBOL),
         return x * 1000 if x < 1_000_000_000_000 else x
     s_ms = _ms(start)
     e_ms = _ms(end)
+    only_limit = (s_ms is None and e_ms is None)
 
     # serve from in-memory only for 1-minute (fed by WS)
-    rows = []
     if granularity.upper() == "ONE_MINUTE":
-        keys = sorted(k for k in candles.keys() if (s_ms is None or k>=s_ms) and (e_ms is None or k<=e_ms))
-        for k in keys[-limit:]:
-            o,h,l,c,v = candles[k]
-            rows.append({"start": str(k//1000), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
-        if rows:
-            return {"candles": rows}
+        if only_limit:
+            # latest N candles, array-of-arrays (warmup fix)
+            keys = sorted(candles.keys())[-limit:]
+            if keys:
+                out_arr: List[List[float]] = []
+                for k in keys:
+                    o,h,l,c,v = candles[k]
+                    out_arr.append([int(k//1000), float(l), float(h), float(o), float(c), float(v)])
+                return out_arr
+        else:
+            rows = []
+            keys = sorted(k for k in candles.keys() if (s_ms is None or k>=s_ms) and (e_ms is None or k<=e_ms))
+            for k in keys[-limit:]:
+                o,h,l,c,v = candles[k]
+                rows.append({"start": str(k//1000), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
+            if rows:
+                return {"candles": rows}
 
     # REST backfill (public)
     sym = _normalize_symbol(product_id)
@@ -195,22 +206,26 @@ def get_candles(product_id: str = Query(default=SYMBOL),
         raise HTTPException(status_code=502, detail=f"hitbtc candles error: {e}")
 
     out=[]
+    out_arr: List[List[float]] = []
     # shape: [{"t":"2024-01-01T00:00:00Z","o":"...","h":"...","l":"...","c":"...","v":"..."}...]
     for r in data[-limit:]:
         try:
             t = r.get("t") or r.get("timestamp")
             dt = datetime.fromisoformat(t.replace("Z","+00:00"))
             ot = int(dt.timestamp())
-            o,h,l,c,v = str(r.get("o","")), str(r.get("h","")), str(r.get("l","")), str(r.get("c","")), str(r.get("v",""))
+            o,h,l,c,v = float(r.get("o","0")), float(r.get("h","0")), float(r.get("l","0")), float(r.get("c","0")), float(r.get("v","0"))
         except Exception:
             continue
-        out.append({"start": str(ot), "open": o, "high": h, "low": l, "close": c, "volume": v})
+        out.append({"start": str(ot), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
+        out_arr.append([int(ot), float(l), float(h), float(o), float(c), float(v)])
         if period == "M1":
             try:
                 _update_candle(float(c), ot*1000)
             except Exception:
                 pass
     log.info(f"[TRACE] REST candles fetched: symbol={sym} period={period} rows={len(out)}")
+    if only_limit:
+        return out_arr
     return {"candles": out}
 
 @app.get("/accounts")
