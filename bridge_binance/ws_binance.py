@@ -8,7 +8,6 @@ from urllib import request as urlreq, parse as urlparse
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query, Path
-from fastapi.responses import JSONResponse
 import websockets
 import uvicorn
 
@@ -164,8 +163,21 @@ async def _ws_loop():
             await asyncio.sleep(backoff)
             backoff = min(backoff*2, 15)
 
-# ---- FastAPI app (mirrors Coinbase endpoints) ----
-app = FastAPI(title="bridge-binance", version="0.2")
+# ---- FastAPI app ----
+app = FastAPI(title="bridge-binance", version="0.3")
+
+# Map Coinbase granularities → Binance intervals
+GRAN_MAP = {
+    "ONE_MINUTE": "1m",
+    "FIVE_MINUTE": "5m",
+    "FIFTEEN_MINUTE": "15m",
+    "THIRTY_MINUTE": "30m",
+    "ONE_HOUR": "1h",
+    "TWO_HOUR": "2h",
+    "FOUR_HOUR": "4h",
+    "SIX_HOUR": "6h",
+    "ONE_DAY": "1d",
+}
 
 @app.get("/health")
 def health(): return {"ok": True}
@@ -184,34 +196,32 @@ def get_candles(product_id: str = Query(default=SYMBOL),
            start: Optional[int] = Query(default=None),
            end: Optional[int] = Query(default=None),
            limit: int = Query(default=350)):
-    if granularity != "ONE_MINUTE":
-        return {"candles": []}
-    # --- minimal change: auto-detect seconds vs milliseconds for start/end ---
+    # time params: accept seconds or ms; normalize to ms
     def _ms(x: Optional[int]) -> Optional[int]:
         if x is None: return None
-        # treat values < 10^12 as seconds; convert to ms
         return x * 1000 if x < 1_000_000_000_000 else x
     s_ms = _ms(start)
     e_ms = _ms(end)
 
-    # 1) Serve from in-memory if available
-    keys = sorted(k for k in candles.keys() if (s_ms is None or k >= s_ms) and (e_ms is None or k <= e_ms))
+    # serve from memory only for 1-minute (that’s what WS updates)
     rows: List[Dict[str,str]] = []
-    for k in keys[-limit:]:
-        o,h,l,c,v = candles[k]
-        rows.append({"start": str(k//1000), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
-    if rows:
-        return {"candles": rows}
+    if granularity.upper() == "ONE_MINUTE":
+        keys = sorted(k for k in candles.keys() if (s_ms is None or k >= s_ms) and (e_ms is None or k <= e_ms))
+        for k in keys[-limit:]:
+            o,h,l,c,v = candles[k]
+            rows.append({"start": str(k//1000), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
+        if rows:
+            return {"candles": rows}
 
-    # 2) Backfill via Binance klines (public)
+    # REST backfill (any granularity)
     sym = _normalize_symbol(product_id)
-    interval = "1m"  # ONE_MINUTE
+    interval = GRAN_MAP.get(granularity.upper(), "1m")
     qs = {"symbol": sym, "interval": interval, "limit": str(min(max(1, limit), 1000))}
     if s_ms is not None: qs["startTime"] = str(s_ms)
     if e_ms is not None: qs["endTime"]   = str(e_ms)
     url = f"{BINANCE_BASE_URL}/api/v3/klines?{urlparse.urlencode(qs)}"
     try:
-        data = _http_get(url)  # returns list
+        data = _http_get(url)  # list of kline arrays
     except HTTPException:
         raise
     except Exception as e:
@@ -219,19 +229,19 @@ def get_candles(product_id: str = Query(default=SYMBOL),
 
     out = []
     for r in data[-limit:]:
-        # r = [ openTime, open, high, low, close, volume, closeTime, ... ]
         try:
             ot = int(r[0])//1000
             o,h,l,c,v = str(r[1]), str(r[2]), str(r[3]), str(r[4]), str(r[5])
         except Exception:
             continue
         out.append({"start": str(ot), "open": o, "high": h, "low": l, "close": c, "volume": v})
-        # seed in-memory so future calls have data immediately
-        try:
-            close_time_ms = int(r[6])
-            _update_candle(float(c), close_time_ms)
-        except Exception:
-            pass
+        # seed 1m cache when interval is 1m
+        if interval == "1m":
+            try:
+                close_time_ms = int(r[6])
+                _update_candle(float(c), close_time_ms)
+            except Exception:
+                pass
     log.info(f"[TRACE] REST klines fetched: symbol={sym} interval={interval} rows={len(out)}")
     return {"candles": out}
 
@@ -267,25 +277,19 @@ def balance_quote(product_id: str = Query(...)):
 
 @app.get("/product/{product_id}")
 def product_info(product_id: str = Path(...)):
-    # Minimal parity: return latest price with same shape used by Go client
-    # (Coinbase bridge exposes more metadata; we surface price+stale here.)
     return price(product_id)
 
 # --- Order endpoints (market by quote size), with partial-fill enrichment ---
-
 def _my_trades(symbol: str, order_id: int) -> List[Dict]:
-    # https://binance-docs.github.io/apidocs/spot/en/#account-trade-list-user_data
     return _binance_signed("/api/v3/myTrades", {"symbol": symbol, "orderId": str(order_id)})
 
 @app.post("/orders/market_buy")
 def orders_market_buy(product_id: str = Query(...), quote_size: str = Query(...)):
-    # Delegate to single market endpoint (Coinbase bridge exposes both)
     return order_market(product_id=product_id, side="BUY", quote_size=quote_size)
 
 @app.post("/order/market")
 def order_market(product_id: str = Query(...), side: str = Query(...), quote_size: str = Query(...)):
-    # Place market order using quote as notional (Binance uses quoteOrderQty)
-    sym = product_id.upper().replace("-", "")
+    sym = _normalize_symbol(product_id)
     side = side.upper()
     payload = _binance_signed_post("/api/v3/order",
         {"symbol": sym, "side": side, "type": "MARKET", "quoteOrderQty": quote_size})
@@ -303,7 +307,6 @@ def order_market(product_id: str = Query(...), side: str = Query(...), quote_siz
         "side": side.lower(),
     }
 
-    # Enrich via myTrades (fills)
     try:
         trades = _my_trades(sym, int(order_id))
         filled = Decimal("0"); value = Decimal("0"); fee = Decimal("0")
@@ -334,9 +337,8 @@ def order_market(product_id: str = Query(...), side: str = Query(...), quote_siz
 
 @app.get("/order/{order_id}")
 def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
-    sym = product_id.upper().replace("-", "")
+    sym = _normalize_symbol(product_id)
     od = _binance_signed("/api/v3/order", {"symbol": sym, "orderId": order_id})
-    # Normalize minimal Coinbase-like order view + enrich with trades
     resp = {
         "order_id": str(od.get("orderId")),
         "product_id": product_id,

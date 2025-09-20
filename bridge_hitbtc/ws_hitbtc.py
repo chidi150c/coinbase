@@ -4,11 +4,10 @@
 import os, asyncio, json, time, base64, logging
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
-from urllib import request as urlreq
+from urllib import request as urlreq, parse as urlparse
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query, Path
-from fastapi.responses import JSONResponse
 import websockets
 import uvicorn
 
@@ -49,7 +48,6 @@ def _update_candle(px: float, ts_ms: int, vol: float = 0.0):
     _trim_old()
 
 def _normalize_symbol(pid: str) -> str:
-    # HitBTC typically uses BTCUSDT as well (no dash). Just upper-case and strip '-'.
     return (pid or SYMBOL).upper().replace("-", "")
 
 def _http_get(url: str, headers: Optional[Dict[str,str]] = None):
@@ -83,7 +81,6 @@ def _req(path: str, method="GET", body: Optional[bytes]=None) -> Dict:
 
 def _split(pid: str) -> Tuple[str,str]:
     p = pid.upper().replace("-", "")
-    # HitBTC typically uses BTCUSDT as well
     if len(p)>3: return p[:-3], p[-3:]
     return p, "USD"
 
@@ -93,6 +90,20 @@ def _sum_available(accts: List[Dict], asset: str) -> str:
         if r.get("currency","").upper()==a:
             return str(r.get("available_balance",{}).get("value","0"))
     return "0"
+
+# Map Coinbase granularities → HitBTC periods
+GRAN_MAP = {
+    "ONE_MINUTE": "M1",
+    "FIVE_MINUTE": "M5",
+    "FIFTEEN_MINUTE": "M15",
+    "THIRTY_MINUTE": "M30",
+    "ONE_HOUR": "H1",
+    "FOUR_HOUR": "H4",
+    "ONE_DAY": "D1",
+    # If TWO_HOUR / SIX_HOUR are requested, approximate to nearest available:
+    "TWO_HOUR": "H1",
+    "SIX_HOUR": "H4",
+}
 
 async def _ws_loop():
     global last_price, last_ts_ms
@@ -129,7 +140,7 @@ async def _ws_loop():
             await asyncio.sleep(backoff)
             backoff = min(backoff*2, 15)
 
-app = FastAPI(title="bridge-hitbtc", version="0.2")
+app = FastAPI(title="bridge-hitbtc", version="0.3")
 
 @app.get("/health")
 def health(): return {"ok": True}
@@ -148,29 +159,34 @@ def get_candles(product_id: str = Query(default=SYMBOL),
            start: Optional[int] = Query(default=None),
            end: Optional[int] = Query(default=None),
            limit: int = Query(default=350)):
-    if granularity != "ONE_MINUTE":
-        return {"candles":[]}
-    # auto-detect seconds vs milliseconds for start/end (seconds < 1e12)
+    # normalize times (seconds vs ms)
     def _ms(x: Optional[int]) -> Optional[int]:
         if x is None: return None
         return x * 1000 if x < 1_000_000_000_000 else x
     s_ms = _ms(start)
     e_ms = _ms(end)
 
-    # 1) Serve from in-memory first
-    keys = sorted(k for k in candles.keys() if (s_ms is None or k>=s_ms) and (e_ms is None or k<=e_ms))
-    rows=[]
-    for k in keys[-limit:]:
-        o,h,l,c,v = candles[k]
-        rows.append({"start": str(k//1000), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
-    if rows:
-        return {"candles": rows}
+    # serve from in-memory only for 1-minute (fed by WS)
+    rows = []
+    if granularity.upper() == "ONE_MINUTE":
+        keys = sorted(k for k in candles.keys() if (s_ms is None or k>=s_ms) and (e_ms is None or k<=e_ms))
+        for k in keys[-limit:]:
+            o,h,l,c,v = candles[k]
+            rows.append({"start": str(k//1000), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
+        if rows:
+            return {"candles": rows}
 
-    # 2) REST backfill from public endpoint
+    # REST backfill (public)
     sym = _normalize_symbol(product_id)
-    # HitBTC v3 public candles: GET /api/3/public/candles/{symbol}?period=M1&limit=N
-    period = "M1"
-    url = f"{HITBTC_BASE_URL}/api/3/public/candles/{sym}?period={period}&limit={min(max(1,limit),1000)}"
+    period = GRAN_MAP.get(granularity.upper(), "M1")
+    # HitBTC v3 public: GET /api/3/public/candles/{symbol}?period=M1&limit=N&from=ISO&to=ISO (from/to optional)
+    qs = {"period": period, "limit": str(min(max(1, limit), 1000))}
+    # If start/end provided, pass ISO8601
+    if s_ms is not None:
+        qs["from"] = datetime.utcfromtimestamp(s_ms/1000).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if e_ms is not None:
+        qs["to"] = datetime.utcfromtimestamp(e_ms/1000).strftime("%Y-%m-%dT%H:%M:%SZ")
+    url = f"{HITBTC_BASE_URL}/api/3/public/candles/{sym}?{urlparse.urlencode(qs)}"
     try:
         data = _http_get(url)
     except HTTPException:
@@ -189,16 +205,16 @@ def get_candles(product_id: str = Query(default=SYMBOL),
         except Exception:
             continue
         out.append({"start": str(ot), "open": o, "high": h, "low": l, "close": c, "volume": v})
-        try:
-            _update_candle(float(c), ot*1000)
-        except Exception:
-            pass
+        if period == "M1":
+            try:
+                _update_candle(float(c), ot*1000)
+            except Exception:
+                pass
     log.info(f"[TRACE] REST candles fetched: symbol={sym} period={period} rows={len(out)}")
     return {"candles": out}
 
 @app.get("/accounts")
 def accounts(limit: int = 250):
-    # HitBTC: GET /api/3/spot/balance
     payload = _req("/api/3/spot/balance")
     rows = payload if isinstance(payload, list) else payload.get("balance", [])
     out=[]
@@ -229,22 +245,17 @@ def balance_quote(product_id: str = Query(...)):
 
 @app.get("/product/{product_id}")
 def product_info(product_id: str = Path(...)):
-    # Minimal parity: return price view as Coinbase broker expects
     return price(product_id)
 
 # --- Orders (market), partial-fill enrichment ---
-# HitBTC v3 spot order create: POST /api/3/spot/order { "symbol": "...", "side": "buy|sell", "type":"market", "quantity": "..."}
-# We implement market-by-quote as: quantity ≈ quote / last_price (best-effort), then place type=market.
 def _place_order(symbol: str, side: str, quantity: str) -> Dict:
     body = json.dumps({"symbol": symbol, "side": side.lower(), "type":"market", "quantity": quantity}).encode("utf-8")
     return _req("/api/3/spot/order", method="POST", body=body)
 
 def _get_order(order_id: str) -> Dict:
-    # HitBTC v3: GET /api/3/spot/order/{order_id}
     return _req(f"/api/3/spot/order/{order_id}")
 
 def _order_trades(order_id: str) -> List[Dict]:
-    # HitBTC v3: GET /api/3/spot/order/{order_id}/trades
     payload = _req(f"/api/3/spot/order/{order_id}/trades")
     return payload if isinstance(payload, list) else payload.get("trades", [])
 
@@ -256,7 +267,6 @@ def orders_market_buy(product_id: str = Query(...), quote_size: str = Query(...)
 def order_market(product_id: str = Query(...), side: str = Query(...), quote_size: str = Query(...)):
     sym = _normalize_symbol(product_id)
     side = side.upper()
-    # Approximate quantity from last price (HitBTC doesn't natively support quote notional in v3)
     px = last_price or 0.0
     if px <= 0:
         raise HTTPException(status_code=503, detail="Last price unavailable")
@@ -276,7 +286,6 @@ def order_market(product_id: str = Query(...), side: str = Query(...), quote_siz
         "side": side.lower(),
     }
 
-    # Enrich with trades
     try:
         trades = _order_trades(order_id)
         filled = Decimal("0"); value = Decimal("0"); fee = Decimal("0")
@@ -308,7 +317,6 @@ def order_market(product_id: str = Query(...), side: str = Query(...), quote_siz
 @app.get("/order/{order_id}")
 def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
     od = _get_order(order_id)
-    # Basic normalization + enrichment
     resp = {
         "order_id": str(od.get("id") or order_id),
         "product_id": product_id,
