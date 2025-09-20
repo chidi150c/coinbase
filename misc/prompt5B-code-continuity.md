@@ -2830,8 +2830,8 @@ async def _runner():
 if __name__ == "__main__":
     try: asyncio.run(_runner())
     except KeyboardInterrupt: pass
-}}
 
+}}
 app.py{{
 import os
 import json

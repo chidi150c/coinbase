@@ -96,10 +96,6 @@ type Trader struct {
 	// NEW: index of the designated runner lot (-1 if none). Not persisted; derived on load.
 	runnerIdx int
 
-	// NEW: independent pyramiding anchor (stable reference, not tied to latest scalp)
-	pyramidAnchorPrice float64
-	pyramidAnchorTime  time.Time
-
 	// --- NEW: adverse gate helpers (since last add) ---
 	// BUY path trackers:
 	winLow      float64 // lowest price seen since lastAdd (BUY adverse tracking)
