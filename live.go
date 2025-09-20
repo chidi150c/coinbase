@@ -24,9 +24,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
-	"sort"
 )
 
 // runLive executes the real-time loop with cadence intervalSec (seconds).
@@ -252,8 +252,21 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 							trader.SetEquityUSD(eq)
 							eqReady = true
 						} else if !eqReady {
+							// TRACE: break down balances and price to see why eq<=0
+							lb := bal[strings.ToUpper(base)]
+							lq := bal[strings.ToUpper(quote)]
+							lp := history[len(history)-1].Close // or latest.Close in candle loop
+							log.Printf("TRACE equity_breakdown path=%s base=%s quote=%s bal_base=%.8f bal_quote=%.8f lastPrice=%.8f eq=%.8f",
+								func() string {
+									if trader.cfg.BridgeURL != "" {
+										return "bridge|fallback"
+									}
+									return "broker"
+								}(),
+								base, quote, lb, lq, lp, eq)
 							log.Printf("[EQUITY] waiting for accounts (eq<=0)")
 						}
+
 					} else if !eqReady {
 						log.Printf("[EQUITY] waiting for accounts (error: %v)", err)
 					}
@@ -330,8 +343,21 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 							trader.SetEquityUSD(eq)
 							eqReady = true
 						} else if !eqReady {
+							// TRACE: break down balances and price to see why eq<=0
+							lb := bal[strings.ToUpper(base)]
+							lq := bal[strings.ToUpper(quote)]
+							lp := history[len(history)-1].Close // or latest.Close in candle loop
+							log.Printf("TRACE equity_breakdown path=%s base=%s quote=%s bal_base=%.8f bal_quote=%.8f lastPrice=%.8f eq=%.8f",
+								func() string {
+									if trader.cfg.BridgeURL != "" {
+										return "bridge|fallback"
+									}
+									return "broker"
+								}(),
+								base, quote, lb, lq, lp, eq)
 							log.Printf("[EQUITY] waiting for accounts (eq<=0)")
 						}
+
 					} else if !eqReady {
 						log.Printf("[EQUITY] waiting for accounts (error: %v)", err)
 					}
@@ -514,7 +540,7 @@ func maybeWalkForwardRefit(cfg Config, mdl *ExtendedLogit, history []Candle, las
 type bridgePriceResp struct {
 	ProductID string  `json:"product_id"`
 	Price     float64 `json:"price"`
-	TS        any     `json:"ts"`   // accept number/string timestamps
+	TS        any     `json:"ts"` // accept number/string timestamps
 	Stale     bool    `json:"stale"`
 }
 

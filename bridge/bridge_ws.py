@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import os, asyncio, json, time
 from typing import Dict, List, Optional
-
+from fastapi import HTTPException
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -216,6 +216,13 @@ async def health():
         "age_ms": age_ms,
         "stale": stale,
     })
+
+@app.get("/accounts")
+async def accounts(limit: int = 250):
+    # Explicitly document why this returns 404 so Go-side logs are meaningful
+    msg = f"/accounts not implemented on {EXCHANGE} ws-bridge; set USE_LIVE_EQUITY=false or unset BRIDGE_URL for balances"
+    print(f"[bridge-ws] TRACE: {msg} (limit={limit})")
+    raise HTTPException(status_code=404, detail=msg)
 
 @app.get("/price")
 async def price(product_id: str = Query(default=SYMBOL)):
