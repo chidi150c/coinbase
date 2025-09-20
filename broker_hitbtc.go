@@ -192,8 +192,8 @@ func (h *HitbtcBridge) PlaceMarketQuote(ctx context.Context, product string, sid
 	// Enrich via GET /order/{order_id}, identical to broker_bridge.go
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		o2, err := h.fetchOrder(ctx, product, ord.OrderID)
-		if err == nil && (o2.FilledSize > 0 || o2.ExecutedValue > 0) {
+		o2, err := h.fetchOrder(ctx, product, ord.ID)
+		if err == nil && (o2.BaseSize > 0 || o2.QuoteSpent > 0) {
 			return o2, nil
 		}
 		time.Sleep(200 * time.Millisecond)
