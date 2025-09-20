@@ -163,7 +163,14 @@ def get_candles(product_id: str = Query(default=SYMBOL),
            limit: int = Query(default=350)):
     if granularity != "ONE_MINUTE":
         return {"candles": []}
-    keys = sorted(k for k in candles.keys() if (start is None or k >= start) and (end is None or k <= end))
+    # --- minimal change: auto-detect seconds vs milliseconds for start/end ---
+    def _ms(x: Optional[int]) -> Optional[int]:
+        if x is None: return None
+        # treat values < 10^12 as seconds; convert to ms
+        return x * 1000 if x < 1_000_000_000_000 else x
+    s_ms = _ms(start)
+    e_ms = _ms(end)
+    keys = sorted(k for k in candles.keys() if (s_ms is None or k >= s_ms) and (e_ms is None or k <= e_ms))
     rows = []
     for k in keys[-limit:]:
         o,h,l,c,v = candles[k]
