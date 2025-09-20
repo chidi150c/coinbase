@@ -156,7 +156,7 @@ def price(product_id: str = Query(default=SYMBOL)):
     return {"product_id": product_id, "price": float(last_price) if last_price else 0.0, "ts": last_ts_ms, "stale": stale}
 
 @app.get("/candles")
-def candles(product_id: str = Query(default=SYMBOL),
+def get_candles(product_id: str = Query(default=SYMBOL),
            granularity: str = Query(default="ONE_MINUTE"),
            start: Optional[int] = Query(default=None),
            end: Optional[int] = Query(default=None),
