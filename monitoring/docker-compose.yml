@@ -9,6 +9,8 @@ services:
       SYMBOL: "BTCUSDT"
       PORT: "8788"
       STALE_MS: "3000"
+    ports:
+      - "8788:8788"
     networks:
       - monitoring_network
     restart: unless-stopped
@@ -23,6 +25,8 @@ services:
       SYMBOL: "BTCUSDT"
       PORT: "8789"
       STALE_MS: "3000"
+    ports:
+      - "8789:8789"
     networks:
       - monitoring_network
     restart: unless-stopped
@@ -41,6 +45,8 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+    ports:
+      - "8787:8787"
     networks:
       monitoring_network:
         aliases: [bridge]
