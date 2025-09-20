@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # FILE: bridge_binance/ws_binance.py
 # FastAPI app that mirrors Coinbase bridge endpoints/JSON using Binance WS/REST.
-import os, asyncio, json, time, hmac, hashlib
+import os, asyncio, json, time, hmac, hashlib, logging
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 from urllib import request as urlreq, parse as urlparse
@@ -11,6 +11,10 @@ from fastapi import FastAPI, HTTPException, Query, Path
 from fastapi.responses import JSONResponse
 import websockets
 import uvicorn
+
+# ---- Logging ----
+log = logging.getLogger("bridge-binance")
+logging.basicConfig(level=logging.INFO)
 
 # ---- Config (mirror coinbase .env knobs where applicable) ----
 SYMBOL   = os.getenv("SYMBOL", "BTCUSDT").upper().replace("-", "")
@@ -47,6 +51,24 @@ def _update_candle(px: float, ts_ms: int, vol: float = 0.0):
         if px < l: l = px
         candles[m] = [o,h,l,px,v+vol]
     _trim_old_candles()
+
+def _normalize_symbol(pid: str) -> str:
+    s = (pid or SYMBOL).upper().replace("-", "")
+    # Map BTC-USD style to Binance spot convention BTCUSDT
+    if s.endswith("USD") and not s.endswith("USDT"):
+        return s + "T"
+    return s
+
+def _http_get(url: str, headers: Optional[Dict[str,str]] = None):
+    req = urlreq.Request(url, headers=headers or {})
+    with urlreq.urlopen(req, timeout=10) as resp:
+        body = resp.read().decode("utf-8", "ignore")
+        if resp.status != 200:
+            raise HTTPException(status_code=resp.status, detail=body[:200])
+        try:
+            return json.loads(body)
+        except Exception:
+            raise HTTPException(status_code=500, detail="Invalid JSON")
 
 def _binance_signed(path: str, params: Dict[str,str]) -> Dict:
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
@@ -103,8 +125,9 @@ def _sum_available(accts: List[Dict], asset: str) -> str:
 # ---- WS consumer ----
 async def _ws_loop():
     global last_price, last_ts_ms
-    sym = SYMBOL.lower()
+    sym = _normalize_symbol(SYMBOL).lower()
     url = f"wss://stream.binance.com:9443/stream?streams={sym}@bookTicker/{sym}@trade"
+    log.info(f"[TRACE] WS subscribe {url}")
     backoff = 1
     while True:
         try:
@@ -170,12 +193,47 @@ def get_candles(product_id: str = Query(default=SYMBOL),
         return x * 1000 if x < 1_000_000_000_000 else x
     s_ms = _ms(start)
     e_ms = _ms(end)
+
+    # 1) Serve from in-memory if available
     keys = sorted(k for k in candles.keys() if (s_ms is None or k >= s_ms) and (e_ms is None or k <= e_ms))
-    rows = []
+    rows: List[Dict[str,str]] = []
     for k in keys[-limit:]:
         o,h,l,c,v = candles[k]
         rows.append({"start": str(k//1000), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
-    return {"candles": rows}
+    if rows:
+        return {"candles": rows}
+
+    # 2) Backfill via Binance klines (public)
+    sym = _normalize_symbol(product_id)
+    interval = "1m"  # ONE_MINUTE
+    qs = {"symbol": sym, "interval": interval, "limit": str(min(max(1, limit), 1000))}
+    if s_ms is not None: qs["startTime"] = str(s_ms)
+    if e_ms is not None: qs["endTime"]   = str(e_ms)
+    url = f"{BINANCE_BASE_URL}/api/v3/klines?{urlparse.urlencode(qs)}"
+    try:
+        data = _http_get(url)  # returns list
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"binance klines error: {e}")
+
+    out = []
+    for r in data[-limit:]:
+        # r = [ openTime, open, high, low, close, volume, closeTime, ... ]
+        try:
+            ot = int(r[0])//1000
+            o,h,l,c,v = str(r[1]), str(r[2]), str(r[3]), str(r[4]), str(r[5])
+        except Exception:
+            continue
+        out.append({"start": str(ot), "open": o, "high": h, "low": l, "close": c, "volume": v})
+        # seed in-memory so future calls have data immediately
+        try:
+            close_time_ms = int(r[6])
+            _update_candle(float(c), close_time_ms)
+        except Exception:
+            pass
+    log.info(f"[TRACE] REST klines fetched: symbol={sym} interval={interval} rows={len(out)}")
+    return {"candles": out}
 
 @app.get("/accounts")
 def accounts(limit: int = 250):

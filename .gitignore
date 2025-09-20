@@ -76,7 +76,7 @@ tmp/
 *.csv.tmp
 *.json.tmp
 monitoring/grafana-data/
-
+prompt5B-code-continuity.md
 # ---- Docker / local overrides (if any) ----
 docker-compose.override.yml
 docker-compose.override.yml-

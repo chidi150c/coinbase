@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # FILE: bridge_hitbtc/ws_hitbtc.py
 # FastAPI app that mirrors Coinbase bridge endpoints/JSON using HitBTC WS/REST.
-import os, asyncio, json, time, base64
+import os, asyncio, json, time, base64, logging
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 from urllib import request as urlreq
@@ -11,6 +11,10 @@ from fastapi import FastAPI, HTTPException, Query, Path
 from fastapi.responses import JSONResponse
 import websockets
 import uvicorn
+
+# ---- Logging ----
+log = logging.getLogger("bridge-hitbtc")
+logging.basicConfig(level=logging.INFO)
 
 SYMBOL   = os.getenv("SYMBOL", "BTCUSDT").upper().replace("-", "")
 PORT     = int(os.getenv("PORT", "8788"))
@@ -43,6 +47,21 @@ def _update_candle(px: float, ts_ms: int, vol: float = 0.0):
         if px<l: l=px
         candles[m] = [o,h,l,px,v+vol]
     _trim_old()
+
+def _normalize_symbol(pid: str) -> str:
+    # HitBTC typically uses BTCUSDT as well (no dash). Just upper-case and strip '-'.
+    return (pid or SYMBOL).upper().replace("-", "")
+
+def _http_get(url: str, headers: Optional[Dict[str,str]] = None):
+    req = urlreq.Request(url, headers=headers or {})
+    with urlreq.urlopen(req, timeout=10) as resp:
+        body = resp.read().decode("utf-8", "ignore")
+        if resp.status != 200:
+            raise HTTPException(status_code=resp.status, detail=body[:200])
+        try:
+            return json.loads(body)
+        except Exception:
+            raise HTTPException(status_code=500, detail="Invalid JSON")
 
 def _req(path: str, method="GET", body: Optional[bytes]=None) -> Dict:
     if not HITBTC_API_KEY or not HITBTC_API_SECRET:
@@ -78,12 +97,13 @@ def _sum_available(accts: List[Dict], asset: str) -> str:
 async def _ws_loop():
     global last_price, last_ts_ms
     url = "wss://api.hitbtc.com/api/3/ws/public"
-    sub = {"method":"subscribe","ch":"trades","params":{"symbol":[SYMBOL]}}
+    sub = {"method":"subscribe","ch":"trades","params":{"symbols":[_normalize_symbol(SYMBOL)]}}
     backoff = 1
     while True:
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_queue=1024) as ws:
                 await ws.send(json.dumps(sub))
+                log.info(f"[TRACE] WS subscribe params={sub}")
                 backoff = 1
                 while True:
                     raw = await ws.recv()
@@ -94,9 +114,11 @@ async def _ws_loop():
                         continue
                     if msg.get("ch")=="trades" and "data" in msg:
                         for d in msg["data"]:
-                            if d.get("t")==SYMBOL:
+                            instr = d.get("symbol") or d.get("t") or d.get("s")
+                            if instr == _normalize_symbol(SYMBOL):
+                                pr = d.get("price", d.get("p"))
                                 try:
-                                    px = float(d.get("p"))
+                                    px = float(pr) if pr is not None else None
                                 except Exception:
                                     px = None
                                 if px and px>0:
@@ -134,12 +156,45 @@ def get_candles(product_id: str = Query(default=SYMBOL),
         return x * 1000 if x < 1_000_000_000_000 else x
     s_ms = _ms(start)
     e_ms = _ms(end)
+
+    # 1) Serve from in-memory first
     keys = sorted(k for k in candles.keys() if (s_ms is None or k>=s_ms) and (e_ms is None or k<=e_ms))
     rows=[]
     for k in keys[-limit:]:
         o,h,l,c,v = candles[k]
         rows.append({"start": str(k//1000), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
-    return {"candles": rows}
+    if rows:
+        return {"candles": rows}
+
+    # 2) REST backfill from public endpoint
+    sym = _normalize_symbol(product_id)
+    # HitBTC v3 public candles: GET /api/3/public/candles/{symbol}?period=M1&limit=N
+    period = "M1"
+    url = f"{HITBTC_BASE_URL}/api/3/public/candles/{sym}?period={period}&limit={min(max(1,limit),1000)}"
+    try:
+        data = _http_get(url)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"hitbtc candles error: {e}")
+
+    out=[]
+    # shape: [{"t":"2024-01-01T00:00:00Z","o":"...","h":"...","l":"...","c":"...","v":"..."}...]
+    for r in data[-limit:]:
+        try:
+            t = r.get("t") or r.get("timestamp")
+            dt = datetime.fromisoformat(t.replace("Z","+00:00"))
+            ot = int(dt.timestamp())
+            o,h,l,c,v = str(r.get("o","")), str(r.get("h","")), str(r.get("l","")), str(r.get("c","")), str(r.get("v",""))
+        except Exception:
+            continue
+        out.append({"start": str(ot), "open": o, "high": h, "low": l, "close": c, "volume": v})
+        try:
+            _update_candle(float(c), ot*1000)
+        except Exception:
+            pass
+    log.info(f"[TRACE] REST candles fetched: symbol={sym} period={period} rows={len(out)}")
+    return {"candles": out}
 
 @app.get("/accounts")
 def accounts(limit: int = 250):
@@ -178,8 +233,8 @@ def product_info(product_id: str = Path(...)):
     return price(product_id)
 
 # --- Orders (market), partial-fill enrichment ---
-# HitBTC v3 spot order create: POST /api/3/spot/order { "symbol": "...", "side": "buy|sell", "type":"market", "quantity": "..."} or quote notional via "strictValidate": false + "cost"?
-# We will implement market-by-quote as: compute quantity = quote / last_price (best-effort) and place type=market.
+# HitBTC v3 spot order create: POST /api/3/spot/order { "symbol": "...", "side": "buy|sell", "type":"market", "quantity": "..."}
+# We implement market-by-quote as: quantity ≈ quote / last_price (best-effort), then place type=market.
 def _place_order(symbol: str, side: str, quantity: str) -> Dict:
     body = json.dumps({"symbol": symbol, "side": side.lower(), "type":"market", "quantity": quantity}).encode("utf-8")
     return _req("/api/3/spot/order", method="POST", body=body)
@@ -199,7 +254,7 @@ def orders_market_buy(product_id: str = Query(...), quote_size: str = Query(...)
 
 @app.post("/order/market")
 def order_market(product_id: str = Query(...), side: str = Query(...), quote_size: str = Query(...)):
-    sym = product_id.upper().replace("-", "")
+    sym = _normalize_symbol(product_id)
     side = side.upper()
     # Approximate quantity from last price (HitBTC doesn't natively support quote notional in v3)
     px = last_price or 0.0
@@ -253,7 +308,6 @@ def order_market(product_id: str = Query(...), side: str = Query(...), quote_siz
 @app.get("/order/{order_id}")
 def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
     od = _get_order(order_id)
-    sym = product_id.upper().replace("-", "")
     # Basic normalization + enrichment
     resp = {
         "order_id": str(od.get("id") or order_id),
