@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"encoding/json"
+	"errors" // <-- added
 	"fmt"
 	"io"
 	"net/http"
@@ -233,6 +234,11 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 					var bal map[string]float64
 					if trader.cfg.BridgeURL != "" {
 						bal, err = fetchBridgeAccounts(ctxEq, trader.cfg.BridgeURL)
+						if err != nil && errors.Is(err, errBridgeAccountsNotFound) {
+							// Fallback to broker if bridge lacks /accounts
+							log.Printf("TRACE EQUITY fallback: bridge /accounts 404 -> broker")
+							bal, err = fetchBrokerBalances(ctxEq, trader, trader.cfg.ProductID)
+						}
 					} else {
 						bal, err = fetchBrokerBalances(ctxEq, trader, trader.cfg.ProductID)
 					}
@@ -307,6 +313,10 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 					var bal map[string]float64
 					if trader.cfg.BridgeURL != "" {
 						bal, err = fetchBridgeAccounts(ctxEq, trader.cfg.BridgeURL)
+						if err != nil && errors.Is(err, errBridgeAccountsNotFound) {
+							log.Printf("TRACE EQUITY fallback: bridge /accounts 404 -> broker")
+							bal, err = fetchBrokerBalances(ctxEq, trader, trader.cfg.ProductID)
+						}
 					} else {
 						bal, err = fetchBrokerBalances(ctxEq, trader, trader.cfg.ProductID)
 					}
@@ -363,6 +373,9 @@ type bridgeAccount struct {
 	Platform         string       `json:"platform"`
 }
 
+// Sentinel error for missing bridge /accounts endpoint
+var errBridgeAccountsNotFound = errors.New("bridge accounts endpoint not found") // <-- added
+
 func fetchBridgeAccounts(ctx context.Context, bridgeURL string) (map[string]float64, error) {
 	u := strings.TrimRight(bridgeURL, "/") + "/accounts?limit=250"
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
@@ -374,6 +387,10 @@ func fetchBridgeAccounts(ctx context.Context, bridgeURL string) (map[string]floa
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		io.Copy(io.Discard, resp.Body)
+		return nil, errBridgeAccountsNotFound // <-- added
+	}
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("bridge /accounts %d: %s", resp.StatusCode, string(b))
@@ -420,6 +437,10 @@ func initLiveEquity(ctx context.Context, cfg Config, trader *Trader, lastPrice f
 func attemptLiveEquityRebase(ctx context.Context, cfg Config, trader *Trader, lastPrice float64) bool {
 	bal, err := fetchBridgeAccounts(ctx, cfg.BridgeURL)
 	if err != nil {
+		if errors.Is(err, errBridgeAccountsNotFound) {
+			log.Printf("TRACE EQUITY fallback: bridge /accounts 404 -> broker") // <-- added
+			return attemptLiveEquityRebaseBroker(ctx, trader, lastPrice)        // <-- added
+		}
 		return false
 	}
 	base, quote := splitProductID(cfg.ProductID)
@@ -501,7 +522,6 @@ type bridgePriceResp struct {
 func parseBridgeTS(v any) (time.Time, bool) {
 	switch t := v.(type) {
 	case float64:
-		// Treat as unix seconds; if large, assume ms.
 		n := int64(t)
 		if n > 1e12 { // ms
 			return time.Unix(n/1000, 0).UTC(), true
@@ -514,7 +534,6 @@ func parseBridgeTS(v any) (time.Time, bool) {
 		if s == "" {
 			return time.Time{}, false
 		}
-		// Try numeric first
 		if f, err := strconv.ParseFloat(s, 64); err == nil {
 			n := int64(f)
 			if n > 1e12 { // ms
@@ -524,7 +543,6 @@ func parseBridgeTS(v any) (time.Time, bool) {
 				return time.Unix(n, 0).UTC(), true
 			}
 		}
-		// Try RFC3339
 		if tt, err := time.Parse(time.RFC3339, s); err == nil {
 			return tt.UTC(), true
 		}
