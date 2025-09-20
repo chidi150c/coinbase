@@ -434,15 +434,32 @@ func fetchBridgeAccounts(ctx context.Context, bridgeURL string) (map[string]floa
 }
 
 func splitProductID(pid string) (base, quote string) {
-	parts := strings.Split(strings.ToUpper(strings.TrimSpace(pid)), "-")
+	p := strings.ToUpper(strings.TrimSpace(pid))
+	parts := strings.Split(p, "-")
 	if len(parts) == 2 {
 		return parts[0], parts[1]
 	}
-	if len(pid) > 3 {
-		return strings.ToUpper(pid[:len(pid)-3]), strings.ToUpper(pid[len(pid)-3:])
+
+	// Handle common suffix (quote) symbols used by Binance/others without a dash.
+	// Order matters: match the longest known suffixes first.
+	knownQuotes := []string{
+		"FDUSD", "USDT", "USDC", "BUSD", "TUSD", // 5/4-letter stablecoins
+		"EUR", "GBP", "TRY", "BRL",              // fiat
+		"BTC", "ETH", "BNB", "USD",              // crypto/fiat 3-letter
 	}
-	return strings.ToUpper(pid), "USD"
+	for _, q := range knownQuotes {
+		if strings.HasSuffix(p, q) && len(p) > len(q) {
+			return p[:len(p)-len(q)], q
+		}
+	}
+
+	// Fallback: old heuristic (last 3 chars as quote).
+	if len(p) > 3 {
+		return p[:len(p)-3], p[len(p)-3:]
+	}
+	return p, "USD"
 }
+
 
 func computeLiveEquity(bal map[string]float64, base, quote string, lastPrice float64) float64 {
 	q := bal[strings.ToUpper(quote)]
