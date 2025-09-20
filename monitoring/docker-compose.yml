@@ -1,8 +1,8 @@
 services:
   bridge_hitbtc:
     build:
-      context: ../bridge
-      dockerfile: Dockerfile.ws
+      context: ../bridge_hitbtc        # CHANGED from ../bridge
+      dockerfile: Dockerfile           # CHANGED from Dockerfile.ws
     container_name: bridge_hitbtc
     environment:
       EXCHANGE: "hitbtc"
@@ -15,8 +15,8 @@ services:
 
   bridge_binance:
     build:
-      context: ../bridge
-      dockerfile: Dockerfile.ws
+      context: ../bridge_binance       # CHANGED from ../bridge
+      dockerfile: Dockerfile           # CHANGED from Dockerfile.ws
     container_name: bridge_binance
     environment:
       EXCHANGE: "binance"
@@ -70,8 +70,7 @@ services:
       monitoring_network:
         aliases: [bot-hitbtc]
 
-   # NEW: second bot instance for Binance
-  
+  # NEW: second bot instance for Binance
   bot_binance:
     depends_on: [bridge_binance]
     image: ghcr.io/chidi150c/coinbase-bot:latest
