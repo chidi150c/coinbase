@@ -66,19 +66,13 @@ func main() {
 	var broker Broker
 	switch strings.ToLower(getEnv("BROKER", "")) {
 	case "binance":
-		broker = NewBinanceBroker()
+		broker = NewBinanceBridge(cfg.BridgeURL)
 	case "hitbtc":
-		hb, err := NewHitBTCBrokerFromEnv()
-		if err != nil {
-			log.Fatalf("hitbtc broker init: %v", err)
-		}
-		broker = hb
+		broker = NewHitbtcBridge(cfg.BridgeURL)
+	case "bridge":
+		broker = NewBridgeBroker(cfg.BridgeURL)
 	default:
-		if cfg.BridgeURL != "" {
-			broker = NewBridgeBroker(cfg.BridgeURL)
-		} else {
-			broker = NewPaperBroker()
-		}
+		broker = NewPaperBroker()	
 	}
 
 	model := newModel()

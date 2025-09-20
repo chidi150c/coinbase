@@ -1,6 +1,6 @@
 // FILE: broker_binance.go
-// Package main — HTTP broker against the Binance WS/REST FastAPI sidecar.
-// Mirrors broker_bridge.go behavior and contract; only Name() and defaults differ.
+// Package main — HTTP broker against the Binance FastAPI sidecar.
+// NOTE: This is a minimal clone of broker_bridge.go with only base URL and Name() changed.
 package main
 
 import (
@@ -22,6 +22,7 @@ type BinanceBridge struct {
 
 func NewBinanceBridge(base string) *BinanceBridge {
 	if strings.TrimSpace(base) == "" {
+		// default to the docker-compose service for Binance bridge
 		base = "http://bridge_binance:8789"
 	}
 	base = strings.TrimRight(base, "/")
@@ -31,24 +32,24 @@ func NewBinanceBridge(base string) *BinanceBridge {
 	}
 }
 
-func (bb *BinanceBridge) Name() string { return "binance-bridge" }
+func (b *BinanceBridge) Name() string { return "binance-bridge" }
 
-// --- Price ---
+// --- Price / Product ---
 
-func (bb *BinanceBridge) GetNowPrice(ctx context.Context, product string) (float64, error) {
-	u := fmt.Sprintf("%s/product/%s", bb.base, url.PathEscape(product))
+func (b *BinanceBridge) GetNowPrice(ctx context.Context, product string) (float64, error) {
+	u := fmt.Sprintf("%s/product/%s", b.base, url.PathEscape(product))
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return 0, err
 	}
-	resp, err := bb.hc.Do(req)
+	resp, err := b.hc.Do(req)
 	if err != nil {
 		return 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return 0, fmt.Errorf("bridge product %d: %s", resp.StatusCode, string(b))
+		xb, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("bridge product %d: %s", resp.StatusCode, string(xb))
 	}
 	var payload struct {
 		ProductID string  `json:"product_id"`
@@ -64,32 +65,36 @@ func (bb *BinanceBridge) GetNowPrice(ctx context.Context, product string) (float
 
 // --- Candles ---
 
-func (bb *BinanceBridge) GetRecentCandles(ctx context.Context, product string, granularity string, limit int) ([]Candle, error) {
+func (b *BinanceBridge) GetRecentCandles(ctx context.Context, product string, granularity string, limit int) ([]Candle, error) {
 	if limit <= 0 {
 		limit = 350
 	}
-	u := fmt.Sprintf("%s/candles?product_id=%s&granularity=%s&limit=%d", bb.base, url.QueryEscape(product), url.QueryEscape(granularity), limit)
+	u := fmt.Sprintf("%s/candles?product_id=%s&granularity=%s&limit=%d",
+		b.base, url.QueryEscape(product), url.QueryEscape(granularity), limit)
+
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := bb.hc.Do(req)
+	resp, err := b.hc.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("bridge candles %d: %s", resp.StatusCode, string(b))
+		xb, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("bridge candles %d: %s", resp.StatusCode, string(xb))
 	}
+
+	// IMPORTANT: keep this anonymous struct EXACTLY as in broker_bridge.go
 	var out struct {
 		Candles []struct {
-			Start  string `json:"start"`
-			Open   string `json:"open"`
-			High   string `json:"high"`
-			Low    string `json:"low"`
-			Close  string `json:"close"`
-			Volume string `json:"volume"`
+			Start  string
+			Open   string
+			High   string
+			Low    string
+			Close  string
+			Volume string
 		} `json:"candles"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -98,23 +103,22 @@ func (bb *BinanceBridge) GetRecentCandles(ctx context.Context, product string, g
 	return toCandles(out.Candles), nil
 }
 
-// --- Balances (live equity helpers) ---
+// --- Live balances / equity helpers (mirror broker_bridge.go) ---
 
-func (bb *BinanceBridge) GetAvailableBase(ctx context.Context, product string) (asset string, available float64, step float64, err error) {
-	base, _ := splitProductID(product)
-	u := fmt.Sprintf("%s/balance/base?product_id=%s", bb.base, url.QueryEscape(product))
+func (b *BinanceBridge) GetAvailableBase(ctx context.Context, product string) (asset string, available float64, step float64, err error) {
+	u := fmt.Sprintf("%s/balance/base?product_id=%s", b.base, url.QueryEscape(product))
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
-		return base, 0, 0, err
+		return "", 0, 0, err
 	}
-	resp, err := bb.hc.Do(req)
+	resp, err := b.hc.Do(req)
 	if err != nil {
-		return base, 0, 0, err
+		return "", 0, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return base, 0, 0, fmt.Errorf("bridge balance/base %d: %s", resp.StatusCode, string(b))
+		xb, _ := io.ReadAll(resp.Body)
+		return "", 0, 0, fmt.Errorf("bridge balance/base %d: %s", resp.StatusCode, string(xb))
 	}
 	var payload struct {
 		Asset     string `json:"asset"`
@@ -122,29 +126,25 @@ func (bb *BinanceBridge) GetAvailableBase(ctx context.Context, product string) (
 		Step      string `json:"step"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return base, 0, 0, err
+		return "", 0, 0, err
 	}
-	asset = payload.Asset
-	available = parseFloat(payload.Available)
-	step = parseFloat(payload.Step)
-	return
+	return payload.Asset, parseFloat(payload.Available), parseFloat(payload.Step), nil
 }
 
-func (bb *BinanceBridge) GetAvailableQuote(ctx context.Context, product string) (asset string, available float64, step float64, err error) {
-	_, quote := splitProductID(product)
-	u := fmt.Sprintf("%s/balance/quote?product_id=%s", bb.base, url.QueryEscape(product))
+func (b *BinanceBridge) GetAvailableQuote(ctx context.Context, product string) (asset string, available float64, step float64, err error) {
+	u := fmt.Sprintf("%s/balance/quote?product_id=%s", b.base, url.QueryEscape(product))
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
-		return quote, 0, 0, err
+		return "", 0, 0, err
 	}
-	resp, err := bb.hc.Do(req)
+	resp, err := b.hc.Do(req)
 	if err != nil {
-		return quote, 0, 0, err
+		return "", 0, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return quote, 0, 0, fmt.Errorf("bridge balance/quote %d: %s", resp.StatusCode, string(b))
+		xb, _ := io.ReadAll(resp.Body)
+		return "", 0, 0, fmt.Errorf("bridge balance/quote %d: %s", resp.StatusCode, string(xb))
 	}
 	var payload struct {
 		Asset     string `json:"asset"`
@@ -152,30 +152,29 @@ func (bb *BinanceBridge) GetAvailableQuote(ctx context.Context, product string) 
 		Step      string `json:"step"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return quote, 0, 0, err
+		return "", 0, 0, err
 	}
-	asset = payload.Asset
-	available = parseFloat(payload.Available)
-	step = parseFloat(payload.Step)
-	return
+	return payload.Asset, parseFloat(payload.Available), parseFloat(payload.Step), nil
 }
 
-// --- Orders (market by quote USD) ---
+// --- Orders (market by quote), exact body/shape as broker_bridge.go expects ---
 
-func (bb *BinanceBridge) PlaceMarketQuote(ctx context.Context, product string, side OrderSide, quoteUSD float64) (*PlacedOrder, error) {
+func (b *BinanceBridge) PlaceMarketQuote(ctx context.Context, product string, side OrderSide, quoteUSD float64) (*PlacedOrder, error) {
 	body := map[string]any{
 		"product_id": product,
-		"side":       side.String(),
+		"side":       side, // IMPORTANT: mirror broker_bridge.go (no .String())
 		"quote_size": fmt.Sprintf("%.8f", quoteUSD),
 	}
-	b, _ := json.Marshal(body)
-	u := fmt.Sprintf("%s/order/market", bb.base)
-	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(b))
+	data, _ := json.Marshal(body)
+	u := fmt.Sprintf("%s/order/market", b.base)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := bb.hc.Do(req)
+
+	resp, err := b.hc.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -184,38 +183,38 @@ func (bb *BinanceBridge) PlaceMarketQuote(ctx context.Context, product string, s
 		xb, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("bridge order/market %d: %s", resp.StatusCode, string(xb))
 	}
+
 	var ord PlacedOrder
 	if err := json.NewDecoder(resp.Body).Decode(&ord); err != nil {
 		return nil, err
 	}
 
-	// Enrich with fills via GET /order/{order_id} (micro-retry)
+	// Enrich via GET /order/{order_id}, identical to broker_bridge.go
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		o2, err := bb.fetchOrder(ctx, product, ord.OrderID)
+		o2, err := b.fetchOrder(ctx, product, ord.OrderID)
 		if err == nil && (o2.FilledSize > 0 || o2.ExecutedValue > 0) {
 			return o2, nil
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	// Fallback to original ord (could be still-new order)
 	return &ord, nil
 }
 
-func (bb *BinanceBridge) fetchOrder(ctx context.Context, product, orderID string) (*PlacedOrder, error) {
-	u := fmt.Sprintf("%s/order/%s", bb.base, url.PathEscape(orderID))
+func (b *BinanceBridge) fetchOrder(ctx context.Context, product, orderID string) (*PlacedOrder, error) {
+	u := fmt.Sprintf("%s/order/%s", b.base, url.PathEscape(orderID))
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := bb.hc.Do(req)
+	resp, err := b.hc.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("bridge order get %d: %s", resp.StatusCode, string(b))
+		xb, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("bridge order get %d: %s", resp.StatusCode, string(xb))
 	}
 	var ord PlacedOrder
 	if err := json.NewDecoder(resp.Body).Decode(&ord); err != nil {
@@ -224,10 +223,15 @@ func (bb *BinanceBridge) fetchOrder(ctx context.Context, product, orderID string
 	return &ord, nil
 }
 
-// --- helpers shared with broker_bridge ---
+// --- helpers (EXACTLY like broker_bridge.go) ---
 
 func toCandles(rows []struct {
-	Start, Open, High, Low, Close, Volume string
+	Start  string
+	Open   string
+	High   string
+	Low    string
+	Close  string
+	Volume string
 }) []Candle {
 	out := make([]Candle, 0, len(rows))
 	for _, r := range rows {
