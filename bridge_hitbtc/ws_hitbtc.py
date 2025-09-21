@@ -28,7 +28,7 @@ HITBTC_BASE_URL   = os.getenv("HITBTC_BASE_URL", "https://api.hitbtc.com").strip
 last_price: Optional[float] = None
 last_ts_ms: Optional[int] = None
 candles: Dict[int, List[float]] = {}  # minute_ms -> [o,h,l,c,vol]
-_first_tick_logged: bool = False  # <-- TRACE: first-tick marker
+_first_tick_logged: bool = False  # TRACE: first-tick marker
 
 # ---- Time & candle helpers ----
 def _now_ms() -> int:
@@ -38,7 +38,6 @@ def _now_iso() -> str:
     return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
 def _minute_start(ts_ms: int) -> int:
-    # align to minute in milliseconds
     return (ts_ms // 60000) * 60000
 
 def _trim_old(max_minutes=6000):
@@ -131,6 +130,7 @@ GRAN_MAP = {
     "TWO_HOUR": "H1",
     "SIX_HOUR": "H4",
 }
+_PERIOD_TO_GRAN = {v: k for k, v in GRAN_MAP.items()}
 
 # ---- WebSocket: HitBTC market data
 async def _ws_loop():
@@ -266,24 +266,43 @@ def price(product_id: str = Query(default=SYMBOL)):
 
 @app.get("/candles")
 def get_candles(
+    # legacy names
     product_id: str = Query(default=SYMBOL),
     granularity: str = Query(default="ONE_MINUTE"),
     start: Optional[int] = Query(default=None),
     end: Optional[int] = Query(default=None),
     limit: int = Query(default=350),
+    # binance-style aliases (optional)
+    symbol: Optional[str] = Query(default=None),
+    interval: Optional[str] = Query(default=None),
+    startTime: Optional[int] = Query(default=None),
+    endTime: Optional[int] = Query(default=None),
 ):
+    # alias resolution
+    pid = (symbol or product_id or SYMBOL)
+    eff_gran = granularity.upper()
+    if interval:
+        # map hitbtc-like / binance intervals to our granularity keys when possible
+        iv = interval.strip().upper()
+        # accept "1m/5m/15m/1h/4h/1d" → map to M1/M5/M15/H1/H4/D1 → gran
+        _iv_map = {"1M":"M1","5M":"M5","15M":"M15","30M":"M30","1H":"H1","4H":"H4","1D":"D1",
+                   "1m":"M1","5m":"M5","15m":"M15","30m":"M30","1h":"H1","4h":"H4","1d":"D1"}
+        period_guess = _iv_map.get(iv, None) or _iv_map.get(interval, None)
+        if period_guess:
+            eff_gran = _PERIOD_TO_GRAN.get(period_guess, eff_gran)
+
     # normalize timestamps (accept seconds or ms)
     def _ms(x: Optional[int]) -> Optional[int]:
         if x is None:
             return None
         return x * 1000 if x < 1_000_000_000_000 else x
 
-    s_ms = _ms(start)
-    e_ms = _ms(end)
+    s_ms = _ms(startTime if startTime is not None else start)
+    e_ms = _ms(endTime   if endTime   is not None else end)
     only_limit = (s_ms is None and e_ms is None)
 
     # serve from WS cache for ONE_MINUTE when possible
-    if granularity.upper() == "ONE_MINUTE":
+    if eff_gran == "ONE_MINUTE":
         keys = (
             sorted(candles.keys())[-limit:]
             if only_limit
@@ -300,15 +319,61 @@ def get_candles(
                 "close":  str(c),
                 "volume": str(v),
             })
-        if not rows:
-            log.warning(f"[CANDLES] src=WS ZERO rows sym={_normalize_symbol(product_id)} g={granularity} limit={limit} start={start} end={end} cache_size={len(candles)}")
-        else:
-            log.info(f"[CANDLES] src=WS sym={_normalize_symbol(product_id)} g={granularity} limit={limit} start={start} end={end} returned={len(rows)} cache_size={len(candles)}")
-        return {"candles": rows}
+        if rows:
+            log.info(f"[CANDLES] src=WS sym={_normalize_symbol(pid)} g={eff_gran} limit={limit} start={s_ms} end={e_ms} returned={len(rows)} cache_size={len(candles)}")
+            return {"candles": rows}
 
-    # REST backfill for other granularities (public)
-    sym = _normalize_symbol(product_id)
-    period = GRAN_MAP.get(granularity.upper(), "M1")
+        # If only limit provided and cache is empty, perform public REST backfill for M1 to seed cache
+        if only_limit:
+            sym = _normalize_symbol(pid)
+            period = "M1"
+            qs = {"period": period, "limit": str(min(max(1, limit), 1000))}
+            url = f"{HITBTC_BASE_URL}/api/3/public/candles/{sym}?{urlparse.urlencode(qs)}"
+            try:
+                data = _http_get(url)
+            except HTTPException:
+                raise
+            except Exception as e:
+                log.warning(f"[CANDLES] REST error sym={sym} period={period} err={e}")
+                raise HTTPException(status_code=502, detail=f"hitbtc candles error: {e}")
+
+            out_seeded = 0
+            for r in data[-limit:]:
+                try:
+                    t = r.get("t") or r.get("timestamp")
+                    dt = datetime.fromisoformat((t or "").replace("Z", "+00:00"))
+                    ot = int(dt.timestamp())
+                    c = float(r.get("c", "0"))
+                except Exception:
+                    continue
+                try:
+                    _update_candle(float(c), ot * 1000)
+                    out_seeded += 1
+                except Exception:
+                    pass
+            log.info(f"[CANDLES] backfill M1 seeded={out_seeded} sym={sym}")
+
+            # re-serve from cache after seeding
+            keys = sorted(candles.keys())[-limit:]
+            rows = []
+            for k in keys:
+                o, h, l, c, v = candles[k]
+                rows.append({
+                    "start":  str(int(k // 1000)),
+                    "open":   str(o),
+                    "high":   str(h),
+                    "low":    str(l),
+                    "close":  str(c),
+                    "volume": str(v),
+                })
+            log.info(f"[CANDLES] src=WS(after-backfill) sym={_normalize_symbol(pid)} g={eff_gran} limit={limit} returned={len(rows)} cache_size={len(candles)}")
+            return {"candles": rows}
+
+        # not only-limit (range query) and still empty → fall through to REST range fetch below
+
+    # REST backfill for other granularities or range queries
+    sym = _normalize_symbol(pid)
+    period = GRAN_MAP.get(eff_gran, "M1")
     qs = {"period": period, "limit": str(min(max(1, limit), 1000))}
     if s_ms is not None:
         qs["from"] = datetime.utcfromtimestamp(s_ms / 1000).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -353,9 +418,9 @@ def get_candles(
                 pass
 
     if not out:
-        log.warning(f"[CANDLES] src=REST ZERO rows sym={sym} period={period} limit={limit} start={start} end={end}")
+        log.warning(f"[CANDLES] src=REST ZERO rows sym={sym} period={period} limit={limit} start={s_ms} end={e_ms}")
     else:
-        log.info(f"[CANDLES] src=REST sym={sym} period={period} limit={limit} returned={len(out)} start={start} end={end}")
+        log.info(f"[CANDLES] src=REST sym={sym} period={period} limit={limit} returned={len(out)} start={s_ms} end={e_ms}")
     return {"candles": out}
 
 @app.get("/accounts")

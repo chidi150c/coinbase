@@ -29,7 +29,7 @@ BINANCE_RECV_WINDOW = os.getenv("BINANCE_RECV_WINDOW", "5000").strip()  # ms
 last_price: Optional[float] = None
 last_ts_ms: Optional[int] = None
 candles: Dict[int, List[float]] = {}  # minuteStartMs -> [o,h,l,c,vol]
-_first_tick_logged: bool = False  # <-- TRACE: first-tick marker
+_first_tick_logged: bool = False  # TRACE: first-tick marker
 
 # ---- Helpers ----
 def _now_ms() -> int: return int(time.time() * 1000)
@@ -187,6 +187,8 @@ GRAN_MAP = {
     "SIX_HOUR": "6h",
     "ONE_DAY": "1d",
 }
+# Reverse for alias mapping
+_INTERVAL_TO_GRAN = {v: k for k, v in GRAN_MAP.items()}
 
 @app.get("/health")
 def health(): return {"ok": True}
@@ -200,26 +202,40 @@ def price(product_id: str = Query(default=SYMBOL)):
     return {"product_id": product_id, "price": float(last_price) if last_price else 0.0, "ts": last_ts_ms, "stale": stale}
 
 @app.get("/candles")
-def get_candles(product_id: str = Query(default=SYMBOL),
-           granularity: str = Query(default="ONE_MINUTE"),
-           start: Optional[int] = Query(default=None),
-           end: Optional[int] = Query(default=None),
-           limit: int = Query(default=350)):
+def get_candles(
+    # legacy names
+    product_id: str = Query(default=SYMBOL),
+    granularity: str = Query(default="ONE_MINUTE"),
+    start: Optional[int] = Query(default=None),
+    end: Optional[int] = Query(default=None),
+    limit: int = Query(default=350),
+    # binance-style aliases (additive; optional)
+    symbol: Optional[str] = Query(default=None),
+    interval: Optional[str] = Query(default=None),
+    startTime: Optional[int] = Query(default=None),
+    endTime: Optional[int] = Query(default=None),
+):
+    # alias resolution
+    pid = (symbol or product_id or SYMBOL)
+    eff_gran = granularity.upper()
+    if interval:
+        interval = interval.lower()
+        eff_gran = _INTERVAL_TO_GRAN.get(interval, eff_gran)
+
     # time params: accept seconds or ms; normalize to ms
     def _ms(x: Optional[int]) -> Optional[int]:
         if x is None: return None
         return x * 1000 if x < 1_000_000_000_000 else x
-    s_ms = _ms(start)
-    e_ms = _ms(end)
+    s_ms = _ms(startTime if startTime is not None else start)
+    e_ms = _ms(endTime   if endTime   is not None else end)
     only_limit = (s_ms is None and e_ms is None)
 
     # serve from memory only for 1-minute (that’s what WS updates)
-    if granularity.upper() == "ONE_MINUTE":
+    if eff_gran == "ONE_MINUTE":
         if only_limit:
-            # latest N candles, array-of-arrays (warmup fix)
             keys = sorted(candles.keys())[-limit:]
             if not keys:
-                log.warning(f"[CANDLES] ONE_MINUTE cache empty; will try REST backfill sym={_normalize_symbol(product_id)} limit={limit}")
+                log.warning(f"[CANDLES] ONE_MINUTE cache empty; will try REST backfill sym={_normalize_symbol(pid)} limit={limit}")
             if keys:
                 out_arr = []
                 for k in keys:
@@ -233,14 +249,14 @@ def get_candles(product_id: str = Query(default=SYMBOL),
             for k in keys[-limit:]:
                 o,h,l,c,v = candles[k]
                 rows.append({"start": str(k//1000), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
-            log.info(f"[CANDLES] src=WS g=ONE_MINUTE return={len(rows)} cache_size={len(candles)} start={start} end={end}")
+            log.info(f"[CANDLES] src=WS g=ONE_MINUTE return={len(rows)} cache_size={len(candles)} start={s_ms} end={e_ms}")
             if rows:
                 return {"candles": rows}
 
     # REST backfill (any granularity)
-    sym = _normalize_symbol(product_id)
-    interval = GRAN_MAP.get(granularity.upper(), "1m")
-    qs = {"symbol": sym, "interval": interval, "limit": str(min(max(1, limit), 1000))}
+    sym = _normalize_symbol(pid)
+    interval_eff = GRAN_MAP.get(eff_gran, "1m")
+    qs = {"symbol": sym, "interval": interval_eff, "limit": str(min(max(1, limit), 1000))}
     if s_ms is not None: qs["startTime"] = str(s_ms)
     if e_ms is not None: qs["endTime"]   = str(e_ms)
     url = f"{BINANCE_BASE_URL}/api/v3/klines?{urlparse.urlencode(qs)}"
@@ -259,21 +275,18 @@ def get_candles(product_id: str = Query(default=SYMBOL),
             o,h,l,c,v = float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])
         except Exception:
             continue
-        # object row (existing behavior for start/end queries)
         out.append({"start": str(ot), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
-        # array row (warmup fix for limit-only)
         out_arr.append([int(ot), float(l), float(h), float(o), float(c), float(v)])
-        # seed 1m cache when interval is 1m
-        if interval == "1m":
+        if interval_eff == "1m":
             try:
                 close_time_ms = int(r[6])
                 _update_candle(float(c), close_time_ms)
             except Exception:
                 pass
-    log.info(f"[CANDLES] src=REST sym={sym} interval={interval} rows={len(out)}")
+    log.info(f"[CANDLES] src=REST sym={sym} interval={interval_eff} rows={len(out)}")
     if only_limit:
         if not out_arr:
-            log.warning(f"[CANDLES] REST returned 0 rows sym={sym} interval={interval} limit={limit}")
+            log.warning(f"[CANDLES] REST returned 0 rows sym={sym} interval={interval_eff} limit={limit}")
         return out_arr
     return {"candles": out}
 
