@@ -28,21 +28,18 @@ HITBTC_BASE_URL   = os.getenv("HITBTC_BASE_URL", "https://api.hitbtc.com").strip
 last_price: Optional[float] = None
 last_ts_ms: Optional[int] = None
 candles: Dict[int, List[float]] = {}  # minute_ms -> [o,h,l,c,vol]
-
+_first_tick_logged: bool = False  # <-- TRACE: first-tick marker
 
 # ---- Time & candle helpers ----
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
-
 def _now_iso() -> str:
     return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-
 
 def _minute_start(ts_ms: int) -> int:
     # align to minute in milliseconds
     return (ts_ms // 60000) * 60000
-
 
 def _trim_old(max_minutes=6000):
     if len(candles) <= max_minutes:
@@ -51,7 +48,6 @@ def _trim_old(max_minutes=6000):
     for k in sorted(candles.keys())[:-max_minutes]:
         candles.pop(k, None)
     log.debug(f"[CANDLES] trimmed old entries: dropped={drop}, kept={len(candles)}")
-
 
 def _update_candle(px: float, ts_ms: int, vol: float = 0.0):
     m = _minute_start(ts_ms)
@@ -66,10 +62,8 @@ def _update_candle(px: float, ts_ms: int, vol: float = 0.0):
         log.debug(f"[CANDLES] update m={m//1000} o={o} h={nh} l={nl} c={px} v={v+vol}")
     _trim_old()
 
-
 def _normalize_symbol(pid: str) -> str:
     return (pid or SYMBOL).upper().replace("-", "")
-
 
 def _http_get(url: str, headers: Optional[Dict[str, str]] = None):
     log.debug(f"[REST] GET {url}")
@@ -86,7 +80,6 @@ def _http_get(url: str, headers: Optional[Dict[str, str]] = None):
         except Exception:
             log.error(f"[REST] invalid JSON for {url}")
             raise HTTPException(status_code=500, detail="Invalid JSON")
-
 
 def _req(path: str, method="GET", body: Optional[bytes] = None) -> Dict:
     if not HITBTC_API_KEY or not HITBTC_API_SECRET:
@@ -112,13 +105,11 @@ def _req(path: str, method="GET", body: Optional[bytes] = None) -> Dict:
             log.error(f"[REST AUTH] invalid JSON for {url}")
             raise HTTPException(status_code=500, detail="Invalid JSON from HitBTC")
 
-
 def _split(pid: str) -> Tuple[str, str]:
     p = pid.upper().replace("-", "")
     if len(p) > 3:
         return p[:-3], p[-3:]
     return p, "USD"
-
 
 def _sum_available(accts: List[Dict], asset: str) -> str:
     a = asset.upper()
@@ -126,7 +117,6 @@ def _sum_available(accts: List[Dict], asset: str) -> str:
         if r.get("currency", "").upper() == a:
             return str(r.get("available_balance", {}).get("value", "0"))
     return "0"
-
 
 # Map Coinbase granularities → HitBTC periods
 GRAN_MAP = {
@@ -142,7 +132,6 @@ GRAN_MAP = {
     "SIX_HOUR": "H4",
 }
 
-
 # ---- WebSocket: HitBTC market data
 async def _ws_loop():
     """
@@ -151,7 +140,7 @@ async def _ws_loop():
       - subscribe to `ticker/1s`       (fallback mid from a/b)
     Updates: last_price, last_ts_ms, in-memory minute candles.
     """
-    global last_price, last_ts_ms
+    global last_price, last_ts_ms, _first_tick_logged
     url = "wss://api.hitbtc.com/api/3/ws/public"
     sym = _normalize_symbol(SYMBOL)
     subs = [
@@ -220,7 +209,9 @@ async def _ws_loop():
                         last_price = px
                         last_ts_ms = ts_ms
                         _update_candle(px, ts_ms, 0.0)
-                        log.debug(f"[WS] tick sym={sym} px={px:.8f} ts_ms={ts_ms}")
+                        if not _first_tick_logged:
+                            _first_tick_logged = True
+                            log.info(f"[WS] first tick sym={sym} px={px:.8f} ts_ms={ts_ms}")
         except Exception as e:
             log.warning(f"[WS] disconnect err={e} backoff={backoff}s")
             if LOG_LEVEL == "DEBUG":
@@ -228,10 +219,8 @@ async def _ws_loop():
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 15)
 
-
 # ---- HTTP app
 app = FastAPI(title="bridge-hitbtc", version="0.5")
-
 
 # --- simple access log middleware (lite)
 @app.middleware("http")
@@ -243,7 +232,6 @@ async def _access_log(request: Request, call_next):
         duration_ms = int((time.time() - start) * 1000)
         log.info(f"[HTTP] {request.method} {request.url.path} q={dict(request.query_params)} {duration_ms}ms")
     return response
-
 
 @app.get("/health")
 def health():
@@ -261,7 +249,6 @@ def health():
         "stale": stale,
     }
 
-
 @app.get("/price")
 def price(product_id: str = Query(default=SYMBOL)):
     age_ms = None
@@ -276,7 +263,6 @@ def price(product_id: str = Query(default=SYMBOL)):
         "ts": last_ts_ms,
         "stale": stale,
     }
-
 
 @app.get("/candles")
 def get_candles(
@@ -314,8 +300,10 @@ def get_candles(
                 "close":  str(c),
                 "volume": str(v),
             })
-        log.info(f"[CANDLES] src=WS sym={_normalize_symbol(product_id)} g={granularity} limit={limit} "
-                 f"start={start} end={end} returned={len(rows)} cache_size={len(candles)}")
+        if not rows:
+            log.warning(f"[CANDLES] src=WS ZERO rows sym={_normalize_symbol(product_id)} g={granularity} limit={limit} start={start} end={end} cache_size={len(candles)}")
+        else:
+            log.info(f"[CANDLES] src=WS sym={_normalize_symbol(product_id)} g={granularity} limit={limit} start={start} end={end} returned={len(rows)} cache_size={len(candles)}")
         return {"candles": rows}
 
     # REST backfill for other granularities (public)
@@ -364,10 +352,11 @@ def get_candles(
             except Exception:
                 pass
 
-    log.info(f"[CANDLES] src=REST sym={sym} period={period} limit={limit} returned={len(out)} "
-             f"start={start} end={end}")
+    if not out:
+        log.warning(f"[CANDLES] src=REST ZERO rows sym={sym} period={period} limit={limit} start={start} end={end}")
+    else:
+        log.info(f"[CANDLES] src=REST sym={sym} period={period} limit={limit} returned={len(out)} start={start} end={end}")
     return {"candles": out}
-
 
 @app.get("/accounts")
 def accounts(limit: int = 250):
@@ -386,7 +375,6 @@ def accounts(limit: int = 250):
     log.info(f"[ACCOUNTS] size={len(out)}")
     return {"accounts": out, "has_next": False, "cursor": "", "size": len(out)}
 
-
 @app.get("/balance/base")
 def balance_base(product_id: str = Query(...)):
     base, _ = _split(product_id)
@@ -394,7 +382,6 @@ def balance_base(product_id: str = Query(...)):
     value = _sum_available(accts["accounts"], base)
     log.info(f"[BALANCE] base asset={base} available={value}")
     return {"asset": base, "available": value, "step": "0"}
-
 
 @app.get("/balance/quote")
 def balance_quote(product_id: str = Query(...)):
@@ -404,14 +391,12 @@ def balance_quote(product_id: str = Query(...)):
     log.info(f"[BALANCE] quote asset={quote} available={value}")
     return {"asset": quote, "available": value, "step": "0"}
 
-
 @app.get("/product/{product_id}")
 def product_info(product_id: str = Path(...)):
     # mirror /price snapshot for arbitrary product_id
     resp = price(product_id)
     log.debug(f"[PRODUCT] {product_id} -> price={resp.get('price')} ts={resp.get('ts')}")
     return resp
-
 
 # --- Orders (market), partial-fill enrichment ---
 def _place_order(symbol: str, side: str, quantity: str) -> Dict:
@@ -420,21 +405,17 @@ def _place_order(symbol: str, side: str, quantity: str) -> Dict:
     }).encode("utf-8")
     return _req("/api/3/spot/order", method="POST", body=body)
 
-
 def _get_order(order_id: str) -> Dict:
     return _req(f"/api/3/spot/order/{order_id}")
-
 
 def _order_trades(order_id: str) -> List[Dict]:
     payload = _req(f"/api/3/spot/order/{order_id}/trades")
     return payload if isinstance(payload, list) else payload.get("trades", [])
 
-
 @app.post("/orders/market_buy")
 def orders_market_buy(product_id: str = Query(...), quote_size: str = Query(...)):
     log.info(f"[ORDER] market_buy pid={product_id} quote_size={quote_size}")
     return order_market(product_id=product_id, side="BUY", quote_size=quote_size)
-
 
 @app.post("/order/market")
 def order_market(product_id: str = Query(...), side: str = Query(...), quote_size: str = Query(...)):
@@ -490,7 +471,6 @@ def order_market(product_id: str = Query(...), side: str = Query(...), quote_siz
         log.warning(f"[ORDER] trades fetch error id={order_id} err={e}")
     return resp
 
-
 @app.get("/order/{order_id}")
 def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
     log.info(f"[ORDER] get id={order_id} pid={product_id}")
@@ -535,7 +515,6 @@ def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
         log.warning(f"[ORDER] trades fetch error id={order_id} err={e}")
     return resp
 
-
 # ---- Runner
 async def _runner():
     log.info(f"[BOOT] starting bridge-hitbtc PORT={PORT} SYMBOL={SYMBOL} LOG_LEVEL={LOG_LEVEL}")
@@ -543,7 +522,6 @@ async def _runner():
     cfg  = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
     srv  = uvicorn.Server(cfg)
     await asyncio.gather(task, srv.serve())
-
 
 if __name__ == "__main__":
     try:

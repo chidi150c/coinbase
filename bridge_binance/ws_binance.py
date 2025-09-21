@@ -29,6 +29,7 @@ BINANCE_RECV_WINDOW = os.getenv("BINANCE_RECV_WINDOW", "5000").strip()  # ms
 last_price: Optional[float] = None
 last_ts_ms: Optional[int] = None
 candles: Dict[int, List[float]] = {}  # minuteStartMs -> [o,h,l,c,vol]
+_first_tick_logged: bool = False  # <-- TRACE: first-tick marker
 
 # ---- Helpers ----
 def _now_ms() -> int: return int(time.time() * 1000)
@@ -123,14 +124,18 @@ def _sum_available(accts: List[Dict], asset: str) -> str:
 
 # ---- WS consumer ----
 async def _ws_loop():
-    global last_price, last_ts_ms
+    global last_price, last_ts_ms, _first_tick_logged
     sym = _normalize_symbol(SYMBOL).lower()
     url = f"wss://stream.binance.com:9443/stream?streams={sym}@bookTicker/{sym}@trade"
-    log.info(f"[TRACE] WS subscribe {url}")
+    log.info(f"[WS] connecting url={url}")
     backoff = 1
+    attempt = 0
     while True:
+        attempt += 1
         try:
+            log.info(f"[WS] connect attempt={attempt}")
             async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_queue=1024) as ws:
+                log.info(f"[WS] connected streams={sym}@bookTicker,{sym}@trade")
                 backoff = 1
                 while True:
                     raw = await ws.recv()
@@ -150,7 +155,7 @@ async def _ws_loop():
                         except Exception:
                             px = None
                     elif stream.endswith("@trade"):
-                        p = data.get("p")
+                        p = data.get("p") or data.get("price")
                         try:
                             if p is not None: px = float(p)
                         except Exception:
@@ -159,7 +164,11 @@ async def _ws_loop():
                         last_price = px
                         last_ts_ms = ts
                         _update_candle(px, ts)
-        except Exception:
+                        if not _first_tick_logged:
+                            _first_tick_logged = True
+                            log.info(f"[WS] first tick px={px:.8f} ts_ms={ts}")
+        except Exception as e:
+            log.warning(f"[WS] disconnect err={e} backoff={backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff*2, 15)
 
@@ -209,11 +218,14 @@ def get_candles(product_id: str = Query(default=SYMBOL),
         if only_limit:
             # latest N candles, array-of-arrays (warmup fix)
             keys = sorted(candles.keys())[-limit:]
+            if not keys:
+                log.warning(f"[CANDLES] ONE_MINUTE cache empty; will try REST backfill sym={_normalize_symbol(product_id)} limit={limit}")
             if keys:
                 out_arr = []
                 for k in keys:
                     o,h,l,c,v = candles[k]
                     out_arr.append([int(k//1000), float(l), float(h), float(o), float(c), float(v)])
+                log.info(f"[CANDLES] src=WS g=ONE_MINUTE return={len(out_arr)} cache_size={len(candles)}")
                 return out_arr
         else:
             rows: List[Dict[str,str]] = []
@@ -221,6 +233,7 @@ def get_candles(product_id: str = Query(default=SYMBOL),
             for k in keys[-limit:]:
                 o,h,l,c,v = candles[k]
                 rows.append({"start": str(k//1000), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
+            log.info(f"[CANDLES] src=WS g=ONE_MINUTE return={len(rows)} cache_size={len(candles)} start={start} end={end}")
             if rows:
                 return {"candles": rows}
 
@@ -257,8 +270,10 @@ def get_candles(product_id: str = Query(default=SYMBOL),
                 _update_candle(float(c), close_time_ms)
             except Exception:
                 pass
-    log.info(f"[TRACE] REST klines fetched: symbol={sym} interval={interval} rows={len(out)}")
+    log.info(f"[CANDLES] src=REST sym={sym} interval={interval} rows={len(out)}")
     if only_limit:
+        if not out_arr:
+            log.warning(f"[CANDLES] REST returned 0 rows sym={sym} interval={interval} limit={limit}")
         return out_arr
     return {"candles": out}
 
