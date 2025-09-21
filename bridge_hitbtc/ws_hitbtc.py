@@ -266,162 +266,83 @@ def price(product_id: str = Query(default=SYMBOL)):
 
 @app.get("/candles")
 def get_candles(
-    # legacy names
+    # legacy names (intentionally ignored for HitBTC-specific handler)
     product_id: str = Query(default=SYMBOL),
     granularity: str = Query(default="ONE_MINUTE"),
     start: Optional[int] = Query(default=None),
     end: Optional[int] = Query(default=None),
     limit: int = Query(default=350),
-    # binance-style aliases (optional)
+    # authoritative HitBTC-facing params
     symbol: Optional[str] = Query(default=None),
     interval: Optional[str] = Query(default=None),
     startTime: Optional[int] = Query(default=None),
     endTime: Optional[int] = Query(default=None),
 ):
-    # alias resolution
-    pid = (symbol or product_id or SYMBOL)
-    eff_gran = granularity.upper()
-    if interval:
-        # map hitbtc-like / binance intervals to our granularity keys when possible
-        iv = interval.strip().upper()
-        # accept "1m/5m/15m/1h/4h/1d" → map to M1/M5/M15/H1/H4/D1 → gran
-        _iv_map = {"1M":"M1","5M":"M5","15M":"M15","30M":"M30","1H":"H1","4H":"H4","1D":"D1",
-                   "1m":"M1","5m":"M5","15m":"M15","30m":"M30","1h":"H1","4h":"H4","1d":"D1"}
-        period_guess = _iv_map.get(iv, None) or _iv_map.get(interval, None)
-        if period_guess:
-            eff_gran = _PERIOD_TO_GRAN.get(period_guess, eff_gran)
+    """
+    HitBTC-specific /candles passthrough:
+      - Talks only to https://api.hitbtc.com/api/3/public/candles/{symbol}
+      - Allowed params: period (derived from interval), limit, optional from/till (RFC3339 UTC)
+      - startTime/endTime validation: convert seconds→ms; require start<end when both present
+      - If only limit provided, omit from/till entirely
+      - No cross-bridge aliasing or Coinbase product/granularity handling
+      - Propagate non-2xx as errors; log upstream URL/status/body snippet
+    """
+    sym = _normalize_symbol(symbol or SYMBOL)
 
-    # normalize timestamps (accept seconds or ms)
-    def _ms(x: Optional[int]) -> Optional[int]:
-        if x is None:
+    # interval -> HitBTC period
+    period_map = {"1m": "M1", "5m": "M5", "15m": "M15", "30m": "M30", "1h": "H1", "4h": "H4", "1d": "D1"}
+    ivl = (interval or "1m").strip().lower()
+    period = period_map.get(ivl)
+    if not period:
+        raise HTTPException(status_code=400, detail=f"unsupported interval {interval}")
+
+    # normalize times (accept seconds -> ms) then to RFC3339
+    def _to_ms(v: Optional[int]) -> Optional[int]:
+        if v is None:
             return None
-        return x * 1000 if x < 1_000_000_000_000 else x
+        return v * 1000 if v <= 1_000_000_000_000 else v
 
-    s_ms = _ms(startTime if startTime is not None else start)
-    e_ms = _ms(endTime   if endTime   is not None else end)
-    only_limit = (s_ms is None and e_ms is None)
+    st_ms = _to_ms(startTime)
+    et_ms = _to_ms(endTime)
 
-    # serve from WS cache for ONE_MINUTE when possible
-    if eff_gran == "ONE_MINUTE":
-        keys = (
-            sorted(candles.keys())[-limit:]
-            if only_limit
-            else sorted(k for k in candles.keys() if (s_ms is None or k >= s_ms) and (e_ms is None or k <= e_ms))[-limit:]
-        )
-        rows = []
-        for k in keys:
-            o, h, l, c, v = candles[k]
-            rows.append({
-                "start":  str(int(k // 1000)),  # seconds
-                "open":   str(o),
-                "high":   str(h),
-                "low":    str(l),
-                "close":  str(c),
-                "volume": str(v),
-            })
-        if rows:
-            log.info(f"[CANDLES] src=WS sym={_normalize_symbol(pid)} g={eff_gran} limit={limit} start={s_ms} end={e_ms} returned={len(rows)} cache_size={len(candles)}")
-            return {"candles": rows}
+    if (st_ms is None) ^ (et_ms is None):
+        # one provided without the other -> require both or none
+        raise HTTPException(status_code=400, detail="startTime and endTime must be provided together or omitted")
 
-        # If only limit provided and cache is empty, perform public REST backfill for M1 to seed cache
-        if only_limit:
-            sym = _normalize_symbol(pid)
-            period = "M1"
-            qs = {"period": period, "limit": str(min(max(1, limit), 1000))}
-            url = f"{HITBTC_BASE_URL}/api/3/public/candles/{sym}?{urlparse.urlencode(qs)}"
-            try:
-                data = _http_get(url)
-            except HTTPException:
-                raise
-            except Exception as e:
-                log.warning(f"[CANDLES] REST error sym={sym} period={period} err={e}")
-                raise HTTPException(status_code=502, detail=f"hitbtc candles error: {e}")
+    params = {"period": period, "limit": str(min(max(1, limit), 1000))}
 
-            out_seeded = 0
-            for r in data[-limit:]:
-                try:
-                    t = r.get("t") or r.get("timestamp")
-                    dt = datetime.fromisoformat((t or "").replace("Z", "+00:00"))
-                    ot = int(dt.timestamp())
-                    c = float(r.get("c", "0"))
-                except Exception:
-                    continue
-                try:
-                    _update_candle(float(c), ot * 1000)
-                    out_seeded += 1
-                except Exception:
-                    pass
-            log.info(f"[CANDLES] backfill M1 seeded={out_seeded} sym={sym}")
+    if st_ms is not None and et_ms is not None:
+        if st_ms >= et_ms:
+            raise HTTPException(status_code=400, detail="startTime must be < endTime")
+        def _rfc3339(ms: int) -> str:
+            return datetime.utcfromtimestamp(ms / 1000).replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+        params["from"] = _rfc3339(st_ms)
+        params["till"] = _rfc3339(et_ms)
 
-            # re-serve from cache after seeding
-            keys = sorted(candles.keys())[-limit:]
-            rows = []
-            for k in keys:
-                o, h, l, c, v = candles[k]
-                rows.append({
-                    "start":  str(int(k // 1000)),
-                    "open":   str(o),
-                    "high":   str(h),
-                    "low":    str(l),
-                    "close":  str(c),
-                    "volume": str(v),
-                })
-            log.info(f"[CANDLES] src=WS(after-backfill) sym={_normalize_symbol(pid)} g={eff_gran} limit={limit} returned={len(rows)} cache_size={len(candles)}")
-            return {"candles": rows}
+    qs = urlparse.urlencode(params)
+    upstream = f"{HITBTC_BASE_URL}/api/3/public/candles/{sym}"
+    url = f"{upstream}?{qs}" if qs else upstream
 
-        # not only-limit (range query) and still empty → fall through to REST range fetch below
-
-    # REST backfill for other granularities or range queries
-    sym = _normalize_symbol(pid)
-    period = GRAN_MAP.get(eff_gran, "M1")
-    qs = {"period": period, "limit": str(min(max(1, limit), 1000))}
-    if s_ms is not None:
-        qs["from"] = datetime.utcfromtimestamp(s_ms / 1000).strftime("%Y-%m-%dT%H:%M:%SZ")
-    if e_ms is not None:
-        qs["to"] = datetime.utcfromtimestamp(e_ms / 1000).strftime("%Y-%m-%dT%H:%M:%SZ")
-    url = f"{HITBTC_BASE_URL}/api/3/public/candles/{sym}?{urlparse.urlencode(qs)}"
+    # Perform upstream GET with logging and strict error propagation
     try:
-        data = _http_get(url)
+        req = urlreq.Request(url)
+        with urlreq.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", "ignore")
+            snippet = body[:200]
+            log.info(f"[HITBTC] GET {url} -> {resp.status} body[:200]={snippet!r}")
+            if resp.status < 200 or resp.status >= 300:
+                raise HTTPException(status_code=resp.status, detail=snippet)
+            try:
+                data = json.loads(body)
+            except Exception:
+                raise HTTPException(status_code=502, detail="Invalid JSON from HitBTC")
     except HTTPException:
         raise
     except Exception as e:
-        log.warning(f"[CANDLES] REST error sym={sym} period={period} err={e}")
         raise HTTPException(status_code=502, detail=f"hitbtc candles error: {e}")
 
-    out: List[Dict] = []
-    # shape: [{"t":"2024-01-01T00:00:00Z","o":"...","h":"...","l":"...","c":"...","v":"..."}...]
-    for r in data[-limit:]:
-        try:
-            t = r.get("t") or r.get("timestamp")
-            dt = datetime.fromisoformat((t or "").replace("Z", "+00:00"))
-            ot = int(dt.timestamp())
-            o = float(r.get("o", "0"))
-            h = float(r.get("h", "0"))
-            l = float(r.get("l", "0"))
-            c = float(r.get("c", "0"))
-            v = float(r.get("v", "0"))
-        except Exception:
-            continue
-        out.append({
-            "start":  str(ot),
-            "open":   str(o),
-            "high":   str(h),
-            "low":    str(l),
-            "close":  str(c),
-            "volume": str(v),
-        })
-        # warm the 1m cache if period matches
-        if period == "M1":
-            try:
-                _update_candle(float(c), ot * 1000)
-            except Exception:
-                pass
-
-    if not out:
-        log.warning(f"[CANDLES] src=REST ZERO rows sym={sym} period={period} limit={limit} start={s_ms} end={e_ms}")
-    else:
-        log.info(f"[CANDLES] src=REST sym={sym} period={period} limit={limit} returned={len(out)} start={s_ms} end={e_ms}")
-    return {"candles": out}
+    # Return upstream JSON directly (list of candle objects)
+    return data
 
 @app.get("/accounts")
 def accounts(limit: int = 250):
