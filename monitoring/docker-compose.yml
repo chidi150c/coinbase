@@ -1,14 +1,13 @@
+version: "3.9"
+
 services:
   bridge_hitbtc:
     build:
       context: ../bridge_hitbtc        # CHANGED from ../bridge
       dockerfile: Dockerfile           # CHANGED from Dockerfile.ws
     container_name: bridge_hitbtc
-    environment:
-      EXCHANGE: "hitbtc"
-      SYMBOL: "BTCUSDT"
-      PORT: "8788"
-      STALE_MS: "3000"
+    env_file:
+      - /opt/coinbase/env/hitbtc.env   # includes PORT, STALE_MS, optional SYMBOL
     ports:
       - "8788:8788"
     networks:
@@ -20,11 +19,8 @@ services:
       context: ../bridge_binance       # CHANGED from ../bridge
       dockerfile: Dockerfile           # CHANGED from Dockerfile.ws
     container_name: bridge_binance
-    environment:
-      EXCHANGE: "binance"
-      SYMBOL: "BTCUSDT"
-      PORT: "8789"
-      STALE_MS: "3000"
+    env_file:
+      - /opt/coinbase/env/binance.env  # includes PORT, STALE_MS, optional SYMBOL
     ports:
       - "8789:8789"
     networks:
@@ -59,8 +55,6 @@ services:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
     env_file:
-      - /opt/coinbase/env/bot.env
-      - /opt/coinbase/env/hitbtc.env          # HITBTC_API_KEY/SECRET, base URL, sandbox flag
       - /opt/coinbase/env/bot_hitbtc.env      # broker/product/state overrides for HitBTC
     restart: unless-stopped
     expose:
@@ -85,8 +79,6 @@ services:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
     env_file:
-      - /opt/coinbase/env/bot.env
-      - /opt/coinbase/env/binance.env         # holds BINANCE_API_KEY/SECRET
       - /opt/coinbase/env/bot_binance.env     # broker/product/state overrides for Binance
     restart: unless-stopped
     expose:
@@ -109,7 +101,6 @@ services:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
     env_file:
-      - /opt/coinbase/env/bot.env
       - /opt/coinbase/env/bot_coinbase.env    # <-- NEW: pin Coinbase broker/symbol/state
     restart: unless-stopped
     expose:
