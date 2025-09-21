@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync" // <-- added
 )
 
 // runLive executes the real-time loop with cadence intervalSec (seconds).
@@ -690,6 +691,56 @@ type candleJSON struct {
 	Volume string `json:"volume"`
 }
 
+// --- schema detection cache (per bridge URL) ---
+const (
+	candleStyleUnknown = 0
+	candleStyleLegacy  = 1 // product_id+granularity, start/end in seconds
+	candleStyleBinance = 2 // symbol+interval, startTime/endTime in ms
+)
+
+var (
+	candleStyleMu      sync.Mutex
+	candleStyleByBridge = map[string]int{}
+)
+
+func getCandleStyle(bridgeURL string) int {
+	k := strings.TrimRight(bridgeURL, "/")
+	candleStyleMu.Lock()
+	defer candleStyleMu.Unlock()
+	return candleStyleByBridge[k]
+}
+func setCandleStyle(bridgeURL string, style int) {
+	k := strings.TrimRight(bridgeURL, "/")
+	candleStyleMu.Lock()
+	candleStyleByBridge[k] = style
+	candleStyleMu.Unlock()
+}
+
+func binanceIntervalToken(g string) string {
+	switch strings.ToUpper(strings.TrimSpace(g)) {
+	case "ONE_MINUTE":
+		return "1m"
+	case "FIVE_MINUTE":
+		return "5m"
+	case "FIFTEEN_MINUTE":
+		return "15m"
+	case "THIRTY_MINUTE":
+		return "30m"
+	case "ONE_HOUR":
+		return "1h"
+	case "TWO_HOUR":
+		return "2h"
+	case "FOUR_HOUR":
+		return "4h"
+	case "SIX_HOUR":
+		return "6h"
+	case "ONE_DAY":
+		return "1d"
+	default:
+		return ""
+	}
+}
+
 // fetchHistoryPaged pulls up to want candles from the bridge, paging backward by time.
 func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want int) ([]Candle, error) {
 	if pageLimit <= 0 || pageLimit > 350 {
@@ -707,31 +758,82 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 	out := make([]Candle, 0, want+1024)
 	seen := make(map[int64]struct{})
 
+	style := getCandleStyle(bridgeURL) // 0=unknown; prefer to probe
+
 	for len(out) < want {
 		start := end.Add(-time.Duration((pageLimit+5)*secPer) * time.Second)
-		u := fmt.Sprintf("%s/candles?product_id=%s&granularity=%s&limit=%d&start=%d&end=%d",
-			strings.TrimRight(bridgeURL, "/"), productID, granularity, pageLimit, start.Unix(), end.Unix())
 
-		log.Printf("TRACE WARMUP PAGE url=%s", u)
+		var (
+			rows   []candleJSON
+			lastErr error
+		)
 
-		resp, err := http.Get(u)
-		if err != nil {
-			return nil, err
+		// We try up to two styles in a defined order:
+		//  - if unknown: binance then legacy
+		//  - if known=binance: binance then legacy (fallback if empty)
+		//  - if known=legacy: legacy then binance (fallback if empty)
+		tryOrder := []int{candleStyleBinance, candleStyleLegacy}
+		if style == candleStyleLegacy {
+			tryOrder = []int{candleStyleLegacy, candleStyleBinance}
 		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			b, _ := io.ReadAll(resp.Body)
+
+		for _, try := range tryOrder {
+			var u string
+			switch try {
+			case candleStyleBinance:
+				iv := binanceIntervalToken(granularity)
+				if iv == "" {
+					continue
+				}
+				u = fmt.Sprintf("%s/candles?symbol=%s&interval=%s&limit=%d&startTime=%d&endTime=%d",
+					strings.TrimRight(bridgeURL, "/"), productID, iv, pageLimit, start.Unix()*1000, end.Unix()*1000)
+			default: // candleStyleLegacy
+				u = fmt.Sprintf("%s/candles?product_id=%s&granularity=%s&limit=%d&start=%d&end=%d",
+					strings.TrimRight(bridgeURL, "/"), productID, granularity, pageLimit, start.Unix(), end.Unix())
+			}
+
+			log.Printf("TRACE WARMUP PAGE url=%s (style=%s)", u, map[int]string{candleStyleLegacy: "legacy", candleStyleBinance: "binance"}[try])
+
+			resp, err := http.Get(u)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				b, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				lastErr = fmt.Errorf("bridge /candles %d: %s", resp.StatusCode, string(b))
+				continue
+			}
+
+			var raw any
+			if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+				resp.Body.Close()
+				lastErr = err
+				continue
+			}
 			resp.Body.Close()
-			return nil, fmt.Errorf("bridge /candles %d: %s", resp.StatusCode, string(b))
-		}
-		var raw any
-		if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-			resp.Body.Close()
-			return nil, err
-		}
-		resp.Body.Close()
 
-		rows := normalizeCandles(raw)
-		log.Printf("TRACE WARMUP PAGE rows=%d window=[%d,%d] limit=%d", len(rows), start.Unix(), end.Unix(), pageLimit)
+			rows = normalizeCandles(raw)
+			log.Printf("TRACE WARMUP PAGE rows=%d window=[%d,%d] limit=%d (style=%s)", len(rows), start.Unix(), end.Unix(), pageLimit, map[int]string{candleStyleLegacy: "legacy", candleStyleBinance: "binance"}[try])
+
+			// Select this style once we see non-empty data
+			if len(rows) > 0 && style != try {
+				setCandleStyle(bridgeURL, try)
+				log.Printf("TRACE WARMUP schema selected=%s", map[int]string{candleStyleLegacy: "legacy", candleStyleBinance: "binance"}[try])
+			}
+
+			// If rows is non-nil (even if empty), stop trying alternates and use it.
+			if rows != nil {
+				break
+			}
+		}
+
+		// If we couldn't even decode (both attempts errored), return the last error.
+		if rows == nil && lastErr != nil {
+			return nil, lastErr
+		}
+		// If rows is empty, stop paging (no more data).
 		if len(rows) == 0 {
 			break
 		}
@@ -791,7 +893,8 @@ func normalizeCandles(raw any) []candleJSON {
 func toCandleJSON(arr []any) []candleJSON {
 	out := make([]candleJSON, 0, len(arr))
 	for _, it := range arr {
-		if m, ok := it.(map[string]any); ok {
+		switch m := it.(type) {
+		case map[string]any:
 			out = append(out, candleJSON{
 				Start:  asStr(m["start"]),
 				Open:   asStr(m["open"]),
@@ -800,6 +903,29 @@ func toCandleJSON(arr []any) []candleJSON {
 				Close:  asStr(m["close"]),
 				Volume: asStr(m["volume"]),
 			})
+		case []any:
+			// Fallback for Binance /klines array-of-arrays shape:
+			// [ openTime(ms), open, high, low, close, volume, closeTime(ms), ... ]
+			if len(m) >= 6 {
+				startMS := int64(0)
+				switch t := m[0].(type) {
+				case float64:
+					startMS = int64(t)
+				case string:
+					if f, err := strconv.ParseFloat(t, 64); err == nil {
+						startMS = int64(f)
+					}
+				}
+				startSec := startMS / 1000
+				out = append(out, candleJSON{
+					Start:  strconv.FormatInt(startSec, 10),
+					Open:   asStr(m[1]),
+					High:   asStr(m[2]),
+					Low:    asStr(m[3]),
+					Close:  asStr(m[4]),
+					Volume: asStr(m[5]),
+				})
+			}
 		}
 	}
 	return out

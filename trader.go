@@ -57,19 +57,19 @@ type Position struct {
 
 // BotState is the persistent snapshot of trader state.
 type BotState struct {
-	EquityUSD         float64
-	DailyStart        time.Time
-	DailyPnL          float64
-	Lots              []*Position
-	Model             *AIMicroModel
-	MdlExt            *ExtendedLogit
-	WalkForwardMin    int
-	LastFit           time.Time
-	LastAdd           time.Time
-	WinLow            float64
-	LatchedGate       float64
-	WinHigh           float64
-	LatchedGateShort  float64
+	EquityUSD        float64
+	DailyStart       time.Time
+	DailyPnL         float64
+	Lots             []*Position
+	Model            *AIMicroModel
+	MdlExt           *ExtendedLogit
+	WalkForwardMin   int
+	LastFit          time.Time
+	LastAdd          time.Time
+	WinLow           float64
+	LatchedGate      float64
+	WinHigh          float64
+	LatchedGateShort float64
 }
 
 type Trader struct {
@@ -1192,19 +1192,19 @@ func (t *Trader) saveState() error {
 		return nil
 	}
 	state := BotState{
-		EquityUSD:         t.equityUSD,
-		DailyStart:        t.dailyStart,
-		DailyPnL:          t.dailyPnL,
-		Lots:              t.lots,
-		Model:             t.model,
-		MdlExt:            t.mdlExt,
-		WalkForwardMin:    t.cfg.Extended().WalkForwardMin,
-		LastFit:           t.lastFit,
-		LastAdd:           t.lastAdd,
-		WinLow:            t.winLow,
-		LatchedGate:       t.latchedGate,
-		WinHigh:           t.winHigh,
-		LatchedGateShort:  t.latchedGateShort,
+		EquityUSD:        t.equityUSD,
+		DailyStart:       t.dailyStart,
+		DailyPnL:         t.dailyPnL,
+		Lots:             t.lots,
+		Model:            t.model,
+		MdlExt:           t.mdlExt,
+		WalkForwardMin:   t.cfg.Extended().WalkForwardMin,
+		LastFit:          t.lastFit,
+		LastAdd:          t.lastAdd,
+		WinLow:           t.winLow,
+		LatchedGate:      t.latchedGate,
+		WinHigh:          t.winHigh,
+		LatchedGateShort: t.latchedGateShort,
 	}
 	bs, err := json.MarshalIndent(state, "", " ")
 	if err != nil {
