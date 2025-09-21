@@ -203,92 +203,87 @@ def price(product_id: str = Query(default=SYMBOL)):
 
 @app.get("/candles")
 def get_candles(
-    # legacy names
+    # legacy names (ignored for Binance-specific handler)
     product_id: str = Query(default=SYMBOL),
     granularity: str = Query(default="ONE_MINUTE"),
     start: Optional[int] = Query(default=None),
     end: Optional[int] = Query(default=None),
     limit: int = Query(default=350),
-    # binance-style aliases (additive; optional)
+    # binance-style params (authoritative)
     symbol: Optional[str] = Query(default=None),
     interval: Optional[str] = Query(default=None),
     startTime: Optional[int] = Query(default=None),
     endTime: Optional[int] = Query(default=None),
 ):
-    # alias resolution
-    pid = (symbol or product_id or SYMBOL)
-    eff_gran = granularity.upper()
-    if interval:
-        interval = interval.lower()
-        eff_gran = _INTERVAL_TO_GRAN.get(interval, eff_gran)
+    """
+    Binance-specific /candles passthrough:
+      - Talks only to https://api.binance.com/api/v3/klines
+      - Allowed params: symbol, interval, limit, startTime, endTime (ms)
+      - startTime/endTime validation: convert seconds→ms, require start<end, clamp endTime to now
+      - If only limit provided, omit startTime/endTime entirely
+      - No cross-bridge aliasing or Coinbase product/granularity handling
+      - Propagate non-2xx as errors; log upstream URL/status/body snippet
+    """
+    # Choose authoritative params strictly from Binance query names
+    sym = (symbol or SYMBOL)
+    ivl = (interval or "1m")
+    lim = limit
 
-    # time params: accept seconds or ms; normalize to ms
-    def _ms(x: Optional[int]) -> Optional[int]:
-        if x is None: return None
-        return x * 1000 if x < 1_000_000_000_000 else x
-    s_ms = _ms(startTime if startTime is not None else start)
-    e_ms = _ms(endTime   if endTime   is not None else end)
-    only_limit = (s_ms is None and e_ms is None)
+    # Normalize and validate times
+    now_ms = _now_ms()
 
-    # serve from memory only for 1-minute (that’s what WS updates)
-    if eff_gran == "ONE_MINUTE":
-        if only_limit:
-            keys = sorted(candles.keys())[-limit:]
-            if not keys:
-                log.warning(f"[CANDLES] ONE_MINUTE cache empty; will try REST backfill sym={_normalize_symbol(pid)} limit={limit}")
-            if keys:
-                out_arr = []
-                for k in keys:
-                    o,h,l,c,v = candles[k]
-                    out_arr.append([int(k//1000), float(l), float(h), float(o), float(c), float(v)])
-                log.info(f"[CANDLES] src=WS g=ONE_MINUTE return={len(out_arr)} cache_size={len(candles)}")
-                return out_arr
+    def _to_ms(v: Optional[int]) -> Optional[int]:
+        if v is None:
+            return None
+        # accept seconds -> ms
+        return v * 1000 if v <= 1_000_000_000_000 else v
+
+    st_ms = _to_ms(startTime if startTime is not None else None)
+    et_ms = _to_ms(endTime if endTime is not None else None)
+
+    params = urlparse.urlencode(
+        {k: v for k, v in {
+            "symbol": sym,
+            "interval": ivl,
+            "limit": str(min(max(1, lim), 1000)),
+        }.items() if v not in (None, "")}
+    )
+
+    # Only include times if BOTH present
+    if st_ms is not None and et_ms is not None:
+        if et_ms > now_ms:
+            et_ms = now_ms
+        if st_ms >= et_ms:
+            raise HTTPException(status_code=400, detail="startTime must be < endTime")
+        time_qs = urlparse.urlencode({"startTime": str(st_ms), "endTime": str(et_ms)})
+        if params:
+            params = f"{params}&{time_qs}"
         else:
-            rows: List[Dict[str,str]] = []
-            keys = sorted(k for k in candles.keys() if (s_ms is None or k >= s_ms) and (e_ms is None or k <= e_ms))
-            for k in keys[-limit:]:
-                o,h,l,c,v = candles[k]
-                rows.append({"start": str(k//1000), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
-            log.info(f"[CANDLES] src=WS g=ONE_MINUTE return={len(rows)} cache_size={len(candles)} start={s_ms} end={e_ms}")
-            if rows:
-                return {"candles": rows}
+            params = time_qs
 
-    # REST backfill (any granularity)
-    sym = _normalize_symbol(pid)
-    interval_eff = GRAN_MAP.get(eff_gran, "1m")
-    qs = {"symbol": sym, "interval": interval_eff, "limit": str(min(max(1, limit), 1000))}
-    if s_ms is not None: qs["startTime"] = str(s_ms)
-    if e_ms is not None: qs["endTime"]   = str(e_ms)
-    url = f"{BINANCE_BASE_URL}/api/v3/klines?{urlparse.urlencode(qs)}"
+    upstream = f"{BINANCE_BASE_URL}/api/v3/klines"
+    url = f"{upstream}?{params}" if params else upstream
+
+    # Call upstream; log URL/status/body snippet; propagate non-2xx
     try:
-        data = _http_get(url)  # list of kline arrays
+        req = urlreq.Request(url)
+        with urlreq.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", "ignore")
+            snippet = body[:200]
+            log.info(f"[BINANCE] GET {url} -> {resp.status} body[:200]={snippet!r}")
+            if resp.status < 200 or resp.status >= 300:
+                raise HTTPException(status_code=resp.status, detail=snippet)
+            try:
+                data = json.loads(body)
+            except Exception:
+                raise HTTPException(status_code=502, detail="Invalid JSON from Binance")
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"binance klines error: {e}")
 
-    out: List[Dict[str,str]] = []
-    out_arr: List[List[float]] = []
-    for r in data[-limit:]:
-        try:
-            ot = int(r[0])//1000
-            o,h,l,c,v = float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])
-        except Exception:
-            continue
-        out.append({"start": str(ot), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
-        out_arr.append([int(ot), float(l), float(h), float(o), float(c), float(v)])
-        if interval_eff == "1m":
-            try:
-                close_time_ms = int(r[6])
-                _update_candle(float(c), close_time_ms)
-            except Exception:
-                pass
-    log.info(f"[CANDLES] src=REST sym={sym} interval={interval_eff} rows={len(out)}")
-    if only_limit:
-        if not out_arr:
-            log.warning(f"[CANDLES] REST returned 0 rows sym={sym} interval={interval_eff} limit={limit}")
-        return out_arr
-    return {"candles": out}
+    # Return upstream array directly; do not coerce into Coinbase schema
+    return data
 
 @app.get("/accounts")
 def accounts(limit: int = 250):
