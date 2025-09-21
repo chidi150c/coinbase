@@ -57,14 +57,14 @@ type Position struct {
 
 // BotState is the persistent snapshot of trader state.
 type BotState struct {
-	EquityUSD      float64
-	DailyStart     time.Time
-	DailyPnL       float64
-	Lots           []*Position
-	Model          *AIMicroModel
-	MdlExt         *ExtendedLogit
-	WalkForwardMin int
-	LastFit        time.Time
+	EquityUSD         float64
+	DailyStart        time.Time
+	DailyPnL          float64
+	Lots              []*Position
+	Model             *AIMicroModel
+	MdlExt            *ExtendedLogit
+	WalkForwardMin    int
+	LastFit           time.Time
 	LastAdd           time.Time
 	WinLow            float64
 	LatchedGate       float64
@@ -101,8 +101,8 @@ type Trader struct {
 	winLow      float64 // lowest price seen since lastAdd (BUY adverse tracking)
 	latchedGate float64 // latched adverse gate once threshold time is reached; reset on new add
 	// SELL path trackers (NEW):
-	winHigh           float64 // highest price seen since lastAdd (SELL adverse tracking)
-	latchedGateShort  float64 // latched adverse gate for SELL once threshold time is reached; reset on new add
+	winHigh          float64 // highest price seen since lastAdd (SELL adverse tracking)
+	latchedGateShort float64 // latched adverse gate for SELL once threshold time is reached; reset on new add
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -162,7 +162,8 @@ func (t *Trader) SetEquityUSD(v float64) {
 	// persist new state (no-op if disabled)
 	if err := t.saveState(); err != nil {
 		log.Printf("[WARN] saveState: %v", err)
-		
+		// TODO: remove TRACE
+		log.Printf("TRACE state.save error=%v", err)
 	}
 }
 
@@ -184,6 +185,8 @@ func (t *Trader) updateDaily(date time.Time) {
 		t.dailyPnL = 0
 		if err := t.saveState(); err != nil {
 			log.Printf("[WARN] saveState: %v", err)
+			// TODO: remove TRACE
+			log.Printf("TRACE state.save error=%v", err)
 		}
 	}
 }
@@ -346,6 +349,8 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 	t.mu.Unlock()
 	var placed *PlacedOrder
 	if !t.cfg.DryRun {
+		// TODO: remove TRACE
+		log.Printf("TRACE order.close request side=%s baseReq=%.8f quoteEst=%.2f priceSnap=%.8f", closeSide, baseRequested, quote, price)
 		var err error
 		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote)
 		if err != nil {
@@ -355,6 +360,11 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 			// Re-lock before returning so caller's Unlock matches.
 			t.mu.Lock()
 			return "", fmt.Errorf("close order failed: %w", err)
+		}
+		// TODO: remove TRACE
+		if placed != nil {
+			log.Printf("TRACE order.close placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
+				placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
 		}
 		mtxOrders.WithLabelValues("live", string(closeSide)).Inc()
 	}
@@ -389,6 +399,8 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 		if baseFilled+tol < baseRequested {
 			log.Printf("[WARN] partial fill (exit): requested_base=%.8f filled_base=%.8f (%.2f%%)",
 				baseRequested, baseFilled, 100.0*(baseFilled/baseRequested))
+			// TODO: remove TRACE
+			log.Printf("TRACE fill.exit partial requested=%.8f filled=%.8f", baseRequested, baseFilled)
 		}
 	}
 	// refresh price snapshot (best-effort) if no execution price was available
@@ -476,6 +488,8 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 	// persist new state
 	if err := t.saveState(); err != nil {
 		log.Printf("[WARN] saveState: %v", err)
+		// TODO: remove TRACE
+		log.Printf("TRACE state.save error=%v", err)
 	}
 
 	_ = removedWasRunner // kept to emphasize runner path; no extra logs.
@@ -516,6 +530,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			pb.mu.Unlock()
 		}
 	}
+
+	// TODO: remove TRACE
+	log.Printf("TRACE step.start ts=%s price=%.8f lots=%d runnerIdx=%d lastAdd=%s winLow=%.8f winHigh=%.8f latched=%.8f latchedShort=%.8f",
+		now.Format(time.RFC3339), c[len(c)-1].Close, len(t.lots), t.runnerIdx,
+		t.lastAdd.Format(time.RFC3339), t.winLow, t.winHigh, t.latchedGate, t.latchedGateShort)
 
 	// --- EXIT path: if any lots are open, evaluate TP/SL for each and close those that trigger.
 	if len(t.lots) > 0 {
@@ -594,12 +613,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	d := decide(c, t.model, t.mdlExt)
 	log.Printf("[DEBUG] Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v", len(t.lots), d.Signal, d.Reason, buyThreshold, sellThreshold, t.cfg.LongOnly)
 
-	// Ignore discretionary SELL signals while lots are open; exits are TP/SL only.
-	// if len(t.lots) > 0 && d.Signal == Sell {
-	// 	t.mu.Unlock()
-	// 	return "HOLD", nil
-	// }
-
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
 
 	price := c[len(c)-1].Close
@@ -648,6 +661,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	if isAdd {
 		// 1) Spacing: always enforce (s=0 means no wait; set >0 to require time gap)
 		s := pyramidMinSeconds()
+		// TODO: remove TRACE
+		log.Printf("TRACE pyramid.spacing since_last=%.1fs need>=%ds", time.Since(t.lastAdd).Seconds(), s)
 		if time.Since(t.lastAdd) < time.Duration(s)*time.Second {
 			t.mu.Unlock()
 			hrs := time.Since(t.lastAdd).Hours()
@@ -685,6 +700,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			tFloorMin = math.Log(basePct/floor) / lambda
 		}
 
+		// TODO: remove TRACE
+		log.Printf("TRACE pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
+			d.Signal, elapsedMin, basePct, effPct, lambda, floor, tFloorMin)
+
 		last := t.latestEntry()
 		if last > 0 {
 			if d.Signal == Buy {
@@ -712,6 +731,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					t.mu.Unlock()
 					log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
 						price, gatePrice, t.winLow, effPct, basePct, reasonElapsedHr)
+					// TODO: remove TRACE
+					log.Printf("TRACE pyramid.block.buy price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGate)
 					return "HOLD", nil
 				}
 			} else { // SELL
@@ -738,6 +759,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					t.mu.Unlock()
 					log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
 						price, gatePrice, t.winHigh, effPct, basePct, reasonElapsedHr)
+					// TODO: remove TRACE
+					log.Printf("TRACE pyramid.block.sell price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateShort)
 					return "HOLD", nil
 				}
 			}
@@ -757,6 +780,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 	base := quote / price
 	side := d.SignalToSide()
+
+	// TODO: remove TRACE
+	log.Printf("TRACE sizing.pre side=%s eq=%.2f riskPct=%.4f quote=%.2f price=%.8f base=%.8f", side, t.equityUSD, riskPct, quote, price, base)
 
 	// Unified epsilon for spare checks
 	const spareEps = 1e-9
@@ -784,6 +810,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			log.Fatalf("BUY blocked: missing/invalid QUOTE step for %s (step=%.8f)", t.cfg.ProductID, qstep)
 		}
 
+		// TODO: remove TRACE
+		log.Printf("TRACE buy.gate.pre availQuote=%.2f reservedShort=%.2f needQuoteRaw=%.2f qstep=%.8f",
+			availQuote, reservedShortQuote, quote, qstep)
+
 		// Floor the needed quote to step.
 		neededQuote := quote
 		if qstep > 0 {
@@ -801,6 +831,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			t.mu.Unlock()
 			log.Printf("[DEBUG] GATE BUY: need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 				neededQuote, spare, availQuote, reservedShortQuote, qstep)
+			// TODO: remove TRACE
+			log.Printf("TRACE buy.gate.block need=%.2f spare=%.2f", neededQuote, spare)
 			return "HOLD", nil
 		}
 
@@ -815,6 +847,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				t.mu.Unlock()
 				log.Printf("[DEBUG] GATE BUY: need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 					neededQuote, spare, availQuote, reservedShortQuote, qstep)
+				// TODO: remove TRACE
+				log.Printf("TRACE buy.gate.block minNotional need=%.2f spare=%.2f", neededQuote, spare)
 				return "HOLD", nil
 			}
 		}
@@ -822,6 +856,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		// Use the final neededQuote; recompute base.
 		quote = neededQuote
 		base = quote / price
+
+		// TODO: remove TRACE
+		log.Printf("TRACE buy.gate.post needQuote=%.2f spare=%.2f base=%.8f", quote, spare, base)
 	}
 
 	// If SELL, require spare base inventory (spot safe)
@@ -847,6 +884,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			log.Fatalf("SELL blocked: missing/invalid BASE step for %s (step=%.8f)", t.cfg.ProductID, step)
 		}
 
+		// TODO: remove TRACE
+		log.Printf("TRACE sell.gate.pre availBase=%.8f reservedLong=%.8f needBaseRaw=%.8f step=%.8f",
+			availBase, reservedLong, base, step)
+
 		// Floor the *needed* base to step (if known) and cap by spare availability
 		neededBase := base
 		if step > 0 {
@@ -863,6 +904,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			t.mu.Unlock()
 			log.Printf("[DEBUG] GATE SELL: need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
 				neededBase, spare, availBase, reservedLong, step)
+			// TODO: remove TRACE
+			log.Printf("TRACE sell.gate.block need=%.8f spare=%.8f", neededBase, spare)
 			return "HOLD", nil
 		}
 
@@ -886,9 +929,14 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				t.mu.Unlock()
 				log.Printf("[DEBUG] GATE SELL: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
 					base, spare, availBase, reservedLong, step)
+				// TODO: remove TRACE
+				log.Printf("TRACE sell.gate.block minNotional need=%.8f spare=%.8f", base, spare)
 				return "HOLD", nil
 			}
 		}
+
+		// TODO: remove TRACE
+		log.Printf("TRACE sell.gate.post needBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
 	}
 
 	// Stops/takes (baseline for scalps)
@@ -965,6 +1013,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	t.mu.Unlock()
 	var placed *PlacedOrder
 	if !t.cfg.DryRun {
+		// TODO: remove TRACE
+		log.Printf("TRACE order.open request side=%s quote=%.2f baseEst=%.8f priceSnap=%.8f stop=%.8f take=%.8f",
+			side, quote, base, price, stop, take)
 		var err error
 		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
 		if err != nil {
@@ -974,6 +1025,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				log.Printf("[WARN] open order %.2f USD failed (%v); retrying with ORDER_MIN_USD=%.2f", quote, err, t.cfg.OrderMinUSD)
 				quote = t.cfg.OrderMinUSD
 				base = quote / price
+				// TODO: remove TRACE
+				log.Printf("TRACE order.open retry side=%s quote=%.2f baseEst=%.8f", side, quote, base)
 				placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
 			}
 			if err != nil {
@@ -982,6 +1035,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 				return "", err
 			}
+		}
+		// TODO: remove TRACE
+		if placed != nil {
+			log.Printf("TRACE order.open placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
+				placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
 		}
 		mtxOrders.WithLabelValues("live", string(side)).Inc()
 		mtxTrades.WithLabelValues("open").Inc()
@@ -1013,6 +1071,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		if baseToUse+tol < baseRequested {
 			log.Printf("[WARN] partial fill: requested_base=%.8f filled_base=%.8f (%.2f%%)",
 				baseRequested, baseToUse, 100.0*(baseToUse/baseRequested))
+			// TODO: remove TRACE
+			log.Printf("TRACE fill.open partial requested=%.8f filled=%.8f", baseRequested, baseToUse)
 		}
 	}
 
@@ -1070,6 +1130,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	t.winHigh = priceToUse
 	t.latchedGateShort = 0
 
+	// TODO: remove TRACE
+	log.Printf("TRACE lot.open side=%s open=%.8f sizeBase=%.8f stop=%.8f take=%.8f fee=%.4f runnerIdx=%d lots=%d",
+		side, newLot.OpenPrice, newLot.SizeBase, newLot.Stop, newLot.Take, newLot.EntryFee, t.runnerIdx, len(t.lots))
+
 	// Assign/designate runner if none exists yet; otherwise this is a scalp.
 	if t.runnerIdx == -1 {
 		t.runnerIdx = len(t.lots) - 1 // the just-added lot is runner
@@ -1080,6 +1144,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		r.TrailStop = 0
 		// Ensure runner's stretched targets are applied (keeps baseline behavior for runner).
 		t.applyRunnerTargets(r)
+		// TODO: remove TRACE
+		log.Printf("TRACE runner.assign idx=%d open=%.8f stop=%.8f take=%.8f", t.runnerIdx, r.OpenPrice, r.Stop, r.Take)
 	}
 
 	t.aggregateOpen()
@@ -1099,6 +1165,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// persist new state
 	if err := t.saveState(); err != nil {
 		log.Printf("[WARN] saveState: %v", err)
+		// TODO: remove TRACE
+		log.Printf("TRACE state.save error=%v", err)
 	}
 	t.mu.Unlock()
 	return msg, nil
@@ -1124,19 +1192,19 @@ func (t *Trader) saveState() error {
 		return nil
 	}
 	state := BotState{
-		EquityUSD:      t.equityUSD,
-		DailyStart:     t.dailyStart,
-		DailyPnL:       t.dailyPnL,
-		Lots:           t.lots,
-		Model:          t.model,
-		MdlExt:         t.mdlExt,
-		WalkForwardMin: t.cfg.Extended().WalkForwardMin,
-		LastFit:        t.lastFit,
-		LastAdd:          t.lastAdd,
-		WinLow:           t.winLow,
-		LatchedGate:      t.latchedGate,
-		WinHigh:          t.winHigh,
-		LatchedGateShort: t.latchedGateShort,
+		EquityUSD:         t.equityUSD,
+		DailyStart:        t.dailyStart,
+		DailyPnL:          t.dailyPnL,
+		Lots:              t.lots,
+		Model:             t.model,
+		MdlExt:            t.mdlExt,
+		WalkForwardMin:    t.cfg.Extended().WalkForwardMin,
+		LastFit:           t.lastFit,
+		LastAdd:           t.lastAdd,
+		WinLow:            t.winLow,
+		LatchedGate:       t.latchedGate,
+		WinHigh:           t.winHigh,
+		LatchedGateShort:  t.latchedGateShort,
 	}
 	bs, err := json.MarshalIndent(state, "", " ")
 	if err != nil {
@@ -1196,10 +1264,10 @@ func (t *Trader) loadState() error {
 	}
 
 	// Restore pyramiding gate memory (if present in state file).
-	t.lastAdd          = st.LastAdd
-	t.winLow           = st.WinLow
-	t.latchedGate      = st.LatchedGate
-	t.winHigh          = st.WinHigh
+	t.lastAdd = st.LastAdd
+	t.winLow = st.WinLow
+	t.latchedGate = st.LatchedGate
+	t.winHigh = st.WinHigh
 	t.latchedGateShort = st.LatchedGateShort
 
 	// --- Restart warmup for pyramiding decay/adverse tracking ---

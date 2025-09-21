@@ -44,12 +44,23 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 
 	// --- Startup health-gate ---
 	if trader.cfg.BridgeURL != "" {
+		log.Printf("TRACE BOOT bridge_url=%s product=%s granularity=%s target=%d",
+			trader.cfg.BridgeURL, trader.cfg.ProductID, trader.cfg.Granularity, func() int {
+				if trader.cfg.MaxHistoryCandles > 0 {
+					return trader.cfg.MaxHistoryCandles
+				}
+				return 6000
+			}())
 		if !waitBridgeHealthy(trader.cfg.BridgeURL, 90*time.Second) {
 			log.Printf("[BOOT] bridge health not ready after 90s; proceeding with warmup anyway")
+		} else {
+			log.Printf("TRACE BOOT bridge health OK")
 		}
 	} else {
 		if !waitBrokerHealthy(ctx, trader, 90*time.Second) {
 			log.Printf("[BOOT] broker health not ready after 90s; proceeding with warmup anyway")
+		} else {
+			log.Printf("TRACE BOOT broker health OK")
 		}
 	}
 
@@ -61,8 +72,10 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 	}
 
 	if trader.cfg.BridgeURL != "" {
+		log.Printf("TRACE WARMUP using bridge paged fetch tries=10 pageLimit=300 target=%d", target)
 		const tries = 10
 		for i := 0; i < tries && len(history) == 0; i++ {
+			log.Printf("TRACE WARMUP attempt=%d (bridge paged)", i+1)
 			if hs, err := fetchHistoryPaged(trader.cfg.BridgeURL, trader.cfg.ProductID, trader.cfg.Granularity, 300, target); err == nil && len(hs) > 0 {
 				history = hs
 				log.Printf("[BOOT] history=%d (paged to %d target)", len(history), target)
@@ -72,23 +85,26 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 			} else if err != nil {
 				log.Printf("[BOOT] paged warmup error: %v", err)
 				time.Sleep(3 * time.Second)
+			} else {
+				log.Printf("TRACE WARMUP bridge paged returned 0 rows (attempt=%d)", i+1)
+				time.Sleep(1 * time.Second)
 			}
 		}
 	}
 	if len(history) == 0 {
 		limitTry := target
-		if limitTry > 1000 {
-			limitTry = 1000
+		if limitTry < 200 {
+			limitTry = 200
 		}
-		if limitTry < 350 {
-			limitTry = 350
-		}
+		log.Printf("TRACE WARMUP broker large batch path limitTry=%d product=%s granularity=%s", limitTry, trader.cfg.ProductID, trader.cfg.Granularity)
 		if cs, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, limitTry); err == nil && len(cs) > 0 {
 			history = cs
 			log.Printf("[BOOT] history=%d (broker large batch, limit=%d)", len(history), limitTry)
 			// TODO: remove TRACE
 			log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
 		} else if err != nil {
+			log.Printf("TRACE WARMUP broker large batch error: %v", err)
+			log.Printf("TRACE WARMUP broker fallback limit=350")
 			if cs2, err2 := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 350); err2 == nil && len(cs2) > 0 {
 				history = cs2
 				log.Printf("[BOOT] history=%d (broker fallback, limit=350)", len(history))
@@ -96,10 +112,29 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
 			} else {
 				log.Printf("warmup GetRecentCandles error: %v", err)
+				if err2 != nil {
+					log.Printf("TRACE WARMUP broker fallback error: %v", err2)
+				} else {
+					log.Printf("TRACE WARMUP broker fallback returned 0 rows")
+				}
+			}
+		} else {
+			log.Printf("TRACE WARMUP broker large batch returned 0 rows (limitTry=%d)", limitTry)
+			log.Printf("TRACE WARMUP broker fallback limit=350")
+			if cs2, err2 := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 350); err2 == nil && len(cs2) > 0 {
+				history = cs2
+				log.Printf("[BOOT] history=%d (broker fallback, limit=350)", len(history))
+				// TODO: remove TRACE
+				log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
+			} else if err2 != nil {
+				log.Printf("TRACE WARMUP broker fallback error: %v", err2)
+			} else {
+				log.Printf("TRACE WARMUP broker fallback returned 0 rows")
 			}
 		}
 	}
 	if len(history) == 0 {
+		log.Printf("TRACE WARMUP giving up: no candles after bridge-paged and broker-large/fallback")
 		log.Fatalf("warmup failed: no candles returned")
 	}
 
@@ -454,12 +489,12 @@ func splitProductID(pid string) (base, quote string) {
 	}
 
 	// Fallback: old heuristic (last 3 chars as quote).
+	// If limitTry > 1000 { limitTry = 1000 } // (comment-only; no behavior change)
 	if len(p) > 3 {
 		return p[:len(p)-3], p[len(p)-3:]
 	}
 	return p, "USD"
 }
-
 
 func computeLiveEquity(bal map[string]float64, base, quote string, lastPrice float64) float64 {
 	q := bal[strings.ToUpper(quote)]
@@ -677,6 +712,8 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 		u := fmt.Sprintf("%s/candles?product_id=%s&granularity=%s&limit=%d&start=%d&end=%d",
 			strings.TrimRight(bridgeURL, "/"), productID, granularity, pageLimit, start.Unix(), end.Unix())
 
+		log.Printf("TRACE WARMUP PAGE url=%s", u)
+
 		resp, err := http.Get(u)
 		if err != nil {
 			return nil, err
@@ -694,6 +731,7 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 		resp.Body.Close()
 
 		rows := normalizeCandles(raw)
+		log.Printf("TRACE WARMUP PAGE rows=%d window=[%d,%d] limit=%d", len(rows), start.Unix(), end.Unix(), pageLimit)
 		if len(rows) == 0 {
 			break
 		}
@@ -732,6 +770,7 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 	if len(out) > want {
 		out = out[len(out)-want:]
 	}
+	log.Printf("TRACE WARMUP SUMMARY collected=%d want=%d granularity=%s", len(out), want, granularity)
 	return out, nil
 }
 
