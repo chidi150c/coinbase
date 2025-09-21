@@ -342,7 +342,7 @@ def get_candles(
         raise HTTPException(status_code=502, detail=f"hitbtc candles error: {e}")
 
     # Return upstream JSON directly (list of candle objects)
-    return data
+    return {"candles": data}
 
 @app.get("/accounts")
 def accounts(limit: int = 250):

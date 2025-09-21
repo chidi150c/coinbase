@@ -282,8 +282,8 @@ def get_candles(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"binance klines error: {e}")
 
-    # Return upstream array directly; do not coerce into Coinbase schema
-    return data
+    # Return object-wrapped candles to match expected schema
+    return {"candles": data}
 
 @app.get("/accounts")
 def accounts(limit: int = 250):
