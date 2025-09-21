@@ -19,38 +19,55 @@ SYMBOL   = os.getenv("SYMBOL", "BTCUSDT").upper().replace("-", "")
 PORT     = int(os.getenv("PORT", "8788"))
 STALE_MS = int(os.getenv("STALE_MS", "3000"))
 
-HITBTC_API_KEY   = os.getenv("HITBTC_API_KEY", "").strip()
-HITBTC_API_SECRET= os.getenv("HITBTC_API_SECRET", "").strip()
-HITBTC_BASE_URL  = os.getenv("HITBTC_BASE_URL", "https://api.hitbtc.com").strip().rstrip("/")
+HITBTC_API_KEY    = os.getenv("HITBTC_API_KEY", "").strip()
+HITBTC_API_SECRET = os.getenv("HITBTC_API_SECRET", "").strip()
+HITBTC_BASE_URL   = os.getenv("HITBTC_BASE_URL", "https://api.hitbtc.com").strip().rstrip("/")
 
 last_price: Optional[float] = None
 last_ts_ms: Optional[int] = None
-candles: Dict[int, List[float]] = {}
+candles: Dict[int, List[float]] = {}  # minute_ms -> [o,h,l,c,vol]
 
-def _now_ms() -> int: return int(time.time()*1000)
-def _now_iso() -> str: return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-def _minute_start(ts_ms: int) -> int: return (ts_ms//60000)*60000
+
+# ---- Time & candle helpers ----
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _now_iso() -> str:
+    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+
+def _minute_start(ts_ms: int) -> int:
+    # align to minute in milliseconds
+    return (ts_ms // 60000) * 60000
+
 
 def _trim_old(max_minutes=6000):
-    if len(candles) <= max_minutes: return
+    if len(candles) <= max_minutes:
+        return
     for k in sorted(candles.keys())[:-max_minutes]:
-        candles.pop(k,None)
+        candles.pop(k, None)
+
 
 def _update_candle(px: float, ts_ms: int, vol: float = 0.0):
     m = _minute_start(ts_ms)
     if m not in candles:
-        candles[m] = [px,px,px,px,vol]
+        candles[m] = [px, px, px, px, vol]
     else:
-        o,h,l,c,v = candles[m]
-        if px>h: h=px
-        if px<l: l=px
-        candles[m] = [o,h,l,px,v+vol]
+        o, h, l, c, v = candles[m]
+        if px > h:
+            h = px
+        if px < l:
+            l = px
+        candles[m] = [o, h, l, px, v + vol]
     _trim_old()
+
 
 def _normalize_symbol(pid: str) -> str:
     return (pid or SYMBOL).upper().replace("-", "")
 
-def _http_get(url: str, headers: Optional[Dict[str,str]] = None):
+
+def _http_get(url: str, headers: Optional[Dict[str, str]] = None):
     req = urlreq.Request(url, headers=headers or {})
     with urlreq.urlopen(req, timeout=10) as resp:
         body = resp.read().decode("utf-8", "ignore")
@@ -61,7 +78,8 @@ def _http_get(url: str, headers: Optional[Dict[str,str]] = None):
         except Exception:
             raise HTTPException(status_code=500, detail="Invalid JSON")
 
-def _req(path: str, method="GET", body: Optional[bytes]=None) -> Dict:
+
+def _req(path: str, method="GET", body: Optional[bytes] = None) -> Dict:
     if not HITBTC_API_KEY or not HITBTC_API_SECRET:
         raise HTTPException(status_code=401, detail="Missing HITBTC_API_KEY/SECRET")
     url = f"{HITBTC_BASE_URL}{path}"
@@ -79,17 +97,21 @@ def _req(path: str, method="GET", body: Optional[bytes]=None) -> Dict:
         except Exception:
             raise HTTPException(status_code=500, detail="Invalid JSON from HitBTC")
 
-def _split(pid: str) -> Tuple[str,str]:
+
+def _split(pid: str) -> Tuple[str, str]:
     p = pid.upper().replace("-", "")
-    if len(p)>3: return p[:-3], p[-3:]
+    if len(p) > 3:
+        return p[:-3], p[-3:]
     return p, "USD"
+
 
 def _sum_available(accts: List[Dict], asset: str) -> str:
     a = asset.upper()
     for r in accts:
-        if r.get("currency","").upper()==a:
-            return str(r.get("available_balance",{}).get("value","0"))
+        if r.get("currency", "").upper() == a:
+            return str(r.get("available_balance", {}).get("value", "0"))
     return "0"
+
 
 # Map Coinbase granularities → HitBTC periods
 GRAN_MAP = {
@@ -105,98 +127,160 @@ GRAN_MAP = {
     "SIX_HOUR": "H4",
 }
 
+
+# ---- WebSocket: HitBTC market data
 async def _ws_loop():
+    """
+    HitBTC public WS:
+      - subscribe to `ticker/price/1s` (prefer 'c' last price)
+      - subscribe to `ticker/1s`       (fallback mid from a/b)
+    Updates: last_price, last_ts_ms, in-memory minute candles.
+    """
     global last_price, last_ts_ms
     url = "wss://api.hitbtc.com/api/3/ws/public"
-    sub = {"method":"subscribe","ch":"trades","params":{"symbols":[_normalize_symbol(SYMBOL)]}}
+    sym = _normalize_symbol(SYMBOL)
+    subs = [
+        {"method": "subscribe", "ch": "ticker/price/1s", "params": {"symbols": [sym]}, "id": 1},
+        {"method": "subscribe", "ch": "ticker/1s",       "params": {"symbols": [sym]}, "id": 2},
+    ]
     backoff = 1
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_queue=1024) as ws:
-                await ws.send(json.dumps(sub))
-                log.info(f"[TRACE] WS subscribe params={sub}")
+            async with websockets.connect(
+                url, ping_interval=25, ping_timeout=25, max_queue=1024
+            ) as ws:
+                for s in subs:
+                    await ws.send(json.dumps(s))
+                log.info(f"[TRACE] WS subscribed: {sym} -> ticker/price/1s, ticker/1s")
                 backoff = 1
+
                 while True:
                     raw = await ws.recv()
-                    ts = _now_ms()
                     try:
                         msg = json.loads(raw)
                     except Exception:
                         continue
-                    if msg.get("ch")=="trades" and "data" in msg:
-                        for d in msg["data"]:
-                            instr = d.get("symbol") or d.get("t") or d.get("s")
-                            if instr == _normalize_symbol(SYMBOL):
-                                pr = d.get("price", d.get("p"))
-                                try:
-                                    px = float(pr) if pr is not None else None
-                                except Exception:
-                                    px = None
-                                if px and px>0:
-                                    last_price = px
-                                    last_ts_ms = ts
-                                    _update_candle(px, ts)
+                    if not isinstance(msg, dict):
+                        continue
+
+                    ch = msg.get("ch")
+                    data = msg.get("data")
+                    if ch not in ("ticker/price/1s", "ticker/1s") or not data:
+                        continue
+
+                    row = data.get(sym) or {}
+                    ts_ms = int(row.get("t") or _now_ms())  # ms
+                    px = None
+
+                    # 1) preferred last price 'c' when available
+                    c = row.get("c")
+                    if c is not None:
+                        try:
+                            px = float(c)
+                        except Exception:
+                            px = None
+
+                    # 2) fallback mid of a/b from ticker/1s
+                    if px is None and ch == "ticker/1s":
+                        try:
+                            a = float(row.get("a") or 0.0)
+                            b = float(row.get("b") or 0.0)
+                            if a > 0 and b > 0:
+                                px = (a + b) / 2.0
+                        except Exception:
+                            px = None
+
+                    if px is not None and px > 0:
+                        last_price = px
+                        last_ts_ms = ts_ms
+                        _update_candle(px, ts_ms, 0.0)
         except Exception:
             await asyncio.sleep(backoff)
-            backoff = min(backoff*2, 15)
+            backoff = min(backoff * 2, 15)
 
-app = FastAPI(title="bridge-hitbtc", version="0.3")
+
+# ---- HTTP app
+app = FastAPI(title="bridge-hitbtc", version="0.4")
+
 
 @app.get("/health")
-def health(): return {"ok": True}
+def health():
+    age_ms = None
+    stale = True
+    if last_ts_ms is not None:
+        age_ms = max(0, _now_ms() - last_ts_ms)
+        stale = age_ms > STALE_MS
+    return {
+        "ok": True,
+        "exchange": "hitbtc",
+        "symbol": SYMBOL,
+        "price": float(last_price) if last_price else 0.0,
+        "age_ms": age_ms,
+        "stale": stale,
+    }
+
 
 @app.get("/price")
 def price(product_id: str = Query(default=SYMBOL)):
-    age_ms = None; stale=True
+    age_ms = None
+    stale = True
     if last_ts_ms is not None:
-        age_ms = max(0, _now_ms()-last_ts_ms)
-        stale  = age_ms > STALE_MS
-    return {"product_id": product_id, "price": float(last_price) if last_price else 0.0, "ts": last_ts_ms, "stale": stale}
+        age_ms = max(0, _now_ms() - last_ts_ms)
+        stale = age_ms > STALE_MS
+    return {
+        "product_id": product_id,
+        "price": float(last_price) if last_price else 0.0,
+        "ts": last_ts_ms,
+        "stale": stale,
+    }
+
 
 @app.get("/candles")
-def get_candles(product_id: str = Query(default=SYMBOL),
-           granularity: str = Query(default="ONE_MINUTE"),
-           start: Optional[int] = Query(default=None),
-           end: Optional[int] = Query(default=None),
-           limit: int = Query(default=350)):
-    # normalize times (seconds vs ms)
+def get_candles(
+    product_id: str = Query(default=SYMBOL),
+    granularity: str = Query(default="ONE_MINUTE"),
+    start: Optional[int] = Query(default=None),
+    end: Optional[int] = Query(default=None),
+    limit: int = Query(default=350),
+):
+    # normalize timestamps (accept seconds or ms)
     def _ms(x: Optional[int]) -> Optional[int]:
-        if x is None: return None
+        if x is None:
+            return None
         return x * 1000 if x < 1_000_000_000_000 else x
+
     s_ms = _ms(start)
     e_ms = _ms(end)
     only_limit = (s_ms is None and e_ms is None)
 
-    # serve from in-memory only for 1-minute (fed by WS)
+    # serve from WS cache for ONE_MINUTE when possible
     if granularity.upper() == "ONE_MINUTE":
-        if only_limit:
-            # latest N candles, array-of-arrays (warmup fix)
-            keys = sorted(candles.keys())[-limit:]
-            if keys:
-                out_arr: List[List[float]] = []
-                for k in keys:
-                    o,h,l,c,v = candles[k]
-                    out_arr.append([int(k//1000), float(l), float(h), float(o), float(c), float(v)])
-                return out_arr
-        else:
-            rows = []
-            keys = sorted(k for k in candles.keys() if (s_ms is None or k>=s_ms) and (e_ms is None or k<=e_ms))
-            for k in keys[-limit:]:
-                o,h,l,c,v = candles[k]
-                rows.append({"start": str(k//1000), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
-            if rows:
-                return {"candles": rows}
+        rows = []
+        keys = (
+            sorted(candles.keys())[-limit:]
+            if only_limit
+            else sorted(k for k in candles.keys() if (s_ms is None or k >= s_ms) and (e_ms is None or k <= e_ms))[-limit:]
+        )
+        for k in keys:
+            o, h, l, c, v = candles[k]
+            rows.append({
+                "start":  str(int(k // 1000)),  # seconds
+                "open":   str(o),
+                "high":   str(h),
+                "low":    str(l),
+                "close":  str(c),
+                "volume": str(v),
+            })
+        return {"candles": rows}
 
-    # REST backfill (public)
+    # REST backfill for other granularities (public)
     sym = _normalize_symbol(product_id)
     period = GRAN_MAP.get(granularity.upper(), "M1")
-    # HitBTC v3 public: GET /api/3/public/candles/{symbol}?period=M1&limit=N&from=ISO&to=ISO (from/to optional)
     qs = {"period": period, "limit": str(min(max(1, limit), 1000))}
-    # If start/end provided, pass ISO8601
     if s_ms is not None:
-        qs["from"] = datetime.utcfromtimestamp(s_ms/1000).strftime("%Y-%m-%dT%H:%M:%SZ")
+        qs["from"] = datetime.utcfromtimestamp(s_ms / 1000).strftime("%Y-%m-%dT%H:%M:%SZ")
     if e_ms is not None:
-        qs["to"] = datetime.utcfromtimestamp(e_ms/1000).strftime("%Y-%m-%dT%H:%M:%SZ")
+        qs["to"] = datetime.utcfromtimestamp(e_ms / 1000).strftime("%Y-%m-%dT%H:%M:%SZ")
     url = f"{HITBTC_BASE_URL}/api/3/public/candles/{sym}?{urlparse.urlencode(qs)}"
     try:
         data = _http_get(url)
@@ -205,37 +289,47 @@ def get_candles(product_id: str = Query(default=SYMBOL),
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"hitbtc candles error: {e}")
 
-    out=[]
-    out_arr: List[List[float]] = []
+    out: List[Dict] = []
     # shape: [{"t":"2024-01-01T00:00:00Z","o":"...","h":"...","l":"...","c":"...","v":"..."}...]
     for r in data[-limit:]:
         try:
             t = r.get("t") or r.get("timestamp")
-            dt = datetime.fromisoformat(t.replace("Z","+00:00"))
+            dt = datetime.fromisoformat((t or "").replace("Z", "+00:00"))
             ot = int(dt.timestamp())
-            o,h,l,c,v = float(r.get("o","0")), float(r.get("h","0")), float(r.get("l","0")), float(r.get("c","0")), float(r.get("v","0"))
+            o = float(r.get("o", "0"))
+            h = float(r.get("h", "0"))
+            l = float(r.get("l", "0"))
+            c = float(r.get("c", "0"))
+            v = float(r.get("v", "0"))
         except Exception:
             continue
-        out.append({"start": str(ot), "open": str(o), "high": str(h), "low": str(l), "close": str(c), "volume": str(v)})
-        out_arr.append([int(ot), float(l), float(h), float(o), float(c), float(v)])
+        out.append({
+            "start":  str(ot),
+            "open":   str(o),
+            "high":   str(h),
+            "low":    str(l),
+            "close":  str(c),
+            "volume": str(v),
+        })
+        # warm the 1m cache if period matches
         if period == "M1":
             try:
-                _update_candle(float(c), ot*1000)
+                _update_candle(float(c), ot * 1000)
             except Exception:
                 pass
+
     log.info(f"[TRACE] REST candles fetched: symbol={sym} period={period} rows={len(out)}")
-    if only_limit:
-        return out_arr
     return {"candles": out}
+
 
 @app.get("/accounts")
 def accounts(limit: int = 250):
     payload = _req("/api/3/spot/balance")
     rows = payload if isinstance(payload, list) else payload.get("balance", [])
-    out=[]
+    out = []
     for r in rows:
-        cur = str(r.get("currency","")).upper()
-        avail = str(r.get("available", r.get("cash","0")))
+        cur = str(r.get("currency", "")).upper()
+        avail = str(r.get("available", r.get("cash", "0")))
         out.append({
             "currency": cur,
             "available_balance": {"value": avail, "currency": cur},
@@ -244,12 +338,14 @@ def accounts(limit: int = 250):
         })
     return {"accounts": out, "has_next": False, "cursor": "", "size": len(out)}
 
+
 @app.get("/balance/base")
 def balance_base(product_id: str = Query(...)):
     base, _ = _split(product_id)
     accts = accounts()
     value = _sum_available(accts["accounts"], base)
     return {"asset": base, "available": value, "step": "0"}
+
 
 @app.get("/balance/quote")
 def balance_quote(product_id: str = Query(...)):
@@ -258,25 +354,34 @@ def balance_quote(product_id: str = Query(...)):
     value = _sum_available(accts["accounts"], quote)
     return {"asset": quote, "available": value, "step": "0"}
 
+
 @app.get("/product/{product_id}")
 def product_info(product_id: str = Path(...)):
+    # mirror /price snapshot for arbitrary product_id
     return price(product_id)
+
 
 # --- Orders (market), partial-fill enrichment ---
 def _place_order(symbol: str, side: str, quantity: str) -> Dict:
-    body = json.dumps({"symbol": symbol, "side": side.lower(), "type":"market", "quantity": quantity}).encode("utf-8")
+    body = json.dumps({
+        "symbol": symbol, "side": side.lower(), "type": "market", "quantity": quantity
+    }).encode("utf-8")
     return _req("/api/3/spot/order", method="POST", body=body)
+
 
 def _get_order(order_id: str) -> Dict:
     return _req(f"/api/3/spot/order/{order_id}")
+
 
 def _order_trades(order_id: str) -> List[Dict]:
     payload = _req(f"/api/3/spot/order/{order_id}/trades")
     return payload if isinstance(payload, list) else payload.get("trades", [])
 
+
 @app.post("/orders/market_buy")
 def orders_market_buy(product_id: str = Query(...), quote_size: str = Query(...)):
     return order_market(product_id=product_id, side="BUY", quote_size=quote_size)
+
 
 @app.post("/order/market")
 def order_market(product_id: str = Query(...), side: str = Query(...), quote_size: str = Query(...)):
@@ -306,9 +411,9 @@ def order_market(product_id: str = Query(...), side: str = Query(...), quote_siz
         filled = Decimal("0"); value = Decimal("0"); fee = Decimal("0")
         fills = []
         for t in trades:
-            qty = Decimal(str(t.get("quantity","0")))
-            price = Decimal(str(t.get("price","0")))
-            commission = Decimal(str(t.get("fee","0")))
+            qty = Decimal(str(t.get("quantity", "0")))
+            price = Decimal(str(t.get("price", "0")))
+            commission = Decimal(str(t.get("fee", "0")))
             fills.append({
                 "price": str(price),
                 "size": str(qty),
@@ -329,28 +434,29 @@ def order_market(product_id: str = Query(...), side: str = Query(...), quote_siz
         pass
     return resp
 
+
 @app.get("/order/{order_id}")
 def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
     od = _get_order(order_id)
     resp = {
         "order_id": str(od.get("id") or order_id),
         "product_id": product_id,
-        "status": "open" if str(od.get("status","")).lower() in ("new","partially_filled") else "done",
+        "status": "open" if str(od.get("status", "")).lower() in ("new", "partially_filled") else "done",
         "created_at": _now_iso(),
-        "filled_size": str(od.get("quantity_cumulative","0")),
+        "filled_size": str(od.get("quantity_cumulative", "0")),
         "executed_value": "0",
         "fill_fees": "0",
         "fills": [],
-        "side": str(od.get("side","")).lower(),
+        "side": str(od.get("side", "")).lower(),
     }
     try:
         trades = _order_trades(order_id)
         filled = Decimal("0"); value = Decimal("0"); fee = Decimal("0")
-        fills=[]
+        fills = []
         for t in trades:
-            qty = Decimal(str(t.get("quantity","0")))
-            price = Decimal(str(t.get("price","0")))
-            commission = Decimal(str(t.get("fee","0")))
+            qty = Decimal(str(t.get("quantity", "0")))
+            price = Decimal(str(t.get("price", "0")))
+            commission = Decimal(str(t.get("fee", "0")))
             fills.append({
                 "price": str(price),
                 "size": str(qty),
@@ -359,24 +465,29 @@ def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
                 "time": _now_iso(),
             })
             filled += qty
-            value  += qty*price
+            value  += qty * price
             fee    += commission
         if fills:
             resp["fills"] = fills
             resp["filled_size"] = str(filled)
             resp["executed_value"] = str(value)
             resp["fill_fees"] = str(fee)
-            resp["status"] = "done" if str(od.get("status","")).lower() in ("filled","canceled","expired","rejected") else resp["status"]
+            resp["status"] = "done" if str(od.get("status", "")).lower() in ("filled", "canceled", "expired", "rejected") else resp["status"]
     except Exception:
         pass
     return resp
 
+
+# ---- Runner
 async def _runner():
     task = asyncio.create_task(_ws_loop())
     cfg  = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
     srv  = uvicorn.Server(cfg)
     await asyncio.gather(task, srv.serve())
 
+
 if __name__ == "__main__":
-    try: asyncio.run(_runner())
-    except KeyboardInterrupt: pass
+    try:
+        asyncio.run(_runner())
+    except KeyboardInterrupt:
+        pass
