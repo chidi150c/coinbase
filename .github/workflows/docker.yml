@@ -8,7 +8,8 @@ on:
 env:
   REGISTRY: ghcr.io
   BOT_IMAGE: ghcr.io/${{ github.repository_owner }}/coinbase-bot
-  BRIDGE_IMAGE: ghcr.io/${{ github.repository_owner }}/coinbase-bridge
+  BRIDGE_BINANCE_IMAGE: ghcr.io/${{ github.repository_owner }}/coinbase-bridge-binance
+  BRIDGE_HITBTC_IMAGE: ghcr.io/${{ github.repository_owner }}/coinbase-bridge-hitbtc
 
 jobs:
   build:
@@ -47,16 +48,30 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Bridge image
-      - name: Build & push bridge
+      # Bridge (Binance) image
+      - name: Build & push bridge (binance)
         uses: docker/build-push-action@v5
         with:
-          context: ./bridge
-          file: ./bridge/Dockerfile
+          context: ./bridge_binance
+          file: ./bridge_binance/Dockerfile
           push: true
           platforms: linux/amd64
           tags: |
-            ${{ env.BRIDGE_IMAGE }}:latest
-            ${{ env.BRIDGE_IMAGE }}:${{ github.sha }}
+            ${{ env.BRIDGE_BINANCE_IMAGE }}:latest
+            ${{ env.BRIDGE_BINANCE_IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Bridge (HitBTC) image
+      - name: Build & push bridge (hitbtc)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./bridge_hitbtc
+          file: ./bridge_hitbtc/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.BRIDGE_HITBTC_IMAGE }}:latest
+            ${{ env.BRIDGE_HITBTC_IMAGE }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
