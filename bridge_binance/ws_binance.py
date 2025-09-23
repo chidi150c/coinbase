@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib import request as urlreq, parse as urlparse
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Query, Path
+from fastapi import FastAPI, HTTPException, Query, Path, Body
 import websockets
 import uvicorn
 
@@ -328,7 +328,23 @@ def orders_market_buy(product_id: str = Query(...), quote_size: str = Query(...)
     return order_market(product_id=product_id, side="BUY", quote_size=quote_size)
 
 @app.post("/order/market")
-def order_market(product_id: str = Query(...), side: str = Query(...), quote_size: str = Query(...)):
+def order_market(
+    product_id: Optional[str] = Query(default=None),
+    side: Optional[str] = Query(default=None),
+    quote_size: Optional[str] = Query(default=None),
+    body: Optional[Dict] = Body(default=None),
+):
+    # Optional JSON body fallback (no behavior change for existing clients using query params)
+    if (product_id is None or side is None or quote_size is None) and isinstance(body, dict):
+        product_id = product_id or body.get("product_id")
+        side = (side or body.get("side"))
+        qs = body.get("quote_size")
+        quote_size = quote_size or (str(qs) if qs is not None else None)
+
+    # Validate required fields after merging
+    if not product_id or not side or not quote_size:
+        raise HTTPException(status_code=422, detail="Missing required fields: product_id, side, quote_size (query or JSON body)")
+
     sym = _normalize_symbol(product_id)
     side = side.upper()
     payload = _binance_signed_post("/api/v3/order",
