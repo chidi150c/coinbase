@@ -286,6 +286,7 @@ def get_candles(
       - If only limit provided, omit from/till entirely
       - No cross-bridge aliasing or Coinbase product/granularity handling
       - Propagate non-2xx as errors; log upstream URL/status/body snippet
+      - Always return {"candles":[...]}
     """
     sym = _normalize_symbol(symbol or SYMBOL)
 
@@ -342,9 +343,8 @@ def get_candles(
         raise HTTPException(status_code=502, detail=f"hitbtc candles error: {e}")
 
     # Always return an object with "candles": [...]
-    if isinstance(data, list):
-        data = {"candles": data}
-    return data
+    candles_payload = data if isinstance(data, list) else data.get("candles", data)
+    return {"candles": candles_payload}
 
 @app.get("/accounts")
 def accounts(limit: int = 250):
