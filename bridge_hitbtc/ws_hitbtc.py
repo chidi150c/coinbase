@@ -341,7 +341,9 @@ def get_candles(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"hitbtc candles error: {e}")
 
-    # Return upstream JSON directly (list of candle objects)
+    # Always return an object with "candles": [...]
+    if isinstance(data, list):
+        data = {"candles": data}
     return data
 
 @app.get("/accounts")
