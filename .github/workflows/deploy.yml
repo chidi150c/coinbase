@@ -31,17 +31,22 @@ jobs:
 
       - name: Deploy (git sync + compose rollout)
         env:
-          SSH_HOST:  ${{ secrets.SSH_HOST }}
-          SSH_USER:  ${{ secrets.SSH_USER }}
+          SSH_HOST:   ${{ secrets.SSH_HOST }}
+          SSH_USER:   ${{ secrets.SSH_USER }}
           DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}   # e.g. /home/chidi/coinbase/monitoring
-          REPO_URL:  https://github.com/${{ github.repository }}.git
+          REPO_URL:   https://github.com/${{ github.repository }}.git
+          GIT_SHA:    ${{ github.sha }}
+          HUMAN_TAG:  ${{ github.ref_name }}
         run: |
-          ssh -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" bash -s -- "$DEPLOY_DIR" "$REPO_URL" <<'EOF'
+          ssh -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" bash -s -- "$DEPLOY_DIR" "$REPO_URL" "$GIT_SHA" "$HUMAN_TAG" <<'EOF'
           set -euo pipefail
           DEPLOY_DIR="${1:-/home/chidi/coinbase/monitoring}"
           REPO_URL="$2"
+          GIT_SHA_IN="$3"
+          HUMAN_TAG_IN="$4"
           REPO_DIR="$(dirname "$DEPLOY_DIR")"
 
+          # Sync repo
           if [ ! -d "$REPO_DIR/.git" ]; then
             mkdir -p "$REPO_DIR"
             git clone "$REPO_URL" "$REPO_DIR"
@@ -52,6 +57,18 @@ jobs:
           fi
 
           cd "$DEPLOY_DIR"
-          docker compose up -d --pull=always --force-recreate
+
+          # Inject CI/CD identity into runtime (compose can reference these)
+          # IMAGE_SHA kept equal to GIT_SHA to preserve existing naming.
+          cat > .env.ci <<ENVVARS
+          GIT_SHA=${GIT_SHA_IN}
+          IMAGE_SHA=${GIT_SHA_IN}
+          HUMAN_TAG=${HUMAN_TAG_IN}
+          ENVVARS
+
+          # Rollout with fresh pulls and full recreate
+          docker compose --env-file .env.ci up -d --pull=always --force-recreate
+
+          # Optional hygiene
           docker image prune -f
           EOF

@@ -7,6 +7,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
+  GIT_SHA: ${{ github.sha }}
+  HUMAN_TAG: ${{ github.ref_name }}
   BOT_IMAGE: ghcr.io/${{ github.repository_owner }}/coinbase-bot
   BRIDGE_BINANCE_IMAGE: ghcr.io/${{ github.repository_owner }}/coinbase-bridge-binance
   BRIDGE_HITBTC_IMAGE: ghcr.io/${{ github.repository_owner }}/coinbase-bridge-hitbtc
@@ -36,42 +38,69 @@ jobs:
 
       # Bot image
       - name: Build & push bot
+        id: build_bot
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           push: true
           platforms: linux/amd64
+          pull: true
+          no-cache: true
           tags: |
-            ${{ env.BOT_IMAGE }}:latest
-            ${{ env.BOT_IMAGE }}:${{ github.sha }}
+            ${{ env.BOT_IMAGE }}:${{ env.GIT_SHA }}
+            ${{ env.BOT_IMAGE }}:${{ env.HUMAN_TAG }}
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.GIT_SHA }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+          build-args: |
+            GIT_SHA=${{ env.GIT_SHA }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       # Bridge (Binance) image
       - name: Build & push bridge (binance)
+        id: build_binance
         uses: docker/build-push-action@v5
         with:
           context: ./bridge_binance
           file: ./bridge_binance/Dockerfile
           push: true
           platforms: linux/amd64
+          pull: true
+          no-cache: true
           tags: |
-            ${{ env.BRIDGE_BINANCE_IMAGE }}:latest
-            ${{ env.BRIDGE_BINANCE_IMAGE }}:${{ github.sha }}
+            ${{ env.BRIDGE_BINANCE_IMAGE }}:${{ env.GIT_SHA }}
+            ${{ env.BRIDGE_BINANCE_IMAGE }}:${{ env.HUMAN_TAG }}
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.GIT_SHA }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+          build-args: |
+            GIT_SHA=${{ env.GIT_SHA }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       # Bridge (HitBTC) image
       - name: Build & push bridge (hitbtc)
+        id: build_hitbtc
         uses: docker/build-push-action@v5
         with:
           context: ./bridge_hitbtc
           file: ./bridge_hitbtc/Dockerfile
           push: true
           platforms: linux/amd64
+          pull: true
+          no-cache: true
           tags: |
-            ${{ env.BRIDGE_HITBTC_IMAGE }}:latest
-            ${{ env.BRIDGE_HITBTC_IMAGE }}:${{ github.sha }}
+            ${{ env.BRIDGE_HITBTC_IMAGE }}:${{ env.GIT_SHA }}
+            ${{ env.BRIDGE_HITBTC_IMAGE }}:${{ env.HUMAN_TAG }}
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.GIT_SHA }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+          build-args: |
+            GIT_SHA=${{ env.GIT_SHA }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

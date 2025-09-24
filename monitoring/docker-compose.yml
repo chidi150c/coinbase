@@ -1,9 +1,6 @@
-
 services:
   bridge_hitbtc:
-    build:
-      context: ../bridge_hitbtc        # CHANGED from ../bridge
-      dockerfile: Dockerfile           # CHANGED from Dockerfile.ws
+    image: ghcr.io/chidi150c/coinbase-bridge-hitbtc:${IMAGE_SHA}  # pinned to CI SHA
     container_name: bridge_hitbtc
     env_file:
       - /opt/coinbase/env/hitbtc.env   # includes PORT, STALE_MS, optional SYMBOL
@@ -14,9 +11,7 @@ services:
     restart: unless-stopped
 
   bridge_binance:
-    build:
-      context: ../bridge_binance       # CHANGED from ../bridge
-      dockerfile: Dockerfile           # CHANGED from Dockerfile.ws
+    image: ghcr.io/chidi150c/coinbase-bridge-binance:${IMAGE_SHA} # pinned to CI SHA
     container_name: bridge_binance
     env_file:
       - /opt/coinbase/env/binance.env  # includes PORT, STALE_MS, optional SYMBOL

@@ -85,5 +85,18 @@ git restore --source=HEAD --staged --worktree .
 git checkout -- .
 git reset --hard
 
+=======================================================
+
+# from monitoring/ directory
+docker compose build --pull --no-cache bridge_binance bridge_hitbtc
+docker compose up -d --force-recreate bridge_binance bridge_hitbtc
+
+# confirm new image build times/IDs
+docker compose images
+
+===============================================================
+# One-time manual deep clean (careful—removes ALL unused stuff):
+docker system prune -a -f --volumes
+
 
 
