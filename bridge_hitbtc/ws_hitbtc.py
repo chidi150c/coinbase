@@ -30,6 +30,12 @@ last_ts_ms: Optional[int] = None
 candles: Dict[int, List[float]] = {}  # minute_ms -> [o,h,l,c,vol]
 _first_tick_logged: bool = False  # TRACE: first-tick marker
 
+# Internal WS preference trackers (orderbook mid primary, ticker last fallback)
+_last_mid_px: Optional[float] = None
+_last_mid_ts: Optional[int] = None
+_last_last_px: Optional[float] = None
+_last_last_ts: Optional[int] = None
+
 # ---- Time & candle helpers ----
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -136,16 +142,16 @@ _PERIOD_TO_GRAN = {v: k for k, v in GRAN_MAP.items()}
 async def _ws_loop():
     """
     HitBTC public WS:
-      - subscribe to `ticker/price/1s` (prefer 'c' last price)
-      - subscribe to `ticker/1s`       (fallback mid from a/b)
+      - subscribe to `orderbook/top/1000ms` (primary: mid = (bid+ask)/2)
+      - subscribe to `ticker/price/1s`      (fallback: last price 'c')
     Updates: last_price, last_ts_ms, in-memory minute candles.
     """
-    global last_price, last_ts_ms, _first_tick_logged
+    global last_price, last_ts_ms, _first_tick_logged, _last_mid_px, _last_mid_ts, _last_last_px, _last_last_ts
     url = "wss://api.hitbtc.com/api/3/ws/public"
     sym = _normalize_symbol(SYMBOL)
     subs = [
-        {"method": "subscribe", "ch": "ticker/price/1s", "params": {"symbols": [sym]}, "id": 1},
-        {"method": "subscribe", "ch": "ticker/1s",       "params": {"symbols": [sym]}, "id": 2},
+        {"method": "subscribe", "ch": "orderbook/top/1000ms", "params": {"symbols": [sym]}, "id": 1},
+        {"method": "subscribe", "ch": "ticker/price/1s",      "params": {"symbols": [sym]}, "id": 2},
     ]
     backoff = 1
     conn_attempt = 0
@@ -158,7 +164,7 @@ async def _ws_loop():
             ) as ws:
                 for s in subs:
                     await ws.send(json.dumps(s))
-                log.info(f"[WS] subscribed streams for {sym}: ticker/price/1s, ticker/1s")
+                log.info(f"[WS] subscribed streams for {sym}: orderbook/top/1000ms, ticker/price/1s")
                 backoff = 1
 
                 while True:
@@ -180,44 +186,71 @@ async def _ws_loop():
 
                     ch = msg.get("ch")
                     data = msg.get("data")
-                    if ch not in ("ticker/price/1s", "ticker/1s") or not data:
+                    if ch not in ("orderbook/top/1000ms", "ticker/price/1s") or not data:
                         continue
 
                     row = data.get(sym) or {}
                     ts_ms = int(row.get("t") or _now_ms())  # ms
-                    px = None
 
-                    # 1) preferred last price 'c' when available
-                    c = row.get("c")
-                    if c is not None:
-                        try:
-                            px = float(c)
-                        except Exception:
-                            px = None
-
-                    # 2) fallback mid of a/b from ticker/1s
-                    if px is None and ch == "ticker/1s":
+                    # Track individual feeds
+                    if ch == "orderbook/top/1000ms":
                         try:
                             a = float(row.get("a") or 0.0)
                             b = float(row.get("b") or 0.0)
                             if a > 0 and b > 0:
-                                px = (a + b) / 2.0
+                                _last_mid_px = (a + b) / 2.0
+                                _last_mid_ts = ts_ms
                         except Exception:
-                            px = None
+                            pass
+                    elif ch == "ticker/price/1s":
+                        c = row.get("c")
+                        try:
+                            if c is not None:
+                                _last_last_px = float(c)
+                                _last_last_ts = ts_ms
+                        except Exception:
+                            pass
+
+                    # Choose price: prefer mid updated within ~1s, else last, else keep prior
+                    now_ms = _now_ms()
+                    px = None
+                    if _last_mid_px is not None and _last_mid_ts is not None and (now_ms - _last_mid_ts) <= 1000:
+                        px = _last_mid_px
+                        ts_for_px = _last_mid_ts
+                    elif _last_last_px is not None:
+                        px = _last_last_px
+                        ts_for_px = _last_last_ts or ts_ms
+                    else:
+                        # No new feed yet; keep last known price (no stall)
+                        px = last_price
+                        ts_for_px = last_ts_ms or ts_ms
 
                     if px is not None and px > 0:
                         last_price = px
-                        last_ts_ms = ts_ms
-                        _update_candle(px, ts_ms, 0.0)
+                        last_ts_ms = ts_for_px
+                        _update_candle(px, ts_for_px, 0.0)
                         if not _first_tick_logged:
                             _first_tick_logged = True
-                            log.info(f"[WS] first tick sym={sym} px={px:.8f} ts_ms={ts_ms}")
+                            log.info(f"[WS] first tick sym={sym} px={px:.8f} ts_ms={ts_for_px}")
         except Exception as e:
             log.warning(f"[WS] disconnect err={e} backoff={backoff}s")
             if LOG_LEVEL == "DEBUG":
                 log.debug(traceback.format_exc())
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 15)
+
+# Keep candles flowing even if both feeds stall briefly (emit last seen price)
+async def _keepalive_loop():
+    global last_price, last_ts_ms
+    while True:
+        await asyncio.sleep(1)
+        if last_price is None:
+            continue
+        now_ms = _now_ms()
+        # If no tick applied in the last second, write a heartbeat candle update
+        if last_ts_ms is None or (now_ms - last_ts_ms) > 1000:
+            last_ts_ms = now_ms
+            _update_candle(last_price, now_ms, 0.0)
 
 # ---- HTTP app
 app = FastAPI(title="bridge-hitbtc", version="0.5")
@@ -506,10 +539,11 @@ def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
 # ---- Runner
 async def _runner():
     log.info(f"[BOOT] starting bridge-hitbtc PORT={PORT} SYMBOL={SYMBOL} LOG_LEVEL={LOG_LEVEL}")
-    task = asyncio.create_task(_ws_loop())
+    task_ws = asyncio.create_task(_ws_loop())
+    task_keepalive = asyncio.create_task(_keepalive_loop())
     cfg  = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
     srv  = uvicorn.Server(cfg)
-    await asyncio.gather(task, srv.serve())
+    await asyncio.gather(task_ws, task_keepalive, srv.serve())
 
 if __name__ == "__main__":
     try:
