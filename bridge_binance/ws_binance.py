@@ -31,12 +31,6 @@ last_ts_ms: Optional[int] = None
 candles: Dict[int, List[float]] = {}  # minuteStartMs -> [o,h,l,c,vol]
 _first_tick_logged: bool = False  # TRACE: first-tick marker
 
-# Prefer @bookTicker mid; fallback to @trade last
-_last_mid_px: Optional[float] = None
-_last_mid_ts: Optional[int] = None
-_last_last_px: Optional[float] = None
-_last_last_ts: Optional[int] = None
-
 # ---- Helpers ----
 def _now_ms() -> int: return int(time.time() * 1000)
 def _now_iso() -> str: return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
@@ -130,7 +124,7 @@ def _sum_available(accts: List[Dict], asset: str) -> str:
 
 # ---- WS consumer ----
 async def _ws_loop():
-    global last_price, last_ts_ms, _first_tick_logged, _last_mid_px, _last_mid_ts, _last_last_px, _last_last_ts
+    global last_price, last_ts_ms, _first_tick_logged
     sym = _normalize_symbol(SYMBOL).lower()
     url = f"wss://stream.binance.com:9443/stream?streams={sym}@bookTicker/{sym}@trade"
     log.info(f"[WS] connecting url={url}")
@@ -152,60 +146,31 @@ async def _ws_loop():
                         continue
                     stream = msg.get("stream","")
                     data   = msg.get("data",{})
-                    # Track feeds separately
+                    px = None
                     if stream.endswith("@bookTicker"):
                         a = data.get("a"); b = data.get("b")
                         try:
                             if a is not None and b is not None:
-                                _last_mid_px = (float(a)+float(b))/2.0
-                                _last_mid_ts = ts
+                                px = (float(a)+float(b))/2.0
                         except Exception:
-                            pass
+                            px = None
                     elif stream.endswith("@trade"):
                         p = data.get("p") or data.get("price")
                         try:
-                            if p is not None:
-                                _last_last_px = float(p)
-                                _last_last_ts = ts
+                            if p is not None: px = float(p)
                         except Exception:
-                            pass
-
-                    # Prefer mid updated within ~1s, else last, else keep prior (no stalling)
-                    now_ms = _now_ms()
-                    px = None
-                    if _last_mid_px is not None and _last_mid_ts is not None and (now_ms - _last_mid_ts) <= 1000:
-                        px = _last_mid_px
-                        ts_for_px = _last_mid_ts
-                    elif _last_last_px is not None:
-                        px = _last_last_px
-                        ts_for_px = _last_last_ts or ts
-                    else:
-                        px = last_price
-                        ts_for_px = last_ts_ms or ts
-
+                            px = None
                     if px and px > 0:
                         last_price = px
-                        last_ts_ms = ts_for_px
-                        _update_candle(px, ts_for_px)
+                        last_ts_ms = ts
+                        _update_candle(px, ts)
                         if not _first_tick_logged:
                             _first_tick_logged = True
-                            log.info(f"[WS] first tick px={px:.8f} ts_ms={ts_for_px}")
+                            log.info(f"[WS] first tick px={px:.8f} ts_ms={ts}")
         except Exception as e:
             log.warning(f"[WS] disconnect err={e} backoff={backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff*2, 15)
-
-# Keep candles flowing even if both feeds stall briefly (emit last seen price)
-async def _keepalive_loop():
-    global last_price, last_ts_ms
-    while True:
-        await asyncio.sleep(1)
-        if last_price is None:
-            continue
-        now_ms = _now_ms()
-        if last_ts_ms is None or (now_ms - last_ts_ms) > 1000:
-            last_ts_ms = now_ms
-            _update_candle(last_price, now_ms)
 
 # ---- FastAPI app ----
 app = FastAPI(title="bridge-binance", version="0.3")
@@ -471,11 +436,10 @@ def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
 
 # ---- Runner ----
 async def _runner():
-    task_ws = asyncio.create_task(_ws_loop())
-    task_keepalive = asyncio.create_task(_keepalive_loop())
+    task = asyncio.create_task(_ws_loop())
     cfg  = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
     srv  = uvicorn.Server(cfg)
-    await asyncio.gather(task_ws, task_keepalive, srv.serve())
+    await asyncio.gather(task, srv.serve())
 
 if __name__ == "__main__":
     try: asyncio.run(_runner())
