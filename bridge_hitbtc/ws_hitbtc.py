@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib import request as urlreq, parse as urlparse
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Query, Path, Request
+from fastapi import FastAPI, HTTPException, Query, Path, Request, Body
 import websockets
 import uvicorn
 
@@ -42,6 +42,14 @@ def _now_ms() -> int:
 
 def _now_iso() -> str:
     return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+def _ms_to_iso(ms: Optional[int]) -> Optional[str]:
+    if ms is None:
+        return None
+    try:
+        return datetime.utcfromtimestamp(ms / 1000).replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return None
 
 def _minute_start(ts_ms: int) -> int:
     return (ts_ms // 60000) * 60000
@@ -293,7 +301,7 @@ def price(product_id: str = Query(default=SYMBOL)):
     return {
         "product_id": product_id,
         "price": float(last_price) if last_price else 0.0,
-        "ts": last_ts_ms,
+        "ts": _ms_to_iso(last_ts_ms),
         "stale": stale,
     }
 
@@ -439,7 +447,23 @@ def orders_market_buy(product_id: str = Query(...), quote_size: str = Query(...)
     return order_market(product_id=product_id, side="BUY", quote_size=quote_size)
 
 @app.post("/order/market")
-def order_market(product_id: str = Query(...), side: str = Query(...), quote_size: str = Query(...)):
+def order_market(
+    product_id: Optional[str] = Query(default=None),
+    side: Optional[str] = Query(default=None),
+    quote_size: Optional[str] = Query(default=None),
+    body: Optional[Dict] = Body(default=None),
+):
+    # Optional JSON body fallback (no behavior change for existing clients using query params)
+    if (product_id is None or side is None or quote_size is None) and isinstance(body, dict):
+        product_id = product_id or body.get("product_id")
+        side = (side or body.get("side"))
+        qs = body.get("quote_size")
+        quote_size = quote_size or (str(qs) if qs is not None else None)
+
+    # Validate required fields after merging
+    if not product_id or not side or not quote_size:
+        raise HTTPException(status_code=422, detail="Missing required fields: product_id, side, quote_size (query or JSON body)")
+
     sym = _normalize_symbol(product_id)
     side = side.upper()
     px = last_price or 0.0

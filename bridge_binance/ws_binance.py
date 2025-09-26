@@ -124,12 +124,27 @@ def _sum_available(accts: List[Dict], asset: str) -> str:
 
 # ---- WS consumer ----
 async def _ws_loop():
+    """
+    Prefer last trade (@trade) as the primary tick.
+    Fallback to orderbook mid (@bookTicker) if trade stalls (> TRADE_STALL_MS).
+    Never block candle updates; always use the freshest available source.
+    """
     global last_price, last_ts_ms, _first_tick_logged
     sym = _normalize_symbol(SYMBOL).lower()
     url = f"wss://stream.binance.com:9443/stream?streams={sym}@bookTicker/{sym}@trade"
     log.info(f"[WS] connecting url={url}")
     backoff = 1
     attempt = 0
+
+    # Minimal local stall threshold (ms) for trade before falling back to mid
+    TRADE_STALL_MS = 1000
+
+    # Track both feeds separately
+    last_trade_px: Optional[float] = None
+    last_trade_ts: Optional[int] = None
+    last_mid_px: Optional[float] = None
+    last_mid_ts: Optional[int] = None
+
     while True:
         attempt += 1
         try:
@@ -139,34 +154,49 @@ async def _ws_loop():
                 backoff = 1
                 while True:
                     raw = await ws.recv()
-                    ts = _now_ms()
+                    now_ms = _now_ms()
                     try:
                         msg = json.loads(raw)
                     except Exception:
                         continue
                     stream = msg.get("stream","")
                     data   = msg.get("data",{})
-                    px = None
-                    if stream.endswith("@bookTicker"):
+
+                    # Update per-source caches
+                    if stream.endswith("@trade"):
+                        p = data.get("p") or data.get("price")
+                        try:
+                            if p is not None:
+                                last_trade_px = float(p)
+                                last_trade_ts = now_ms
+                        except Exception:
+                            pass
+                    elif stream.endswith("@bookTicker"):
                         a = data.get("a"); b = data.get("b")
                         try:
                             if a is not None and b is not None:
-                                px = (float(a)+float(b))/2.0
+                                mid = (float(a) + float(b)) / 2.0
+                                if mid > 0:
+                                    last_mid_px = mid
+                                    last_mid_ts = now_ms
                         except Exception:
-                            px = None
-                    elif stream.endswith("@trade"):
-                        p = data.get("p") or data.get("price")
-                        try:
-                            if p is not None: px = float(p)
-                        except Exception:
-                            px = None
-                    if px and px > 0:
-                        last_price = px
-                        last_ts_ms = ts
-                        _update_candle(px, ts)
+                            pass
+
+                    # Choose preferred tick: trade if fresh, else mid if available
+                    chosen_px = None
+                    if last_trade_px and last_trade_ts:
+                        if now_ms - last_trade_ts <= TRADE_STALL_MS:
+                            chosen_px = last_trade_px
+                    if chosen_px is None and last_mid_px:
+                        chosen_px = last_mid_px
+
+                    if chosen_px and chosen_px > 0:
+                        last_price = chosen_px
+                        last_ts_ms = now_ms
+                        _update_candle(chosen_px, now_ms)
                         if not _first_tick_logged:
                             _first_tick_logged = True
-                            log.info(f"[WS] first tick px={px:.8f} ts_ms={ts}")
+                            log.info(f"[WS] first tick px={chosen_px:.8f} ts_ms={now_ms}")
         except Exception as e:
             log.warning(f"[WS] disconnect err={e} backoff={backoff}s")
             await asyncio.sleep(backoff)
