@@ -291,7 +291,7 @@ async def _keepalive_loop():
         now_ms = _now_ms()
         # If no tick applied in the last second, write a heartbeat candle update
         if last_ts_ms is None or (now_ms - last_ts_ms) > 1000:
-            last_ts_ms = now_ms
+             # don’t bump last_ts_ms here — only write a candle heartbeat
             _update_candle(last_price, now_ms, 0.0)
 
 # ---- HTTP app
