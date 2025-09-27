@@ -232,7 +232,15 @@ async def _ws_loop():
                         continue
 
                     row = data.get(sym) or {}
-                    ts_ms = int(row.get("t") or _now_ms())  # ms
+
+                    # --- EDIT #1: normalize WS timestamp (seconds -> ms if needed)
+                    t_raw = row.get("t")
+                    try:
+                        ts_ms = int(t_raw) if t_raw is not None else _now_ms()
+                        if ts_ms < 1_000_000_000_000:
+                            ts_ms *= 1000
+                    except Exception:
+                        ts_ms = _now_ms()
 
                     # Track individual feeds
                     if ch == "orderbook/top/1000ms":
@@ -267,7 +275,9 @@ async def _ws_loop():
                     # Only on real tick choose/update state (no heartbeat)
                     if px is not None and px > 0 and ts_for_px is not None:
                         last_price = px
-                        last_ts_ms = ts_for_px
+                        # --- EDIT #2: use local receipt time for staleness
+                        last_ts_ms = now_ms
+                        # Keep candle bucketing aligned with exchange/open time
                         _update_candle(px, ts_for_px, 0.0)
                         if not _first_tick_logged:
                             _first_tick_logged = True
