@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib import request as urlreq, parse as urlparse
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Query, Path, Request
+from fastapi import FastAPI, HTTPException, Query, Path, Request, Body
 import websockets
 import uvicorn
 
@@ -132,7 +132,7 @@ GRAN_MAP = {
     "ONE_HOUR": "H1",
     "FOUR_HOUR": "H4",
     "ONE_DAY": "D1",
-    # If TWO_HOUR / SIX_HOUR are requested, approximate to nearest available:
+    # Approximate for unsupported:
     "TWO_HOUR": "H1",
     "SIX_HOUR": "H4",
 }
@@ -253,7 +253,7 @@ async def _keepalive_loop():
             _update_candle(last_price, now_ms, 0.0)
 
 # ---- HTTP app
-app = FastAPI(title="bridge-hitbtc", version="0.5")
+app = FastAPI(title="bridge-hitbtc", version="0.6")
 
 # --- simple access log middleware (lite)
 @app.middleware("http")
@@ -297,55 +297,66 @@ def price(product_id: str = Query(default=SYMBOL)):
         "stale": stale,
     }
 
+# ---- /candles (dual-mode like Binance bridge) ----
 @app.get("/candles")
 def get_candles(
-    # legacy names (intentionally ignored for HitBTC-specific handler)
-    product_id: str = Query(default=SYMBOL),
-    granularity: str = Query(default="ONE_MINUTE"),
-    start: Optional[int] = Query(default=None),
-    end: Optional[int] = Query(default=None),
+    # Legacy (Coinbase-like) params
+    product_id: Optional[str] = Query(default=None),
+    granularity: Optional[str] = Query(default=None),
+    start: Optional[int] = Query(default=None),  # seconds
+    end: Optional[int] = Query(default=None),    # seconds
     limit: int = Query(default=350),
-    # authoritative HitBTC-facing params
+    # Native params (preferred)
     symbol: Optional[str] = Query(default=None),
     interval: Optional[str] = Query(default=None),
-    startTime: Optional[int] = Query(default=None),
-    endTime: Optional[int] = Query(default=None),
+    startTime: Optional[int] = Query(default=None),  # ms or seconds
+    endTime: Optional[int] = Query(default=None),    # ms or seconds
 ):
     """
-    HitBTC-specific /candles passthrough:
-      - Talks only to https://api.hitbtc.com/api/3/public/candles/{symbol}
-      - Allowed params: period (derived from interval), limit, optional from/till (RFC3339 UTC)
-      - startTime/endTime validation: convert seconds→ms; require start<end when both present
-      - If only limit provided, omit from/till entirely
-      - No cross-bridge aliasing or Coinbase product/granularity handling
-      - Propagate non-2xx as errors; log upstream URL/status/body snippet
-      - Always return {"candles":[...]}
+    Dual-mode:
+      • Legacy mode (product_id + granularity [+ start/end seconds]): returns normalized objects
+        [{"start","open","high","low","close","volume"}...].
+      • Native mode (symbol + interval [+ startTime/endTime]): returns array-of-arrays klines:
+        [[openTimeMs, open, high, low, close, volume, ...], ...] wrapped in {"candles":[...]}.
     """
-    sym = _normalize_symbol(symbol or SYMBOL)
+    legacy_mode = (symbol is None and interval is None)
 
-    # interval -> HitBTC period
-    period_map = {"1m": "M1", "5m": "M5", "15m": "M15", "30m": "M30", "1h": "H1", "4h": "H4", "1d": "D1"}
-    ivl = (interval or "1m").strip().lower()
-    period = period_map.get(ivl)
-    if not period:
-        raise HTTPException(status_code=400, detail=f"unsupported interval {interval}")
+    # Resolve symbol & period
+    if legacy_mode:
+        pid = (product_id or SYMBOL)
+        sym = _normalize_symbol(pid)
+        gran = (granularity or "ONE_MINUTE").upper()
+        period = GRAN_MAP.get(gran, "M1")
+        st_s = start
+        et_s = end
+    else:
+        sym = _normalize_symbol(symbol or SYMBOL)
+        ivl = (interval or "1m").strip().lower()
+        period_map = {"1m": "M1", "5m": "M5", "15m": "M15", "30m": "M30", "1h": "H1", "2h": "H1", "4h": "H4", "6h": "H4", "1d": "D1"}
+        period = period_map.get(ivl)
+        if not period:
+            raise HTTPException(status_code=400, detail=f"unsupported interval {interval}")
+        st_s = None
+        et_s = None
 
-    # normalize times (accept seconds -> ms) then to RFC3339
+    # Normalize times
+    now_ms = _now_ms()
     def _to_ms(v: Optional[int]) -> Optional[int]:
-        if v is None:
-            return None
+        if v is None: return None
         return v * 1000 if v <= 1_000_000_000_000 else v
 
-    st_ms = _to_ms(startTime)
-    et_ms = _to_ms(endTime)
+    # Prefer legacy start/end when in legacy mode; else use native
+    st_ms = _to_ms(st_s if legacy_mode else (startTime if startTime is not None else None))
+    et_ms = _to_ms(et_s if legacy_mode else (endTime if endTime is not None else None))
 
-    if (st_ms is None) ^ (et_ms is None):
-        # one provided without the other -> require both or none
-        raise HTTPException(status_code=400, detail="startTime and endTime must be provided together or omitted")
-
-    params = {"period": period, "limit": str(min(max(1, limit), 1000))}
-
+    # Build query
+    params = {
+        "period": period,
+        "limit": str(min(max(1, limit), 1000)),
+    }
     if st_ms is not None and et_ms is not None:
+        if et_ms > now_ms:
+            et_ms = now_ms
         if st_ms >= et_ms:
             raise HTTPException(status_code=400, detail="startTime must be < endTime")
         def _rfc3339(ms: int) -> str:
@@ -357,7 +368,7 @@ def get_candles(
     upstream = f"{HITBTC_BASE_URL}/api/3/public/candles/{sym}"
     url = f"{upstream}?{qs}" if qs else upstream
 
-    # Perform upstream GET with logging and strict error propagation
+    # Fetch upstream
     try:
         req = urlreq.Request(url)
         with urlreq.urlopen(req, timeout=15) as resp:
@@ -375,9 +386,71 @@ def get_candles(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"hitbtc candles error: {e}")
 
-    # Always return an object with "candles": [...]
-    candles_payload = data if isinstance(data, list) else data.get("candles", data)
-    return {"candles": candles_payload}
+    # HitBTC candle rows are objects. Accept multiple possible keys defensively.
+    rows = data if isinstance(data, list) else data.get("candles", [])
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=502, detail="Unexpected candles shape")
+
+    def _pick(d: dict, *keys, default="0"):
+        for k in keys:
+            if k in d and d[k] is not None:
+                return d[k]
+        return default
+
+    # Convert to desired shapes
+    if legacy_mode:
+        # Normalized object list for Coinbase-style: start/open/high/low/close/volume
+        out = []
+        for r in rows:
+            if not isinstance(r, dict): continue
+            ts = _pick(r, "timestamp", "t")               # RFC3339 or epoch?
+            # Parse ts → seconds
+            try:
+                if isinstance(ts, (int, float)):
+                    start_sec = int(float(ts)) // 1000 if float(ts) > 1e12 else int(float(ts))
+                else:
+                    # RFC3339 like "2024-09-27T03:00:00Z"
+                    start_sec = int(datetime.fromisoformat(str(ts).replace("Z","+00:00")).timestamp())
+            except Exception:
+                continue
+            o = str(_pick(r, "open", "o", default="0"))
+            h = str(_pick(r, "max", "high", "h", default="0"))
+            l = str(_pick(r, "min", "low", "l", default="0"))
+            c = str(_pick(r, "close", "c", default="0"))
+            v = str(_pick(r, "volume", "v", default="0"))
+            out.append({
+                "start":  str(start_sec),
+                "open":   o,
+                "high":   h,
+                "low":    l,
+                "close":  c,
+                "volume": v,
+            })
+        return {"candles": out}
+    else:
+        # Native mode: array-of-arrays klines
+        klines = []
+        for r in rows:
+            if not isinstance(r, dict): continue
+            ts = _pick(r, "timestamp", "t")
+            # Convert ts to ms
+            try:
+                if isinstance(ts, (int, float)):
+                    open_ms = int(float(ts))
+                    if open_ms < 1e12:
+                        open_ms *= 1000
+                else:
+                    open_ms = int(datetime.fromisoformat(str(ts).replace("Z","+00:00")).timestamp() * 1000)
+            except Exception:
+                continue
+            o = float(_pick(r, "open", "o", default="0"))
+            h = float(_pick(r, "max", "high", "h", default="0"))
+            l = float(_pick(r, "min", "low", "l", default="0"))
+            c = float(_pick(r, "close", "c", default="0"))
+            v = float(_pick(r, "volume", "v", default="0"))
+            # Shape aligned with Binance klines used by the Go normalizer
+            klines.append([open_ms, str(o), str(h), str(l), str(c), str(v), open_ms + 1])
+        return {"candles": klines}
 
 @app.get("/accounts")
 def accounts(limit: int = 250):
@@ -439,7 +512,22 @@ def orders_market_buy(product_id: str = Query(...), quote_size: str = Query(...)
     return order_market(product_id=product_id, side="BUY", quote_size=quote_size)
 
 @app.post("/order/market")
-def order_market(product_id: str = Query(...), side: str = Query(...), quote_size: str = Query(...)):
+def order_market(
+    product_id: Optional[str] = Query(default=None),
+    side: Optional[str] = Query(default=None),
+    quote_size: Optional[str] = Query(default=None),
+    body: Optional[Dict] = Body(default=None),
+):
+    # Optional JSON body fallback (keeps parity with Binance bridge)
+    if (product_id is None or side is None or quote_size is None) and isinstance(body, dict):
+        product_id = product_id or body.get("product_id")
+        side = (side or body.get("side"))
+        qs = body.get("quote_size")
+        quote_size = quote_size or (str(qs) if qs is not None else None)
+
+    if not product_id or not side or not quote_size:
+        raise HTTPException(status_code=422, detail="Missing required fields: product_id, side, quote_size (query or JSON body)")
+
     sym = _normalize_symbol(product_id)
     side = side.upper()
     px = last_price or 0.0
