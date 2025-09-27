@@ -123,6 +123,48 @@ def _sum_available(accts: List[Dict], asset: str) -> str:
             return str(r.get("available_balance", {}).get("value", "0"))
     return "0"
 
+# --- NEW: symbol metadata cache for steps (quantity_increment, tick_size) ---
+_symbol_meta_cache: Dict[str, Dict[str, str]] = {}
+
+def _get_symbol_meta(sym: str) -> Dict[str, str]:
+    """Fetch and cache HitBTC symbol metadata; returns {} on failure."""
+    key = sym.upper()
+    if key in _symbol_meta_cache:
+        return _symbol_meta_cache[key]
+    try:
+        url = f"{HITBTC_BASE_URL}/api/3/public/symbol/{key}"
+        j = _http_get(url)
+        # The v3 API returns an object keyed by symbol or a single object; handle both.
+        if isinstance(j, dict) and key in j and isinstance(j[key], dict):
+            meta = j[key]
+        elif isinstance(j, dict):
+            meta = j
+        else:
+            meta = {}
+        out = {
+            "quantity_increment": str(meta.get("quantity_increment", "") or ""),
+            "tick_size": str(meta.get("tick_size", "") or ""),
+        }
+        _symbol_meta_cache[key] = out
+        log.debug(f"[META] cached {key} quantity_increment={out['quantity_increment']} tick_size={out['tick_size']}")
+        return out
+    except Exception as e:
+        log.debug(f"[META] fetch failed for {key}: {e}")
+        _symbol_meta_cache[key] = {}
+        return {}
+
+def _env_step(name: str) -> Optional[str]:
+    """Return env override if set to positive numeric string, else None."""
+    v = os.getenv(name, "").strip()
+    if not v:
+        return None
+    try:
+        if float(v) > 0:
+            return v
+    except Exception:
+        pass
+    return None
+
 # Map Coinbase granularities → HitBTC periods
 GRAN_MAP = {
     "ONE_MINUTE": "M1",
@@ -474,16 +516,40 @@ def balance_base(product_id: str = Query(...)):
     base, _ = _split(product_id)
     accts = accounts()
     value = _sum_available(accts["accounts"], base)
+    # --- derive base step: env BASE_STEP > symbol.quantity_increment > "0"
+    step = _env_step("BASE_STEP")
+    if step is None:
+        meta = _get_symbol_meta(_normalize_symbol(product_id))
+        qinc = meta.get("quantity_increment") or ""
+        try:
+            if qinc and float(qinc) > 0:
+                step = qinc
+        except Exception:
+            step = None
+    if step is None:
+        step = "0"
     log.info(f"[BALANCE] base asset={base} available={value}")
-    return {"asset": base, "available": value, "step": "0"}
+    return {"asset": base, "available": value, "step": step}
 
 @app.get("/balance/quote")
 def balance_quote(product_id: str = Query(...)):
     _, quote = _split(product_id)
     accts = accounts()
     value = _sum_available(accts["accounts"], quote)
+    # --- derive quote step: env QUOTE_STEP > symbol.tick_size > "0"
+    step = _env_step("QUOTE_STEP")
+    if step is None:
+        meta = _get_symbol_meta(_normalize_symbol(product_id))
+        tick = meta.get("tick_size") or ""
+        try:
+            if tick and float(tick) > 0:
+                step = tick
+        except Exception:
+            step = None
+    if step is None:
+        step = "0"
     log.info(f"[BALANCE] quote asset={quote} available={value}")
-    return {"asset": quote, "available": value, "step": "0"}
+    return {"asset": quote, "available": value, "step": step}
 
 @app.get("/product/{product_id}")
 def product_info(product_id: str = Path(...)):

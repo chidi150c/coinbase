@@ -25,11 +25,18 @@ BINANCE_API_SECRET  = os.getenv("BINANCE_API_SECRET", "").strip()
 BINANCE_BASE_URL    = os.getenv("BINANCE_BASE_URL", "https://api.binance.com").strip().rstrip("/")
 BINANCE_RECV_WINDOW = os.getenv("BINANCE_RECV_WINDOW", "5000").strip()  # ms
 
+# Optional local step fallbacks
+BASE_STEP_FALLBACK  = os.getenv("BASE_STEP", "").strip()
+QUOTE_STEP_FALLBACK = os.getenv("QUOTE_STEP", "").strip()
+
 # ---- In-memory state ----
 last_price: Optional[float] = None
 last_ts_ms: Optional[int] = None
 candles: Dict[int, List[float]] = {}  # minuteStartMs -> [o,h,l,c,vol]
 _first_tick_logged: bool = False  # TRACE: first-tick marker
+
+# Simple cache for symbol metadata (LOT_SIZE.stepSize, PRICE_FILTER.tickSize)
+_symbol_meta_cache: Dict[str, Dict[str, str]] = {}
 
 # ---- Helpers ----
 def _now_ms() -> int: return int(time.time() * 1000)
@@ -121,6 +128,41 @@ def _sum_available(accts: List[Dict], asset: str) -> str:
         if a.get("currency","").upper() == asset:
             return str(a.get("available_balance",{}).get("value","0"))
     return "0"
+
+def _get_symbol_steps(sym: str) -> Tuple[str, str]:
+    """
+    Return (base_step, tick_size) as strings for given Binance symbol.
+    Uses /api/v3/exchangeInfo and caches results.
+    """
+    key = sym.upper()
+    if key in _symbol_meta_cache:
+        meta = _symbol_meta_cache[key]
+        return meta.get("base_step", "0"), meta.get("tick_size", "0")
+
+    url = f"{BINANCE_BASE_URL}/api/v3/exchangeInfo?symbol={key}"
+    info = _http_get(url)
+    base_step = "0"
+    tick_size = "0"
+    try:
+        symbols = info.get("symbols") or []
+        if symbols:
+            s = symbols[0]
+            filters = s.get("filters") or []
+            for f in filters:
+                ft = f.get("filterType")
+                if ft == "LOT_SIZE":
+                    step = str(f.get("stepSize", "0"))
+                    if step and step != "0":
+                        base_step = step
+                elif ft == "PRICE_FILTER":
+                    ts = str(f.get("tickSize", "0"))
+                    if ts and ts != "0":
+                        tick_size = ts
+    except Exception:
+        pass
+
+    _symbol_meta_cache[key] = {"base_step": base_step, "tick_size": tick_size}
+    return base_step, tick_size
 
 # ---- WS consumer ----
 async def _ws_loop():
@@ -371,14 +413,26 @@ def balance_base(product_id: str = Query(...)):
     base, _ = _split_product(product_id)
     accts = accounts()  # same process
     value = _sum_available(accts["accounts"], base)
-    return {"asset": base, "available": value, "step": "0"}
+
+    # Derive base step from exchange info (LOT_SIZE.stepSize) with env fallback
+    sym = _normalize_symbol(product_id)
+    base_step, _tick_size = _get_symbol_steps(sym)
+    step = BASE_STEP_FALLBACK or base_step or "0"
+
+    return {"asset": base, "available": value, "step": step}
 
 @app.get("/balance/quote")
 def balance_quote(product_id: str = Query(...)):
     _, quote = _split_product(product_id)
     accts = accounts()
     value = _sum_available(accts["accounts"], quote)
-    return {"asset": quote, "available": value, "step": "0"}
+
+    # Derive quote step from exchange info (PRICE_FILTER.tickSize) with env fallback
+    sym = _normalize_symbol(product_id)
+    _base_step, tick_size = _get_symbol_steps(sym)
+    step = QUOTE_STEP_FALLBACK or tick_size or "0"
+
+    return {"asset": quote, "available": value, "step": step}
 
 @app.get("/product/{product_id}")
 def product_info(product_id: str = Path(...)):
@@ -494,7 +548,7 @@ def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
             resp["filled_size"] = str(filled)
             resp["executed_value"] = str(value)
             resp["fill_fees"] = str(fee)
-            resp["status"] = "done" if str(od.get("status")) in ("FILLED","EXPIRED","CANCELED","REJECTED") else resp["status"]
+            resp["status"] = "done" if str(od.get("status")) in ("FILLED","EXPIRED","CANCELED","REJECTED") else "open" if resp["status"] == "open" else resp["status"]
     except Exception:
         pass
     return resp
