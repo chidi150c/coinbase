@@ -278,11 +278,14 @@ def get_candles(
     st_ms = _to_ms(st_s if legacy_mode else (startTime if startTime is not None else None))
     et_ms = _to_ms(et_s if legacy_mode else (endTime if endTime is not None else None))
 
+    # ✅ define lim before using it
+    lim = max(1, min(int(limit), 1000))
+
     params = urlparse.urlencode(
         {k: v for k, v in {
             "symbol": sym,
             "interval": ivl,
-            "limit": str(min(max(1, lim), 1000)),
+            "limit": str(lim),
         }.items() if v not in (None, "")}
     )
 
