@@ -35,7 +35,7 @@ last_ts_ms: Optional[int] = None
 candles: Dict[int, List[float]] = {}  # minuteStartMs -> [o,h,l,c,vol]
 _first_tick_logged: bool = False  # TRACE: first-tick marker
 
-# Simple cache for symbol metadata (LOT_SIZE.stepSize, PRICE_FILTER.tickSize)
+# Simple cache for symbol metadata (LOT_SIZE.stepSize, quotePrecision → quote step)
 _symbol_meta_cache: Dict[str, Dict[str, str]] = {}
 
 # ---- Helpers ----
@@ -131,38 +131,39 @@ def _sum_available(accts: List[Dict], asset: str) -> str:
 
 def _get_symbol_steps(sym: str) -> Tuple[str, str]:
     """
-    Return (base_step, tick_size) as strings for given Binance symbol.
-    Uses /api/v3/exchangeInfo and caches results.
+    Return (base_step, quote_step) as strings for given Binance symbol.
+    base_step  = LOT_SIZE.stepSize
+    quote_step = 10^(-quotePrecision)  # for quoteOrderQty increments
     """
     key = sym.upper()
     if key in _symbol_meta_cache:
         meta = _symbol_meta_cache[key]
-        return meta.get("base_step", "0"), meta.get("tick_size", "0")
+        return meta.get("base_step", "0"), meta.get("quote_step", "0")
 
     url = f"{BINANCE_BASE_URL}/api/v3/exchangeInfo?symbol={key}"
     info = _http_get(url)
     base_step = "0"
-    tick_size = "0"
+    quote_step = "0"
     try:
         symbols = info.get("symbols") or []
         if symbols:
             s = symbols[0]
-            filters = s.get("filters") or []
-            for f in filters:
-                ft = f.get("filterType")
-                if ft == "LOT_SIZE":
+            # LOT_SIZE -> base step
+            for f in (s.get("filters") or []):
+                if f.get("filterType") == "LOT_SIZE":
                     step = str(f.get("stepSize", "0"))
                     if step and step != "0":
                         base_step = step
-                elif ft == "PRICE_FILTER":
-                    ts = str(f.get("tickSize", "0"))
-                    if ts and ts != "0":
-                        tick_size = ts
+                        break
+            # quotePrecision -> quote step (as decimal increment for quoteOrderQty)
+            qp = s.get("quotePrecision")
+            if isinstance(qp, int) and qp >= 0:
+                quote_step = f"{1/(10**qp):.{qp}f}" if qp > 0 else "1"
     except Exception:
         pass
 
-    _symbol_meta_cache[key] = {"base_step": base_step, "tick_size": tick_size}
-    return base_step, tick_size
+    _symbol_meta_cache[key] = {"base_step": base_step, "quote_step": quote_step}
+    return base_step, quote_step
 
 # ---- WS consumer ----
 async def _ws_loop():
@@ -416,7 +417,7 @@ def balance_base(product_id: str = Query(...)):
 
     # Derive base step from exchange info (LOT_SIZE.stepSize) with env fallback
     sym = _normalize_symbol(product_id)
-    base_step, _tick_size = _get_symbol_steps(sym)
+    base_step, _quote_step = _get_symbol_steps(sym)
     step = BASE_STEP_FALLBACK or base_step or "0"
 
     return {"asset": base, "available": value, "step": step}
@@ -427,10 +428,10 @@ def balance_quote(product_id: str = Query(...)):
     accts = accounts()
     value = _sum_available(accts["accounts"], quote)
 
-    # Derive quote step from exchange info (PRICE_FILTER.tickSize) with env fallback
+    # Derive quote step from exchange info (quotePrecision) with env fallback
     sym = _normalize_symbol(product_id)
-    _base_step, tick_size = _get_symbol_steps(sym)
-    step = QUOTE_STEP_FALLBACK or tick_size or "0"
+    _base_step, quote_step = _get_symbol_steps(sym)
+    step = QUOTE_STEP_FALLBACK or quote_step or "0"
 
     return {"asset": quote, "available": value, "step": step}
 
