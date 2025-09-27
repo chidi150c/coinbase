@@ -81,3 +81,7 @@ prompt5B-code-continuity.md
 docker-compose.override.yml
 docker-compose.override.yml-
 *.local.yml
+.venv/
+.venv/
+**/.venv/
+__pycache__/
