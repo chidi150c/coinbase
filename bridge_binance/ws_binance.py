@@ -233,31 +233,37 @@ def price(product_id: str = Query(default=SYMBOL)):
 
 @app.get("/candles")
 def get_candles(
-    # legacy names (ignored for Binance-specific handler)
-    product_id: str = Query(default=SYMBOL),
-    granularity: str = Query(default="ONE_MINUTE"),
-    start: Optional[int] = Query(default=None),
-    end: Optional[int] = Query(default=None),
+    # legacy (Coinbase-like) params
+    product_id: Optional[str] = Query(default=None),
+    granularity: Optional[str] = Query(default=None),
+    start: Optional[int] = Query(default=None),  # seconds
+    end: Optional[int] = Query(default=None),    # seconds
     limit: int = Query(default=350),
-    # binance-style params (authoritative)
+    # Binance-native params
     symbol: Optional[str] = Query(default=None),
     interval: Optional[str] = Query(default=None),
-    startTime: Optional[int] = Query(default=None),
-    endTime: Optional[int] = Query(default=None),
+    startTime: Optional[int] = Query(default=None),  # ms or seconds
+    endTime: Optional[int] = Query(default=None),    # ms or seconds
 ):
     """
-    Binance-specific /candles passthrough:
-      - Talks only to https://api.binance.com/api/v3/klines
-      - Allowed params: symbol, interval, limit, startTime, endTime (ms)
-      - startTime/endTime validation: convert seconds→ms, require start<end, clamp endTime to now
-      - If only limit provided, omit startTime/endTime entirely
-      - No cross-bridge aliasing or Coinbase product/granularity handling
-      - Propagate non-2xx as errors; log upstream URL/status/body snippet
+    /candles dual-mode:
+      • Legacy mode (product_id + granularity [+ start/end seconds]): returns Coinbase-normalized objects.
+      • Binance mode (symbol + interval [+ startTime/endTime ms]): passthrough array-of-arrays (wrapped).
     """
-    # Choose authoritative params strictly from Binance query names
-    sym = (symbol or SYMBOL)
-    ivl = (interval or "1m")
-    lim = limit
+    legacy_mode = (symbol is None and interval is None)
+
+    # Resolve symbol/interval either from native params or legacy aliases
+    if legacy_mode:
+        pid = (product_id or SYMBOL)
+        sym = _normalize_symbol(pid)
+        ivl = GRAN_MAP.get((granularity or "ONE_MINUTE").upper(), "1m")
+        st_s = start
+        et_s = end
+    else:
+        sym = (symbol or SYMBOL)
+        ivl = (interval or "1m")
+        st_s = None
+        et_s = None
 
     # Normalize and validate times
     now_ms = _now_ms()
@@ -268,8 +274,9 @@ def get_candles(
         # accept seconds -> ms
         return v * 1000 if v <= 1_000_000_000_000 else v
 
-    st_ms = _to_ms(startTime if startTime is not None else None)
-    et_ms = _to_ms(endTime if endTime is not None else None)
+    # Prefer legacy start/end when in legacy mode; else take native startTime/endTime
+    st_ms = _to_ms(st_s if legacy_mode else (startTime if startTime is not None else None))
+    et_ms = _to_ms(et_s if legacy_mode else (endTime if endTime is not None else None))
 
     params = urlparse.urlencode(
         {k: v for k, v in {
@@ -312,8 +319,33 @@ def get_candles(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"binance klines error: {e}")
 
-    # Return object-wrapped candles to match expected schema
-    return {"candles": data}
+    # Shape:
+    #  - legacy mode => normalize array-of-arrays into [{"start","open","high","low","close","volume"}...]
+    #  - native mode => passthrough array-of-arrays (wrapped)
+    if not isinstance(data, list):
+        raise HTTPException(status_code=502, detail="Unexpected klines shape")
+    if not legacy_mode:
+        return {"candles": data}
+
+    out = []
+    for row in data:
+        # Binance kline: [ openTime(ms), open, high, low, close, volume, closeTime, ... ]
+        if not isinstance(row, list) or len(row) < 6:
+            continue
+        open_ms, o, h, l, c, v = row[0], row[1], row[2], row[3], row[4], row[5]
+        try:
+            start_sec = int(int(float(open_ms)) // 1000)
+            out.append({
+                "start":  str(start_sec),
+                "open":   str(o),
+                "high":   str(h),
+                "low":    str(l),
+                "close":  str(c),
+                "volume": str(v),
+            })
+        except Exception:
+            continue
+    return {"candles": out}
 
 @app.get("/accounts")
 def accounts(limit: int = 250):
