@@ -123,7 +123,7 @@ def _sum_available(accts: List[Dict], asset: str) -> str:
             return str(r.get("available_balance", {}).get("value", "0"))
     return "0"
 
-# --- NEW: symbol metadata cache for steps (quantity_increment, tick_size) ---
+# --- symbol metadata cache for steps (quantity_increment, tick_size) ---
 _symbol_meta_cache: Dict[str, Dict[str, str]] = {}
 
 def _get_symbol_meta(sym: str) -> Dict[str, str]:
@@ -180,13 +180,13 @@ GRAN_MAP = {
 }
 _PERIOD_TO_GRAN = {v: k for k, v in GRAN_MAP.items()}
 
-# ---- WebSocket: HitBTC market data
+# ---- WebSocket: HitBTC market data (candles & staleness updated ONLY on real ticks)
 async def _ws_loop():
     """
     HitBTC public WS:
       - subscribe to `orderbook/top/1000ms` (primary: mid = (bid+ask)/2)
       - subscribe to `ticker/price/1s`      (fallback: last price 'c')
-    Updates: last_price, last_ts_ms, in-memory minute candles.
+    Updates happen only on real WS ticks; no heartbeat.
     """
     global last_price, last_ts_ms, _first_tick_logged, _last_mid_px, _last_mid_ts, _last_last_px, _last_last_ts
     url = "wss://api.hitbtc.com/api/3/ws/public"
@@ -253,21 +253,19 @@ async def _ws_loop():
                         except Exception:
                             pass
 
-                    # Choose price: prefer mid updated within ~1s, else last, else keep prior
+                    # Choose price: prefer mid updated within ~1s, else last, else keep prior (no updates if no fresh data)
                     now_ms = _now_ms()
                     px = None
+                    ts_for_px = None
                     if _last_mid_px is not None and _last_mid_ts is not None and (now_ms - _last_mid_ts) <= 1000:
                         px = _last_mid_px
                         ts_for_px = _last_mid_ts
-                    elif _last_last_px is not None:
+                    elif _last_last_px is not None and _last_last_ts is not None:
                         px = _last_last_px
-                        ts_for_px = _last_last_ts or ts_ms
-                    else:
-                        # No new feed yet; keep last known price (no stall)
-                        px = last_price
-                        ts_for_px = last_ts_ms or ts_ms
+                        ts_for_px = _last_last_ts
 
-                    if px is not None and px > 0:
+                    # Only on real tick choose/update state (no heartbeat)
+                    if px is not None and px > 0 and ts_for_px is not None:
                         last_price = px
                         last_ts_ms = ts_for_px
                         _update_candle(px, ts_for_px, 0.0)
@@ -281,21 +279,8 @@ async def _ws_loop():
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 15)
 
-# Keep candles flowing even if both feeds stall briefly (emit last seen price)
-async def _keepalive_loop():
-    global last_price, last_ts_ms
-    while True:
-        await asyncio.sleep(1)
-        if last_price is None:
-            continue
-        now_ms = _now_ms()
-        # If no tick applied in the last second, write a heartbeat candle update
-        if last_ts_ms is None or (now_ms - last_ts_ms) > 1000:
-             # don’t bump last_ts_ms here — only write a candle heartbeat
-            _update_candle(last_price, now_ms, 0.0)
-
 # ---- HTTP app
-app = FastAPI(title="bridge-hitbtc", version="0.6")
+app = FastAPI(title="bridge-hitbtc", version="0.7")
 
 # --- simple access log middleware (lite)
 @app.middleware("http")
@@ -690,14 +675,13 @@ def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
         log.warning(f"[ORDER] trades fetch error id={order_id} err={e}")
     return resp
 
-# ---- Runner
+# ---- Runner (no heartbeat)
 async def _runner():
     log.info(f"[BOOT] starting bridge-hitbtc PORT={PORT} SYMBOL={SYMBOL} LOG_LEVEL={LOG_LEVEL}")
     task_ws = asyncio.create_task(_ws_loop())
-    task_keepalive = asyncio.create_task(_keepalive_loop())
     cfg  = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
     srv  = uvicorn.Server(cfg)
-    await asyncio.gather(task_ws, task_keepalive, srv.serve())
+    await asyncio.gather(task_ws, srv.serve())
 
 if __name__ == "__main__":
     try:
