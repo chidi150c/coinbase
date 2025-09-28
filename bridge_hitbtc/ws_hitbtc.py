@@ -21,6 +21,11 @@ SYMBOL   = os.getenv("SYMBOL", "BTCUSDT").upper().replace("-", "")
 PORT     = int(os.getenv("PORT", "8788"))
 STALE_MS = int(os.getenv("STALE_MS", "3000"))
 
+# Heartbeat behavior: if true, heartbeat will also touch last_ts_ms (keeps stale=false).
+HEARTBEAT_TOUCH_TS = os.getenv("HEARTBEAT_TOUCH_TS", "false").lower() == "true"
+# Heartbeat interval seconds
+HEARTBEAT_SEC = float(os.getenv("HEARTBEAT_SEC", "1"))
+
 HITBTC_API_KEY    = os.getenv("HITBTC_API_KEY", "").strip()
 HITBTC_API_SECRET = os.getenv("HITBTC_API_SECRET", "").strip()
 HITBTC_BASE_URL   = os.getenv("HITBTC_BASE_URL", "https://api.hitbtc.com").strip().rstrip("/")
@@ -134,7 +139,6 @@ def _get_symbol_meta(sym: str) -> Dict[str, str]:
     try:
         url = f"{HITBTC_BASE_URL}/api/3/public/symbol/{key}"
         j = _http_get(url)
-        # The v3 API returns an object keyed by symbol or a single object; handle both.
         if isinstance(j, dict) and key in j and isinstance(j[key], dict):
             meta = j[key]
         elif isinstance(j, dict):
@@ -180,13 +184,13 @@ GRAN_MAP = {
 }
 _PERIOD_TO_GRAN = {v: k for k, v in GRAN_MAP.items()}
 
-# ---- WebSocket: HitBTC market data (candles & staleness updated ONLY on real ticks)
+# ---- WebSocket: HitBTC market data (real-tick updates)
 async def _ws_loop():
     """
     HitBTC public WS:
       - subscribe to `orderbook/top/1000ms` (primary: mid = (bid+ask)/2)
       - subscribe to `ticker/price/1s`      (fallback: last price 'c')
-    Updates happen only on real WS ticks; no heartbeat.
+    Updates happen only on real WS ticks.
     """
     global last_price, last_ts_ms, _first_tick_logged, _last_mid_px, _last_mid_ts, _last_last_px, _last_last_ts
     url = "wss://api.hitbtc.com/api/3/ws/public"
@@ -221,7 +225,6 @@ async def _ws_loop():
                     if not isinstance(msg, dict):
                         continue
 
-                    # Subscription acks
                     if "result" in msg and msg.get("id") in (1, 2):
                         log.debug(f"[WS] subscribe ack id={msg.get('id')} result={msg.get('result')}")
                         continue
@@ -233,7 +236,7 @@ async def _ws_loop():
 
                     row = data.get(sym) or {}
 
-                    # --- EDIT #1: normalize WS timestamp (seconds -> ms if needed)
+                    # Normalize WS timestamp (seconds → ms if needed)
                     t_raw = row.get("t")
                     try:
                         ts_ms = int(t_raw) if t_raw is not None else _now_ms()
@@ -242,7 +245,7 @@ async def _ws_loop():
                     except Exception:
                         ts_ms = _now_ms()
 
-                    # Track individual feeds
+                    # Track feeds
                     if ch == "orderbook/top/1000ms":
                         try:
                             a = float(row.get("a") or 0.0)
@@ -261,7 +264,7 @@ async def _ws_loop():
                         except Exception:
                             pass
 
-                    # Choose price: prefer mid updated within ~1s, else last, else keep prior (no updates if no fresh data)
+                    # Choose price: prefer mid updated within ~1s, else last
                     now_ms = _now_ms()
                     px = None
                     ts_for_px = None
@@ -272,12 +275,11 @@ async def _ws_loop():
                         px = _last_last_px
                         ts_for_px = _last_last_ts
 
-                    # Only on real tick choose/update state (no heartbeat)
+                    # Update on real tick
                     if px is not None and px > 0 and ts_for_px is not None:
                         last_price = px
-                        # --- EDIT #2: use local receipt time for staleness
+                        # Use receipt time for staleness
                         last_ts_ms = now_ms
-                        # Keep candle bucketing aligned with exchange/open time
                         _update_candle(px, ts_for_px, 0.0)
                         if not _first_tick_logged:
                             _first_tick_logged = True
@@ -289,10 +291,23 @@ async def _ws_loop():
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 15)
 
-# ---- HTTP app
-app = FastAPI(title="bridge-hitbtc", version="0.7")
+# ---- Heartbeat: keep candles continuous; staleness touch is configurable
+async def _keepalive_loop():
+    global last_price, last_ts_ms
+    while True:
+        await asyncio.sleep(HEARTBEAT_SEC)
+        if last_price is None:
+            continue
+        now_ms = _now_ms()
+        # Always keep candles continuous
+        _update_candle(last_price, now_ms, 0.0)
+        # Optionally keep /price fresh (staleness off)
+        if HEARTBEAT_TOUCH_TS:
+            last_ts_ms = now_ms
 
-# --- simple access log middleware (lite)
+# ---- HTTP app
+app = FastAPI(title="bridge-hitbtc", version="0.8")
+
 @app.middleware("http")
 async def _access_log(request: Request, call_next):
     start = time.time()
@@ -349,13 +364,6 @@ def get_candles(
     startTime: Optional[int] = Query(default=None),  # ms or seconds
     endTime: Optional[int] = Query(default=None),    # ms or seconds
 ):
-    """
-    Dual-mode:
-      • Legacy mode (product_id + granularity [+ start/end seconds]): returns normalized objects
-        [{"start","open","high","low","close","volume"}...].
-      • Native mode (symbol + interval [+ startTime/endTime]): returns array-of-arrays klines:
-        [[openTimeMs, open, high, low, close, volume, ...], ...] wrapped in {"candles":[...]}.
-    """
     legacy_mode = (symbol is None and interval is None)
 
     # Resolve symbol & period
@@ -376,17 +384,14 @@ def get_candles(
         st_s = None
         et_s = None
 
-    # Normalize times
     now_ms = _now_ms()
     def _to_ms(v: Optional[int]) -> Optional[int]:
         if v is None: return None
         return v * 1000 if v <= 1_000_000_000_000 else v
 
-    # Prefer legacy start/end when in legacy mode; else use native
     st_ms = _to_ms(st_s if legacy_mode else (startTime if startTime is not None else None))
     et_ms = _to_ms(et_s if legacy_mode else (endTime if endTime is not None else None))
 
-    # Build query
     params = {
         "period": period,
         "limit": str(min(max(1, limit), 1000)),
@@ -405,7 +410,6 @@ def get_candles(
     upstream = f"{HITBTC_BASE_URL}/api/3/public/candles/{sym}"
     url = f"{upstream}?{qs}" if qs else upstream
 
-    # Fetch upstream
     try:
         req = urlreq.Request(url)
         with urlreq.urlopen(req, timeout=15) as resp:
@@ -423,7 +427,6 @@ def get_candles(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"hitbtc candles error: {e}")
 
-    # HitBTC candle rows are objects. Accept multiple possible keys defensively.
     rows = data if isinstance(data, list) else data.get("candles", [])
     if not isinstance(rows, list):
         raise HTTPException(status_code=502, detail="Unexpected candles shape")
@@ -434,19 +437,15 @@ def get_candles(
                 return d[k]
         return default
 
-    # Convert to desired shapes
     if legacy_mode:
-        # Normalized object list for Coinbase-style: start/open/high/low/close/volume
         out = []
         for r in rows:
             if not isinstance(r, dict): continue
-            ts = _pick(r, "timestamp", "t")               # RFC3339 or epoch?
-            # Parse ts → seconds
+            ts = _pick(r, "timestamp", "t")
             try:
                 if isinstance(ts, (int, float)):
                     start_sec = int(float(ts)) // 1000 if float(ts) > 1e12 else int(float(ts))
                 else:
-                    # RFC3339 like "2024-09-27T03:00:00Z"
                     start_sec = int(datetime.fromisoformat(str(ts).replace("Z","+00:00")).timestamp())
             except Exception:
                 continue
@@ -465,12 +464,10 @@ def get_candles(
             })
         return {"candles": out}
     else:
-        # Native mode: array-of-arrays klines
         klines = []
         for r in rows:
             if not isinstance(r, dict): continue
             ts = _pick(r, "timestamp", "t")
-            # Convert ts to ms
             try:
                 if isinstance(ts, (int, float)):
                     open_ms = int(float(ts))
@@ -485,7 +482,6 @@ def get_candles(
             l = float(_pick(r, "min", "low", "l", default="0"))
             c = float(_pick(r, "close", "c", default="0"))
             v = float(_pick(r, "volume", "v", default="0"))
-            # Shape aligned with Binance klines used by the Go normalizer
             klines.append([open_ms, str(o), str(h), str(l), str(c), str(v), open_ms + 1])
         return {"candles": klines}
 
@@ -511,7 +507,6 @@ def balance_base(product_id: str = Query(...)):
     base, _ = _split(product_id)
     accts = accounts()
     value = _sum_available(accts["accounts"], base)
-    # --- derive base step: env BASE_STEP > symbol.quantity_increment > "0"
     step = _env_step("BASE_STEP")
     if step is None:
         meta = _get_symbol_meta(_normalize_symbol(product_id))
@@ -531,7 +526,6 @@ def balance_quote(product_id: str = Query(...)):
     _, quote = _split(product_id)
     accts = accounts()
     value = _sum_available(accts["accounts"], quote)
-    # --- derive quote step: env QUOTE_STEP > symbol.tick_size > "0"
     step = _env_step("QUOTE_STEP")
     if step is None:
         meta = _get_symbol_meta(_normalize_symbol(product_id))
@@ -548,7 +542,6 @@ def balance_quote(product_id: str = Query(...)):
 
 @app.get("/product/{product_id}")
 def product_info(product_id: str = Path(...)):
-    # mirror /price snapshot for arbitrary product_id
     resp = price(product_id)
     log.debug(f"[PRODUCT] {product_id} -> price={resp.get('price')} ts={resp.get('ts')}")
     return resp
@@ -579,7 +572,6 @@ def order_market(
     quote_size: Optional[str] = Query(default=None),
     body: Optional[Dict] = Body(default=None),
 ):
-    # Optional JSON body fallback (keeps parity with Binance bridge)
     if (product_id is None or side is None or quote_size is None) and isinstance(body, dict):
         product_id = product_id or body.get("product_id")
         side = (side or body.get("side"))
@@ -685,13 +677,14 @@ def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
         log.warning(f"[ORDER] trades fetch error id={order_id} err={e}")
     return resp
 
-# ---- Runner (no heartbeat)
+# ---- Runner
 async def _runner():
-    log.info(f"[BOOT] starting bridge-hitbtc PORT={PORT} SYMBOL={SYMBOL} LOG_LEVEL={LOG_LEVEL}")
+    log.info(f"[BOOT] starting bridge-hitbtc PORT={PORT} SYMBOL={SYMBOL} LOG_LEVEL={LOG_LEVEL} HEARTBEAT_TOUCH_TS={HEARTBEAT_TOUCH_TS} HEARTBEAT_SEC={HEARTBEAT_SEC}")
     task_ws = asyncio.create_task(_ws_loop())
+    task_hb = asyncio.create_task(_keepalive_loop())
     cfg  = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
     srv  = uvicorn.Server(cfg)
-    await asyncio.gather(task_ws, srv.serve())
+    await asyncio.gather(task_ws, task_hb, srv.serve())
 
 if __name__ == "__main__":
     try:
