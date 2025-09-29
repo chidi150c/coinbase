@@ -65,11 +65,11 @@ type BotState struct {
 	MdlExt           *ExtendedLogit
 	WalkForwardMin   int
 	LastFit          time.Time
-	LastAdd          time.Time
-	WinLow           float64
-	LatchedGate      float64
-	WinHigh          float64
-	LatchedGateShort float64
+	// LastAdd          time.Time
+	// WinLow           float64
+	// LatchedGate      float64
+	// WinHigh          float64
+	// LatchedGateShort float64
 
 	// --- NEW: side-aware pyramiding state (persisted) ---
 	LastAddBuy      time.Time
@@ -1284,11 +1284,11 @@ func (t *Trader) saveState() error {
 		MdlExt:           t.mdlExt,
 		WalkForwardMin:   t.cfg.Extended().WalkForwardMin,
 		LastFit:          t.lastFit,
-		LastAdd:          t.lastAdd,
-		WinLow:           t.winLow,
-		LatchedGate:      t.latchedGate,
-		WinHigh:          t.winHigh,
-		LatchedGateShort: t.latchedGateShort,
+		// LastAdd:          t.lastAdd,
+		// WinLow:           t.winLow,
+		// LatchedGate:      t.latchedGate,
+		// WinHigh:          t.winHigh,
+		// LatchedGateShort: t.latchedGateShort,
 
 		// NEW: persist side-aware pyramiding memory
 		LastAddBuy:      t.lastAddBuy,
@@ -1356,11 +1356,11 @@ func (t *Trader) loadState() error {
 	}
 
 	// Restore pyramiding gate memory (if present in state file).
-	t.lastAdd = st.LastAdd
-	t.winLow = st.WinLow
-	t.latchedGate = st.LatchedGate
-	t.winHigh = st.WinHigh
-	t.latchedGateShort = st.LatchedGateShort
+	// t.lastAdd = st.LastAdd
+	// t.winLow = st.WinLow
+	// t.latchedGate = st.LatchedGate
+	// t.winHigh = st.WinHigh
+	// t.latchedGateShort = st.LatchedGateShort
 
 	// NEW: restore side-aware memory
 	t.lastAddBuy = st.LastAddBuy

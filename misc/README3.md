@@ -5,6 +5,9 @@ jq '{lots: [.Lots[] | {side: .Side, base: .SizeBase, open: .OpenPrice, stop: .St
      count: (.Lots|length)}' /opt/coinbase/state/bot_state.json
 
 jq '{lots: [.Lots[] | {side: .Side, base: .SizeBase, open: .OpenPrice, stop: .Stop, take: .Take, opened: .OpenTime, reason: (.reason // "")}],
+     count: (.Lots|length)}' /opt/coinbase/state/bot_state.coinbase.json
+
+jq '{lots: [.Lots[] | {side: .Side, base: .SizeBase, open: .OpenPrice, stop: .Stop, take: .Take, opened: .OpenTime, reason: (.reason // "")}],
      count: (.Lots|length)}' /opt/coinbase/state/bot_state.binance.json
 
 =========================================
