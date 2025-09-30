@@ -37,13 +37,15 @@ jobs:
           REPO_URL:   https://github.com/${{ github.repository }}.git
           GIT_SHA:    ${{ github.sha }}
           HUMAN_TAG:  ${{ github.ref_name }}
+          GHCR_NS:    ${{ vars.GHCR_NS }}
         run: |
-          ssh -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" bash -s -- "$DEPLOY_DIR" "$REPO_URL" "$GIT_SHA" "$HUMAN_TAG" <<'EOF'
+          ssh -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" bash -s -- "$DEPLOY_DIR" "$REPO_URL" "$GIT_SHA" "$HUMAN_TAG" "$GHCR_NS" <<'EOF'
           set -euo pipefail
           DEPLOY_DIR="${1:-/home/chidi/coinbase/monitoring}"
           REPO_URL="$2"
           GIT_SHA_IN="$3"
           HUMAN_TAG_IN="$4"
+          GHCR_NS_IN="${5:-}"
           REPO_DIR="$(dirname "$DEPLOY_DIR")"
 
           # Sync repo
@@ -58,12 +60,21 @@ jobs:
 
           cd "$DEPLOY_DIR"
 
+          # Patch docker-compose image namespace and bot tags (idempotent)
+          # - Replace ghcr.io/chidi150c with ghcr.io/${GHCR_NS:-chidi150c}
+          # - Tag all bot images with ${IMAGE_SHA}
+          if [ -f docker-compose.yml ]; then
+            sed -i 's#ghcr.io/chidi150c/#ghcr.io/${GHCR_NS:-chidi150c}/#g' docker-compose.yml
+            sed -i 's#\(ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot\):latest#\1:${IMAGE_SHA}#g' docker-compose.yml
+          fi
+
           # Inject CI/CD identity into runtime (compose can reference these)
           # IMAGE_SHA kept equal to GIT_SHA to preserve existing naming.
           cat > .env.ci <<ENVVARS
           GIT_SHA=${GIT_SHA_IN}
           IMAGE_SHA=${GIT_SHA_IN}
           HUMAN_TAG=${HUMAN_TAG_IN}
+          GHCR_NS=${GHCR_NS_IN}
           ENVVARS
 
           # Rollout with fresh pulls and full recreate

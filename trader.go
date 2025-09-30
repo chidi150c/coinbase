@@ -86,7 +86,6 @@ type Trader struct {
 	model      *AIMicroModel
 	pos        *Position   // kept for backward compatibility with earlier logic
 	lots       []*Position // NEW: multiple lots when pyramiding is enabled
-	lastAdd    time.Time   // NEW: last time a pyramid add was placed
 	dailyStart time.Time
 	dailyPnL   float64
 	mu         sync.Mutex
@@ -103,14 +102,6 @@ type Trader struct {
 
 	// NEW: index of the designated runner lot (-1 if none). Not persisted; derived on load.
 	runnerIdx int
-
-	// --- NEW: adverse gate helpers (since last add) ---
-	// BUY path trackers:
-	winLow      float64 // lowest price seen since lastAdd (BUY adverse tracking)
-	latchedGate float64 // latched adverse gate once threshold time is reached; reset on new add
-	// SELL path trackers (NEW):
-	winHigh          float64 // highest price seen since lastAdd (SELL adverse tracking)
-	latchedGateShort float64 // latched adverse gate for SELL once threshold time is reached; reset on new add
 
 	// --- NEW: side-aware pyramiding state (kept in-memory; mirrored to legacy fields for logs) ---
 	lastAddBuy      time.Time
@@ -496,14 +487,8 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 		// If any lots remain, restart the decay clock from now to avoid instant latch.
 		// If none remain, also set now; next add will proceed normally.
 		now := time.Now().UTC()
-		t.lastAdd = now
 		// Reset adverse tracking; winLow/winHigh will start accumulating after t_floor_min,
 		// and latching can only occur after 2*t_floor_min from this new anchor.
-		t.winLow = 0
-		t.latchedGate = 0
-		t.winHigh = 0
-		t.latchedGateShort = 0
-
 		// --- NEW: side-aware reset based on closed lot side ---
 		if lot.Side == SideBuy {
 			t.lastAddBuy = now
@@ -570,9 +555,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	// TODO: remove TRACE
-	log.Printf("TRACE step.start ts=%s price=%.8f lots=%d runnerIdx=%d lastAdd=%s winLow=%.8f winHigh=%.8f latched=%.8f latchedShort=%.8f",
+	log.Printf("TRACE step.start ts=%s price=%.8f lots=%d runnerIdx=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f",
 		now.Format(time.RFC3339), c[len(c)-1].Close, len(t.lots), t.runnerIdx,
-		t.lastAdd.Format(time.RFC3339), t.winLow, t.winHigh, t.latchedGate, t.latchedGateShort)
+		t.lastAddBuy.Format(time.RFC3339),t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell)
 
 	// --- EXIT path: if any lots are open, evaluate TP/SL for each and close those that trigger.
 	if len(t.lots) > 0 {
@@ -656,12 +641,15 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	price := c[len(c)-1].Close
 
 	// --- NEW: track lowest price since last add (BUY path) and highest price (SELL path) ---
-	if !t.lastAdd.IsZero() {
-		if t.winLow == 0 || price < t.winLow {
-			t.winLow = price
-		}
-		if t.winHigh == 0 || price > t.winHigh {
-			t.winHigh = price
+	if !t.lastAddBuy.IsZero() {
+		if t.winLowBuy == 0 || price < t.winLowBuy {
+			t.winLowBuy = price
+		}	
+	}
+
+	if !t.lastAddSell.IsZero() {
+		if t.winHighSell == 0 || price > t.winHighSell {
+			t.winHighSell = price
 		}
 	}
 
@@ -810,7 +798,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if t.latchedGateSell == 0 && elapsedMin >= 2.0*tFloorMin && t.winHighSell > 0 {
 					t.latchedGateSell = t.winHighSell
 				}
-				// baseline gate: last * (1 + effPct); latched replaces baseline
+				// baseline gate: last * (1.0 + effPct); latched replaces baseline
 				gatePrice := last * (1.0 + effPct/100.0)
 				if t.latchedGateSell > 0 {
 					gatePrice = t.latchedGateSell
@@ -1196,13 +1184,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 	t.lots = append(t.lots, newLot)
 	// Use wall clock for lastAdd to drive spacing/decay even if candle time is zero.
-	t.lastAdd = wallNow
 	// Reset adverse tracking for the new add (legacy fields preserved for logs/compat).
-	t.winLow = priceToUse
-	t.latchedGate = 0
-	t.winHigh = priceToUse
-	t.latchedGateShort = 0
-
 	// --- NEW: side-aware resets/anchors for pyramiding memory ---
 	if side == SideBuy {
 		t.lastAddBuy = wallNow
@@ -1276,21 +1258,14 @@ func (t *Trader) saveState() error {
 		return nil
 	}
 	state := BotState{
-		EquityUSD:        t.equityUSD,
-		DailyStart:       t.dailyStart,
-		DailyPnL:         t.dailyPnL,
-		Lots:             t.lots,
-		Model:            t.model,
-		MdlExt:           t.mdlExt,
-		WalkForwardMin:   t.cfg.Extended().WalkForwardMin,
-		LastFit:          t.lastFit,
-		// LastAdd:          t.lastAdd,
-		// WinLow:           t.winLow,
-		// LatchedGate:      t.latchedGate,
-		// WinHigh:          t.winHigh,
-		// LatchedGateShort: t.latchedGateShort,
-
-		// NEW: persist side-aware pyramiding memory
+		EquityUSD:      t.equityUSD,
+		DailyStart:     t.dailyStart,
+		DailyPnL:       t.dailyPnL,
+		Lots:           t.lots,
+		Model:          t.model,
+		MdlExt:         t.mdlExt,
+		WalkForwardMin: t.cfg.Extended().WalkForwardMin,
+		LastFit:        t.lastFit,
 		LastAddBuy:      t.lastAddBuy,
 		LastAddSell:     t.lastAddSell,
 		WinLowBuy:       t.winLowBuy,
@@ -1355,14 +1330,6 @@ func (t *Trader) loadState() error {
 		}
 	}
 
-	// Restore pyramiding gate memory (if present in state file).
-	// t.lastAdd = st.LastAdd
-	// t.winLow = st.WinLow
-	// t.latchedGate = st.LatchedGate
-	// t.winHigh = st.WinHigh
-	// t.latchedGateShort = st.LatchedGateShort
-
-	// NEW: restore side-aware memory
 	t.lastAddBuy = st.LastAddBuy
 	t.lastAddSell = st.LastAddSell
 	t.winLowBuy = st.WinLowBuy
@@ -1373,13 +1340,6 @@ func (t *Trader) loadState() error {
 	// --- Restart warmup for pyramiding decay/adverse tracking ---
 	// If we restored with open lots but have no lastAdd, seed the decay clock to "now"
 	// and reset adverse trackers/latches so they rebuild over real time (prevents instant latch).
-	if len(t.lots) > 0 && t.lastAdd.IsZero() {
-		t.lastAdd = time.Now().UTC()
-		t.winLow = 0
-		t.latchedGate = 0
-		t.winHigh = 0
-		t.latchedGateShort = 0
-	}
 	// NEW: ensure side-aware anchors are also seeded if missing while lots exist.
 	if len(t.lots) > 0 {
 		now := time.Now().UTC()

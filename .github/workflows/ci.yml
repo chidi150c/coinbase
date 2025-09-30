@@ -10,9 +10,22 @@ jobs:
   go-ci:
     name: Go vet & test
     runs-on: ubuntu-latest
+    env:
+      IMAGE_SHA: ${{ github.sha }}
+      GHCR_NS: ${{ vars.GHCR_NS }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Rewrite monitoring/docker-compose.yml image refs (namespace + bot tag)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="monitoring/docker-compose.yml"
+          test -f "$f"
+          # Replace hard-coded namespace with ghcr.io/${GHCR_NS:-chidi150c}
+          sed -i 's#ghcr.io/chidi150c/#ghcr.io/${GHCR_NS:-chidi150c}/#g' "$f"
+          # Tag all bot services with ${IMAGE_SHA} instead of :latest
+          sed -i 's#\(ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot\):latest#\1:${IMAGE_SHA}#g' "$f"
       - name: Setup Go
         uses: actions/setup-go@v5
         with:

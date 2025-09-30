@@ -65,11 +65,19 @@ type BotState struct {
 	MdlExt           *ExtendedLogit
 	WalkForwardMin   int
 	LastFit          time.Time
-	LastAdd          time.Time
-	WinLow           float64
-	LatchedGate      float64
-	WinHigh          float64
-	LatchedGateShort float64
+	// LastAdd          time.Time
+	// WinLow           float64
+	// LatchedGate      float64
+	// WinHigh          float64
+	// LatchedGateShort float64
+
+	// --- NEW: side-aware pyramiding state (persisted) ---
+	LastAddBuy      time.Time
+	LastAddSell     time.Time
+	WinLowBuy       float64
+	WinHighSell     float64
+	LatchedGateBuy  float64
+	LatchedGateSell float64
 }
 
 type Trader struct {
@@ -103,6 +111,14 @@ type Trader struct {
 	// SELL path trackers (NEW):
 	winHigh          float64 // highest price seen since lastAdd (SELL adverse tracking)
 	latchedGateShort float64 // latched adverse gate for SELL once threshold time is reached; reset on new add
+
+	// --- NEW: side-aware pyramiding state (kept in-memory; mirrored to legacy fields for logs) ---
+	lastAddBuy      time.Time
+	lastAddSell     time.Time
+	winLowBuy       float64
+	winHighSell     float64
+	latchedGateBuy  float64
+	latchedGateSell float64
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -252,6 +268,16 @@ func (t *Trader) latestEntry() float64 {
 		return 0
 	}
 	return t.lots[len(t.lots)-1].OpenPrice
+}
+
+// --- NEW: side-aware latestEntry helper (does not alter existing latestEntry name/signature) ---
+func (t *Trader) latestEntryBySide(side OrderSide) float64 {
+	for i := len(t.lots) - 1; i >= 0; i-- {
+		if t.lots[i].Side == side {
+			return t.lots[i].OpenPrice
+		}
+	}
+	return 0
 }
 
 // aggregateOpen sets t.pos to the latest lot (for legacy reads) or nil.
@@ -469,13 +495,25 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 	if wasNewest {
 		// If any lots remain, restart the decay clock from now to avoid instant latch.
 		// If none remain, also set now; next add will proceed normally.
-		t.lastAdd = time.Now().UTC()
+		now := time.Now().UTC()
+		t.lastAdd = now
 		// Reset adverse tracking; winLow/winHigh will start accumulating after t_floor_min,
 		// and latching can only occur after 2*t_floor_min from this new anchor.
 		t.winLow = 0
 		t.latchedGate = 0
 		t.winHigh = 0
 		t.latchedGateShort = 0
+
+		// --- NEW: side-aware reset based on closed lot side ---
+		if lot.Side == SideBuy {
+			t.lastAddBuy = now
+			t.winLowBuy = 0
+			t.latchedGateBuy = 0
+		} else {
+			t.lastAddSell = now
+			t.winHighSell = 0
+			t.latchedGateSell = 0
+		}
 	}
 
 	t.aggregateOpen()
@@ -659,13 +697,21 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// Gating for pyramiding adds — spacing + adverse move (with optional time-decay).
 	if isAdd {
+		// Choose side-aware anchor set
+		var lastAddSide time.Time
+		if d.Signal == Buy {
+			lastAddSide = t.lastAddBuy
+		} else {
+			lastAddSide = t.lastAddSell
+		}
+
 		// 1) Spacing: always enforce (s=0 means no wait; set >0 to require time gap)
 		s := pyramidMinSeconds()
 		// TODO: remove TRACE
-		log.Printf("TRACE pyramid.spacing since_last=%.1fs need>=%ds", time.Since(t.lastAdd).Seconds(), s)
-		if time.Since(t.lastAdd) < time.Duration(s)*time.Second {
+		log.Printf("TRACE pyramid.spacing since_last=%.1fs need>=%ds", time.Since(lastAddSide).Seconds(), s)
+		if time.Since(lastAddSide) < time.Duration(s)*time.Second {
 			t.mu.Unlock()
-			hrs := time.Since(t.lastAdd).Hours()
+			hrs := time.Since(lastAddSide).Hours()
 			log.Printf("[DEBUG] pyramid: blocked by spacing; since_last=%vHours need>=%ds", fmt.Sprintf("%.1f", hrs), s)
 			return "HOLD", nil
 		}
@@ -677,8 +723,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		floor := pyramidDecayMinPct()
 		elapsedMin := 0.0
 		if lambda > 0 {
-			if !t.lastAdd.IsZero() {
-				elapsedMin = time.Since(t.lastAdd).Minutes()
+			if !lastAddSide.IsZero() {
+				elapsedMin = time.Since(lastAddSide).Minutes()
 			} else {
 				elapsedMin = 0.0
 			}
@@ -704,63 +750,90 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		log.Printf("TRACE pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
 			d.Signal, elapsedMin, basePct, effPct, lambda, floor, tFloorMin)
 
-		last := t.latestEntry()
+		// Use side-aware latest entry for adverse gate anchoring
+		var last float64
+		if d.Signal == Buy {
+			last = t.latestEntryBySide(SideBuy)
+		} else {
+			last = t.latestEntryBySide(SideSell)
+		}
+
 		if last > 0 {
 			if d.Signal == Buy {
-				// BUY adverse tracker
+				// BUY adverse tracker (side-aware)
 				if elapsedMin >= tFloorMin {
-					if t.winLow == 0 || price < t.winLow {
-						t.winLow = price
+					if t.winLowBuy == 0 || price < t.winLowBuy {
+						t.winLowBuy = price
 					}
 				} else {
-					t.winLow = 0
+					t.winLowBuy = 0
 				}
 				// latch at 2*t_floor_min
-				if t.latchedGate == 0 && elapsedMin >= 2.0*tFloorMin && t.winLow > 0 {
-					t.latchedGate = t.winLow
+				if t.latchedGateBuy == 0 && elapsedMin >= 2.0*tFloorMin && t.winLowBuy > 0 {
+					t.latchedGateBuy = t.winLowBuy
 				}
 				// baseline gate: last * (1 - effPct); latched replaces baseline
 				gatePrice := last * (1.0 - effPct/100.0)
-				if t.latchedGate > 0 {
-					gatePrice = t.latchedGate
+				if t.latchedGateBuy > 0 {
+					gatePrice = t.latchedGateBuy
 				}
+				// --- NEW: clamp to min(winLowBuy, last BUY open)
+				clamp := last
+				if t.winLowBuy > 0 && t.winLowBuy < clamp {
+					clamp = t.winLowBuy
+				}
+				if gatePrice > clamp {
+					gatePrice = clamp
+				}
+
+				// mirror for legacy reason/log fields
 				reasonGatePrice = gatePrice
-				reasonLatched = t.latchedGate
+				reasonLatched = t.latchedGateBuy
 
 				if !(price <= gatePrice) {
 					t.mu.Unlock()
 					log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
-						price, gatePrice, t.winLow, effPct, basePct, reasonElapsedHr)
+						price, gatePrice, t.winLowBuy, effPct, basePct, reasonElapsedHr)
 					// TODO: remove TRACE
-					log.Printf("TRACE pyramid.block.buy price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGate)
+					log.Printf("TRACE pyramid.block.buy price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateBuy)
 					return "HOLD", nil
 				}
 			} else { // SELL
-				// SELL adverse tracker
+				// SELL adverse tracker (side-aware)
 				if elapsedMin >= tFloorMin {
-					if t.winHigh == 0 || price > t.winHigh {
-						t.winHigh = price
+					if t.winHighSell == 0 || price > t.winHighSell {
+						t.winHighSell = price
 					}
 				} else {
-					t.winHigh = 0
+					t.winHighSell = 0
 				}
-				if t.latchedGateShort == 0 && elapsedMin >= 2.0*tFloorMin && t.winHigh > 0 {
-					t.latchedGateShort = t.winHigh
+				if t.latchedGateSell == 0 && elapsedMin >= 2.0*tFloorMin && t.winHighSell > 0 {
+					t.latchedGateSell = t.winHighSell
 				}
 				// baseline gate: last * (1 + effPct); latched replaces baseline
 				gatePrice := last * (1.0 + effPct/100.0)
-				if t.latchedGateShort > 0 {
-					gatePrice = t.latchedGateShort
+				if t.latchedGateSell > 0 {
+					gatePrice = t.latchedGateSell
 				}
+				// --- NEW: clamp to max(winHighSell, last SELL open)
+				clamp := last
+				if t.winHighSell > 0 && t.winHighSell > clamp {
+					clamp = t.winHighSell
+				}
+				if gatePrice < clamp {
+					gatePrice = clamp
+				}
+
+				// mirror for legacy reason/log fields
 				reasonGatePrice = gatePrice
-				reasonLatched = t.latchedGateShort
+				reasonLatched = t.latchedGateSell
 
 				if !(price >= gatePrice) {
 					t.mu.Unlock()
 					log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
-						price, gatePrice, t.winHigh, effPct, basePct, reasonElapsedHr)
+						price, gatePrice, t.winHighSell, effPct, basePct, reasonElapsedHr)
 					// TODO: remove TRACE
-					log.Printf("TRACE pyramid.block.sell price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateShort)
+					log.Printf("TRACE pyramid.block.sell price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateSell)
 					return "HOLD", nil
 				}
 			}
@@ -1124,11 +1197,22 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	t.lots = append(t.lots, newLot)
 	// Use wall clock for lastAdd to drive spacing/decay even if candle time is zero.
 	t.lastAdd = wallNow
-	// Reset adverse tracking for the new add.
+	// Reset adverse tracking for the new add (legacy fields preserved for logs/compat).
 	t.winLow = priceToUse
 	t.latchedGate = 0
 	t.winHigh = priceToUse
 	t.latchedGateShort = 0
+
+	// --- NEW: side-aware resets/anchors for pyramiding memory ---
+	if side == SideBuy {
+		t.lastAddBuy = wallNow
+		t.winLowBuy = priceToUse
+		t.latchedGateBuy = 0
+	} else {
+		t.lastAddSell = wallNow
+		t.winHighSell = priceToUse
+		t.latchedGateSell = 0
+	}
 
 	// TODO: remove TRACE
 	log.Printf("TRACE lot.open side=%s open=%.8f sizeBase=%.8f stop=%.8f take=%.8f fee=%.4f runnerIdx=%d lots=%d",
@@ -1200,11 +1284,19 @@ func (t *Trader) saveState() error {
 		MdlExt:           t.mdlExt,
 		WalkForwardMin:   t.cfg.Extended().WalkForwardMin,
 		LastFit:          t.lastFit,
-		LastAdd:          t.lastAdd,
-		WinLow:           t.winLow,
-		LatchedGate:      t.latchedGate,
-		WinHigh:          t.winHigh,
-		LatchedGateShort: t.latchedGateShort,
+		// LastAdd:          t.lastAdd,
+		// WinLow:           t.winLow,
+		// LatchedGate:      t.latchedGate,
+		// WinHigh:          t.winHigh,
+		// LatchedGateShort: t.latchedGateShort,
+
+		// NEW: persist side-aware pyramiding memory
+		LastAddBuy:      t.lastAddBuy,
+		LastAddSell:     t.lastAddSell,
+		WinLowBuy:       t.winLowBuy,
+		WinHighSell:     t.winHighSell,
+		LatchedGateBuy:  t.latchedGateBuy,
+		LatchedGateSell: t.latchedGateSell,
 	}
 	bs, err := json.MarshalIndent(state, "", " ")
 	if err != nil {
@@ -1264,11 +1356,19 @@ func (t *Trader) loadState() error {
 	}
 
 	// Restore pyramiding gate memory (if present in state file).
-	t.lastAdd = st.LastAdd
-	t.winLow = st.WinLow
-	t.latchedGate = st.LatchedGate
-	t.winHigh = st.WinHigh
-	t.latchedGateShort = st.LatchedGateShort
+	// t.lastAdd = st.LastAdd
+	// t.winLow = st.WinLow
+	// t.latchedGate = st.LatchedGate
+	// t.winHigh = st.WinHigh
+	// t.latchedGateShort = st.LatchedGateShort
+
+	// NEW: restore side-aware memory
+	t.lastAddBuy = st.LastAddBuy
+	t.lastAddSell = st.LastAddSell
+	t.winLowBuy = st.WinLowBuy
+	t.winHighSell = st.WinHighSell
+	t.latchedGateBuy = st.LatchedGateBuy
+	t.latchedGateSell = st.LatchedGateSell
 
 	// --- Restart warmup for pyramiding decay/adverse tracking ---
 	// If we restored with open lots but have no lastAdd, seed the decay clock to "now"
@@ -1279,6 +1379,20 @@ func (t *Trader) loadState() error {
 		t.latchedGate = 0
 		t.winHigh = 0
 		t.latchedGateShort = 0
+	}
+	// NEW: ensure side-aware anchors are also seeded if missing while lots exist.
+	if len(t.lots) > 0 {
+		now := time.Now().UTC()
+		if t.lastAddBuy.IsZero() {
+			t.lastAddBuy = now
+			t.winLowBuy = 0
+			t.latchedGateBuy = 0
+		}
+		if t.lastAddSell.IsZero() {
+			t.lastAddSell = now
+			t.winHighSell = 0
+			t.latchedGateSell = 0
+		}
 	}
 	return nil
 }
@@ -1407,4 +1521,4 @@ func isMounted(dir string) (bool, error) {
 	}
 	return false, nil
 }
-}} with only the necessary minimal changes to implement {{replace single-side pyramiding adverse-gate with side-aware gating in trader.go using latestEntry(side) and per-side lastAdd/winLowBuy/winHighSell/latch fields, clamping BUY adds to price ≤ min(winLowBuy, last BUY open) and SELL adds to price ≥ max(winHighSell, last SELL open)}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{replace single-side pyramiding adverse-gate with side-aware gating in trader.go using latestEntry(side) and per-side lastAdd/winLowBuy/winHighSell/latch fields, clamping BUY adds to price ≤ min(winLowBuy, last BUY open) and SELL adds to price ≥ max(winHighSell, last SELL open)}}. Return the complete file, copy-paste ready.
+}} with only the necessary minimal changes to implement {{replace TRACE/DEBUG pyramiding logs to use side-aware fields lastAddBuy/lastAddSell, winLowBuy/winHighSell, and latchedGateBuy/latchedGateSell instead of lastAdd/winLow/winHigh/latchedGate/latchedGateShort}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{replace TRACE/DEBUG pyramiding logs to use side-aware fields lastAddBuy/lastAddSell, winLowBuy/winHighSell, and latchedGateBuy/latchedGateSell instead of lastAdd/winLow/winHigh/latchedGate/latchedGateShort}}. Return the complete file, copy-paste ready, in IDE.
