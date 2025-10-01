@@ -102,5 +102,10 @@ docker compose images
 # One-time manual deep clean (careful—removes ALL unused stuff):
 docker system prune -a -f --volumes
 
+==============================================================
+# Confirm the exit PnL trace is live
+docker compose logs bot --since 30m | grep 'TRACE exit.classify' || true
+
+
 
 

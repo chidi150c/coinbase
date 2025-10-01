@@ -36,6 +36,14 @@ var (
 			Help: "Equity in USD",
 		},
 	)
+	// Counts exits split by reason; reasons are things like take_profit, stop_loss, trailing_stop, other.
+	mtxExitReasons = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "bot_exit_reasons_total",
+			Help: "Total exits split by reason and side",
+		},
+		[]string{"reason", "side"}, // side: buy|sell (the side of the CLOSED lot)
+	)
 
 	// ---- New metrics (non-breaking; appended) ----
 
@@ -78,8 +86,9 @@ var (
 func init() {
 	prometheus.MustRegister(mtxOrders, mtxDecisions, mtxPnL)
 	// Register new metrics without altering existing ones.
-	prometheus.MustRegister(botModelMode, botVolRiskFactor, botWalkForwardFits)
 	prometheus.MustRegister(mtxTrades)
+	prometheus.MustRegister(mtxExitReasons)
+	prometheus.MustRegister(botModelMode, botVolRiskFactor, botWalkForwardFits)
 }
 
 // Helper setters (optional use by other files; do not impact existing behavior)

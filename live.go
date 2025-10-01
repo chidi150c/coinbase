@@ -257,11 +257,14 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				lastRefit, trader.mdlExt = maybeWalkForwardRefit(trader.cfg, trader.mdlExt, history, lastRefit)
 
 				// Step trader
-				_, err = trader.step(ctx, history)
+				msg, err := trader.step(ctx, history)
 				if err != nil {
 					log.Printf("step err: %v", err)
 					time.Sleep(time.Duration(trader.cfg.TickInterval()) * time.Second)
 					continue
+				} else if msg != "" {
+					// Print EXIT / PAPER lines in tick mode too
+					log.Printf("%s", msg)
 				}
 
 				// Live equity refresh (bridge or broker)

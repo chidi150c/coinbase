@@ -445,15 +445,46 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 	pl -= lot.EntryFee // subtract entry fee recorded
 	pl -= exitFee      // subtract exit fee now
 
+ 	// --- TRACE: classification breakdown ---
+    // This prints everything we need to understand why this exit is a loss or win:
+    // - side, open/exec price, filled size
+    // - raw P/L before fees, entry/exit fees, final P/L
+    // - reason (tp/sl/trailing), and whether it was runner/scalp
+    rawPL := func() float64 {
+		// raw (price move only), before fees:
+		if lot.Side == SideBuy {
+				return (priceExec - lot.OpenPrice) * baseFilled
+		}
+		return (lot.OpenPrice - priceExec) * baseFilled
+    }()
+    kind := "scalp"
+    if idx == t.runnerIdx {
+            kind = "runner"
+    }
+    log.Printf("TRACE exit.classify side=%s kind=%s reason=%s open=%.8f exec=%.8f baseFilled=%.8f rawPL=%.6f entryFee=%.6f exitFee=%.6f finalPL=%.6f",
+            lot.Side, kind, exitReason, lot.OpenPrice, priceExec, baseFilled, rawPL, lot.EntryFee, exitFee, pl)
+	
 	t.dailyPnL += pl
 	t.equityUSD += pl
 
 	// --- NEW: increment win/loss trades ---
+	
 	if pl >= 0 {
 		mtxTrades.WithLabelValues("win").Inc()
 	} else {
 		mtxTrades.WithLabelValues("loss").Inc()
 	}
+
+	// Normalize/sanitize reason and side label for metrics
+	reasonLbl := exitReason
+	if reasonLbl == "" {
+		reasonLbl = "other"
+	}
+	sideLbl := "buy"
+	if lot.Side == SideSell {
+		sideLbl = "sell"
+	}
+	mtxExitReasons.WithLabelValues(reasonLbl, sideLbl).Inc()
 
 	// Track if we removed the runner and adjust runnerIdx accordingly after removal.
 	removedWasRunner := (idx == t.runnerIdx)
