@@ -253,6 +253,11 @@ func trailDistancePct() float64 {
 	return getEnvFloat("TRAIL_DISTANCE_PCT", 0.0)
 }
 
+// --- NEW: post-only entry env tunables (0/disabled by default) ---
+func limitPriceOffsetBps() float64 { return getEnvFloat("LIMIT_PRICE_OFFSET_BPS", 0.0) } // e.g., 5 = 0.05%
+func spreadMinBps() float64        { return getEnvFloat("SPREAD_MIN_BPS", 0.0) }         // gate; 0 disables
+func limitTimeoutSec() int         { return getEnvInt("LIMIT_TIMEOUT_SEC", 0) }          // wait window; 0 disables
+
 // latestEntry returns the most recent long lot entry price, or 0 if none.
 func (t *Trader) latestEntry() float64 {
 	if len(t.lots) == 0 {
@@ -1105,6 +1110,49 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	t.mu.Unlock()
 	var placed *PlacedOrder
 	if !t.cfg.DryRun {
+		// --- NEW: post-only limit entry emulation with timeout fallback ---
+		offsetBps := limitPriceOffsetBps()
+		limitWait := limitTimeoutSec()
+		spreadGate := spreadMinBps() // NOTE: spread not available from Broker; gate effective only when 0
+		useLimit := offsetBps > 0 && limitWait > 0
+
+		if useLimit {
+			// We don't have bid/ask spread from the Broker interface; if a positive gate is set, skip.
+			if spreadGate > 0 {
+				log.Printf("TRACE postonly.skip reason=spread_gate_unavailable spread_min_bps=%.3f", spreadGate)
+				useLimit = false
+			}
+		}
+
+		if useLimit {
+			// Compute desired limit anchor relative to current snapshot 'price'
+			limitPx := price
+			if side == SideBuy {
+				limitPx = price * (1.0 - offsetBps/10000.0)
+			} else {
+				limitPx = price * (1.0 + offsetBps/10000.0)
+			}
+			deadline := time.Now().Add(time.Duration(limitWait) * time.Second)
+			log.Printf("TRACE postonly.start side=%s offset_bps=%.3f limit=%.8f timeout_sec=%d", side, offsetBps, limitPx, limitWait)
+
+			// Poll broker price until we hit the limit condition or timeout.
+			for time.Now().Before(deadline) {
+				ctxPx, cancelPx := context.WithTimeout(ctx, 600*time.Millisecond)
+				px, errPx := t.broker.GetNowPrice(ctxPx, t.cfg.ProductID)
+				cancelPx()
+				if errPx == nil && px > 0 {
+					if (side == SideBuy && px <= limitPx) || (side == SideSell && px >= limitPx) {
+						log.Printf("TRACE postonly.hit px=%.8f limit=%.8f", px, limitPx)
+						break
+					}
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			if time.Now().After(deadline) {
+				log.Printf("TRACE postonly.timeout fallback=market")
+			}
+		}
+
 		// TODO: remove TRACE
 		log.Printf("TRACE order.open request side=%s quote=%.2f baseEst=%.8f priceSnap=%.8f stop=%.8f take=%.8f",
 			side, quote, base, price, stop, take)

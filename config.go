@@ -47,6 +47,12 @@ type Config struct {
 
 	// Live equity gating (unprefixed; universal)
 	LiveEquity bool // if true, rebase & refresh equity from live balances
+
+	// Order entry (unprefixed; universal)
+	OrderType            string // "market" or "limit"
+	LimitPriceOffsetBps  int    // maker price offset from mid in bps
+	SpreadMinBps         int    // minimum spread (bps) to attempt maker entry
+	LimitTimeoutSec      int    // cancel-and-market fallback timeout (seconds)
 }
 
 // loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
@@ -79,6 +85,12 @@ func loadConfigFromEnv() Config {
 
 		// Live equity
 		LiveEquity: getEnvBool("USE_LIVE_EQUITY", false),
+
+		// Order entry
+		OrderType:           getEnv("ORDER_TYPE", "market"),
+		LimitPriceOffsetBps: getEnvInt("LIMIT_PRICE_OFFSET_BPS", 5),
+		SpreadMinBps:        getEnvInt("SPREAD_MIN_BPS", 2),
+		LimitTimeoutSec:     getEnvInt("LIMIT_TIMEOUT_SEC", 5),
 	}
 
 	// Historical carry-over: if someone still sets BROKER=X, we may still

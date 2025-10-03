@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -199,6 +200,52 @@ func (b *BinanceBridge) PlaceMarketQuote(ctx context.Context, product string, si
 		time.Sleep(200 * time.Millisecond)
 	}
 	return &ord, nil
+}
+
+// --- NEW: Post-only limit (LIMIT_MAKER) with size snapping to lot step ---
+// Returns the created order ID (best-effort), or an error.
+func (b *BinanceBridge) PlaceLimitPostOnly(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64) (string, error) {
+	// Snap base size to step (floor) using the bridge's balance endpoint (same as broker_bridge.go style).
+	_, _, baseStep, err := b.GetAvailableBase(ctx, product)
+	if err == nil && baseStep > 0 {
+		steps := math.Floor(baseSize/baseStep + 1e-12)
+		baseSize = steps * baseStep
+	}
+	if baseSize <= 0 {
+		return "", fmt.Errorf("base size after snap is zero")
+	}
+
+	body := map[string]any{
+		"product_id":  product,
+		"side":        side,                          // "BUY" or "SELL"
+		"limit_price": fmt.Sprintf("%.12f", limitPrice),
+		"base_size":   fmt.Sprintf("%.12f", baseSize),
+	}
+	data, _ := json.Marshal(body)
+	u := fmt.Sprintf("%s/order/limit_post_only", b.base)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := b.hc.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		xb, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("bridge order/limit_post_only %d: %s", resp.StatusCode, string(xb))
+	}
+	var out struct {
+		OrderID string `json:"order_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	return out.OrderID, nil
 }
 
 func (b *BinanceBridge) fetchOrder(ctx context.Context, product, orderID string) (*PlacedOrder, error) {
