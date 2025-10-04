@@ -17,6 +17,11 @@
 // GetAvailableBase/GetAvailableQuote call /balance/base or /balance/quote
 // (bridge-normalized shape: {"asset","available","step"} as strings). If the
 // endpoint fails or returns invalid JSON, the process logs a fatal error and exits.
+//
+// NEW (maker-first support; additive to interface):
+//   • PlaceLimitPostOnly: POST /order/limit_post_only {product_id, side, limit_price, base_size, client_order_id}
+//   • GetOrder:           GET  /order/{order_id}?product_id=...
+//   • CancelOrder:        DELETE /order/{order_id}?product_id=...
 
 package main
 
@@ -105,7 +110,7 @@ func (bb *BridgeBroker) GetAvailableQuote(ctx context.Context, product string) (
 	if !ok {
 		log.Printf("GetAvailableQuote: failed calling %s/balance/quote?product_id=%s", bb.base, product)
 		return "", 0, 0, fmt.Errorf("fatal: GetAvailableQuote failed")
-	}   
+	}
 	return asset, avail, step, nil
 }
 
@@ -233,7 +238,7 @@ func (bb *BridgeBroker) GetRecentCandles(ctx context.Context, product, granulari
 	return candles, nil
 }
 
-// --- Orders ---
+// --- Orders (market) ---
 
 func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, side OrderSide, quoteUSD float64) (*PlacedOrder, error) {
 	// Minimal update: send side and quote_size to unified /order/market endpoint.
@@ -363,6 +368,156 @@ func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, si
 		CommissionUSD: commission,
 		CreateTime:    time.Now().UTC(),
 	}, nil
+}
+
+// --- Maker-first additions (post-only limit) ---
+
+// PlaceLimitPostOnly places a post-only limit order and returns the bridge order_id.
+// The bridge is expected to enforce maker-only semantics (post_only) and reject/adjust as needed.
+func (bb *BridgeBroker) PlaceLimitPostOnly(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64) (string, error) {
+	u := bb.base + "/order/limit_post_only"
+	body := map[string]any{
+		"product_id":      product,
+		"side":            strings.ToUpper(string(side)),
+		"limit_price":     fmt.Sprintf("%.10f", limitPrice),
+		"base_size":       fmt.Sprintf("%.10f", baseSize),
+		"client_order_id": uuid.New().String(),
+	}
+	bs, _ := json.Marshal(body)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(bs))
+	if err != nil {
+		return "", fmt.Errorf("newrequest limit_post_only: %w (url=%s)", err, u)
+	}
+	req.Header.Set("User-Agent", "coinbot/bridge")
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := bb.hc.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+
+	b, _ := io.ReadAll(res.Body)
+	if res.StatusCode >= 300 {
+		return "", fmt.Errorf("bridge limit_post_only %d: %s", res.StatusCode, string(b))
+	}
+
+	// Accept either {order_id:"..."} or legacy nested shapes
+	var out struct {
+		OrderID string `json:"order_id"`
+	}
+	if err := json.Unmarshal(b, &out); err == nil && strings.TrimSpace(out.OrderID) != "" {
+		return out.OrderID, nil
+	}
+	var generic map[string]any
+	if err := json.Unmarshal(b, &generic); err == nil {
+		if v, ok := generic["order_id"]; ok {
+			return fmt.Sprintf("%v", v), nil
+		}
+		if sr, ok := generic["success_response"].(map[string]any); ok {
+			if v, ok2 := sr["order_id"]; ok2 {
+				return fmt.Sprintf("%v", v), nil
+			}
+		}
+	}
+	// If bridge returns nothing recognizable, synthesize a client id so caller can still poll/cancel gracefully.
+	return uuid.New().String(), nil
+}
+
+// GetOrder fetches an order summary and maps it into PlacedOrder.
+// Coinbase bridge may return different field names; we normalize here.
+func (bb *BridgeBroker) GetOrder(ctx context.Context, product, orderID string) (*PlacedOrder, error) {
+	u := fmt.Sprintf("%s/order/%s?product_id=%s", bb.base, url.PathEscape(orderID), url.QueryEscape(product))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("newrequest get order: %w (url=%s)", err, u)
+	}
+	req.Header.Set("User-Agent", "coinbot/bridge")
+
+	res, err := bb.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode >= 300 {
+		b, _ := io.ReadAll(res.Body)
+		return nil, fmt.Errorf("bridge get order %d: %s", res.StatusCode, string(b))
+	}
+
+	// Try to decode directly into PlacedOrder first (if bridge already normalizes).
+	var po PlacedOrder
+	if err := json.NewDecoder(res.Body).Decode(&po); err == nil && (po.BaseSize > 0 || po.QuoteSpent > 0 || strings.TrimSpace(po.ID) != "") {
+		if strings.TrimSpace(po.ProductID) == "" {
+			po.ProductID = product
+		}
+		return &po, nil
+	}
+
+	// If direct decode didn't work, re-read and map from Coinbase-like fields.
+	// Re-issue request (body already consumed).
+	req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req2.Header.Set("User-Agent", "coinbot/bridge")
+	res2, err := bb.hc.Do(req2)
+	if err != nil {
+		return nil, err
+	}
+	defer res2.Body.Close()
+	if res2.StatusCode >= 300 {
+		b, _ := io.ReadAll(res2.Body)
+		return nil, fmt.Errorf("bridge get order %d: %s", res2.StatusCode, string(b))
+	}
+	var raw struct {
+		OrderID            string `json:"order_id"`
+		Status             string `json:"status"`
+		FilledSize         string `json:"filled_size"`
+		AverageFilledPrice string `json:"average_filled_price"`
+		CommissionTotalUSD string `json:"commission_total_usd"`
+		Side               string `json:"side"`
+		ProductID          string `json:"product_id"`
+	}
+	if err := json.NewDecoder(res2.Body).Decode(&raw); err != nil {
+		return nil, err
+	}
+	price, _ := strconv.ParseFloat(strings.TrimSpace(raw.AverageFilledPrice), 64)
+	base, _ := strconv.ParseFloat(strings.TrimSpace(raw.FilledSize), 64)
+	commission, _ := strconv.ParseFloat(strings.TrimSpace(raw.CommissionTotalUSD), 64)
+	po = PlacedOrder{
+		ID:            firstNonEmpty(raw.OrderID, orderID),
+		ProductID:     firstNonEmpty(raw.ProductID, product),
+		Side:          OrderSide(strings.ToUpper(strings.TrimSpace(raw.Side))),
+		Price:         price,
+		BaseSize:      base,
+		QuoteSpent:    price * base,
+		CommissionUSD: commission,
+		Status:        raw.Status,
+	}
+	return &po, nil
+}
+
+// CancelOrder requests cancellation of a resting order.
+// Returns nil if bridge accepts or if order is already closed/canceled.
+func (bb *BridgeBroker) CancelOrder(ctx context.Context, product, orderID string) error {
+	u := fmt.Sprintf("%s/order/%s?product_id=%s", bb.base, url.PathEscape(orderID), url.QueryEscape(product))
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	if err != nil {
+		return fmt.Errorf("newrequest cancel: %w (url=%s)", err, u)
+	}
+	req.Header.Set("User-Agent", "coinbot/bridge")
+
+	res, err := bb.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	// Treat any 2xx as success; 404/409 may indicate already closed — best-effort OK.
+	if res.StatusCode >= 300 && res.StatusCode != 404 && res.StatusCode != 409 {
+		b, _ := io.ReadAll(res.Body)
+		return fmt.Errorf("bridge cancel %d: %s", res.StatusCode, string(b))
+	}
+	return nil
 }
 
 // --- small helpers local to this file ---

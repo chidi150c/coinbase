@@ -115,6 +115,25 @@ def _binance_signed_post(path: str, params: Dict[str,str]) -> Dict:
         except Exception:
             raise HTTPException(status_code=500, detail="Invalid JSON from Binance")
 
+def _binance_signed_delete(path: str, params: Dict[str,str]) -> Dict:
+    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        raise HTTPException(status_code=401, detail="Missing BINANCE_API_KEY/SECRET")
+    p = dict(params or {})
+    p.setdefault("timestamp", str(_now_ms()))
+    p.setdefault("recvWindow", BINANCE_RECV_WINDOW)
+    q = urlparse.urlencode(p, doseq=True)
+    sig = hmac.new(BINANCE_API_SECRET.encode("utf-8"), q.encode("utf-8"), hashlib.sha256).hexdigest()
+    url = f"{BINANCE_BASE_URL}{path}?{q}&signature={sig}"
+    req = urlreq.Request(url, method="DELETE", headers={"X-MBX-APIKEY": BINANCE_API_KEY})
+    with urlreq.urlopen(req, timeout=10) as resp:
+        body = resp.read().decode("utf-8")
+        if resp.status != 200:
+            raise HTTPException(status_code=resp.status, detail=body[:200])
+        try:
+            return json.loads(body) if body else {}
+        except Exception:
+            raise HTTPException(status_code=500, detail="Invalid JSON from Binance")
+
 def _split_product(pid: str) -> Tuple[str,str]:
     p = pid.upper().replace("-", "")
     for q in ["FDUSD","USDT","USDC","BUSD","TUSD","EUR","GBP","TRY","BRL","BTC","ETH","BNB","USD"]:
@@ -511,6 +530,48 @@ def order_market(
         pass
     return resp
 
+# --- NEW: Post-only limit (LIMIT_MAKER). Body or query accepted. Returns {order_id} ---
+@app.post("/order/limit_post_only")
+def order_limit_post_only(
+    product_id: Optional[str] = Query(default=None),
+    side: Optional[str] = Query(default=None),
+    limit_price: Optional[str] = Query(default=None),
+    base_size: Optional[str] = Query(default=None),
+    body: Optional[Dict] = Body(default=None),
+):
+    # Merge JSON body fallback if provided
+    if (product_id is None or side is None or limit_price is None or base_size is None) and isinstance(body, dict):
+        product_id = product_id or body.get("product_id")
+        side        = (side or body.get("side"))
+        lp          = body.get("limit_price")
+        bs          = body.get("base_size")
+        limit_price = limit_price or (str(lp) if lp is not None else None)
+        base_size   = base_size   or (str(bs) if bs is not None else None)
+
+    # Validate
+    if not product_id or not side or not limit_price or not base_size:
+        raise HTTPException(status_code=422, detail="Missing required fields: product_id, side, limit_price, base_size (query or JSON body)")
+
+    sym = _normalize_symbol(product_id)
+    side = side.upper()
+    # LIMIT_MAKER is Binance's post-only order. It is rejected if it would trade immediately.
+    payload = _binance_signed_post(
+        "/api/v3/order",
+        {
+            "symbol": sym,
+            "side": side,
+            "type": "LIMIT_MAKER",
+            "price": str(limit_price),
+            "quantity": str(base_size),
+            # timeInForce not required for LIMIT_MAKER
+        },
+    )
+    order_id = payload.get("orderId")
+    if not order_id:
+        # surface upstream details if absent
+        raise HTTPException(status_code=502, detail=f"Binance did not return orderId: {json.dumps(payload)[:200]}")
+    return {"order_id": str(order_id)}
+
 @app.get("/order/{order_id}")
 def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
     sym = _normalize_symbol(product_id)
@@ -553,6 +614,13 @@ def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
     except Exception:
         pass
     return resp
+
+# --- NEW: Cancel order endpoint (DELETE) to align with broker.CancelOrder ---
+@app.delete("/order/{order_id}")
+def order_cancel(order_id: str, product_id: str = Query(default=SYMBOL)):
+    sym = _normalize_symbol(product_id)
+    _ = _binance_signed_delete("/api/v3/order", {"symbol": sym, "orderId": order_id})
+    return {"ok": True, "order_id": str(order_id)}
 
 # ---- Runner ----
 async def _runner():

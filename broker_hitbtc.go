@@ -1,6 +1,11 @@
 // FILE: broker_hitbtc.go
 // Package main — HTTP broker against the HitBTC FastAPI sidecar.
 // NOTE: This is a minimal clone of broker_bridge.go with only base URL and Name() changed.
+// Minimal edits added:
+//   - PlaceLimitPostOnly(ctx, product, side, limitPrice, baseSize) (string, error)
+//   - GetOrder(ctx, product, orderID) (*PlacedOrder, error)
+//   - CancelOrder(ctx, product, orderID) error
+// These enable post-only (maker) entries with a cancel-and-market fallback in trader.go.
 package main
 
 import (
@@ -201,6 +206,91 @@ func (h *HitbtcBridge) PlaceMarketQuote(ctx context.Context, product string, sid
 	return &ord, nil
 }
 
+// --- Maker-first additions ---
+
+// PlaceLimitPostOnly places a post-only limit order via the HitBTC bridge.
+// The bridge maps this to type=limit with postOnly=true (timeInForce=PO).
+func (h *HitbtcBridge) PlaceLimitPostOnly(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64) (string, error) {
+	// Snap base size to the exchange base step (floor).
+	_, _, step, err := h.GetAvailableBase(ctx, product)
+	if err == nil && step > 0 {
+		steps := mathFloorSafe(baseSize/step)
+		b := steps * step
+		if b > 0 {
+			baseSize = b
+		}
+	}
+	if baseSize <= 0 || limitPrice <= 0 {
+		return "", fmt.Errorf("invalid limit params: base=%.10f price=%.10f", baseSize, limitPrice)
+	}
+
+	body := map[string]any{
+		"product_id":  product,
+		"side":        side, // "BUY" | "SELL"
+		"limit_price": fmt.Sprintf("%.8f", limitPrice),
+		"base_size":   fmt.Sprintf("%.8f", baseSize),
+	}
+	data, _ := json.Marshal(body)
+	u := fmt.Sprintf("%s/order/limit_post_only", h.base)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := h.hc.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		xb, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("bridge order/limit_post_only %d: %s", resp.StatusCode, string(xb))
+	}
+
+	// Primary: expect { "order_id": "..." }
+	var ok struct {
+		OrderID string `json:"order_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&ok); err == nil && strings.TrimSpace(ok.OrderID) != "" {
+		return ok.OrderID, nil
+	}
+
+	// Fallback: some bridges may return the full order; try PlacedOrder.
+	var alt PlacedOrder
+	if err := json.NewDecoder(resp.Body).Decode(&alt); err == nil && strings.TrimSpace(alt.ID) != "" {
+		return alt.ID, nil
+	}
+
+	// If we reach here, we couldn't parse a valid ID.
+	return "", fmt.Errorf("bridge returned no order_id for limit_post_only")
+}
+
+// GetOrder exposes order fetch for polling fills (exported wrapper).
+func (h *HitbtcBridge) GetOrder(ctx context.Context, product, orderID string) (*PlacedOrder, error) {
+	return h.fetchOrder(ctx, product, orderID)
+}
+
+// CancelOrder cancels a resting order on the bridge (idempotent).
+func (h *HitbtcBridge) CancelOrder(ctx context.Context, product, orderID string) error {
+	u := fmt.Sprintf("%s/order/%s?product_id=%s", h.base, url.PathEscape(orderID), url.QueryEscape(product))
+	req, err := http.NewRequestWithContext(ctx, "DELETE", u, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := h.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		xb, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("bridge order cancel %d: %s", resp.StatusCode, string(xb))
+	}
+	return nil
+}
+
 func (h *HitbtcBridge) fetchOrder(ctx context.Context, product, orderID string) (*PlacedOrder, error) {
 	u := fmt.Sprintf("%s/order/%s", h.base, url.PathEscape(orderID))
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
@@ -223,41 +313,28 @@ func (h *HitbtcBridge) fetchOrder(ctx context.Context, product, orderID string) 
 	return &ord, nil
 }
 
-// --- helpers (EXACTLY like broker_bridge.go) ---
+// --- helpers (shared) ---
 
-// func toCandles(rows []struct {
-// 	Start  string
-// 	Open   string
-// 	High   string
-// 	Low    string
-// 	Close  string
-// 	Volume string
-// }) []Candle {
-// 	out := make([]Candle, 0, len(rows))
-// 	for _, r := range rows {
-// 		out = append(out, Candle{
-// 			Time:   toUnixTime(r.Start),
-// 			Open:   parseFloat(r.Open),
-// 			High:   parseFloat(r.High),
-// 			Low:    parseFloat(r.Low),
-// 			Close:  parseFloat(r.Close),
-// 			Volume: parseFloat(r.Volume),
-// 		})
-// 	}
-// 	return out
-// }
+// mathFloorSafe is a tiny wrapper to avoid importing math just to floor on a positive number.
+func mathFloorSafe(x float64) float64 {
+	if x <= 0 {
+		return 0
+	}
+	ix := int64(x)
+	f := float64(ix)
+	if f > x {
+		return f - 1
+	}
+	// adjust down if int64 cast rounded up (shouldn't happen for positive)
+	for f > x {
+		f -= 1
+	}
+	// bump up while we can (shouldn't in normal case)
+	for f+1 <= x {
+		f += 1
+	}
+	return f
+}
 
-// func toUnixTime(secStr string) time.Time {
-// 	sec := int64(parseFloat(secStr))
-// 	return time.Unix(sec, 0).UTC()
-// }
-
-// func parseFloat(s string) float64 {
-// 	s = strings.TrimSpace(s)
-// 	if s == "" {
-// 		return 0
-// 	}
-// 	var f float64
-// 	fmt.Sscanf(s, "%f", &f)
-// 	return f
-// }
+// NOTE: Helper functions toCandles/parseFloat/toUnixTime are provided in another broker file
+// (e.g., broker_binance.go). They are package-level, so we reuse them here.

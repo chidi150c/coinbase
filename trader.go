@@ -257,6 +257,7 @@ func trailDistancePct() float64 {
 func limitPriceOffsetBps() float64 { return getEnvFloat("LIMIT_PRICE_OFFSET_BPS", 0.0) } // e.g., 5 = 0.05%
 func spreadMinBps() float64        { return getEnvFloat("SPREAD_MIN_BPS", 0.0) }         // gate; 0 disables
 func limitTimeoutSec() int         { return getEnvInt("LIMIT_TIMEOUT_SEC", 0) }          // wait window; 0 disables
+func orderType() string            { return strings.ToLower(strings.TrimSpace(getEnv("ORDER_TYPE", "market"))) }
 
 // latestEntry returns the most recent long lot entry price, or 0 if none.
 func (t *Trader) latestEntry() float64 {
@@ -450,30 +451,30 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 	pl -= lot.EntryFee // subtract entry fee recorded
 	pl -= exitFee      // subtract exit fee now
 
- 	// --- TRACE: classification breakdown ---
-    // This prints everything we need to understand why this exit is a loss or win:
-    // - side, open/exec price, filled size
-    // - raw P/L before fees, entry/exit fees, final P/L
-    // - reason (tp/sl/trailing), and whether it was runner/scalp
-    rawPL := func() float64 {
+	// --- TRACE: classification breakdown ---
+	// This prints everything we need to understand why this exit is a loss or win:
+	// - side, open/exec price, filled size
+	// - raw P/L before fees, entry/exit fees, final P/L
+	// - reason (tp/sl/trailing), and whether it was runner/scalp
+	rawPL := func() float64 {
 		// raw (price move only), before fees:
 		if lot.Side == SideBuy {
-				return (priceExec - lot.OpenPrice) * baseFilled
+			return (priceExec - lot.OpenPrice) * baseFilled
 		}
 		return (lot.OpenPrice - priceExec) * baseFilled
-    }()
-    kind := "scalp"
-    if idx == t.runnerIdx {
-            kind = "runner"
-    }
-    log.Printf("TRACE exit.classify side=%s kind=%s reason=%s open=%.8f exec=%.8f baseFilled=%.8f rawPL=%.6f entryFee=%.6f exitFee=%.6f finalPL=%.6f",
-            lot.Side, kind, exitReason, lot.OpenPrice, priceExec, baseFilled, rawPL, lot.EntryFee, exitFee, pl)
-	
+	}()
+	kind := "scalp"
+	if idx == t.runnerIdx {
+		kind = "runner"
+	}
+	log.Printf("TRACE exit.classify side=%s kind=%s reason=%s open=%.8f exec=%.8f baseFilled=%.8f rawPL=%.6f entryFee=%.6f exitFee=%.6f finalPL=%.6f",
+		lot.Side, kind, exitReason, lot.OpenPrice, priceExec, baseFilled, rawPL, lot.EntryFee, exitFee, pl)
+
 	t.dailyPnL += pl
 	t.equityUSD += pl
 
 	// --- NEW: increment win/loss trades ---
-	
+
 	if pl >= 0 {
 		mtxTrades.WithLabelValues("win").Inc()
 	} else {
@@ -680,7 +681,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	if !t.lastAddBuy.IsZero() {
 		if t.winLowBuy == 0 || price < t.winLowBuy {
 			t.winLowBuy = price
-		}	
+		}
 	}
 
 	if !t.lastAddSell.IsZero() {
@@ -1110,79 +1111,86 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	t.mu.Unlock()
 	var placed *PlacedOrder
 	if !t.cfg.DryRun {
-		// --- NEW: post-only limit entry emulation with timeout fallback ---
 		offsetBps := limitPriceOffsetBps()
 		limitWait := limitTimeoutSec()
-		spreadGate := spreadMinBps() // NOTE: spread not available from Broker; gate effective only when 0
-		useLimit := offsetBps > 0 && limitWait > 0
+		spreadGate := spreadMinBps() // NOTE: no spread source via Broker; positive gate disables maker attempt
+		wantLimit := orderType() == "limit" && offsetBps > 0 && limitWait > 0
 
-		if useLimit {
-			// We don't have bid/ask spread from the Broker interface; if a positive gate is set, skip.
+		// --- NEW: maker-first routing via Broker when ORDER_TYPE=limit ---
+		if wantLimit {
 			if spreadGate > 0 {
 				log.Printf("TRACE postonly.skip reason=spread_gate_unavailable spread_min_bps=%.3f", spreadGate)
-				useLimit = false
-			}
-		}
-
-		if useLimit {
-			// Compute desired limit anchor relative to current snapshot 'price'
-			limitPx := price
-			if side == SideBuy {
-				limitPx = price * (1.0 - offsetBps/10000.0)
 			} else {
-				limitPx = price * (1.0 + offsetBps/10000.0)
-			}
-			deadline := time.Now().Add(time.Duration(limitWait) * time.Second)
-			log.Printf("TRACE postonly.start side=%s offset_bps=%.3f limit=%.8f timeout_sec=%d", side, offsetBps, limitPx, limitWait)
+				// Compute limit price away from last snapshot; compute base from limit price (keeps notional under control).
+				limitPx := price
+				if side == SideBuy {
+					limitPx = price * (1.0 - offsetBps/10000.0)
+				} else {
+					limitPx = price * (1.0 + offsetBps/10000.0)
+				}
+				baseAtLimit := quote / limitPx
+				log.Printf("TRACE postonly.place side=%s limit=%.8f baseReq=%.8f timeout_sec=%d", side, limitPx, baseAtLimit, limitWait)
 
-			// Poll broker price until we hit the limit condition or timeout.
-			for time.Now().Before(deadline) {
-				ctxPx, cancelPx := context.WithTimeout(ctx, 600*time.Millisecond)
-				px, errPx := t.broker.GetNowPrice(ctxPx, t.cfg.ProductID)
-				cancelPx()
-				if errPx == nil && px > 0 {
-					if (side == SideBuy && px <= limitPx) || (side == SideSell && px >= limitPx) {
-						log.Printf("TRACE postonly.hit px=%.8f limit=%.8f", px, limitPx)
-						break
+				// Place post-only limit and poll for fill
+				orderID, err := t.broker.PlaceLimitPostOnly(ctx, t.cfg.ProductID, side, limitPx, baseAtLimit)
+				if err == nil && strings.TrimSpace(orderID) != "" {
+					deadline := time.Now().Add(time.Duration(limitWait) * time.Second)
+					for time.Now().Before(deadline) {
+						ord, gErr := t.broker.GetOrder(ctx, t.cfg.ProductID, orderID)
+						if gErr == nil && ord != nil && (ord.BaseSize > 0 || ord.QuoteSpent > 0) {
+							placed = ord
+							log.Printf("TRACE postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
+								orderID, placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
+							mtxOrders.WithLabelValues("live", string(side)).Inc()
+							mtxTrades.WithLabelValues("open").Inc()
+							break
+						}
+						time.Sleep(200 * time.Millisecond)
 					}
+					if placed == nil {
+						// Timeout — cancel and fall back to market
+						_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, orderID)
+						log.Printf("TRACE postonly.timeout fallback=market order_id=%s", orderID)
+					}
+				} else if err != nil {
+					log.Printf("TRACE postonly.error fallback=market err=%v", err)
 				}
-				time.Sleep(200 * time.Millisecond)
-			}
-			if time.Now().After(deadline) {
-				log.Printf("TRACE postonly.timeout fallback=market")
 			}
 		}
 
-		// TODO: remove TRACE
-		log.Printf("TRACE order.open request side=%s quote=%.2f baseEst=%.8f priceSnap=%.8f stop=%.8f take=%.8f",
-			side, quote, base, price, stop, take)
-		var err error
-		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
-		if err != nil {
-			// Retry once with ORDER_MIN_USD on insufficient-funds style failures.
-			e := strings.ToLower(err.Error())
-			if quote > t.cfg.OrderMinUSD && (strings.Contains(e, "insufficient") || strings.Contains(e, "funds") || strings.Contains(e, "400")) {
-				log.Printf("[WARN] open order %.2f USD failed (%v); retrying with ORDER_MIN_USD=%.2f", quote, err, t.cfg.OrderMinUSD)
-				quote = t.cfg.OrderMinUSD
-				base = quote / price
-				// TODO: remove TRACE
-				log.Printf("TRACE order.open retry side=%s quote=%.2f baseEst=%.8f", side, quote, base)
-				placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
-			}
+		// If maker path did not result in a fill, fall back to market path (baseline behavior).
+		if placed == nil {
+			// TODO: remove TRACE
+			log.Printf("TRACE order.open request side=%s quote=%.2f baseEst=%.8f priceSnap=%.8f stop=%.8f take=%.8f",
+				side, quote, base, price, stop, take)
+			var err error
+			placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
 			if err != nil {
-				if t.cfg.Extended().UseDirectSlack {
-					postSlack(fmt.Sprintf("ERR step: %v", err))
+				// Retry once with ORDER_MIN_USD on insufficient-funds style failures.
+				e := strings.ToLower(err.Error())
+				if quote > t.cfg.OrderMinUSD && (strings.Contains(e, "insufficient") || strings.Contains(e, "funds") || strings.Contains(e, "400")) {
+					log.Printf("[WARN] open order %.2f USD failed (%v); retrying with ORDER_MIN_USD=%.2f", quote, err, t.cfg.OrderMinUSD)
+					quote = t.cfg.OrderMinUSD
+					base = quote / price
+					// TODO: remove TRACE
+					log.Printf("TRACE order.open retry side=%s quote=%.2f baseEst=%.8f", side, quote, base)
+					placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
 				}
-				return "", err
+				if err != nil {
+					if t.cfg.Extended().UseDirectSlack {
+						postSlack(fmt.Sprintf("ERR step: %v", err))
+					}
+					return "", err
+				}
 			}
+			// TODO: remove TRACE
+			if placed != nil {
+				log.Printf("TRACE order.open placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
+					placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
+			}
+			mtxOrders.WithLabelValues("live", string(side)).Inc()
+			mtxTrades.WithLabelValues("open").Inc()
 		}
-		// TODO: remove TRACE
-		if placed != nil {
-			log.Printf("TRACE order.open placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
-				placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
-		}
-		mtxOrders.WithLabelValues("live", string(side)).Inc()
-		mtxTrades.WithLabelValues("open").Inc()
 	} else {
 		mtxTrades.WithLabelValues("open").Inc()
 	}
@@ -1337,14 +1345,14 @@ func (t *Trader) saveState() error {
 		return nil
 	}
 	state := BotState{
-		EquityUSD:      t.equityUSD,
-		DailyStart:     t.dailyStart,
-		DailyPnL:       t.dailyPnL,
-		Lots:           t.lots,
-		Model:          t.model,
-		MdlExt:         t.mdlExt,
-		WalkForwardMin: t.cfg.Extended().WalkForwardMin,
-		LastFit:        t.lastFit,
+		EquityUSD:       t.equityUSD,
+		DailyStart:      t.dailyStart,
+		DailyPnL:        t.dailyPnL,
+		Lots:            t.lots,
+		Model:           t.model,
+		MdlExt:          t.mdlExt,
+		WalkForwardMin:  t.cfg.Extended().WalkForwardMin,
+		LastFit:         t.lastFit,
 		LastAddBuy:      t.lastAddBuy,
 		LastAddSell:     t.lastAddSell,
 		WinLowBuy:       t.winLowBuy,

@@ -560,6 +560,90 @@ def _order_trades(order_id: str) -> List[Dict]:
     payload = _req(f"/api/3/spot/order/{order_id}/trades")
     return payload if isinstance(payload, list) else payload.get("trades", [])
 
+# --- NEW: Limit Post-Only helpers & endpoints ---
+
+def _place_limit_post_only(symbol: str, side: str, price: str, quantity: str) -> Dict:
+    """
+    HitBTC post-only limit:
+      POST /api/3/spot/order
+      { "symbol", "side": "buy"/"sell", "type": "limit", "timeInForce": "PO", "postOnly": true, "price", "quantity" }
+    """
+    body = json.dumps({
+        "symbol": symbol,
+        "side": side.lower(),
+        "type": "limit",
+        "timeInForce": "PO",
+        "postOnly": True,  # some SDKs accept this, server ignores if timeInForce=PO is honored
+        "price": price,
+        "quantity": quantity,
+    }).encode("utf-8")
+    return _req("/api/3/spot/order", method="POST", body=body)
+
+def _cancel_order(order_id: str) -> Dict:
+    # HitBTC: DELETE /api/3/spot/order/{id}
+    return _req(f"/api/3/spot/order/{order_id}", method="DELETE", body=None)
+
+@app.post("/order/limit_post_only")
+def order_limit_post_only(
+    product_id: Optional[str] = Query(default=None),
+    side: Optional[str] = Query(default=None),
+    limit_price: Optional[str] = Query(default=None),
+    base_size: Optional[str] = Query(default=None),
+    body: Optional[Dict] = Body(default=None),
+):
+    """
+    Places a post-only limit order. Returns just {"order_id": "..."}; the bot polls /order/{id}.
+    Accepts query params or JSON body with the same keys.
+    """
+    if (product_id is None or side is None or limit_price is None or base_size is None) and isinstance(body, dict):
+        product_id  = product_id  or body.get("product_id")
+        side        = side        or body.get("side")
+        limit_price = limit_price or (str(body.get("limit_price")) if body.get("limit_price") is not None else None)
+        base_size   = base_size   or (str(body.get("base_size")) if body.get("base_size") is not None else None)
+
+    if not product_id or not side or not limit_price or not base_size:
+        raise HTTPException(status_code=422, detail="Missing required fields: product_id, side, limit_price, base_size (query or JSON)")
+
+    sym = _normalize_symbol(product_id)
+    side = side.upper()
+    # basic sanity
+    try:
+        if Decimal(limit_price) <= 0 or Decimal(base_size) <= 0:
+            raise Exception("non-positive")
+    except Exception:
+        raise HTTPException(status_code=400, detail="limit_price and base_size must be positive numbers")
+
+    log.info(f"[ORDER] limit_post_only sym={sym} side={side} px={limit_price} qty={base_size}")
+    od = _place_limit_post_only(sym, side, str(limit_price), str(base_size))
+    order_id = str(od.get("id") or od.get("order_id") or "")
+    if not order_id:
+        # Some responses may embed order object differently; try to sniff.
+        if isinstance(od, dict):
+            for k, v in od.items():
+                if isinstance(v, dict) and ("id" in v or "order_id" in v):
+                    order_id = str(v.get("id") or v.get("order_id"))
+                    break
+    if not order_id:
+        log.warning(f"[ORDER] limit_post_only response missing id: {od}")
+        raise HTTPException(status_code=502, detail="limit_post_only: upstream did not return order id")
+    return {"order_id": order_id}
+
+@app.delete("/order/{order_id}")
+def order_cancel(order_id: str, product_id: str = Query(default=SYMBOL)):
+    """
+    Cancel a resting order. Idempotent. Returns {"ok": true, "order_id": "..."} on success.
+    """
+    log.info(f"[ORDER] cancel id={order_id} pid={product_id}")
+    try:
+        _cancel_order(order_id)
+    except HTTPException:
+        # pass-through error codes from upstream
+        raise
+    except Exception as e:
+        # Treat unknown errors as 502 to the client
+        raise HTTPException(status_code=502, detail=f"cancel failed: {e}")
+    return {"ok": True, "order_id": order_id, "product_id": product_id}
+
 @app.post("/orders/market_buy")
 def orders_market_buy(product_id: str = Query(...), quote_size: str = Query(...)):
     log.info(f"[ORDER] market_buy pid={product_id} quote_size={quote_size}")
@@ -656,11 +740,13 @@ def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
             qty = Decimal(str(t.get("quantity", "0")))
             price = Decimal(str(t.get("price", "0")))
             commission = Decimal(str(t.get("fee", "0")))
+            # For limit-maker we mark "M"; market stays "T".
+            liq = "M" if str(od.get("type", "")).lower() == "limit" else "T"
             fills.append({
                 "price": str(price),
                 "size": str(qty),
                 "fee": str(commission),
-                "liquidity": "T",
+                "liquidity": liq,
                 "time": _now_iso(),
             })
             filled += qty

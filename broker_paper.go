@@ -12,6 +12,11 @@
 //   • GetRecentCandles(...) ([]Candle, error)  // unsupported in paper mode
 //   • GetAvailableBase(...) (string, float64, float64, error)   // env-based
 //   • GetAvailableQuote(...) (string, float64, float64, error)  // env-based
+//
+// Minimal additions for maker-first routing compatibility:
+//   • PlaceLimitPostOnly(ctx, product, side, limitPrice, baseSize) (string, error)  // returns "not supported"
+//   • GetOrder(ctx, product, orderID) (*PlacedOrder, error)                          // returns "not supported"
+//   • CancelOrder(ctx, product, orderID) error                                       // returns "not supported"
 package main
 
 import (
@@ -85,6 +90,20 @@ func (p *PaperBroker) GetAvailableBase(ctx context.Context, product string) (ass
 func (p *PaperBroker) GetAvailableQuote(ctx context.Context, product string) (asset string, available float64, step float64, err error) {
 	_, quote := parseProductSymbols(product)
 	return quote, paperQuoteBalance(), quoteStepOverride(), nil
+}
+
+// --- Maker-first additions (stubs to satisfy the Broker interface) ---
+
+func (p *PaperBroker) PlaceLimitPostOnly(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64) (string, error) {
+	return "", errors.New("limit_post_only not supported on paper")
+}
+
+func (p *PaperBroker) GetOrder(ctx context.Context, product, orderID string) (*PlacedOrder, error) {
+	return nil, errors.New("get order not supported on paper")
+}
+
+func (p *PaperBroker) CancelOrder(ctx context.Context, product, orderID string) error {
+	return errors.New("cancel not supported on paper")
 }
 
 // parseProductSymbols splits a product like "BTC-USD" into ("BTC", "USD").

@@ -1,3 +1,4 @@
+# FILE: bridge/app.py
 import os
 import json
 from pathlib import Path
@@ -531,5 +532,113 @@ def balance_quote(product_id: str = Query(..., description="e.g., BTC-USD")):
         if not quote:
             raise RuntimeError("could not resolve quote currency for product")
         return {"asset": quote, "available": _sum_available(quote), "step": quote_step or "0"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# === NEW: Post-only limit order + cancel endpoint ===
+
+class LimitPostOnly(BaseModel):
+    product_id: str
+    side: Literal["BUY", "SELL"]
+    limit_price: str    # accept as string to preserve precision
+    base_size: str      # accept as string to preserve precision
+    client_order_id: Optional[str] = None
+    time_in_force: Optional[Literal["GTC", "IOC", "FOK"]] = "GTC"  # default GTC
+
+@app.post("/order/limit_post_only")
+def order_limit_post_only(payload: LimitPostOnly):
+    """
+    Place a post-only limit order (maker-only). Returns whatever the SDK returns,
+    but we try to ensure an 'order_id' field is present for client convenience.
+    """
+    try:
+        kwargs = dict(
+            client_order_id=payload.client_order_id,
+            product_id=payload.product_id,
+            limit_price=payload.limit_price,
+            base_size=payload.base_size,
+        )
+        # Prefer explicit post_only/time_in_force flags when available
+        # Try multiple method shapes to be robust to SDK versions.
+        candidates = []
+
+        if hasattr(client, "limit_order_buy") and payload.side == "BUY":
+            def _buy():
+                return client.limit_order_buy(post_only=True, time_in_force=payload.time_in_force or "GTC", **kwargs)
+            candidates.append(_buy)
+
+        if hasattr(client, "limit_order_sell") and payload.side == "SELL":
+            def _sell():
+                return client.limit_order_sell(post_only=True, time_in_force=payload.time_in_force or "GTC", **kwargs)
+            candidates.append(_sell)
+
+        if hasattr(client, "place_limit_order"):
+            def _generic():
+                return client.place_limit_order(
+                    client_order_id=payload.client_order_id,
+                    product_id=payload.product_id,
+                    side=payload.side,
+                    limit_price=payload.limit_price,
+                    base_size=payload.base_size,
+                    post_only=True,
+                    time_in_force=payload.time_in_force or "GTC",
+                )
+            candidates.append(_generic)
+
+        last_err: Optional[Exception] = None
+        for fn in candidates:
+            try:
+                resp = fn()
+                out = resp.to_dict() if hasattr(resp, "to_dict") else resp
+                # Best-effort: ensure top-level order_id if possible
+                if isinstance(out, dict):
+                    oid = out.get("order_id") or out.get("orderId")
+                    if not oid:
+                        sr = out.get("success_response") or out.get("successResponse") or {}
+                        oid = sr.get("order_id") or sr.get("orderId")
+                        if oid:
+                            out["order_id"] = oid
+                return out
+            except Exception as e:
+                last_err = e
+                continue
+
+        raise last_err or RuntimeError("No suitable limit order method found on RESTClient")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/order/{order_id}")
+def cancel_order(order_id: str, product_id: Optional[str] = Query(None)):
+    """
+    Request cancellation of a resting order. Returns a small acknowledgment.
+    Tries multiple SDK shapes to accommodate version differences.
+    """
+    try:
+        # Try batch-style cancels first if present
+        tried = False
+        if hasattr(client, "cancel_orders"):
+            tried = True
+            try:
+                resp = client.cancel_orders(order_ids=[order_id])
+                out = resp.to_dict() if hasattr(resp, "to_dict") else resp
+                return {"order_id": order_id, "status": "cancel_requested", "response": out}
+            except Exception:
+                pass
+
+        # Some SDKs expose cancel_order(order_id=..., product_id=...)
+        if hasattr(client, "cancel_order"):
+            tried = True
+            try:
+                resp = client.cancel_order(order_id=order_id, product_id=product_id)
+                out = resp.to_dict() if hasattr(resp, "to_dict") else resp
+                return {"order_id": order_id, "status": "cancel_requested", "response": out}
+            except Exception:
+                pass
+
+        if not tried:
+            raise RuntimeError("No cancel method on RESTClient")
+
+        # If we reached here, cancellation call(s) failed but we still return best-effort ack.
+        return {"order_id": order_id, "status": "cancel_attempted"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

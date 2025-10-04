@@ -3,12 +3,12 @@
 //
 // This file defines the minimal interface the trading loop needs to talk to a
 // market-execution backend (paper or real):
-//   • Broker interface: price lookup, place market order by quote USD, fetch candles
-//   • Common types: OrderSide, PlacedOrder
+//   - Broker interface: price lookup, place market order by quote USD, fetch candles
+//   - Common types: OrderSide, PlacedOrder
 //
 // Two concrete implementations live in separate files:
-//   • broker_paper.go   – in-memory paper broker (no external calls)
-//   • broker_bridge.go  – HTTP client for the Python FastAPI sidecar
+//   - broker_paper.go   – in-memory paper broker (no external calls)
+//   - broker_bridge.go  – HTTP client for the Python FastAPI sidecar
 package main
 
 import (
@@ -24,16 +24,38 @@ const (
 	SideSell OrderSide = "SELL"
 )
 
-// PlacedOrder is a normalized view of a filled/placed market order.
+// (Make sure Candle is defined somewhere in your repo. If not, add it here.)
+// type Candle struct {
+// 	Time   time.Time
+// 	Open   float64
+// 	High   float64
+// 	Low    float64
+// 	Close  float64
+// 	Volume float64
+// }
+
+// PlacedOrder is a normalized view of a filled/placed order (market or limit).
+// JSON tags are required because bridges return snake_case fields.
 type PlacedOrder struct {
-	ID            string
-	ProductID     string
-	Side          OrderSide
-	Price         float64 // average/assumed execution price
-	BaseSize      float64 // filled base (e.g., BTC)
-	QuoteSpent    float64 // spent quote (e.g., USD)
-	CommissionUSD float64 // total commission in quote currency (USD)
-	CreateTime    time.Time
+	ID            string    `json:"order_id,omitempty"`
+	ProductID     string    `json:"product_id,omitempty"`
+	Side          OrderSide `json:"side,omitempty"`
+	Price         float64   `json:"price,omitempty"`                // avg/exec price
+	BaseSize      float64   `json:"base_size,omitempty"`            // filled base
+	QuoteSpent    float64   `json:"quote_spent,omitempty"`          // spent quote
+	CommissionUSD float64   `json:"commission_total_usd,omitempty"` // total commission
+	Liquidity     string    `json:"liquidity,omitempty"`            // "M" or "T"
+	Fills         []Fill    `json:"fills,omitempty"`
+	CreateTime    time.Time `json:"-"` // optional client-side timestamp; not from bridge
+	Status        string    `json:"status"`
+}
+
+// Fill is optional detail for post-trade analysis.
+type Fill struct {
+	Price         float64 `json:"price,omitempty"`
+	BaseSize      float64 `json:"size,omitempty"`
+	CommissionUSD float64 `json:"commission_usd,omitempty"`
+	Liquidity     string  `json:"liquidity,omitempty"` // "M" or "T"
 }
 
 // Broker is the minimal surface the bot needs to operate.
@@ -44,4 +66,9 @@ type Broker interface {
 	GetRecentCandles(ctx context.Context, product string, granularity string, limit int) ([]Candle, error)
 	GetAvailableBase(ctx context.Context, product string) (asset string, available float64, step float64, err error)
 	GetAvailableQuote(ctx context.Context, product string) (asset string, available float64, step float64, err error)
+
+	// Maker-first additions (post-only limit; poll; cancel)
+	PlaceLimitPostOnly(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64) (orderID string, err error)
+	GetOrder(ctx context.Context, product, orderID string) (*PlacedOrder, error)
+	CancelOrder(ctx context.Context, product, orderID string) error
 }

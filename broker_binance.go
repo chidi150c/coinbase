@@ -217,7 +217,7 @@ func (b *BinanceBridge) PlaceLimitPostOnly(ctx context.Context, product string, 
 
 	body := map[string]any{
 		"product_id":  product,
-		"side":        side,                          // "BUY" or "SELL"
+		"side":        side, // "BUY" or "SELL"
 		"limit_price": fmt.Sprintf("%.12f", limitPrice),
 		"base_size":   fmt.Sprintf("%.12f", baseSize),
 	}
@@ -246,6 +246,30 @@ func (b *BinanceBridge) PlaceLimitPostOnly(ctx context.Context, product string, 
 		return "", err
 	}
 	return out.OrderID, nil
+}
+
+// --- Interface-conforming public methods for polling/cancel ---
+
+func (b *BinanceBridge) GetOrder(ctx context.Context, product, orderID string) (*PlacedOrder, error) {
+	return b.fetchOrder(ctx, product, orderID)
+}
+
+func (b *BinanceBridge) CancelOrder(ctx context.Context, product, orderID string) error {
+	u := fmt.Sprintf("%s/order/%s", b.base, url.PathEscape(orderID))
+	req, err := http.NewRequestWithContext(ctx, "DELETE", u, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := b.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		xb, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("bridge order cancel %d: %s", resp.StatusCode, string(xb))
+	}
+	return nil
 }
 
 func (b *BinanceBridge) fetchOrder(ctx context.Context, product, orderID string) (*PlacedOrder, error) {
