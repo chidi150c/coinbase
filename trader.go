@@ -428,7 +428,7 @@ func (t *Trader) book(side OrderSide) *SideBook {
 func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitReason string) (string, error) {
 	// Map aggregate index to (side, local index)
 	side, localIdx := t.aggregateIndexToSide(idx)
-	if side == 0 {
+	if side == "" {
 		// fallback if mapping fails (shouldn't happen)
 		side = SideBuy
 		localIdx = idx
