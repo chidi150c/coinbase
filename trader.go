@@ -1338,6 +1338,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	// --- NEW: side-biased Lot reason (without winLow) ---
+	d = decide(c, t.model, t.mdlExt) // for reason payload reuse
 	var gatesReason string
 	if side == SideBuy {
 		gatesReason = fmt.Sprintf(
@@ -1671,7 +1672,7 @@ func isMounted(dir string) (bool, error) {
 // --- NEW: helper to map aggregate index -> (side, localIdx) using the current books ---
 func (t *Trader) aggregateIndexToSide(idx int) (OrderSide, int) {
 	if idx < 0 {
-		return 0, -1
+		return "", -1
 	}
 	bb := t.book(SideBuy)
 	if idx < len(bb.Lots) {
@@ -1682,5 +1683,5 @@ func (t *Trader) aggregateIndexToSide(idx int) (OrderSide, int) {
 	if idx < len(sb.Lots) {
 		return SideSell, idx
 	}
-	return 0, -1
+	return "", -1
 }
