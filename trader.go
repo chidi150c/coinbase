@@ -89,7 +89,7 @@ type Trader struct {
 	cfg       Config
 	broker    Broker
 	model     *AIMicroModel
-	pos       *Position   // kept for backward compatibility with earlier logic (represents last lot in aggregate)
+	pos       *Position // kept for backward compatibility with earlier logic (represents last lot in aggregate)
 	// lots      []*Position // legacy aggregate view (derived from books; do not mutate directly)
 	mu        sync.Mutex
 	equityUSD float64
@@ -423,6 +423,185 @@ func (t *Trader) book(side OrderSide) *SideBook {
 	return b
 }
 
+// --- NEW: side-aware lot closing (no global index) ---
+func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, localIdx int, exitReason string) (string, error) {
+	book := t.book(side)
+	price := c[len(c)-1].Close
+	lot := book.Lots[localIdx]
+	closeSide := SideSell
+	if lot.Side == SideSell {
+		closeSide = SideBuy
+	}
+	baseRequested := lot.SizeBase
+	quote := baseRequested * price
+
+	// unlock for I/O
+	t.mu.Unlock()
+	var placed *PlacedOrder
+	if !t.cfg.DryRun {
+		// TODO: remove TRACE
+		log.Printf("TRACE order.close request side=%s baseReq=%.8f quoteEst=%.2f priceSnap=%.8f", closeSide, baseRequested, quote, price)
+		var err error
+		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote)
+		if err != nil {
+			if t.cfg.Extended().UseDirectSlack {
+				postSlack(fmt.Sprintf("ERR step: %v", err))
+			}
+			// Re-lock before returning so caller's Unlock matches.
+			t.mu.Lock()
+			return "", fmt.Errorf("close order failed: %w", err)
+		}
+		// TODO: remove TRACE
+		if placed != nil {
+			log.Printf("TRACE order.close placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
+				placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
+		}
+		mtxOrders.WithLabelValues("live", string(closeSide)).Inc()
+	}
+	// re-lock
+	t.mu.Lock()
+
+	// --- NEW: check if the lot being closed is the most recent add for that side ---
+	wasNewest := (localIdx == len(book.Lots)-1)
+
+	// --- MINIMAL CHANGE: use actual filled size/price if available ---
+	priceExec := c[len(c)-1].Close
+	baseFilled := baseRequested
+	if placed != nil {
+		if placed.Price > 0 {
+			priceExec = placed.Price
+		}
+		if placed.BaseSize > 0 {
+			baseFilled = placed.BaseSize
+		}
+		// Log WARN on partial fill (filled < requested) with a small tolerance.
+		const tol = 1e-9
+		if baseFilled+tol < baseRequested {
+			log.Printf("[WARN] partial fill (exit): requested_base=%.8f filled_base=%.8f (%.2f%%)",
+				baseRequested, baseFilled, 100.0*(baseFilled/baseRequested))
+			// TODO: remove TRACE
+			log.Printf("TRACE fill.exit partial requested=%.8f filled=%.8f", baseRequested, baseFilled)
+		}
+	}
+	// refresh price snapshot (best-effort) if no execution price was available
+	if placed == nil || placed.Price <= 0 {
+		priceExec = c[len(c)-1].Close
+	}
+
+	// compute P/L using actual fill size and execution price
+	pl := (priceExec - lot.OpenPrice) * baseFilled
+	if lot.Side == SideSell {
+		pl = (lot.OpenPrice - priceExec) * baseFilled
+	}
+
+	// apply exit fee; prefer broker-provided commission if present ---
+	quoteExec := baseFilled * priceExec
+	feeRate := t.cfg.FeeRatePct
+	exitFee := quoteExec * (feeRate / 100.0)
+	if placed != nil {
+		if placed.CommissionUSD > 0 {
+			exitFee = placed.CommissionUSD
+		} else {
+			log.Printf("[WARN] commission missing (exit); falling back to FEE_RATE_PCT=%.4f%%", feeRate)
+		}
+	}
+	pl -= lot.EntryFee // subtract entry fee recorded
+	pl -= exitFee      // subtract exit fee now
+
+	// --- TRACE: classification breakdown ---
+	rawPL := func() float64 {
+		// raw (price move only), before fees:
+		if lot.Side == SideBuy {
+			return (priceExec - lot.OpenPrice) * baseFilled
+		}
+		return (lot.OpenPrice - priceExec) * baseFilled
+	}()
+	kind := "scalp"
+	if book.RunnerID == localIdx {
+		kind = "runner"
+	}
+	log.Printf("TRACE exit.classify side=%s kind=%s reason=%s open=%.8f exec=%.8f baseFilled=%.8f rawPL=%.6f entryFee=%.6f exitFee=%.6f finalPL=%.6f",
+		lot.Side, kind, exitReason, lot.OpenPrice, priceExec, baseFilled, rawPL, lot.EntryFee, exitFee, pl)
+
+	t.dailyPnL += pl
+	t.equityUSD += pl
+
+	// --- NEW: increment win/loss trades ---
+	if pl >= 0 {
+		mtxTrades.WithLabelValues("win").Inc()
+	} else {
+		mtxTrades.WithLabelValues("loss").Inc()
+	}
+
+	// Normalize/sanitize reason and side label for metrics
+	reasonLbl := exitReason
+	if reasonLbl == "" {
+		reasonLbl = "other"
+	}
+	sideLbl := "buy"
+	if lot.Side == SideSell {
+		sideLbl = "sell"
+	}
+	mtxExitReasons.WithLabelValues(reasonLbl, sideLbl).Inc()
+
+	// Track if we removed the runner and adjust book.RunnerID accordingly after removal.
+	removedWasRunner := (localIdx == book.RunnerID)
+
+	// remove lot at localIdx
+	book.Lots = append(book.Lots[:localIdx], book.Lots[localIdx+1:]...)
+
+	// shift RunnerID if needed
+	if book.RunnerID >= 0 {
+		if localIdx < book.RunnerID {
+			book.RunnerID-- // slice shifted left
+		} else if localIdx == book.RunnerID {
+			// runner removed; promote the NEWEST remaining lot (if any) to runner
+			if len(book.Lots) > 0 {
+				book.RunnerID = len(book.Lots) - 1
+				// reset trailing fields for the newly promoted runner
+				nr := book.Lots[book.RunnerID]
+				nr.TrailActive = false
+				nr.TrailPeak = nr.OpenPrice
+				nr.TrailStop = 0
+				// also re-apply runner targets (keeps existing behavior)
+				t.applyRunnerTargets(nr)
+			} else {
+				book.RunnerID = -1
+			}
+		}
+	}
+
+	// --- if the closed lot was the most recent add FOR THAT SIDE, re-anchor pyramiding timers/state ---
+	if wasNewest {
+		now := time.Now().UTC()
+		if lot.Side == SideBuy {
+			t.lastAddBuy = now
+			t.winLowBuy = 0
+			t.latchedGateBuy = 0
+		} else {
+			t.lastAddSell = now
+			t.winHighSell = 0
+			t.latchedGateSell = 0
+		}
+	}
+
+	// Include reason in message for operator visibility
+	msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
+		c[len(c)-1].Time.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, lot.EntryFee+exitFee)
+	if t.cfg.Extended().UseDirectSlack {
+		postSlack(msg)
+	}
+	// persist new state
+	if err := t.saveState(); err != nil {
+		log.Printf("[WARN] saveState: %v", err)
+		// TODO: remove TRACE
+		log.Printf("TRACE state.save error=%v", err)
+	}
+
+	_ = removedWasRunner // kept to emphasize runner path; no extra logs.
+	return msg, nil
+}
+
 // closeLotAtIndex closes a single lot at global aggregate idx (assumes mutex held), performing I/O unlocked.
 // exitReason is a short label for logs: "take_profit" | "stop_loss" | "trailing_stop" (or other).
 func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitReason string) (string, error) {
@@ -593,9 +772,6 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 		}
 	}
 
-	// // Rebuild legacy aggregate view for logs/compat
-	// t.refreshAggregateFromBooks()
-
 	// Include reason in message for operator visibility
 	msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
 		c[len(c)-1].Time.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, lot.EntryFee+exitFee)
@@ -660,7 +836,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		nearestTakeSell := 0.0
 
 		// Helper to scan a side book
-		scanSide := func(side OrderSide, baseIdx int) (string, bool, error) {
+		scanSide := func(side OrderSide) (string, bool, error) {
 			book := t.book(side)
 			for i := 0; i < len(book.Lots); {
 				lot := book.Lots[i]
@@ -669,7 +845,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if i == book.RunnerID {
 					if trigger, tstop := t.updateRunnerTrail(lot, price); trigger {
 						lot.Stop = tstop
-						msg, err := t.closeLotAtIndex(ctx, c, baseIdx+i, "trailing_stop")
+						msg, err := t.closeLot(ctx, c, side, i, "trailing_stop")
 						if err != nil {
 							t.mu.Unlock()
 							return "", true, err
@@ -698,7 +874,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					}
 				}
 				if trigger {
-					msg, err := t.closeLotAtIndex(ctx, c, baseIdx+i, exitReason)
+					msg, err := t.closeLot(ctx, c, side, i, exitReason)
 					if err != nil {
 						t.mu.Unlock()
 						return "", true, err
@@ -722,15 +898,15 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			return "", false, nil
 		}
 
-		// BUY side first, then SELL; base index for SELL is count of BUY lots
-		if msg, done, err := scanSide(SideBuy, 0); done || err != nil {
+		// BUY side first, then SELL
+		if msg, done, err := scanSide(SideBuy); done || err != nil {
 			return msg, err
 		}
-		if msg, done, err := scanSide(SideSell, lsb); done || err != nil {
+		if msg, done, err := scanSide(SideSell); done || err != nil {
 			return msg, err
 		}
 
-		log.Printf("[DEBUG] nearest Take (BuyLots)=%.2f (SellLots)=%.2f across %d BuyLots and %d SellLots", nearestTakeBuy, nearestTakeSell, lsb, lss)
+		log.Printf("[DEBUG] Nearest Take (BuyLots)=%.2f (SellLots)=%.2f across %d BuyLots and %d SellLots", nearestTakeBuy, nearestTakeSell, lsb, lss)
 	}
 
 	d := decide(c, t.model, t.mdlExt)
@@ -1375,7 +1551,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// TODO: remove TRACE
 	log.Printf("TRACE lot.open side=%s open=%.8f sizeBase=%.8f stop=%.8f take=%.8f fee=%.4f BuyLots=%d SellLots=%d",
-		side, newLot.OpenPrice, newLot.SizeBase, newLot.Stop, newLot.Take, newLot.EntryFee, len(t.book(SideBuy).Lots), len(t.book(SideBuy).Lots))
+		side, newLot.OpenPrice, newLot.SizeBase, newLot.Stop, newLot.Take, newLot.EntryFee, len(t.book(SideBuy).Lots), len(t.book(SideSell).Lots))
 
 	// Assign/designate runner for THIS SIDE if none exists yet; otherwise this is a scalp.
 	if book.RunnerID == -1 {
