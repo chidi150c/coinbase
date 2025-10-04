@@ -91,7 +91,7 @@ type Trader struct {
 	broker    Broker
 	model     *AIMicroModel
 	pos       *Position   // kept for backward compatibility with earlier logic (represents last lot in aggregate)
-	lots      []*Position // legacy aggregate view (derived from books; do not mutate directly)
+	// lots      []*Position // legacy aggregate view (derived from books; do not mutate directly)
 	mu        sync.Mutex
 	equityUSD float64
 
@@ -108,7 +108,7 @@ type Trader struct {
 	books map[OrderSide]*SideBook
 
 	// NEW: index of the designated runner lot in legacy aggregate (-1 if none). Derived from books.
-	runnerIdx int
+	// runnerIdx int
 
 	// --- NEW: side-aware pyramiding state (kept in-memory; mirrored to legacy fields for logs) ---
 	lastAddBuy      time.Time
@@ -131,7 +131,7 @@ func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
 		equityUSD:  cfg.USDEquity,
 		dailyStart: midnightUTC(time.Now().UTC()),
 		stateFile:  cfg.StateFile,
-		runnerIdx:  -1,
+		// runnerIdx:  -1,
 		books: map[OrderSide]*SideBook{
 			SideBuy:  {RunnerID: -1, Lots: nil},
 			SideSell: {RunnerID: -1, Lots: nil},
@@ -162,7 +162,7 @@ func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
 	}
 
 	// Initialize legacy aggregate view for logs/compat.
-	t.refreshAggregateFromBooks()
+	// t.refreshAggregateFromBooks()
 	return t
 }
 
@@ -309,41 +309,41 @@ func (t *Trader) latestEntryBySide(side OrderSide) float64 {
 	return book.Lots[len(book.Lots)-1].OpenPrice
 }
 
-// aggregateOpen sets t.pos to the latest lot (for legacy reads) or nil.
-// Also rebuilds legacy t.lots and runnerIdx from the authoritative books.
-func (t *Trader) aggregateOpen() {
-	t.refreshAggregateFromBooks()
-}
+// // aggregateOpen sets t.pos to the latest lot (for legacy reads) or nil.
+// // Also rebuilds legacy t.lots and runnerIdx from the authoritative books.
+// func (t *Trader) aggregateOpen() {
+// 	t.refreshAggregateFromBooks()
+// }
 
-// --- NEW: rebuild legacy aggregate view & runner index from books ---
-func (t *Trader) refreshAggregateFromBooks() {
-	var agg []*Position
-	rIdx := -1
-	// Flatten BUY first then SELL for deterministic legacy indexing.
-	if b := t.books[SideBuy]; b != nil {
-		for i, p := range b.Lots {
-			if b.RunnerID == i && rIdx == -1 {
-				rIdx = len(agg) // runner position in aggregate
-			}
-			agg = append(agg, p)
-		}
-	}
-	if s := t.books[SideSell]; s != nil {
-		for i, p := range s.Lots {
-			if s.RunnerID == i && rIdx == -1 {
-				rIdx = len(agg)
-			}
-			agg = append(agg, p)
-		}
-	}
-	t.lots = agg
-	t.runnerIdx = rIdx
-	if len(agg) == 0 {
-		t.pos = nil
-	} else {
-		t.pos = agg[len(agg)-1]
-	}
-}
+// // --- NEW: rebuild legacy aggregate view & runner index from books ---
+// func (t *Trader) refreshAggregateFromBooks() {
+// 	var agg []*Position
+// 	rIdx := -1
+// 	// Flatten BUY first then SELL for deterministic legacy indexing.
+// 	if b := t.books[SideBuy]; b != nil {
+// 		for i, p := range b.Lots {
+// 			if b.RunnerID == i && rIdx == -1 {
+// 				rIdx = len(agg) // runner position in aggregate
+// 			}
+// 			agg = append(agg, p)
+// 		}
+// 	}
+// 	if s := t.books[SideSell]; s != nil {
+// 		for i, p := range s.Lots {
+// 			if s.RunnerID == i && rIdx == -1 {
+// 				rIdx = len(agg)
+// 			}
+// 			agg = append(agg, p)
+// 		}
+// 	}
+// 	t.lots = agg
+// 	t.runnerIdx = rIdx
+// 	if len(agg) == 0 {
+// 		t.pos = nil
+// 	} else {
+// 		t.pos = agg[len(agg)-1]
+// 	}
+// }
 
 // applyRunnerTargets adjusts stop/take for the designated runner lot.
 func (t *Trader) applyRunnerTargets(p *Position) {
@@ -429,7 +429,7 @@ func (t *Trader) book(side OrderSide) *SideBook {
 func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitReason string) (string, error) {
 	// Map aggregate index to (side, local index)
 	side, localIdx := t.aggregateIndexToSide(idx)
-	if side == 0 {
+	if side == "" {
 		// fallback if mapping fails (shouldn't happen)
 		side = SideBuy
 		localIdx = idx
@@ -594,8 +594,8 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 		}
 	}
 
-	// Rebuild legacy aggregate view for logs/compat
-	t.refreshAggregateFromBooks()
+	// // Rebuild legacy aggregate view for logs/compat
+	// t.refreshAggregateFromBooks()
 
 	// Include reason in message for operator visibility
 	msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
@@ -648,15 +648,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	// TODO: remove TRACE
-	log.Printf("TRACE step.start ts=%s price=%.8f lots=%d runnerIdx=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f",
-		now.Format(time.RFC3339), c[len(c)-1].Close, len(t.lots), t.runnerIdx,
+	lsb := len(t.book(SideBuy).Lots)
+	lss := len(t.book(SideSell).Lots)
+	log.Printf("TRACE step.start ts=%s price=%.8f lotsBuy=%d lotsSell=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f",
+		now.Format(time.RFC3339), c[len(c)-1].Close, lsb, lss,
 		t.lastAddBuy.Format(time.RFC3339), t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell)
 
 	// --- EXIT path: if any lots are open, evaluate TP/SL and trailing for each side; close one at a time.
-	if len(t.lots) > 0 {
+	if (lsb > 0) || (lss > 0) {
 		price := c[len(c)-1].Close
-		nearestStop := 0.0
-		nearestTake := 0.0
+		nearestTakeBuy := 0.0
+		nearestTakeSell := 0.0
 
 		// Helper to scan a side book
 		scanSide := func(side OrderSide, baseIdx int) (string, bool, error) {
@@ -706,20 +708,14 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					return msg, true, nil
 				}
 
-				// nearest summary (legacy debug)
+				// nearest summary
 				if lot.Side == SideBuy {
-					if nearestStop == 0 || lot.Stop > nearestStop {
-						nearestStop = lot.Stop
-					}
-					if nearestTake == 0 || lot.Take < nearestTake {
-						nearestTake = lot.Take
+					if nearestTakeBuy == 0 || lot.Take < nearestTakeBuy {
+						nearestTakeBuy = lot.Take
 					}
 				} else {
-					if nearestStop == 0 || lot.Stop < nearestStop {
-						nearestStop = lot.Stop
-					}
-					if nearestTake == 0 || lot.Take > nearestTake {
-						nearestTake = lot.Take
+					if nearestTakeSell == 0 || lot.Take > nearestTakeSell {
+						nearestTakeSell = lot.Take
 					}
 				}
 				i++
@@ -727,25 +723,27 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			return "", false, nil
 		}
 
-		// BUY side first, then SELL, mapping through aggregate indices.
+		// BUY side first, then SELL; base index for SELL is count of BUY lots
 		if msg, done, err := scanSide(SideBuy, 0); done || err != nil {
 			return msg, err
 		}
-		if msg, done, err := scanSide(SideSell, len(t.books[SideBuy].Lots)); done || err != nil {
+		if msg, done, err := scanSide(SideSell, lsb); done || err != nil {
 			return msg, err
 		}
 
-		log.Printf("[DEBUG] nearest stop=%.2f take=%.2f across %d lots", nearestStop, nearestTake, len(t.lots))
+		log.Printf("[DEBUG] nearest Take (BuyLots)=%.2f (SellLots)=%.2f across %d BuyLots and %d SellLots", nearestTakeBuy, nearestTakeSell, lsb, lss)
 	}
 
 	d := decide(c, t.model, t.mdlExt)
-	log.Printf("[DEBUG] Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v", len(t.lots), d.Signal, d.Reason, buyThreshold, sellThreshold, t.cfg.LongOnly)
+	totalLots := lsb + lss
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v",
+		totalLots, d.Signal, d.Reason, buyThreshold, sellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
 
 	price := c[len(c)-1].Close
 
-	// --- NEW: track lowest price since last add (BUY path) and highest price (SELL path) ---
+	// --- track lowest price since last add (BUY path) and highest price (SELL path) ---
 	if !t.lastAddBuy.IsZero() {
 		if t.winLowBuy == 0 || price < t.winLowBuy {
 			t.winLowBuy = price
@@ -767,13 +765,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		return fmt.Sprintf("FLAT [%s]", d.Reason), nil
 	}
 
-	// Respect lot cap (both sides, aggregate)
-	if len(t.lots) >= maxConcurrentLots() {
+	// Respect lot cap (both sides)
+	if (lsb + lss) >= maxConcurrentLots() {
 		t.mu.Unlock()
 		log.Printf("[DEBUG] lot cap reached (%d); HOLD", maxConcurrentLots())
 		return "HOLD", nil
 	}
-
 	// Determine the side and its book
 	side := d.SignalToSide()
 	book := t.book(side)
@@ -1339,6 +1336,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	// --- NEW: side-biased Lot reason (without winLow) ---
+	d = decide(c, t.model, t.mdlExt) // for reason payload reuse
 	var gatesReason string
 	if side == SideBuy {
 		gatesReason = fmt.Sprintf(
@@ -1377,8 +1375,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	// TODO: remove TRACE
-	log.Printf("TRACE lot.open side=%s open=%.8f sizeBase=%.8f stop=%.8f take=%.8f fee=%.4f runnerIdx=%d lots=%d",
-		side, newLot.OpenPrice, newLot.SizeBase, newLot.Stop, newLot.Take, newLot.EntryFee, t.runnerIdx, len(t.lots))
+	log.Printf("TRACE lot.open side=%s open=%.8f sizeBase=%.8f stop=%.8f take=%.8f fee=%.4f BuyLots=%d SellLots=%d",
+		side, newLot.OpenPrice, newLot.SizeBase, newLot.Stop, newLot.Take, newLot.EntryFee, len(t.book(SideBuy).Lots), len(t.book(SideBuy).Lots))
 
 	// Assign/designate runner for THIS SIDE if none exists yet; otherwise this is a scalp.
 	if book.RunnerID == -1 {
@@ -1395,7 +1393,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	// Rebuild legacy aggregate view for logs/compat
-	t.refreshAggregateFromBooks()
+	// t.refreshAggregateFromBooks()
 
 	msg := ""
 	if t.cfg.DryRun {
@@ -1540,7 +1538,7 @@ func (t *Trader) loadState() error {
 	}
 
 	// Rebuild legacy aggregate view
-	t.refreshAggregateFromBooks()
+	// t.refreshAggregateFromBooks()
 	return nil
 }
 
@@ -1672,7 +1670,7 @@ func isMounted(dir string) (bool, error) {
 // --- NEW: helper to map aggregate index -> (side, localIdx) using the current books ---
 func (t *Trader) aggregateIndexToSide(idx int) (OrderSide, int) {
 	if idx < 0 {
-		return 0, -1
+		return "", -1
 	}
 	bb := t.book(SideBuy)
 	if idx < len(bb.Lots) {
@@ -1683,7 +1681,7 @@ func (t *Trader) aggregateIndexToSide(idx int) (OrderSide, int) {
 	if idx < len(sb.Lots) {
 		return SideSell, idx
 	}
-	return 0, -1
+	return "", -1
 }
 
-}} with only the necessary minimal changes to implement {{replace legacy aggregate view (t.lots, t.runnerIdx, t.pos) with per-side SideBooks (BookBuy/BookSell) using RunnerID and Lots}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{replace legacy aggregate view (t.lots, t.runnerIdx, t.pos) with per-side SideBooks (BookBuy/BookSell) using RunnerID and Lots}}. Return the complete file, copy-paste ready, in IDE.
+}} with only the necessary minimal changes to implement {{replace global-index lot closing with side-aware closeLot(ctx, c, side, localIdx) and update step() to call it directly}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{replace global-index lot closing with side-aware closeLot(ctx, c, side, localIdx) and update step() to call it directly}}. Return the complete file, copy-paste ready, in IDE.
