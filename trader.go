@@ -55,21 +55,26 @@ type Position struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// --- NEW: per-side book (authoritative store) ---
+type SideBook struct {
+	RunnerID int         `json:"runner_id"`
+	Lots     []*Position `json:"lots"`
+}
+
 // BotState is the persistent snapshot of trader state.
+// NOTE: Persist ONLY the SideBook-based schema now.
 type BotState struct {
-	EquityUSD        float64
-	DailyStart       time.Time
-	DailyPnL         float64
-	Lots             []*Position
-	Model            *AIMicroModel
-	MdlExt           *ExtendedLogit
-	WalkForwardMin   int
-	LastFit          time.Time
-	// LastAdd          time.Time
-	// WinLow           float64
-	// LatchedGate      float64
-	// WinHigh          float64
-	// LatchedGateShort float64
+	EquityUSD      float64
+	DailyStart     time.Time
+	DailyPnL       float64
+	Model          *AIMicroModel
+	MdlExt         *ExtendedLogit
+	WalkForwardMin int
+	LastFit        time.Time
+
+	// --- Persisted per-side books (authoritative) ---
+	BookBuy  SideBook
+	BookSell SideBook
 
 	// --- NEW: side-aware pyramiding state (persisted) ---
 	LastAddBuy      time.Time
@@ -81,15 +86,13 @@ type BotState struct {
 }
 
 type Trader struct {
-	cfg        Config
-	broker     Broker
-	model      *AIMicroModel
-	pos        *Position   // kept for backward compatibility with earlier logic
-	lots       []*Position // NEW: multiple lots when pyramiding is enabled
-	dailyStart time.Time
-	dailyPnL   float64
-	mu         sync.Mutex
-	equityUSD  float64
+	cfg       Config
+	broker    Broker
+	model     *AIMicroModel
+	pos       *Position   // kept for backward compatibility with earlier logic (represents last lot in aggregate)
+	lots      []*Position // legacy aggregate view (derived from books; do not mutate directly)
+	mu        sync.Mutex
+	equityUSD float64
 
 	// NEW (minimal): optional extended head passed through to decide(); nil if unused.
 	mdlExt *ExtendedLogit
@@ -100,7 +103,10 @@ type Trader struct {
 	// NEW: track last model fit time for walk-forward
 	lastFit time.Time
 
-	// NEW: index of the designated runner lot (-1 if none). Not persisted; derived on load.
+	// NEW: per-side books (authoritative)
+	books map[OrderSide]*SideBook
+
+	// NEW: index of the designated runner lot in legacy aggregate (-1 if none). Derived from books.
 	runnerIdx int
 
 	// --- NEW: side-aware pyramiding state (kept in-memory; mirrored to legacy fields for logs) ---
@@ -110,6 +116,10 @@ type Trader struct {
 	winHighSell     float64
 	latchedGateBuy  float64
 	latchedGateSell float64
+
+	// daily
+	dailyStart time.Time
+	dailyPnL   float64
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -121,6 +131,10 @@ func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
 		dailyStart: midnightUTC(time.Now().UTC()),
 		stateFile:  cfg.StateFile,
 		runnerIdx:  -1,
+		books: map[OrderSide]*SideBook{
+			SideBuy:  {RunnerID: -1, Lots: nil},
+			SideSell: {RunnerID: -1, Lots: nil},
+		},
 	}
 
 	// Persistence guard: backtests set PERSIST_STATE=false
@@ -135,7 +149,7 @@ func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
 			log.Printf("[INFO] trader state restored from %s", t.stateFile)
 		} else {
 			log.Printf("[INFO] no prior state restored: %v", err)
-			// >>> FAIL-FAST (requested): if live (not DryRun) and persistence is expected,
+			// >>> FAIL-FAST: if live (not DryRun) and persistence is expected,
 			// and the state path isn't a mounted/writable volume, abort with a clear message.
 			if !t.cfg.DryRun && shouldFatalNoStateMount(t.stateFile) {
 				log.Fatalf("[FATAL] persistence required but state path is not a mounted volume or not writable: STATE_FILE=%s ; "+
@@ -145,10 +159,9 @@ func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
 			}
 		}
 	}
-	// If state has existing lots but no runner assigned (fresh field), default runner to the oldest or 0.
-	if t.runnerIdx == -1 && len(t.lots) > 0 {
-		t.runnerIdx = 0
-	}
+
+	// Initialize legacy aggregate view for logs/compat.
+	t.refreshAggregateFromBooks()
 	return t
 }
 
@@ -259,32 +272,76 @@ func spreadMinBps() float64        { return getEnvFloat("SPREAD_MIN_BPS", 0.0) }
 func limitTimeoutSec() int         { return getEnvInt("LIMIT_TIMEOUT_SEC", 0) }          // wait window; 0 disables
 func orderType() string            { return strings.ToLower(strings.TrimSpace(getEnv("ORDER_TYPE", "market"))) }
 
+// --- NEW: risk ramping envs (side-aware) ---
+func rampEnable() bool          { return getEnvBool("RAMP_ENABLE", false) }
+func rampMode() string          { return strings.ToLower(strings.TrimSpace(getEnv("RAMP_MODE", "linear"))) } // linear|exp
+func rampStartPct() float64     { return getEnvFloat("RAMP_START_PCT", 0.0) }
+func rampStepPct() float64      { return getEnvFloat("RAMP_STEP_PCT", 0.0) }   // for linear
+func rampGrowth() float64       { return getEnvFloat("RAMP_GROWTH", 1.0) }     // for exp
+func rampMaxPct() float64       { return getEnvFloat("RAMP_MAX_PCT", 0.0) }    // 0=unbounded
+func clamp(x, lo, hi float64) float64 {
+	if hi > 0 && x > hi {
+		return hi
+	}
+	if x < lo {
+		return lo
+	}
+	return x
+}
+
 // latestEntry returns the most recent long lot entry price, or 0 if none.
+// NOTE: maintained for compatibility; now uses SideBook(BUY).
 func (t *Trader) latestEntry() float64 {
-	if len(t.lots) == 0 {
+	book := t.books[SideBuy]
+	if book == nil || len(book.Lots) == 0 {
 		return 0
 	}
-	return t.lots[len(t.lots)-1].OpenPrice
+	return book.Lots[len(book.Lots)-1].OpenPrice
 }
 
 // --- NEW: side-aware latestEntry helper (does not alter existing latestEntry name/signature) ---
 func (t *Trader) latestEntryBySide(side OrderSide) float64 {
-	for i := len(t.lots) - 1; i >= 0; i-- {
-		if t.lots[i].Side == side {
-			return t.lots[i].OpenPrice
-		}
+	book := t.books[side]
+	if book == nil || len(book.Lots) == 0 {
+		return 0
 	}
-	return 0
+	return book.Lots[len(book.Lots)-1].OpenPrice
 }
 
 // aggregateOpen sets t.pos to the latest lot (for legacy reads) or nil.
+// Also rebuilds legacy t.lots and runnerIdx from the authoritative books.
 func (t *Trader) aggregateOpen() {
-	if len(t.lots) == 0 {
-		t.pos = nil
-		return
+	t.refreshAggregateFromBooks()
+}
+
+// --- NEW: rebuild legacy aggregate view & runner index from books ---
+func (t *Trader) refreshAggregateFromBooks() {
+	var agg []*Position
+	rIdx := -1
+	// Flatten BUY first then SELL for deterministic legacy indexing.
+	if b := t.books[SideBuy]; b != nil {
+		for i, p := range b.Lots {
+			if b.RunnerID == i && rIdx == -1 {
+				rIdx = len(agg) // runner position in aggregate
+			}
+			agg = append(agg, p)
+		}
 	}
-	// keep last lot as representative for legacy checks
-	t.pos = t.lots[len(t.lots)-1]
+	if s := t.books[SideSell]; s != nil {
+		for i, p := range s.Lots {
+			if s.RunnerID == i && rIdx == -1 {
+				rIdx = len(agg)
+			}
+			agg = append(agg, p)
+		}
+	}
+	t.lots = agg
+	t.runnerIdx = rIdx
+	if len(agg) == 0 {
+		t.pos = nil
+	} else {
+		t.pos = agg[len(agg)-1]
+	}
 }
 
 // applyRunnerTargets adjusts stop/take for the designated runner lot.
@@ -356,11 +413,29 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 	return false, lot.TrailStop
 }
 
-// closeLotAtIndex closes a single lot at idx (assumes mutex held), performing I/O unlocked.
+// --- NEW: helper to get book by side (always non-nil) ---
+func (t *Trader) book(side OrderSide) *SideBook {
+	b := t.books[side]
+	if b == nil {
+		b = &SideBook{RunnerID: -1}
+		t.books[side] = b
+	}
+	return b
+}
+
+// closeLotAtIndex closes a single lot at global aggregate idx (assumes mutex held), performing I/O unlocked.
 // exitReason is a short label for logs: "take_profit" | "stop_loss" | "trailing_stop" (or other).
 func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitReason string) (string, error) {
+	// Map aggregate index to (side, local index)
+	side, localIdx := t.aggregateIndexToSide(idx)
+	if side == 0 {
+		// fallback if mapping fails (shouldn't happen)
+		side = SideBuy
+		localIdx = idx
+	}
+	book := t.book(side)
 	price := c[len(c)-1].Close
-	lot := t.lots[idx]
+	lot := book.Lots[localIdx]
 	closeSide := SideSell
 	if lot.Side == SideSell {
 		closeSide = SideBuy
@@ -394,18 +469,8 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 	// re-lock
 	t.mu.Lock()
 
-	// --- NEW: check if the lot being closed is the most recent add (newest OpenTime) ---
-	wasNewest := true
-	refOpen := lot.OpenTime
-	for j := range t.lots {
-		if j == idx {
-			continue
-		}
-		if !t.lots[j].OpenTime.IsZero() && t.lots[j].OpenTime.After(refOpen) {
-			wasNewest = false
-			break
-		}
-	}
+	// --- NEW: check if the lot being closed is the most recent add for that side ---
+	wasNewest := (localIdx == len(book.Lots)-1)
 
 	// --- MINIMAL CHANGE: use actual filled size/price if available ---
 	priceExec := c[len(c)-1].Close
@@ -452,10 +517,6 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 	pl -= exitFee      // subtract exit fee now
 
 	// --- TRACE: classification breakdown ---
-	// This prints everything we need to understand why this exit is a loss or win:
-	// - side, open/exec price, filled size
-	// - raw P/L before fees, entry/exit fees, final P/L
-	// - reason (tp/sl/trailing), and whether it was runner/scalp
 	rawPL := func() float64 {
 		// raw (price move only), before fees:
 		if lot.Side == SideBuy {
@@ -464,7 +525,7 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 		return (lot.OpenPrice - priceExec) * baseFilled
 	}()
 	kind := "scalp"
-	if idx == t.runnerIdx {
+	if book.RunnerID == localIdx {
 		kind = "runner"
 	}
 	log.Printf("TRACE exit.classify side=%s kind=%s reason=%s open=%.8f exec=%.8f baseFilled=%.8f rawPL=%.6f entryFee=%.6f exitFee=%.6f finalPL=%.6f",
@@ -474,7 +535,6 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 	t.equityUSD += pl
 
 	// --- NEW: increment win/loss trades ---
-
 	if pl >= 0 {
 		mtxTrades.WithLabelValues("win").Inc()
 	} else {
@@ -492,41 +552,36 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 	}
 	mtxExitReasons.WithLabelValues(reasonLbl, sideLbl).Inc()
 
-	// Track if we removed the runner and adjust runnerIdx accordingly after removal.
-	removedWasRunner := (idx == t.runnerIdx)
+	// Track if we removed the runner and adjust book.RunnerID accordingly after removal.
+	removedWasRunner := (localIdx == book.RunnerID)
 
-	// remove lot idx
-	t.lots = append(t.lots[:idx], t.lots[idx+1:]...)
+	// remove lot at localIdx
+	book.Lots = append(book.Lots[:localIdx], book.Lots[localIdx+1:]...)
 
-	// shift runnerIdx if needed
-	if t.runnerIdx >= 0 {
-		if idx < t.runnerIdx {
-			t.runnerIdx-- // slice shifted left
-		} else if idx == t.runnerIdx {
+	// shift RunnerID if needed
+	if book.RunnerID >= 0 {
+		if localIdx < book.RunnerID {
+			book.RunnerID-- // slice shifted left
+		} else if localIdx == book.RunnerID {
 			// runner removed; promote the NEWEST remaining lot (if any) to runner
-			if len(t.lots) > 0 {
-				t.runnerIdx = len(t.lots) - 1
+			if len(book.Lots) > 0 {
+				book.RunnerID = len(book.Lots) - 1
 				// reset trailing fields for the newly promoted runner
-				nr := t.lots[t.runnerIdx]
+				nr := book.Lots[book.RunnerID]
 				nr.TrailActive = false
 				nr.TrailPeak = nr.OpenPrice
 				nr.TrailStop = 0
 				// also re-apply runner targets (keeps existing behavior)
 				t.applyRunnerTargets(nr)
 			} else {
-				t.runnerIdx = -1
+				book.RunnerID = -1
 			}
 		}
 	}
 
-	// --- if the closed lot was the most recent add, re-anchor pyramiding timers/state ---
+	// --- if the closed lot was the most recent add FOR THAT SIDE, re-anchor pyramiding timers/state ---
 	if wasNewest {
-		// If any lots remain, restart the decay clock from now to avoid instant latch.
-		// If none remain, also set now; next add will proceed normally.
 		now := time.Now().UTC()
-		// Reset adverse tracking; winLow/winHigh will start accumulating after t_floor_min,
-		// and latching can only occur after 2*t_floor_min from this new anchor.
-		// --- NEW: side-aware reset based on closed lot side ---
 		if lot.Side == SideBuy {
 			t.lastAddBuy = now
 			t.winLowBuy = 0
@@ -538,7 +593,9 @@ func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitR
 		}
 	}
 
-	t.aggregateOpen()
+	// Rebuild legacy aggregate view for logs/compat
+	t.refreshAggregateFromBooks()
+
 	// Include reason in message for operator visibility
 	msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
 		c[len(c)-1].Time.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, lot.EntryFee+exitFee)
@@ -578,8 +635,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	t.updateDaily(now)
 
 	// --- NEW: walk-forward (re)fit guard hook (no-op other than the guard) ---
-	// Any refit logic must first check shouldRefit(len(c)).
-	// This preserves restored weights when history is thin.
 	_ = t.shouldRefit(len(c)) // intentionally unused here (guard only)
 
 	// Keep paper broker price in sync with the latest close so paper fills are realistic.
@@ -594,79 +649,91 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// TODO: remove TRACE
 	log.Printf("TRACE step.start ts=%s price=%.8f lots=%d runnerIdx=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f",
 		now.Format(time.RFC3339), c[len(c)-1].Close, len(t.lots), t.runnerIdx,
-		t.lastAddBuy.Format(time.RFC3339),t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell)
+		t.lastAddBuy.Format(time.RFC3339), t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell)
 
-	// --- EXIT path: if any lots are open, evaluate TP/SL for each and close those that trigger.
+	// --- EXIT path: if any lots are open, evaluate TP/SL and trailing for each side; close one at a time.
 	if len(t.lots) > 0 {
 		price := c[len(c)-1].Close
 		nearestStop := 0.0
 		nearestTake := 0.0
-		for i := 0; i < len(t.lots); {
-			lot := t.lots[i]
 
-			// --- NEW: runner-only trailing exit check (wired alongside TP/SL) ---
-			if i == t.runnerIdx {
-				if trigger, tstop := t.updateRunnerTrail(lot, price); trigger {
-					// reflect trailing level for visibility in debug/Slack
-					lot.Stop = tstop
-					msg, err := t.closeLotAtIndex(ctx, c, i, "trailing_stop")
+		// Helper to scan a side book
+		scanSide := func(side OrderSide, baseIdx int) (string, bool, error) {
+			book := t.book(side)
+			for i := 0; i < len(book.Lots); {
+				lot := book.Lots[i]
+
+				// runner trailing for this side
+				if i == book.RunnerID {
+					if trigger, tstop := t.updateRunnerTrail(lot, price); trigger {
+						lot.Stop = tstop
+						msg, err := t.closeLotAtIndex(ctx, c, baseIdx+i, "trailing_stop")
+						if err != nil {
+							t.mu.Unlock()
+							return "", true, err
+						}
+						t.mu.Unlock()
+						return msg, true, nil
+					}
+				}
+
+				trigger := false
+				exitReason := ""
+				if lot.Side == SideBuy && (price <= lot.Stop || price >= lot.Take) {
+					trigger = true
+					if price <= lot.Stop {
+						exitReason = "stop_loss"
+					} else {
+						exitReason = "take_profit"
+					}
+				}
+				if lot.Side == SideSell && (price >= lot.Stop || price <= lot.Take) {
+					trigger = true
+					if price >= lot.Stop {
+						exitReason = "stop_loss"
+					} else {
+						exitReason = "take_profit"
+					}
+				}
+				if trigger {
+					msg, err := t.closeLotAtIndex(ctx, c, baseIdx+i, exitReason)
 					if err != nil {
 						t.mu.Unlock()
-						return "", err
+						return "", true, err
 					}
-					// closeLotAtIndex removed index i; continue without i++
 					t.mu.Unlock()
-					return msg, nil
+					return msg, true, nil
 				}
-			}
 
-			trigger := false
-			exitReason := ""
-			if lot.Side == SideBuy && (price <= lot.Stop || price >= lot.Take) {
-				trigger = true
-				if price <= lot.Stop {
-					exitReason = "stop_loss"
+				// nearest summary (legacy debug)
+				if lot.Side == SideBuy {
+					if nearestStop == 0 || lot.Stop > nearestStop {
+						nearestStop = lot.Stop
+					}
+					if nearestTake == 0 || lot.Take < nearestTake {
+						nearestTake = lot.Take
+					}
 				} else {
-					exitReason = "take_profit"
+					if nearestStop == 0 || lot.Stop < nearestStop {
+						nearestStop = lot.Stop
+					}
+					if nearestTake == 0 || lot.Take > nearestTake {
+						nearestTake = lot.Take
+					}
 				}
+				i++
 			}
-			if lot.Side == SideSell && (price >= lot.Stop || price <= lot.Take) {
-				trigger = true
-				if price >= lot.Stop {
-					exitReason = "stop_loss"
-				} else {
-					exitReason = "take_profit"
-				}
-			}
-			if trigger {
-				msg, err := t.closeLotAtIndex(ctx, c, i, exitReason)
-				if err != nil {
-					t.mu.Unlock()
-					return "", err
-				}
-				// closeLotAtIndex removed index i; continue without i++
-				t.mu.Unlock()
-				return msg, nil
-			}
-
-			if lot.Side == SideBuy {
-				if nearestStop == 0 || lot.Stop > nearestStop { // highest stop for long
-					nearestStop = lot.Stop
-				}
-				if nearestTake == 0 || lot.Take < nearestTake { // lowest take for long
-					nearestTake = lot.Take
-				}
-			} else { // SideSell
-				if nearestStop == 0 || lot.Stop < nearestStop { // lowest stop for short
-					nearestStop = lot.Stop
-				}
-				if nearestTake == 0 || lot.Take > nearestTake { // highest take for short
-					nearestTake = lot.Take
-				}
-			}
-
-			i++ // no trigger; move to next
+			return "", false, nil
 		}
+
+		// BUY side first, then SELL, mapping through aggregate indices.
+		if msg, done, err := scanSide(SideBuy, 0); done || err != nil {
+			return msg, err
+		}
+		if msg, done, err := scanSide(SideSell, len(t.books[SideBuy].Lots)); done || err != nil {
+			return msg, err
+		}
+
 		log.Printf("[DEBUG] nearest stop=%.2f take=%.2f across %d lots", nearestStop, nearestTake, len(t.lots))
 	}
 
@@ -683,7 +750,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			t.winLowBuy = price
 		}
 	}
-
 	if !t.lastAddSell.IsZero() {
 		if t.winHighSell == 0 || price > t.winHighSell {
 			t.winHighSell = price
@@ -700,16 +766,19 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		return fmt.Sprintf("FLAT [%s]", d.Reason), nil
 	}
 
-	// Respect lot cap (both sides)
+	// Respect lot cap (both sides, aggregate)
 	if len(t.lots) >= maxConcurrentLots() {
 		t.mu.Unlock()
 		log.Printf("[DEBUG] lot cap reached (%d); HOLD", maxConcurrentLots())
 		return "HOLD", nil
 	}
 
-	// Determine if we are opening first lot or attempting a pyramid add.
-	// --- CHANGED: enable SELL pyramiding symmetry ---
-	isAdd := len(t.lots) > 0 && allowPyramiding() && (d.Signal == Buy || d.Signal == Sell)
+	// Determine the side and its book
+	side := d.SignalToSide()
+	book := t.book(side)
+
+	// Determine if we are opening first lot for THIS SIDE or attempting a pyramid add (side-aware).
+	isAdd := len(book.Lots) > 0 && allowPyramiding() && (d.Signal == Buy || d.Signal == Sell)
 
 	// --- NEW: variables to capture gate audit fields for the reason string (side-biased; no winLow) ---
 	var (
@@ -720,17 +789,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		reasonElapsedHr float64
 	)
 
-	// Gating for pyramiding adds — spacing + adverse move (with optional time-decay).
+	// Gating for pyramiding adds — spacing + adverse move (with optional time-decay), side-aware.
 	if isAdd {
 		// Choose side-aware anchor set
 		var lastAddSide time.Time
-		if d.Signal == Buy {
+		if side == SideBuy {
 			lastAddSide = t.lastAddBuy
 		} else {
 			lastAddSide = t.lastAddSell
 		}
 
-		// 1) Spacing: always enforce (s=0 means no wait; set >0 to require time gap)
+		// 1) Spacing
 		s := pyramidMinSeconds()
 		// TODO: remove TRACE
 		log.Printf("TRACE pyramid.spacing since_last=%.1fs need>=%ds", time.Since(lastAddSide).Seconds(), s)
@@ -765,7 +834,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		reasonEffPct = effPct
 		reasonElapsedHr = elapsedMin / 60.0
 
-		// Time (in minutes) to hit the floor once (t_floor_min); used for latching thresholds.
+		// Time (in minutes) to hit the floor once (t_floor_min)
 		tFloorMin := 0.0
 		if lambda > 0 && basePct > floor {
 			tFloorMin = math.Log(basePct/floor) / lambda
@@ -773,18 +842,13 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 		// TODO: remove TRACE
 		log.Printf("TRACE pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
-			d.Signal, elapsedMin, basePct, effPct, lambda, floor, tFloorMin)
+			side, elapsedMin, basePct, effPct, lambda, floor, tFloorMin)
 
 		// Use side-aware latest entry for adverse gate anchoring
-		var last float64
-		if d.Signal == Buy {
-			last = t.latestEntryBySide(SideBuy)
-		} else {
-			last = t.latestEntryBySide(SideSell)
-		}
+		last := t.latestEntryBySide(side)
 
 		if last > 0 {
-			if d.Signal == Buy {
+			if side == SideBuy {
 				// BUY adverse tracker (side-aware)
 				if elapsedMin >= tFloorMin {
 					if t.winLowBuy == 0 || price < t.winLowBuy {
@@ -802,16 +866,16 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if t.latchedGateBuy > 0 {
 					gatePrice = t.latchedGateBuy
 				}
-				// --- NEW: clamp to min(winLowBuy, last BUY open)
-				clamp := last
-				if t.winLowBuy > 0 && t.winLowBuy < clamp {
-					clamp = t.winLowBuy
+				// clamp to min(winLowBuy, last BUY open)
+				clampP := last
+				if t.winLowBuy > 0 && t.winLowBuy < clampP {
+					clampP = t.winLowBuy
 				}
-				if gatePrice > clamp {
-					gatePrice = clamp
+				if gatePrice > clampP {
+					gatePrice = clampP
 				}
 
-				// mirror for legacy reason/log fields
+				// mirror for reason/log fields
 				reasonGatePrice = gatePrice
 				reasonLatched = t.latchedGateBuy
 
@@ -840,13 +904,13 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if t.latchedGateSell > 0 {
 					gatePrice = t.latchedGateSell
 				}
-				// --- NEW: clamp to max(winHighSell, last SELL open)
-				clamp := last
-				if t.winHighSell > 0 && t.winHighSell > clamp {
-					clamp = t.winHighSell
+				// clamp to max(winHighSell, last SELL open)
+				clampP := last
+				if t.winHighSell > 0 && t.winHighSell > clampP {
+					clampP = t.winHighSell
 				}
-				if gatePrice < clamp {
-					gatePrice = clamp
+				if gatePrice < clampP {
+					gatePrice = clampP
 				}
 
 				// mirror for legacy reason/log fields
@@ -872,12 +936,43 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		riskPct = riskPct * f
 		SetVolRiskFactorMetric(f)
 	}
+
+	// --- NEW: side-aware risk ramping (optional) ---
+	if rampEnable() {
+		k := len(book.Lots) // number of existing lots on THIS SIDE
+		switch rampMode() {
+		case "exp":
+			start := rampStartPct()
+			g := rampGrowth()
+			if g <= 0 {
+				g = 1.0
+			}
+			f := start
+			for i := 0; i < k; i++ {
+				f *= g
+			}
+			if max := rampMaxPct(); max > 0 && f > max {
+				f = max
+			}
+			if f > 0 {
+				riskPct = f
+			}
+		default: // linear
+			start := rampStartPct()
+			step := rampStepPct()
+			f := start + float64(k)*step
+			f = clamp(f, 0, rampMaxPct())
+			if f > 0 {
+				riskPct = f
+			}
+		}
+	}
+
 	quote := (riskPct / 100.0) * t.equityUSD
 	if quote < t.cfg.OrderMinUSD {
 		quote = t.cfg.OrderMinUSD
 	}
 	base := quote / price
-	side := d.SignalToSide()
 
 	// TODO: remove TRACE
 	log.Printf("TRACE sizing.pre side=%s eq=%.2f riskPct=%.4f quote=%.2f price=%.8f base=%.8f", side, t.equityUSD, riskPct, quote, price, base)
@@ -889,8 +984,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	if side == SideBuy {
 		// Reserve quote needed to close all existing short lots at current price.
 		var reservedShortQuote float64
-		for _, lot := range t.lots {
-			if lot.Side == SideSell {
+		if sb := t.book(SideSell); sb != nil {
+			for _, lot := range sb.Lots {
 				reservedShortQuote += lot.SizeBase * price
 			}
 		}
@@ -961,10 +1056,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// If SELL, require spare base inventory (spot safe)
 	if side == SideSell && requireBaseForShort() {
-		// Sum reserved base for long lots
+		// Sum reserved base for long lots (BUY side)
 		var reservedLong float64
-		for _, lot := range t.lots {
-			if lot.Side == SideBuy {
+		if bb := t.book(SideBuy); bb != nil {
+			for _, lot := range bb.Lots {
 				reservedLong += lot.SizeBase
 			}
 		}
@@ -1045,8 +1140,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		take = price * (1.0 - t.cfg.TakeProfitPct/100.0)
 	}
 
-	// Decide if this new entry will be the runner (only when there is no existing runner).
-	willBeRunner := (t.runnerIdx == -1 && len(t.lots) == 0)
+	// Decide if this new entry will be the runner FOR THIS SIDE (only when there is no existing runner in the side).
+	willBeRunner := (book.RunnerID == -1 && len(book.Lots) == 0)
 	if willBeRunner {
 		// Stretch runner targets without introducing new env keys.
 		if side == SideBuy {
@@ -1057,10 +1152,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			take = price * (1.0 - (t.cfg.TakeProfitPct*runnerTPMult)/100.0)
 		}
 	} else if scalpTPDecayEnabled() {
-		// This is a scalp add: compute k = number of existing scalps
-		k := len(t.lots)
-		if t.runnerIdx >= 0 && t.runnerIdx < len(t.lots) {
-			k = len(t.lots) - 1 // exclude the runner from the scalp index
+		// This is a scalp add on THIS SIDE: compute k = number of existing scalps in this side
+		k := len(book.Lots)
+		if book.RunnerID >= 0 && book.RunnerID < len(book.Lots) {
+			k = len(book.Lots) - 1 // exclude the side's runner
 		}
 		baseTP := t.cfg.TakeProfitPct
 		tpPct := baseTP
@@ -1195,7 +1290,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		mtxTrades.WithLabelValues("open").Inc()
 	}
 
-	// Re-lock to mutate state (append new lot or first lot).
+	// Re-lock to mutate state (append new lot to THIS SIDE).
 	t.mu.Lock()
 
 	// --- MINIMAL CHANGE: use actual filled size/price when available ---
@@ -1267,12 +1362,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		OpenTime:  now,
 		EntryFee:  entryFee,
 		Reason:    gatesReason, // side-biased; no winLow
-		// trailing fields default zero/false; they’ll be initialized if this becomes runner
 	}
-	t.lots = append(t.lots, newLot)
+	book.Lots = append(book.Lots, newLot)
 	// Use wall clock for lastAdd to drive spacing/decay even if candle time is zero.
-	// Reset adverse tracking for the new add (legacy fields preserved for logs/compat).
-	// --- NEW: side-aware resets/anchors for pyramiding memory ---
 	if side == SideBuy {
 		t.lastAddBuy = wallNow
 		t.winLowBuy = priceToUse
@@ -1287,21 +1379,22 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	log.Printf("TRACE lot.open side=%s open=%.8f sizeBase=%.8f stop=%.8f take=%.8f fee=%.4f runnerIdx=%d lots=%d",
 		side, newLot.OpenPrice, newLot.SizeBase, newLot.Stop, newLot.Take, newLot.EntryFee, t.runnerIdx, len(t.lots))
 
-	// Assign/designate runner if none exists yet; otherwise this is a scalp.
-	if t.runnerIdx == -1 {
-		t.runnerIdx = len(t.lots) - 1 // the just-added lot is runner
+	// Assign/designate runner for THIS SIDE if none exists yet; otherwise this is a scalp.
+	if book.RunnerID == -1 {
+		book.RunnerID = len(book.Lots) - 1 // the just-added lot is the side's runner
 		// Initialize runner trailing baseline
-		r := t.lots[t.runnerIdx]
+		r := book.Lots[book.RunnerID]
 		r.TrailActive = false
 		r.TrailPeak = r.OpenPrice
 		r.TrailStop = 0
-		// Ensure runner's stretched targets are applied (keeps baseline behavior for runner).
+		// Ensure runner's stretched targets are applied (baseline behavior for runner).
 		t.applyRunnerTargets(r)
 		// TODO: remove TRACE
-		log.Printf("TRACE runner.assign idx=%d open=%.8f stop=%.8f take=%.8f", t.runnerIdx, r.OpenPrice, r.Stop, r.Take)
+		log.Printf("TRACE runner.assign idx=%d open=%.8f stop=%.8f take=%.8f", book.RunnerID, r.OpenPrice, r.Stop, r.Take)
 	}
 
-	t.aggregateOpen()
+	// Rebuild legacy aggregate view for logs/compat
+	t.refreshAggregateFromBooks()
 
 	msg := ""
 	if t.cfg.DryRun {
@@ -1344,15 +1437,19 @@ func (t *Trader) saveState() error {
 	if t.stateFile == "" || !getEnvBool("PERSIST_STATE", true) {
 		return nil
 	}
-	state := BotState{
-		EquityUSD:       t.equityUSD,
-		DailyStart:      t.dailyStart,
-		DailyPnL:        t.dailyPnL,
-		Lots:            t.lots,
-		Model:           t.model,
-		MdlExt:          t.mdlExt,
-		WalkForwardMin:  t.cfg.Extended().WalkForwardMin,
-		LastFit:         t.lastFit,
+	// Build persisted books snapshot
+	st := BotState{
+		EquityUSD:      t.equityUSD,
+		DailyStart:     t.dailyStart,
+		DailyPnL:       t.dailyPnL,
+		Model:          t.model,
+		MdlExt:         t.mdlExt,
+		WalkForwardMin: t.cfg.Extended().WalkForwardMin,
+		LastFit:        t.lastFit,
+
+		BookBuy:  *t.book(SideBuy),
+		BookSell: *t.book(SideSell),
+
 		LastAddBuy:      t.lastAddBuy,
 		LastAddSell:     t.lastAddSell,
 		WinLowBuy:       t.winLowBuy,
@@ -1360,7 +1457,7 @@ func (t *Trader) saveState() error {
 		LatchedGateBuy:  t.latchedGateBuy,
 		LatchedGateSell: t.latchedGateSell,
 	}
-	bs, err := json.MarshalIndent(state, "", " ")
+	bs, err := json.MarshalIndent(st, "", " ")
 	if err != nil {
 		return err
 	}
@@ -1389,12 +1486,10 @@ func (t *Trader) loadState() error {
 	// This prevents negative/old EquityUSD from leaking into runs that don't want it.
 	if !(t.cfg.DryRun || t.cfg.UseLiveEquity()) {
 		t.equityUSD = st.EquityUSD
-	} else {
-		// keep t.equityUSD as initialized from cfg.USDEquity; live rebase will adjust later
 	}
 	t.dailyStart = st.DailyStart
 	t.dailyPnL = st.DailyPnL
-	t.lots = st.Lots
+
 	if st.Model != nil {
 		t.model = st.Model
 	}
@@ -1405,18 +1500,11 @@ func (t *Trader) loadState() error {
 		t.lastFit = st.LastFit
 	}
 
-	t.aggregateOpen()
-	// Re-derive runnerIdx if not set (old state files won't carry it).
-	if t.runnerIdx == -1 && len(t.lots) > 0 {
-		t.runnerIdx = 0
-		// Initialize trailing baseline for current runner if not already set
-		r := t.lots[t.runnerIdx]
-		if r.TrailPeak == 0 {
-			// Initialize baseline to current open price if peak is unset.
-			r.TrailPeak = r.OpenPrice
-		}
-	}
+	// Restore per-side books
+	t.books[SideBuy] = &SideBook{RunnerID: st.BookBuy.RunnerID, Lots: st.BookBuy.Lots}
+	t.books[SideSell] = &SideBook{RunnerID: st.BookSell.RunnerID, Lots: st.BookSell.Lots}
 
+	// Side-aware pyramiding persisted state
 	t.lastAddBuy = st.LastAddBuy
 	t.lastAddSell = st.LastAddSell
 	t.winLowBuy = st.WinLowBuy
@@ -1424,23 +1512,34 @@ func (t *Trader) loadState() error {
 	t.latchedGateBuy = st.LatchedGateBuy
 	t.latchedGateSell = st.LatchedGateSell
 
-	// --- Restart warmup for pyramiding decay/adverse tracking ---
-	// If we restored with open lots but have no lastAdd, seed the decay clock to "now"
-	// and reset adverse trackers/latches so they rebuild over real time (prevents instant latch).
-	// NEW: ensure side-aware anchors are also seeded if missing while lots exist.
-	if len(t.lots) > 0 {
-		now := time.Now().UTC()
-		if t.lastAddBuy.IsZero() {
-			t.lastAddBuy = now
-			t.winLowBuy = 0
-			t.latchedGateBuy = 0
-		}
-		if t.lastAddSell.IsZero() {
-			t.lastAddSell = now
-			t.winHighSell = 0
-			t.latchedGateSell = 0
+	// Initialize runner trailing baseline for current runners if not already set
+	for _, side := range []OrderSide{SideBuy, SideSell} {
+		book := t.book(side)
+		if book.RunnerID >= 0 && book.RunnerID < len(book.Lots) {
+			r := book.Lots[book.RunnerID]
+			if r.TrailPeak == 0 {
+				r.TrailPeak = r.OpenPrice
+			}
 		}
 	}
+
+	// --- Restart warmup for pyramiding decay/adverse tracking ---
+	// If we restored with open lots but have no lastAdd for a side, seed the decay clock to "now"
+	// and reset adverse trackers/latches so they rebuild over real time (prevents instant latch).
+	now := time.Now().UTC()
+	if len(t.book(SideBuy).Lots) > 0 && t.lastAddBuy.IsZero() {
+		t.lastAddBuy = now
+		t.winLowBuy = 0
+		t.latchedGateBuy = 0
+	}
+	if len(t.book(SideSell).Lots) > 0 && t.lastAddSell.IsZero() {
+		t.lastAddSell = now
+		t.winHighSell = 0
+		t.latchedGateSell = 0
+	}
+
+	// Rebuild legacy aggregate view
+	t.refreshAggregateFromBooks()
 	return nil
 }
 
@@ -1567,4 +1666,21 @@ func isMounted(dir string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// --- NEW: helper to map aggregate index -> (side, localIdx) using the current books ---
+func (t *Trader) aggregateIndexToSide(idx int) (OrderSide, int) {
+	if idx < 0 {
+		return 0, -1
+	}
+	bb := t.book(SideBuy)
+	if idx < len(bb.Lots) {
+		return SideBuy, idx
+	}
+	idx -= len(bb.Lots)
+	sb := t.book(SideSell)
+	if idx < len(sb.Lots) {
+		return SideSell, idx
+	}
+	return 0, -1
 }
