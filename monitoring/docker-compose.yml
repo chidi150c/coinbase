@@ -48,6 +48,7 @@ services:
     volumes:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
+      - /opt/coinbase/logs:/opt/coinbase/logs
     env_file:
       - /opt/coinbase/env/bot_hitbtc.env      # broker/product/state overrides for HitBTC
     restart: unless-stopped
@@ -72,6 +73,7 @@ services:
     volumes:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
+      - /opt/coinbase/logs:/opt/coinbase/logs
     env_file:
       - /opt/coinbase/env/bot_binance.env     # broker/product/state overrides for Binance
     restart: unless-stopped
@@ -94,6 +96,7 @@ services:
     volumes:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
+      - /opt/coinbase/logs:/opt/coinbase/logs
     env_file:
       - /opt/coinbase/env/bot_coinbase.env    # <-- NEW: pin Coinbase broker/symbol/state
     restart: unless-stopped
