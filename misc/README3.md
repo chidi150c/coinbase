@@ -121,6 +121,33 @@ docker compose logs bot --since 30m | grep 'TRACE exit.classify' || true
 
 docker compose logs bot_binance --since 30m | grep 'TRACE exit.classify' || true
 
+============================================================
+
+# start tailers (run from the compose directory)
+nohup bash -c 'docker compose logs -f --no-color bot_binance >> /opt/coinbase/logs/bot_binance.log 2>&1' &
+nohup bash -c 'docker compose logs -f --no-color bot_hitbtc  >> /opt/coinbase/logs/bot_hitbtc.log  2>&1' &
+nohup bash -c 'docker compose logs -f --no-color bot         >> /opt/coinbase/logs/bot_coinbase.log 2>&1' &
+
+=========================================================================================================
+mkdir -p /opt/coinbase/logs/audit
+
+# Binance
+nohup bash -c \
+"docker compose logs -f --no-color bot_binance \
+ | grep -E --line-buffered 'pyramid\.baseline\.met|pyramid\.latch\.set|trail\.(activate|raise|trigger)|\[WARN\] FUNDS_EXHAUSTED' \
+ >> /opt/coinbase/logs/audit/binance_audit.log 2>&1" &
+
+# HitBTC
+nohup bash -c \
+"docker compose logs -f --no-color bot_hitbtc \
+ | grep -E --line-buffered 'pyramid\.baseline\.met|pyramid\.latch\.set|trail\.(activate|raise|trigger)|\[WARN\] FUNDS_EXHAUSTED' \
+ >> /opt/coinbase/logs/audit/hitbtc_audit.log 2>&1" &
+
+# Coinbase
+nohup bash -c \
+"docker compose logs -f --no-color bot \
+ | grep -E --line-buffered 'pyramid\.baseline\.met|pyramid\.latch\.set|trail\.(activate|raise|trigger)|\[WARN\] FUNDS_EXHAUSTED' \
+ >> /opt/coinbase/logs/audit/coinbase_audit.log 2>&1" &
 
 
 

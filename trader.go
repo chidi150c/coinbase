@@ -83,6 +83,9 @@ type BotState struct {
 	WinHighSell     float64
 	LatchedGateBuy  float64
 	LatchedGateSell float64
+
+	// --- NEW: equity-at-last-add snapshot for equity strategy trading ---
+	LastAddEquity float64
 }
 
 type Trader struct {
@@ -116,6 +119,9 @@ type Trader struct {
 	winHighSell     float64
 	latchedGateBuy  float64
 	latchedGateSell float64
+
+	// --- NEW: equity-at-last-add snapshot for equity strategy trading ---
+	lastAddEquity float64
 
 	// daily
 	dailyStart time.Time
@@ -942,12 +948,46 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		}
 	}
 
-	// Long-only veto for SELL when flat; unchanged behavior.
+	// --- NEW (minimal): equity strategy trigger detection (SELL scalp add of entire spare base)
+	equityScalp := false
+	var equitySpareBase float64
+	if t.lastAddEquity > 0 && t.equityUSD >= t.lastAddEquity*1.01 {
+		// Only proceed if not long-only; respect existing guard
+		if t.cfg.LongOnly {
+			t.mu.Unlock()
+			return "FLAT (long-only) [equity-scalp]", nil
+		}
+		// Compute spare base = available base - reserved long base
+		var reservedLong float64
+		if bb := t.book(SideBuy); bb != nil {
+			for _, lot := range bb.Lots {
+				reservedLong += lot.SizeBase
+			}
+		}
+		// Ask broker for base availability/step (uniform: live & DryRun).
+		sym, availBase, step, err := t.broker.GetAvailableBase(ctx, t.cfg.ProductID)
+		_ = sym
+		if err == nil && step > 0 {
+			spare := availBase - reservedLong
+			if spare < 0 {
+				spare = 0
+			}
+			// Floor to step
+			if spare > 0 {
+				equitySpareBase = math.Floor(spare/step) * step
+				if equitySpareBase > 0 {
+					equityScalp = true
+				}
+			}
+		}
+	}
+	log.Printf("[DEBUG] EQUITY Trading: equityUSD=%.2f lastAddEquity=%.2f pct_diff=%.6f", t.equityUSD, t.lastAddEquity, t.equityUSD/t.lastAddEquity)
+	// Long-only veto for SELL when flat; unchanged behavior (skipped if equityScalp handled above).
 	if d.Signal == Sell && t.cfg.LongOnly {
 		t.mu.Unlock()
 		return fmt.Sprintf("FLAT (long-only) [%s]", d.Reason), nil
 	}
-	if d.Signal == Flat {
+	if d.Signal == Flat && !equityScalp {
 		t.mu.Unlock()
 		return fmt.Sprintf("FLAT [%s]", d.Reason), nil
 	}
@@ -960,10 +1000,15 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 	// Determine the side and its book
 	side := d.SignalToSide()
+	if equityScalp {
+		side = SideSell // force SELL for equity scalp add
+	}
 	book := t.book(side)
 
 	// Determine if we are opening first lot for THIS SIDE or attempting a pyramid add (side-aware).
 	isAdd := len(book.Lots) > 0 && allowPyramiding() && (d.Signal == Buy || d.Signal == Sell)
+	// --- NEW: skip pyramiding gates for equity scalp add (minimal) ---
+	skipPyramidGates := equityScalp
 
 	// --- NEW: variables to capture gate audit fields for the reason string (side-biased; no winLow) ---
 	var (
@@ -975,7 +1020,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	)
 
 	// Gating for pyramiding adds — spacing + adverse move (with optional time-decay), side-aware.
-	if isAdd {
+	if isAdd && !skipPyramidGates {
 		// Choose side-aware anchor set
 		var lastAddSide time.Time
 		if side == SideBuy {
@@ -1176,6 +1221,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		quote = t.cfg.OrderMinUSD
 	}
 	base := quote / price
+
+	// --- NEW: override sizing for equity scalp to use the entire spare base as the order size (SELL only) ---
+	if equityScalp && side == SideSell && equitySpareBase > 0 {
+		base = equitySpareBase
+		quote = base * price
+	}
 
 	// TODO: remove TRACE
 	log.Printf("TRACE sizing.pre side=%s eq=%.2f riskPct=%.4f quote=%.2f price=%.8f base=%.8f", side, t.equityUSD, riskPct, quote, price, base)
@@ -1590,13 +1641,16 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		t.winHighSell = priceToUse
 		t.latchedGateSell = 0
 	}
+	// --- NEW: capture equity snapshot at add for equity strategy trading ---
+	t.lastAddEquity = t.equityUSD
 
 	// TODO: remove TRACE
 	log.Printf("TRACE lot.open side=%s open=%.8f sizeBase=%.8f stop=%.8f take=%.8f fee=%.4f BuyLots=%d SellLots=%d",
 		side, newLot.OpenPrice, newLot.SizeBase, newLot.Stop, newLot.Take, newLot.EntryFee, len(t.book(SideBuy).Lots), len(t.book(SideSell).Lots))
 
 	// Assign/designate runner for THIS SIDE if none exists yet; otherwise this is a scalp.
-	if book.RunnerID == -1 {
+	// --- NEW: prevent runner assignment for equity scalp add (treat as scalp) ---
+	if book.RunnerID == -1 && !equityScalp {
 		book.RunnerID = len(book.Lots) - 1 // the just-added lot is the side's runner
 		// Initialize runner trailing baseline
 		r := book.Lots[book.RunnerID]
@@ -1672,6 +1726,8 @@ func (t *Trader) saveState() error {
 		WinHighSell:     t.winHighSell,
 		LatchedGateBuy:  t.latchedGateBuy,
 		LatchedGateSell: t.latchedGateSell,
+
+		LastAddEquity: t.lastAddEquity,
 	}
 	bs, err := json.MarshalIndent(st, "", " ")
 	if err != nil {
@@ -1728,6 +1784,9 @@ func (t *Trader) loadState() error {
 	t.latchedGateBuy = st.LatchedGateBuy
 	t.latchedGateSell = st.LatchedGateSell
 
+	// Equity-at-last-add snapshot
+	t.lastAddEquity = st.LastAddEquity
+
 	// Initialize runner trailing baseline for current runners if not already set
 	for _, side := range []OrderSide{SideBuy, SideSell} {
 		book := t.book(side)
@@ -1740,8 +1799,6 @@ func (t *Trader) loadState() error {
 	}
 
 	// --- Restart warmup for pyramiding decay/adverse tracking ---
-	// If we restored with open lots but have no lastAdd for a side, seed the decay clock to "now"
-	// and reset adverse trackers/latches so they rebuild over real time (prevents instant latch).
 	now := time.Now().UTC()
 	if len(t.book(SideBuy).Lots) > 0 && t.lastAddBuy.IsZero() {
 		t.lastAddBuy = now
