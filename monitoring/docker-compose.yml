@@ -44,12 +44,10 @@ services:
   bot_hitbtc:
     depends_on: [bridge_hitbtc]
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
-    entrypoint: ["sh", "-lc"]
-    command: ["stdbuf -oL -eL ./bot -live -interval 1 2>&1 | tee -a /opt/coinbase/logs/bot.log"]
+    command: ["-live", "-interval", "1"]
     volumes:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
-      - /opt/coinbase/logs:/opt/coinbase/logs
     env_file:
       - /opt/coinbase/env/bot_hitbtc.env      # broker/product/state overrides for HitBTC
     restart: unless-stopped
@@ -66,16 +64,14 @@ services:
       monitoring_network:
         aliases: [bot-hitbtc]
 
-  # NEW: second bot instance for Binance
+  # second bot instance for Binance
   bot_binance:
     depends_on: [bridge_binance]
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
-    entrypoint: ["sh", "-lc"]
-    command: ["stdbuf -oL -eL ./bot -live -interval 1 2>&1 | tee -a /opt/coinbase/logs/bot.log"]
+    command: ["-live", "-interval", "1"]
     volumes:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
-      - /opt/coinbase/logs:/opt/coinbase/logs
     env_file:
       - /opt/coinbase/env/bot_binance.env     # broker/product/state overrides for Binance
     restart: unless-stopped
@@ -94,14 +90,12 @@ services:
 
   bot:
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
-    entrypoint: ["sh", "-lc"]
-    command: ["stdbuf -oL -eL ./bot -live -interval 1 2>&1 | tee -a /opt/coinbase/logs/bot.log"]
+    command: ["-live", "-interval", "1"]
     volumes:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
-      - /opt/coinbase/logs:/opt/coinbase/logs
     env_file:
-      - /opt/coinbase/env/bot_coinbase.env    # <-- NEW: pin Coinbase broker/symbol/state
+      - /opt/coinbase/env/bot_coinbase.env
     restart: unless-stopped
     expose:
       - "8080"
