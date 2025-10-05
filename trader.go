@@ -379,6 +379,8 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 				lot.TrailActive = true
 				lot.TrailPeak = price
 				lot.TrailStop = price * (1.0 - dist/100.0)
+				// --- breadcrumb ---
+				log.Printf("TRACE trail.activate side=BUY activate_at=%.8f price=%.8f peak=%.8f stop=%.8f", activateAt, price, lot.TrailPeak, lot.TrailStop)
 			}
 		} else {
 			if price > lot.TrailPeak {
@@ -386,9 +388,13 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 				ts := lot.TrailPeak * (1.0 - dist/100.0)
 				if ts > lot.TrailStop {
 					lot.TrailStop = ts
+					// --- breadcrumb ---
+					log.Printf("TRACE trail.raise side=BUY peak=%.8f stop=%.8f", lot.TrailPeak, lot.TrailStop)
 				}
 			}
 			if price <= lot.TrailStop && lot.TrailStop > 0 {
+				// --- breadcrumb ---
+				log.Printf("TRACE trail.trigger side=BUY price=%.8f stop=%.8f", price, lot.TrailStop)
 				return true, lot.TrailStop
 			}
 		}
@@ -399,13 +405,19 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 				lot.TrailActive = true
 				lot.TrailPeak = price // trough for short
 				lot.TrailStop = price * (1.0 + dist/100.0)
+				// --- breadcrumb ---
+				log.Printf("TRACE trail.activate side=SELL activate_at=%.8f price=%.8f trough=%.8f stop=%.8f", activateAt, price, lot.TrailPeak, lot.TrailStop)
 			}
 		} else {
 			if price < lot.TrailPeak {
 				lot.TrailPeak = price
 				lot.TrailStop = lot.TrailPeak * (1.0 + dist/100.0)
+				// --- breadcrumb ---
+				log.Printf("TRACE trail.raise side=SELL trough=%.8f stop=%.8f", lot.TrailPeak, lot.TrailStop)
 			}
 			if price >= lot.TrailStop && lot.TrailStop > 0 {
+				// --- breadcrumb ---
+				log.Printf("TRACE trail.trigger side=SELL price=%.8f stop=%.8f", price, lot.TrailStop)
 				return true, lot.TrailStop
 			}
 		}
@@ -906,7 +918,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			return msg, err
 		}
 
-		log.Printf("[DEBUG] Nearest Take (BuyLots)=%.2f (SellLots)=%.2f across %d BuyLots and %d SellLots", nearestTakeBuy, nearestTakeSell, lsb, lss)
+		log.Printf("[DEBUG] Nearest Take (Close a Buy Entry at)=%.2f (Close a Sell Entry at)=%.2f across %d BuyLots and %d SellLots", nearestTakeBuy, nearestTakeSell, lsb, lss)
 	}
 
 	d := decide(c, t.model, t.mdlExt)
@@ -1033,6 +1045,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				// latch at 2*t_floor_min
 				if t.latchedGateBuy == 0 && elapsedMin >= 2.0*tFloorMin && t.winLowBuy > 0 {
 					t.latchedGateBuy = t.winLowBuy
+					// --- breadcrumb ---
+					log.Printf("[DEBUG] LATCH SET BUY: latchedGate=%.2f winLow=%.2f elapsedMin=%.1f tFloorMin=%.2f",
+						t.latchedGateBuy, t.winLowBuy, elapsedMin, tFloorMin)
 				}
 				// baseline gate: last * (1 - effPct); latched replaces baseline
 				gatePrice := last * (1.0 - effPct/100.0)
@@ -1051,6 +1066,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				// mirror for reason/log fields
 				reasonGatePrice = gatePrice
 				reasonLatched = t.latchedGateBuy
+
+				// --- breadcrumb when baseline condition met ---
+				if price <= gatePrice {
+					log.Printf("[DEBUG] pyramid: BUY baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
+						price, gatePrice, last, effPct, elapsedMin)
+				}
 
 				if !(price <= gatePrice) {
 					t.mu.Unlock()
@@ -1071,6 +1092,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 				if t.latchedGateSell == 0 && elapsedMin >= 2.0*tFloorMin && t.winHighSell > 0 {
 					t.latchedGateSell = t.winHighSell
+					// --- breadcrumb ---
+					log.Printf("[DEBUG] LATCH SET SELL: latchedGate=%.2f winHigh=%.2f elapsedMin=%.1f tFloorMin=%.2f",
+						t.latchedGateSell, t.winHighSell, elapsedMin, tFloorMin)
 				}
 				// baseline gate: last * (1.0 + effPct); latched replaces baseline
 				gatePrice := last * (1.0 + effPct/100.0)
@@ -1089,6 +1113,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				// mirror for legacy reason/log fields
 				reasonGatePrice = gatePrice
 				reasonLatched = t.latchedGateSell
+
+				// --- breadcrumb when baseline condition met ---
+				if price >= gatePrice {
+					log.Printf("[DEBUG] pyramid: SELL baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
+						price, gatePrice, last, effPct, elapsedMin)
+				}
 
 				if !(price >= gatePrice) {
 					t.mu.Unlock()
@@ -1194,6 +1224,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			spare = 0
 		}
 		if spare+spareEps < neededQuote {
+			// --- breadcrumb ---
+			log.Printf("[WARN] FUNDS_EXHAUSTED BUY need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
+				neededQuote, spare, availQuote, reservedShortQuote, qstep)
 			t.mu.Unlock()
 			log.Printf("[DEBUG] GATE BUY: need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 				neededQuote, spare, availQuote, reservedShortQuote, qstep)
@@ -1210,6 +1243,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				neededQuote = steps * qstep
 			}
 			if spare+spareEps < neededQuote {
+				// --- breadcrumb ---
+				log.Printf("[WARN] FUNDS_EXHAUSTED BUY need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
+					neededQuote, spare, availQuote, reservedShortQuote, qstep)
 				t.mu.Unlock()
 				log.Printf("[DEBUG] GATE BUY: need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 					neededQuote, spare, availQuote, reservedShortQuote, qstep)
@@ -1267,6 +1303,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			spare = 0
 		}
 		if spare+spareEps < neededBase {
+			// --- breadcrumb ---
+			log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
+				neededBase, spare, availBase, reservedLong, step)
 			t.mu.Unlock()
 			log.Printf("[DEBUG] GATE SELL: need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
 				neededBase, spare, availBase, reservedLong, step)
@@ -1292,6 +1331,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			}
 			// >>> Symmetry: re-check spare after min-notional snap <<<
 			if spare+spareEps < base {
+				// --- breadcrumb ---
+				log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
+					base, spare, availBase, reservedLong, step)
 				t.mu.Unlock()
 				log.Printf("[DEBUG] GATE SELL: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
 					base, spare, availBase, reservedLong, step)
