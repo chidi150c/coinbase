@@ -44,7 +44,8 @@ services:
   bot_hitbtc:
     depends_on: [bridge_hitbtc]
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
-    command: [ "sh", "-lc", "stdbuf -oL -eL ./bot -live -interval 1 2>&1 | tee -a /opt/coinbase/logs/bot.log" ]
+    entrypoint: ["sh", "-lc"]
+    command: ["stdbuf -oL -eL ./bot -live -interval 1 2>&1 | tee -a /opt/coinbase/logs/bot.log"]
     volumes:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
@@ -69,7 +70,8 @@ services:
   bot_binance:
     depends_on: [bridge_binance]
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
-    command: [ "sh", "-lc", "stdbuf -oL -eL ./bot -live -interval 1 2>&1 | tee -a /opt/coinbase/logs/bot.log" ]
+    entrypoint: ["sh", "-lc"]
+    command: ["stdbuf -oL -eL ./bot -live -interval 1 2>&1 | tee -a /opt/coinbase/logs/bot.log"]
     volumes:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
@@ -92,7 +94,8 @@ services:
 
   bot:
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
-    command: [ "sh", "-lc", "stdbuf -oL -eL ./bot -live -interval 1 2>&1 | tee -a /opt/coinbase/logs/bot.log" ]
+    entrypoint: ["sh", "-lc"]
+    command: ["stdbuf -oL -eL ./bot -live -interval 1 2>&1 | tee -a /opt/coinbase/logs/bot.log"]
     volumes:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
