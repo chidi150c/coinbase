@@ -86,8 +86,6 @@ type BotState struct {
 
 	// --- NEW: equity-at-last-add snapshots (SELL persisted; legacy fallback supported) ---
 	LastAddEquitySell float64
-	// Legacy field retained for fallback during load:
-	LastAddEquity float64
 	LastAddEquityBuy float64
 }
 
@@ -1570,7 +1568,6 @@ func (t *Trader) saveState() error {
 
 		// Persist SELL equity baseline; keep legacy field for older state compatibility.
 		LastAddEquitySell: t.lastAddEquitySell,
-		LastAddEquity:     0,
 		LastAddEquityBuy: t.lastAddEquityBuy,
 	}
 	bs, err := json.MarshalIndent(st, "", " ")
@@ -1628,7 +1625,7 @@ func (t *Trader) loadState() error {
 	t.latchedGateBuy = st.LatchedGateBuy
 	t.latchedGateSell = st.LatchedGateSell
 	t.lastAddEquitySell = st.LastAddEquitySell
-	t.lastAddEquityBuy = st.LastAddEquitySell
+	t.lastAddEquityBuy = st.LastAddEquityBuy
 
 	// Initialize runner trailing baseline for current runners if not already set
 	for _, side := range []OrderSide{SideBuy, SideSell} {
