@@ -982,6 +982,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			}
 		}
 	}
+	// --- NEW (minimal): BUY equity-trigger flag (does not alter sizing/side; used only for runner promotion) ---
+	equityTriggerBuy := false
+	if t.lastAddEquity > 0 && t.equityUSD >= t.lastAddEquity*1.01 {
+		equityTriggerBuy = true
+	}
+
 	log.Printf("[DEBUG] EQUITY Trading: equityUSD=%.2f lastAddEquity=%.2f pct_diff=%.6f", t.equityUSD, t.lastAddEquity, t.equityUSD/t.lastAddEquity)
 	// Long-only veto for SELL when flat; unchanged behavior (skipped if equityScalp handled above).
 	if d.Signal == Sell && t.cfg.LongOnly {
@@ -1406,7 +1412,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		stop = price * (1.0 + t.cfg.StopLossPct/100.0)
 		take = price * (1.0 - t.cfg.TakeProfitPct/100.0)
 	}
-	
+
 	if scalpTPDecayEnabled() && !(equityScalp && side == SideSell) {
 		// This is a scalp add on THIS SIDE: compute k = number of existing scalps in this side
 		k := len(book.Lots)
@@ -1668,7 +1674,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		// TODO: remove TRACE
 		log.Printf("TRACE runner.assign idx=%d open=%.8f stop=%.8f take=%.8f", book.RunnerID, r.OpenPrice, r.Stop, r.Take)
 	}
-	// (If not equityScalp, leave RunnerID unchanged so first lot is NOT the runner.)
+	// --- NEW (minimal): promote equity-triggered BUY add to runner ---
+	if equityTriggerBuy && side == SideBuy {
+		book.RunnerID = len(book.Lots) - 1
+		r := book.Lots[book.RunnerID]
+		r.TrailActive = false
+		r.TrailPeak = r.OpenPrice
+		r.TrailStop = 0
+		t.applyRunnerTargets(r)
+		log.Printf("TRACE runner.assign idx=%d open=%.8f stop=%.8f take=%.8f", book.RunnerID, r.OpenPrice, r.Stop, r.Take)
+	}
+	// (If not equityScalp/equityTriggerBuy, leave RunnerID unchanged so first lot is NOT the runner.)
 
 	// Rebuild legacy aggregate view for logs/compat
 	// t.refreshAggregateFromBooks()
@@ -1965,4 +1981,4 @@ func (t *Trader) aggregateIndexToSide(idx int) (OrderSide, int) {
 	return "", -1
 }
 
-}} with only the necessary minimal changes to implement {{promote equity-triggered BUY add to runner by setting book.RunnerID to the new BUY lot, calling applyRunnerTargets, and resetting TrailActive/TrailPeak/TrailStop}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{promote equity-triggered BUY add to runner by setting book.RunnerID to the new BUY lot, calling applyRunnerTargets, and resetting TrailActive/TrailPeak/TrailStop}}. Return the complete file, copy-paste ready, in IDE.
+}} with only the necessary minimal changes to implement {{rename lastAddEquity to lastAddEquitySell, add a BUY equity trigger that activates when equity ≤ lastAddEquityBuy0.99 using the entire spare quote for sizing and promoting the new BUY lot to runner by setting book.RunnerID, calling applyRunnerTargets, and resetting TrailActive/TrailPeak/TrailStop, update equity-triggered BUY reservedShortQuote to include fees by multiplying each short’s baseprice by (1+FEE_RATE_PCT/100), and update persistence to write LastAddEquitySell in saveState and in loadState prefer LastAddEquitySell with legacy fallback from LastAddEquity when zero.}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{rename lastAddEquity to lastAddEquitySell, add a BUY equity trigger that activates when equity ≤ lastAddEquityBuy0.99 using the entire spare quote for sizing and promoting the new BUY lot to runner by setting book.RunnerID, calling applyRunnerTargets, and resetting TrailActive/TrailPeak/TrailStop, update equity-triggered BUY reservedShortQuote to include fees by multiplying each short’s baseprice by (1+FEE_RATE_PCT/100), and update persistence to write LastAddEquitySell in saveState and in loadState prefer LastAddEquitySell with legacy fallback from LastAddEquity when zero.}}. Return the complete file, copy-paste ready, in IDE.

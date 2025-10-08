@@ -21,7 +21,7 @@ RISK_PER_TRADE_PCT=15.0          # ↑ larger quote per scalp to matter after ta
 # === Position controls ===
 ALLOW_PYRAMIDING=true
 PYRAMID_DECAY_LAMBDA=0.02
-PYRAMID_MIN_SECONDS_BETWEEN=45    # ↑ avoid over-trading in chop
+PYRAMID_MIN_SECONDS_BETWEEN=0
 PYRAMID_MIN_ADVERSE_PCT=1.5
 PYRAMID_DECAY_MIN_PCT=0.4
 MAX_CONCURRENT_LOTS=8             # ↓ fewer simultaneous scalps
@@ -31,7 +31,7 @@ SCALP_TP_DECAY_ENABLE=true
 SCALP_TP_DEC_MODE=exp
 SCALP_TP_DEC_PCT=0.20
 SCALP_TP_DECAY_FACTOR=0.9850      # ↑ slightly stronger decay on later adds
-SCALP_TP_MIN_PCT=1.8              # floor for later adds
+SCALP_TP_MIN_PCT=1.9              # floor for later adds
 
 # === Exits (TP/SL + runner trailing) ===
 TAKE_PROFIT_PCT=2.5
@@ -73,7 +73,7 @@ USE_LIVE_EQUITY=true
 # === Order entry mode ===
 ORDER_TYPE=limit                 # or "market" (default)
 LIMIT_PRICE_OFFSET_BPS=5         # 5 bps (0.05%) improvement from last/side
-SPREAD_MIN_BPS=1                 # require ≥1 bps spread to attempt maker
+SPREAD_MIN_BPS=0                 # require ≥1 bps spread to attempt maker
 LIMIT_TIMEOUT_SEC=5              # cancel-and-market after 5 seconds if not filled
 
 # === Risk ramp (side-aware) ===

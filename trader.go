@@ -84,8 +84,11 @@ type BotState struct {
 	LatchedGateBuy  float64
 	LatchedGateSell float64
 
-	// --- NEW: equity-at-last-add snapshot for equity strategy trading ---
+	// --- NEW: equity-at-last-add snapshots (SELL persisted; legacy fallback supported) ---
+	LastAddEquitySell float64
+	// Legacy field retained for fallback during load:
 	LastAddEquity float64
+	LastAddEquityBuy float64
 }
 
 type Trader struct {
@@ -120,8 +123,9 @@ type Trader struct {
 	latchedGateBuy  float64
 	latchedGateSell float64
 
-	// --- NEW: equity-at-last-add snapshot for equity strategy trading ---
-	lastAddEquity float64
+	// --- NEW: equity-at-last-add snapshots for equity strategy trading ---
+	lastAddEquitySell float64 // replaces legacy lastAddEquity (SELL path)
+	lastAddEquityBuy  float64 // BUY-side dip trigger baseline (not persisted)
 
 	// daily
 	dailyStart time.Time
@@ -314,42 +318,6 @@ func (t *Trader) latestEntryBySide(side OrderSide) float64 {
 	return book.Lots[len(book.Lots)-1].OpenPrice
 }
 
-// // aggregateOpen sets t.pos to the latest lot (for legacy reads) or nil.
-// // Also rebuilds legacy t.lots and runnerIdx from the authoritative books.
-// func (t *Trader) aggregateOpen() {
-// 	t.refreshAggregateFromBooks()
-// }
-
-// // --- NEW: rebuild legacy aggregate view & runner index from books ---
-// func (t *Trader) refreshAggregateFromBooks() {
-// 	var agg []*Position
-// 	rIdx := -1
-// 	// Flatten BUY first then SELL for deterministic legacy indexing.
-// 	if b := t.books[SideBuy]; b != nil {
-// 		for i, p := range b.Lots {
-// 			if b.RunnerID == i && rIdx == -1 {
-// 				rIdx = len(agg) // runner position in aggregate
-// 			}
-// 			agg = append(agg, p)
-// 		}
-// 	}
-// 	if s := t.books[SideSell]; s != nil {
-// 		for i, p := range s.Lots {
-// 			if s.RunnerID == i && rIdx == -1 {
-// 				rIdx = len(agg)
-// 			}
-// 			agg = append(agg, p)
-// 		}
-// 	}
-// 	t.lots = agg
-// 	t.runnerIdx = rIdx
-// 	if len(agg) == 0 {
-// 		t.pos = nil
-// 	} else {
-// 		t.pos = agg[len(agg)-1]
-// 	}
-// }
-
 // applyRunnerTargets adjusts stop/take for the designated runner lot.
 func (t *Trader) applyRunnerTargets(p *Position) {
 	if p == nil {
@@ -443,193 +411,6 @@ func (t *Trader) book(side OrderSide) *SideBook {
 
 // --- NEW: side-aware lot closing (no global index) ---
 func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, localIdx int, exitReason string) (string, error) {
-	book := t.book(side)
-	price := c[len(c)-1].Close
-	lot := book.Lots[localIdx]
-	closeSide := SideSell
-	if lot.Side == SideSell {
-		closeSide = SideBuy
-	}
-	baseRequested := lot.SizeBase
-	quote := baseRequested * price
-
-	// unlock for I/O
-	t.mu.Unlock()
-	var placed *PlacedOrder
-	if !t.cfg.DryRun {
-		// TODO: remove TRACE
-		log.Printf("TRACE order.close request side=%s baseReq=%.8f quoteEst=%.2f priceSnap=%.8f", closeSide, baseRequested, quote, price)
-		var err error
-		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote)
-		if err != nil {
-			if t.cfg.Extended().UseDirectSlack {
-				postSlack(fmt.Sprintf("ERR step: %v", err))
-			}
-			// Re-lock before returning so caller's Unlock matches.
-			t.mu.Lock()
-			return "", fmt.Errorf("close order failed: %w", err)
-		}
-		// TODO: remove TRACE
-		if placed != nil {
-			log.Printf("TRACE order.close placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
-				placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
-		}
-		mtxOrders.WithLabelValues("live", string(closeSide)).Inc()
-	}
-	// re-lock
-	t.mu.Lock()
-
-	// --- NEW: check if the lot being closed is the most recent add for that side ---
-	wasNewest := (localIdx == len(book.Lots)-1)
-
-	// --- MINIMAL CHANGE: use actual filled size/price if available ---
-	priceExec := c[len(c)-1].Close
-	baseFilled := baseRequested
-	if placed != nil {
-		if placed.Price > 0 {
-			priceExec = placed.Price
-		}
-		if placed.BaseSize > 0 {
-			baseFilled = placed.BaseSize
-		}
-		// Log WARN on partial fill (filled < requested) with a small tolerance.
-		const tol = 1e-9
-		if baseFilled+tol < baseRequested {
-			log.Printf("[WARN] partial fill (exit): requested_base=%.8f filled_base=%.8f (%.2f%%)",
-				baseRequested, baseFilled, 100.0*(baseFilled/baseRequested))
-			// TODO: remove TRACE
-			log.Printf("TRACE fill.exit partial requested=%.8f filled=%.8f", baseRequested, baseFilled)
-		}
-	}
-	// refresh price snapshot (best-effort) if no execution price was available
-	if placed == nil || placed.Price <= 0 {
-		priceExec = c[len(c)-1].Close
-	}
-
-	// compute P/L using actual fill size and execution price
-	pl := (priceExec - lot.OpenPrice) * baseFilled
-	if lot.Side == SideSell {
-		pl = (lot.OpenPrice - priceExec) * baseFilled
-	}
-
-	// apply exit fee; prefer broker-provided commission if present ---
-	quoteExec := baseFilled * priceExec
-	feeRate := t.cfg.FeeRatePct
-	exitFee := quoteExec * (feeRate / 100.0)
-	if placed != nil {
-		if placed.CommissionUSD > 0 {
-			exitFee = placed.CommissionUSD
-		} else {
-			log.Printf("[WARN] commission missing (exit); falling back to FEE_RATE_PCT=%.4f%%", feeRate)
-		}
-	}
-	pl -= lot.EntryFee // subtract entry fee recorded
-	pl -= exitFee      // subtract exit fee now
-
-	// --- TRACE: classification breakdown ---
-	rawPL := func() float64 {
-		// raw (price move only), before fees:
-		if lot.Side == SideBuy {
-			return (priceExec - lot.OpenPrice) * baseFilled
-		}
-		return (lot.OpenPrice - priceExec) * baseFilled
-	}()
-	kind := "scalp"
-	if book.RunnerID == localIdx {
-		kind = "runner"
-	}
-	log.Printf("TRACE exit.classify side=%s kind=%s reason=%s open=%.8f exec=%.8f baseFilled=%.8f rawPL=%.6f entryFee=%.6f exitFee=%.6f finalPL=%.6f",
-		lot.Side, kind, exitReason, lot.OpenPrice, priceExec, baseFilled, rawPL, lot.EntryFee, exitFee, pl)
-
-	t.dailyPnL += pl
-	t.equityUSD += pl
-
-	// --- NEW: increment win/loss trades ---
-	if pl >= 0 {
-		mtxTrades.WithLabelValues("win").Inc()
-	} else {
-		mtxTrades.WithLabelValues("loss").Inc()
-	}
-
-	// Normalize/sanitize reason and side label for metrics
-	reasonLbl := exitReason
-	if reasonLbl == "" {
-		reasonLbl = "other"
-	}
-	sideLbl := "buy"
-	if lot.Side == SideSell {
-		sideLbl = "sell"
-	}
-	mtxExitReasons.WithLabelValues(reasonLbl, sideLbl).Inc()
-
-	// Track if we removed the runner and adjust book.RunnerID accordingly after removal.
-	removedWasRunner := (localIdx == book.RunnerID)
-
-	// remove lot at localIdx
-	book.Lots = append(book.Lots[:localIdx], book.Lots[localIdx+1:]...)
-
-	// shift RunnerID if needed
-	if book.RunnerID >= 0 {
-		if localIdx < book.RunnerID {
-			book.RunnerID-- // slice shifted left
-		} else if localIdx == book.RunnerID {
-			// runner removed; promote the NEWEST remaining lot (if any) to runner
-			if len(book.Lots) > 0 {
-				book.RunnerID = len(book.Lots) - 1
-				// reset trailing fields for the newly promoted runner
-				nr := book.Lots[book.RunnerID]
-				nr.TrailActive = false
-				nr.TrailPeak = nr.OpenPrice
-				nr.TrailStop = 0
-				// also re-apply runner targets (keeps existing behavior)
-				t.applyRunnerTargets(nr)
-			} else {
-				book.RunnerID = -1
-			}
-		}
-	}
-
-	// --- if the closed lot was the most recent add FOR THAT SIDE, re-anchor pyramiding timers/state ---
-	if wasNewest {
-		now := time.Now().UTC()
-		if lot.Side == SideBuy {
-			t.lastAddBuy = now
-			t.winLowBuy = 0
-			t.latchedGateBuy = 0
-		} else {
-			t.lastAddSell = now
-			t.winHighSell = 0
-			t.latchedGateSell = 0
-		}
-	}
-
-	// Include reason in message for operator visibility
-	msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
-		c[len(c)-1].Time.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, lot.EntryFee+exitFee)
-	if t.cfg.Extended().UseDirectSlack {
-		postSlack(msg)
-	}
-	// persist new state
-	if err := t.saveState(); err != nil {
-		log.Printf("[WARN] saveState: %v", err)
-		// TODO: remove TRACE
-		log.Printf("TRACE state.save error=%v", err)
-	}
-
-	_ = removedWasRunner // kept to emphasize runner path; no extra logs.
-	return msg, nil
-}
-
-// closeLotAtIndex closes a single lot at global aggregate idx (assumes mutex held), performing I/O unlocked.
-// exitReason is a short label for logs: "take_profit" | "stop_loss" | "trailing_stop" (or other).
-func (t *Trader) closeLotAtIndex(ctx context.Context, c []Candle, idx int, exitReason string) (string, error) {
-	// Map aggregate index to (side, local index)
-	side, localIdx := t.aggregateIndexToSide(idx)
-	if side == "" {
-		// fallback if mapping fails (shouldn't happen)
-		side = SideBuy
-		localIdx = idx
-	}
 	book := t.book(side)
 	price := c[len(c)-1].Close
 	lot := book.Lots[localIdx]
@@ -948,10 +729,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		}
 	}
 
-	// --- NEW (minimal): equity strategy trigger detection (SELL scalp add of entire spare base)
-	equityScalp := false
+	// --- NEW (minimal): equity strategy trigger detection (SELL runner add of entire spare base)
+	equityTriggerSell := false
 	var equitySpareBase float64
-	if t.lastAddEquity > 0 && t.equityUSD >= t.lastAddEquity*1.01 {
+	if t.lastAddEquitySell > 0 && t.equityUSD >= t.lastAddEquitySell*1.01 {
 		// Only proceed if not long-only; respect existing guard
 		if t.cfg.LongOnly {
 			t.mu.Unlock()
@@ -976,39 +757,73 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			if spare > 0 {
 				equitySpareBase = math.Floor(spare/step) * step
 				if equitySpareBase > 0 {
-					equityScalp = true
+					equityTriggerSell = true
 				}
 			}
 		}
 	}
-	log.Printf("[DEBUG] EQUITY Trading: equityUSD=%.2f lastAddEquity=%.2f pct_diff=%.6f", t.equityUSD, t.lastAddEquity, t.equityUSD/t.lastAddEquity)
-	// Long-only veto for SELL when flat; unchanged behavior (skipped if equityScalp handled above).
+
+	// --- NEW (minimal): BUY equity-trigger flag ---(Buy runner of entire spare quote on dip)
+	equityTriggerBuy := false
+	var equitySpareQuote float64
+	if t.lastAddEquityBuy > 0 && t.equityUSD <= t.lastAddEquityBuy*0.99 {
+		// reserve quote needed to close all SELL lots at current price INCLUDING FEES
+		var reservedShortQuote float64
+		feeMult := 1.0 + (t.cfg.FeeRatePct / 100.0)
+		if sb := t.book(SideSell); sb != nil {
+			for _, lot := range sb.Lots {
+				// include fees in quote needed to close shorts
+				reservedShortQuote += (lot.SizeBase * price) * feeMult
+			}
+		}
+		// Ask broker for quote availability/step
+		sym, availQuote, qstep, err := t.broker.GetAvailableQuote(ctx, t.cfg.ProductID)
+		_ = sym
+		if err == nil && qstep > 0 {
+			spare := availQuote - reservedShortQuote
+			if spare < 0 {
+				spare = 0
+			}
+			if spare > 0 {
+				equitySpareQuote = math.Floor(spare/qstep) * qstep
+				if equitySpareQuote > 0 {
+					equityTriggerBuy = true
+				}
+			}
+		}
+	}
+
+	log.Printf("[DEBUG] EQUITY Trading: equityUSD=%.2f lastAddEquitySell=%.2f pct_diff_sell=%.6f lastAddEquityBuy=%.2f pct_diff_buy=%.6f v", t.equityUSD, t.lastAddEquitySell, t.equityUSD/t.lastAddEquitySell, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy)
+	// Long-only veto for SELL when flat; unchanged behavior.
 	if d.Signal == Sell && t.cfg.LongOnly {
 		t.mu.Unlock()
 		return fmt.Sprintf("FLAT (long-only) [%s]", d.Reason), nil
 	}
-	if d.Signal == Flat && !equityScalp {
+	if d.Signal == Flat && !equityTriggerSell && !equityTriggerBuy {
 		t.mu.Unlock()
 		return fmt.Sprintf("FLAT [%s]", d.Reason), nil
 	}
 
 	// Respect lot cap (both sides)
-	if (lsb + lss) >= maxConcurrentLots() {
+	if (lsb + lss) >= maxConcurrentLots() && !((equityTriggerBuy && d.Signal == Buy) || (equityTriggerSell && d.Signal == Sell)) {
 		t.mu.Unlock()
 		log.Printf("[DEBUG] lot cap reached (%d); HOLD", maxConcurrentLots())
 		return "HOLD", nil
 	}
 	// Determine the side and its book
 	side := d.SignalToSide()
-	if equityScalp {
+	if equityTriggerSell {
 		side = SideSell // force SELL for equity scalp add
+	}
+	if equityTriggerBuy {
+		side = SideBuy // force BUY for equity dip runner
 	}
 	book := t.book(side)
 
 	// Determine if we are opening first lot for THIS SIDE or attempting a pyramid add (side-aware).
 	isAdd := len(book.Lots) > 0 && allowPyramiding() && (d.Signal == Buy || d.Signal == Sell)
-	// --- NEW: skip pyramiding gates for equity scalp add (minimal) ---
-	skipPyramidGates := equityScalp
+	// --- NEW: skip pyramiding gates for equity-triggered paths (minimal) ---
+	skipPyramidGates := equityTriggerSell || equityTriggerBuy
 
 	// --- NEW: variables to capture gate audit fields for the reason string (side-biased; no winLow) ---
 	var (
@@ -1030,13 +845,13 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		}
 
 		// 1) Spacing
-		s := pyramidMinSeconds()
+		psb := pyramidMinSeconds()
 		// TODO: remove TRACE
-		log.Printf("TRACE pyramid.spacing since_last=%.1fs need>=%ds", time.Since(lastAddSide).Seconds(), s)
-		if time.Since(lastAddSide) < time.Duration(s)*time.Second {
+		log.Printf("TRACE pyramid.spacing since_last=%.1fs need>=%ds", time.Since(lastAddSide).Seconds(), psb)
+		if time.Since(lastAddSide) < time.Duration(psb)*time.Second {
 			t.mu.Unlock()
 			hrs := time.Since(lastAddSide).Hours()
-			log.Printf("[DEBUG] pyramid: blocked by spacing; since_last=%vHours need>=%ds", fmt.Sprintf("%.1f", hrs), s)
+			log.Printf("[DEBUG] pyramid: blocked by spacing; since_last=%vHours need>=%ds", fmt.Sprintf("%.1f", hrs), psb)
 			return "HOLD", nil
 		}
 
@@ -1223,9 +1038,14 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	base := quote / price
 
 	// --- NEW: override sizing for equity scalp to use the entire spare base as the order size (SELL only) ---
-	if equityScalp && side == SideSell && equitySpareBase > 0 {
+	if equityTriggerSell && side == SideSell && equitySpareBase > 0 {
 		base = equitySpareBase
 		quote = base * price
+	}
+	// --- NEW: override sizing for BUY equity dip to use entire spare quote ---
+	if equityTriggerBuy && side == SideBuy && equitySpareQuote > 0 {
+		quote = equitySpareQuote
+		base = quote / price
 	}
 
 	// TODO: remove TRACE
@@ -1405,8 +1225,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		stop = price * (1.0 + t.cfg.StopLossPct/100.0)
 		take = price * (1.0 - t.cfg.TakeProfitPct/100.0)
 	}
-	
-	if scalpTPDecayEnabled() && !(equityScalp && side == SideSell) {
+
+	if scalpTPDecayEnabled() && !((equityTriggerBuy && side == SideBuy) || (equityTriggerSell && side == SideSell)) {
 		// This is a scalp add on THIS SIDE: compute k = number of existing scalps in this side
 		k := len(book.Lots)
 		if book.RunnerID >= 0 && book.RunnerID < len(book.Lots) {
@@ -1630,10 +1450,16 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		t.winHighSell = priceToUse
 		t.latchedGateSell = 0
 	}
-	// --- NEW: capture equity snapshot at add for equity strategy trading ---
-	old := t.lastAddEquity
-	t.lastAddEquity = t.equityUSD
-	log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquity)
+	// --- NEW: capture equity snapshots at add (side-specific) ---
+	if side == SideSell {
+		old := t.lastAddEquitySell
+		t.lastAddEquitySell = t.equityUSD
+		log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquitySell)
+	} else {
+		old := t.lastAddEquityBuy
+		t.lastAddEquityBuy = t.equityUSD
+		log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquityBuy)
+	}
 
 	// gross PnL at take
 	pnlGross := (newLot.Take - newLot.OpenPrice) * newLot.SizeBase
@@ -1655,7 +1481,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// Assign/designate runner logic
 	// --- CHANGED: Do NOT auto-assign runner for first/non-equity lots; instead,
 	//               promote the equity-triggered lot to runner immediately.
-	if equityScalp && side == SideSell {
+	if equityTriggerSell && side == SideSell {
 		book.RunnerID = len(book.Lots) - 1 // promote the equity trade lot to runner
 		r := book.Lots[book.RunnerID]
 		// Initialize/Reset trailing fields for the new runner
@@ -1664,10 +1490,19 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		r.TrailStop = 0
 		// Apply runner targets (stretched TP)
 		t.applyRunnerTargets(r)
-		// TODO: remove TRACE
-		log.Printf("TRACE runner.assign idx=%d open=%.8f stop=%.8f take=%.8f", book.RunnerID, r.OpenPrice, r.Stop, r.Take)
+		log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f stop=%.8f take=%.8f", book.RunnerID, side, r.OpenPrice, r.Stop, r.Take)
 	}
-	// (If not equityScalp, leave RunnerID unchanged so first lot is NOT the runner.)
+	// --- NEW (minimal): promote equity-triggered BUY add to runner ---
+	if equityTriggerBuy && side == SideBuy {
+		book.RunnerID = len(book.Lots) - 1
+		r := book.Lots[book.RunnerID]
+		r.TrailActive = false
+		r.TrailPeak = r.OpenPrice
+		r.TrailStop = 0
+		t.applyRunnerTargets(r)
+		log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f stop=%.8f take=%.8f", book.RunnerID, side, r.OpenPrice, r.Stop, r.Take)
+	}
+	// (If not equityTriggerSell/equityTriggerBuy, leave RunnerID unchanged so first lot is NOT the runner.)
 
 	// Rebuild legacy aggregate view for logs/compat
 	// t.refreshAggregateFromBooks()
@@ -1733,7 +1568,10 @@ func (t *Trader) saveState() error {
 		LatchedGateBuy:  t.latchedGateBuy,
 		LatchedGateSell: t.latchedGateSell,
 
-		LastAddEquity: t.lastAddEquity,
+		// Persist SELL equity baseline; keep legacy field for older state compatibility.
+		LastAddEquitySell: t.lastAddEquitySell,
+		LastAddEquity:     0,
+		LastAddEquityBuy: t.lastAddEquityBuy,
 	}
 	bs, err := json.MarshalIndent(st, "", " ")
 	if err != nil {
@@ -1789,9 +1627,14 @@ func (t *Trader) loadState() error {
 	t.winHighSell = st.WinHighSell
 	t.latchedGateBuy = st.LatchedGateBuy
 	t.latchedGateSell = st.LatchedGateSell
-
-	// Equity-at-last-add snapshot
-	t.lastAddEquity = st.LastAddEquity
+	t.lastAddEquityBuy = st.LastAddEquityBuy
+	// Equity baselines:
+	// Prefer new SELL baseline; if zero, fallback to legacy LastAddEquity for backward compatibility.
+	if st.LastAddEquitySell > 0 {
+		t.lastAddEquitySell = st.LastAddEquitySell
+	} else if st.LastAddEquity > 0 {
+		t.lastAddEquitySell = st.LastAddEquity
+	}
 
 	// Initialize runner trailing baseline for current runners if not already set
 	for _, side := range []OrderSide{SideBuy, SideSell} {
