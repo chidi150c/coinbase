@@ -1627,14 +1627,8 @@ func (t *Trader) loadState() error {
 	t.winHighSell = st.WinHighSell
 	t.latchedGateBuy = st.LatchedGateBuy
 	t.latchedGateSell = st.LatchedGateSell
-	t.lastAddEquityBuy = st.LastAddEquityBuy
-	// Equity baselines:
-	// Prefer new SELL baseline; if zero, fallback to legacy LastAddEquity for backward compatibility.
-	if st.LastAddEquitySell > 0 {
-		t.lastAddEquitySell = st.LastAddEquitySell
-	} else if st.LastAddEquity > 0 {
-		t.lastAddEquitySell = st.LastAddEquity
-	}
+	t.lastAddEquitySell = st.LastAddEquitySell
+	t.lastAddEquityBuy = st.LastAddEquitySell
 
 	// Initialize runner trailing baseline for current runners if not already set
 	for _, side := range []OrderSide{SideBuy, SideSell} {
