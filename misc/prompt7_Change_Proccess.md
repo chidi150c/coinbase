@@ -1406,20 +1406,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		stop = price * (1.0 + t.cfg.StopLossPct/100.0)
 		take = price * (1.0 - t.cfg.TakeProfitPct/100.0)
 	}
-
-	// Decide if this new entry will be the runner FOR THIS SIDE.
-	// --- CHANGED: Disable "first-lot becomes runner" behavior (keep false) ---
-	willBeRunner := false
-	if willBeRunner {
-		// (kept for compatibility; will never execute as willBeRunner=false)
-		if side == SideBuy {
-			stop = price * (1.0 - (t.cfg.StopLossPct*runnerStopMult)/100.0)
-			take = price * (1.0 + (t.cfg.TakeProfitPct*runnerTPMult)/100.0)
-		} else {
-			stop = price * (1.0 + (t.cfg.StopLossPct*runnerStopMult)/100.0)
-			take = price * (1.0 - (t.cfg.TakeProfitPct*runnerTPMult)/100.0)
-		}
-	} else if scalpTPDecayEnabled() {
+	
+	if scalpTPDecayEnabled() && !(equityScalp && side == SideSell) {
 		// This is a scalp add on THIS SIDE: compute k = number of existing scalps in this side
 		k := len(book.Lots)
 		if book.RunnerID >= 0 && book.RunnerID < len(book.Lots) {
@@ -1645,30 +1633,30 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 	// --- NEW: capture equity snapshot at add for equity strategy trading ---
 	old := t.lastAddEquity
-    t.lastAddEquity = t.equityUSD
-    log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquity)
+	t.lastAddEquity = t.equityUSD
+	log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquity)
 
 	// gross PnL at take
-    pnlGross := (newLot.Take - newLot.OpenPrice) * newLot.SizeBase
-    if side == SideSell {
-        pnlGross = (newLot.OpenPrice - newLot.Take) * newLot.SizeBase
-    }
+	pnlGross := (newLot.Take - newLot.OpenPrice) * newLot.SizeBase
+	if side == SideSell {
+		pnlGross = (newLot.OpenPrice - newLot.Take) * newLot.SizeBase
+	}
 	// TODO: remove TRACE
 	log.Printf("TRACE lot.open side=%s open=%.8f sizeBase=%.8f stop=%.8f take=%.8f fee=%.4f BuyLots=%d SellLots=%d",
 		side, newLot.OpenPrice, newLot.SizeBase, newLot.Stop, newLot.Take, newLot.EntryFee, len(t.book(SideBuy).Lots), len(t.book(SideSell).Lots))
 
-    // estimate exit fee using configured fee rate (we only know take price, not future commission)
-    estExitFee := (newLot.SizeBase * newLot.Take) * (feeRate / 100.0)
+	// estimate exit fee using configured fee rate (we only know take price, not future commission)
+	estExitFee := (newLot.SizeBase * newLot.Take) * (feeRate / 100.0)
 
-    pnlNet := pnlGross - newLot.EntryFee - estExitFee
+	pnlNet := pnlGross - newLot.EntryFee - estExitFee
 
-    log.Printf("TRACE lot.take_pnl_est side=%s open=%.8f take=%.8f base=%.8f gross=%.6f fees(entry+exit)=%.6f+%.6f net=%.6f",
-        side, newLot.OpenPrice, newLot.Take, newLot.SizeBase, pnlGross, newLot.EntryFee, estExitFee, pnlNet)
+	log.Printf("TRACE lot.take_pnl_est side=%s open=%.8f take=%.8f base=%.8f gross=%.6f fees(entry+exit)=%.6f+%.6f net=%.6f",
+		side, newLot.OpenPrice, newLot.Take, newLot.SizeBase, pnlGross, newLot.EntryFee, estExitFee, pnlNet)
 
 	// Assign/designate runner logic
 	// --- CHANGED: Do NOT auto-assign runner for first/non-equity lots; instead,
 	//               promote the equity-triggered lot to runner immediately.
-	if equityScalp {
+	if equityScalp && side == SideSell {
 		book.RunnerID = len(book.Lots) - 1 // promote the equity trade lot to runner
 		r := book.Lots[book.RunnerID]
 		// Initialize/Reset trailing fields for the new runner
@@ -1977,4 +1965,4 @@ func (t *Trader) aggregateIndexToSide(idx int) (OrderSide, int) {
 	return "", -1
 }
 
-}} with only the necessary minimal changes to implement {{promote equity-triggered SELL add to runner by assigning book.RunnerID to the new lot, applying runner targets via applyRunnerTargets, and resetting trailing fields instead of treating it as a scalp}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{promote equity-triggered SELL add to runner by assigning book.RunnerID to the new lot, applying runner targets via applyRunnerTargets, and resetting trailing fields instead of treating it as a scalp}}. Return the complete file, copy-paste ready, in IDE.
+}} with only the necessary minimal changes to implement {{promote equity-triggered BUY add to runner by setting book.RunnerID to the new BUY lot, calling applyRunnerTargets, and resetting TrailActive/TrailPeak/TrailStop}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{promote equity-triggered BUY add to runner by setting book.RunnerID to the new BUY lot, calling applyRunnerTargets, and resetting TrailActive/TrailPeak/TrailStop}}. Return the complete file, copy-paste ready, in IDE.
