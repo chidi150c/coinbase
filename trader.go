@@ -1406,10 +1406,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		take = price * (1.0 - t.cfg.TakeProfitPct/100.0)
 	}
 
-	// Decide if this new entry will be the runner FOR THIS SIDE (only when there is no existing runner in the side).
-	willBeRunner := (book.RunnerID == -1 && len(book.Lots) == 0)
+	// Decide if this new entry will be the runner FOR THIS SIDE.
+	// --- CHANGED: Disable "first-lot becomes runner" behavior (keep false) ---
+	willBeRunner := false
 	if willBeRunner {
-		// Stretch runner targets without introducing new env keys.
+		// (kept for compatibility; will never execute as willBeRunner=false)
 		if side == SideBuy {
 			stop = price * (1.0 - (t.cfg.StopLossPct*runnerStopMult)/100.0)
 			take = price * (1.0 + (t.cfg.TakeProfitPct*runnerTPMult)/100.0)
@@ -1642,26 +1643,43 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		t.latchedGateSell = 0
 	}
 	// --- NEW: capture equity snapshot at add for equity strategy trading ---
-	t.lastAddEquity = t.equityUSD
+	old := t.lastAddEquity
+    t.lastAddEquity = t.equityUSD
+    log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquity)
 
+	// gross PnL at take
+    pnlGross := (newLot.Take - newLot.OpenPrice) * newLot.SizeBase
+    if side == SideSell {
+        pnlGross = (newLot.OpenPrice - newLot.Take) * newLot.SizeBase
+    }
 	// TODO: remove TRACE
 	log.Printf("TRACE lot.open side=%s open=%.8f sizeBase=%.8f stop=%.8f take=%.8f fee=%.4f BuyLots=%d SellLots=%d",
 		side, newLot.OpenPrice, newLot.SizeBase, newLot.Stop, newLot.Take, newLot.EntryFee, len(t.book(SideBuy).Lots), len(t.book(SideSell).Lots))
 
-	// Assign/designate runner for THIS SIDE if none exists yet; otherwise this is a scalp.
-	// --- NEW: prevent runner assignment for equity scalp add (treat as scalp) ---
-	if book.RunnerID == -1 && !equityScalp {
-		book.RunnerID = len(book.Lots) - 1 // the just-added lot is the side's runner
-		// Initialize runner trailing baseline
+    // estimate exit fee using configured fee rate (we only know take price, not future commission)
+    estExitFee := (newLot.SizeBase * newLot.Take) * (feeRate / 100.0)
+
+    pnlNet := pnlGross - newLot.EntryFee - estExitFee
+
+    log.Printf("TRACE lot.take_pnl_est side=%s open=%.8f take=%.8f base=%.8f gross=%.6f fees(entry+exit)=%.6f+%.6f net=%.6f",
+        side, newLot.OpenPrice, newLot.Take, newLot.SizeBase, pnlGross, newLot.EntryFee, estExitFee, pnlNet)
+
+	// Assign/designate runner logic
+	// --- CHANGED: Do NOT auto-assign runner for first/non-equity lots; instead,
+	//               promote the equity-triggered lot to runner immediately.
+	if equityScalp {
+		book.RunnerID = len(book.Lots) - 1 // promote the equity trade lot to runner
 		r := book.Lots[book.RunnerID]
+		// Initialize/Reset trailing fields for the new runner
 		r.TrailActive = false
 		r.TrailPeak = r.OpenPrice
 		r.TrailStop = 0
-		// Ensure runner's stretched targets are applied (baseline behavior for runner).
+		// Apply runner targets (stretched TP)
 		t.applyRunnerTargets(r)
 		// TODO: remove TRACE
 		log.Printf("TRACE runner.assign idx=%d open=%.8f stop=%.8f take=%.8f", book.RunnerID, r.OpenPrice, r.Stop, r.Take)
 	}
+	// (If not equityScalp, leave RunnerID unchanged so first lot is NOT the runner.)
 
 	// Rebuild legacy aggregate view for logs/compat
 	// t.refreshAggregateFromBooks()

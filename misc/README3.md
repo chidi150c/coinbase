@@ -146,7 +146,7 @@ nohup bash -c \
 # Coinbase
 nohup bash -c \
 "docker compose logs -f --no-color bot \
- | grep -E --line-buffered 'pyramid\.baseline\.met|pyramid\.latch\.set|trail\.(activate|raise|trigger)|\[WARN\] FUNDS_EXHAUSTED' \
+ | grep -E --line-buffered '(pyramid: .*baseline met|pyramid\.latch\.set|trail\.(activate|raise|trigger)|\[WARN\] FUNDS_EXHAUSTED|equity\.baseline\.set|lot\.take_pnl_est|runner\.assign)' \
  >> /opt/coinbase/logs/audit/coinbase_audit.log 2>&1" &
 
 
