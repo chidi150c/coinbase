@@ -418,6 +418,15 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	}
 	baseRequested := lot.SizeBase
 	quote := baseRequested * price
+	// --- Guard: skip close if quote is below our policy floor (exchange-agnostic) ---
+	notional := quote
+	if notional < t.cfg.OrderMinUSD {
+		log.Printf("[CLOSE-SKIP] notional %.2f < ORDER_MIN_USD %.2f; deferring close", notional, t.cfg.OrderMinUSD)
+		msg := fmt.Sprintf("EXIT-SKIP %s notional=%.2f < min=%.2f reason=%s",
+			c[len(c)-1].Time.Format(time.RFC3339), notional, t.cfg.OrderMinUSD, exitReason)
+		return msg, nil
+	}
+
 
 	// unlock for I/O
 	t.mu.Unlock()

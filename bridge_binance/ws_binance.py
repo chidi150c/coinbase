@@ -5,6 +5,7 @@ import os, asyncio, json, time, hmac, hashlib, logging
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 from urllib import request as urlreq, parse as urlparse
+from urllib.error import HTTPError
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query, Path, Body
@@ -96,6 +97,19 @@ def _binance_signed(path: str, params: Dict[str,str]) -> Dict:
         except Exception:
             raise HTTPException(status_code=500, detail="Invalid JSON from Binance")
 
+def _hint_for_binance_error(code, msg):
+    try:
+        c = int(code) if code is not None else None
+    except Exception:
+        c = None
+    if c == -1013:
+        return "Order notional or quantity violates symbol filters (MIN_NOTIONAL/LOT_SIZE); increase size or round qty."
+    if c == -2010:
+        return "Insufficient balance; reduce order size or add funds."
+    if c == -1021:
+        return "Timestamp outside recvWindow; sync system clock or increase BINANCE_RECV_WINDOW."
+    return "See binance_code/binance_msg for details."
+
 def _binance_signed_post(path: str, params: Dict[str,str]) -> Dict:
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         raise HTTPException(status_code=401, detail="Missing BINANCE_API_KEY/SECRET")
@@ -106,14 +120,32 @@ def _binance_signed_post(path: str, params: Dict[str,str]) -> Dict:
     sig = hmac.new(BINANCE_API_SECRET.encode("utf-8"), q.encode("utf-8"), hashlib.sha256).hexdigest()
     url = f"{BINANCE_BASE_URL}{path}?{q}&signature={sig}"
     req = urlreq.Request(url, method="POST", headers={"X-MBX-APIKEY": BINANCE_API_KEY})
-    with urlreq.urlopen(req, timeout=10) as resp:
-        body = resp.read().decode("utf-8")
-        if resp.status != 200:
-            raise HTTPException(status_code=resp.status, detail=body[:200])
+    try:
+        with urlreq.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8")
+            if resp.status != 200:
+                raise HTTPException(status_code=resp.status, detail=body[:200])
+            try:
+                return json.loads(body)
+            except Exception:
+                raise HTTPException(status_code=500, detail="Invalid JSON from Binance")
+    except HTTPError as e:
+        # Attempt to parse Binance JSON error and surface as a 400 with structured detail
+        raw = ""
         try:
-            return json.loads(body)
+            raw = e.read().decode("utf-8", "ignore")
+            payload = json.loads(raw) if raw else {}
         except Exception:
-            raise HTTPException(status_code=500, detail="Invalid JSON from Binance")
+            payload = {}
+        detail = {
+            "exchange": "binance",
+            "endpoint": path,
+            "http_status": e.code,
+            "binance_code": payload.get("code"),
+            "binance_msg": payload.get("msg"),
+            "hint": _hint_for_binance_error(payload.get("code"), payload.get("msg")),
+        }
+        raise HTTPException(status_code=400, detail=detail)
 
 def _binance_signed_delete(path: str, params: Dict[str,str]) -> Dict:
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
