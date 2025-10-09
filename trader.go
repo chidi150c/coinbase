@@ -421,9 +421,10 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	// --- Guard: skip close if quote is below our policy floor (exchange-agnostic) ---
 	notional := quote
 	if notional < t.cfg.OrderMinUSD {
-		log.Printf("[CLOSE-SKIP] notional %.2f < ORDER_MIN_USD %.2f; deferring close", notional, t.cfg.OrderMinUSD)
-		msg := fmt.Sprintf("EXIT-SKIP %s notional=%.2f < min=%.2f reason=%s",
-			c[len(c)-1].Time.Format(time.RFC3339), notional, t.cfg.OrderMinUSD, exitReason)
+		log.Printf("[CLOSE-SKIP] lotSide=%s closeSide=%s base=%.8f price=%.2f notional=%.2f < ORDER_MIN_USD %.2f; deferring",
+		lot.Side, closeSide, baseRequested, price, notional, t.cfg.OrderMinUSD)
+		msg := fmt.Sprintf("EXIT-SKIP %s side=%s→%s notional=%.2f < min=%.2f reason=%s",
+			c[len(c)-1].Time.Format(time.RFC3339), lot.Side, closeSide, notional, t.cfg.OrderMinUSD, exitReason)
 		return msg, nil
 	}
 
@@ -712,7 +713,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			return msg, err
 		}
 
-		log.Printf("[DEBUG] Nearest Take (Close a Buy Entry at)=%.2f (Close a Sell Entry at)=%.2f across %d BuyLots and %d SellLots", nearestTakeBuy, nearestTakeSell, lsb, lss)
+		log.Printf("[DEBUG] Nearest Take (to close a buy lot)=%.2f, (to close a sell lot)=%.2f, across %d BuyLots, and %d SellLots", nearestTakeBuy, nearestTakeSell, lsb, lss)
 	}
 
 	d := decide(c, t.model, t.mdlExt)
