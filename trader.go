@@ -652,6 +652,20 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if i == book.RunnerID {
 					if trigger, tstop := t.updateRunnerTrail(lot, price); trigger {
 						lot.Stop = tstop
+						// --- MINIMAL CHANGE: skip trailing-stop close if notional < ORDER_MIN_USD and CONTINUE ---
+						closeSide := SideSell
+						if lot.Side == SideSell {
+							closeSide = SideBuy
+						}
+						notional := lot.SizeBase * price
+						if notional < t.cfg.OrderMinUSD {
+							log.Printf("[CLOSE-SKIP] lotSide=%s closeSide=%s base=%.8f price=%.2f notional=%.2f < ORDER_MIN_USD %.2f; deferring",
+								lot.Side, closeSide, lot.SizeBase, price, notional, t.cfg.OrderMinUSD)
+							// Do NOT return; continue normal step flow so decision(...) still runs.
+							i++
+							continue
+						}
+						// -------------------------------------------------------------------------------
 						msg, err := t.closeLot(ctx, c, side, i, "trailing_stop")
 						if err != nil {
 							t.mu.Unlock()
