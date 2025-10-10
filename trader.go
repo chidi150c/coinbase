@@ -361,12 +361,12 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 				if ts > lot.TrailStop {
 					lot.TrailStop = ts
 					// --- breadcrumb ---
-					log.Printf("TRACE trail.raise side=BUY peak=%.8f stop=%.8f", lot.TrailPeak, lot.TrailStop)
+					log.Printf("TRACE trail.raise lotSide=BUY peak=%.8f stop=%.8f", lot.TrailPeak, lot.TrailStop)
 				}
 			}
 			if price <= lot.TrailStop && lot.TrailStop > 0 {
 				// --- breadcrumb ---
-				log.Printf("TRACE trail.trigger side=BUY price=%.8f stop=%.8f", price, lot.TrailStop)
+				log.Printf("TRACE trail.trigger lotSide=BUY price=%.8f stop=%.8f", price, lot.TrailStop)
 				return true, lot.TrailStop
 			}
 		}
@@ -385,11 +385,11 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 				lot.TrailPeak = price
 				lot.TrailStop = lot.TrailPeak * (1.0 + dist/100.0)
 				// --- breadcrumb ---
-				log.Printf("TRACE trail.raise side=SELL trough=%.8f stop=%.8f", lot.TrailPeak, lot.TrailStop)
+				log.Printf("TRACE trail.raise lotSide=SELL trough=%.8f stop=%.8f", lot.TrailPeak, lot.TrailStop)
 			}
 			if price >= lot.TrailStop && lot.TrailStop > 0 {
 				// --- breadcrumb ---
-				log.Printf("TRACE trail.trigger side=SELL price=%.8f stop=%.8f", price, lot.TrailStop)
+				log.Printf("TRACE trail.trigger lotSide=SELL price=%.8f stop=%.8f", price, lot.TrailStop)
 				return true, lot.TrailStop
 			}
 		}
@@ -665,7 +665,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 							i++
 							continue
 						}
-						// -------------------------------------------------------------------------------
+						
 						msg, err := t.closeLot(ctx, c, side, i, "trailing_stop")
 						if err != nil {
 							t.mu.Unlock()
@@ -730,6 +730,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		log.Printf("[DEBUG] Nearest Take (to close a buy lot)=%.2f, (to close a sell lot)=%.2f, across %d BuyLots, and %d SellLots", nearestTakeBuy, nearestTakeSell, lsb, lss)
 	}
 
+	//---ADD path continues-----
 	d := decide(c, t.model, t.mdlExt)
 	totalLots := lsb + lss
 	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v",
@@ -826,10 +827,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		return fmt.Sprintf("FLAT [%s]", d.Reason), nil
 	}
 
-	// Respect lot cap (both sides)
+	// GATE1 Respect lot cap (both sides)
 	if (lsb + lss) >= maxConcurrentLots() && !((equityTriggerBuy && d.Signal == Buy) || (equityTriggerSell && d.Signal == Sell)) {
 		t.mu.Unlock()
-		log.Printf("[DEBUG] lot cap reached (%d); HOLD", maxConcurrentLots())
+		log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", maxConcurrentLots())
 		return "HOLD", nil
 	}
 	// Determine the side and its book
@@ -842,7 +843,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 	book := t.book(side)
 
-	// Determine if we are opening first lot for THIS SIDE or attempting a pyramid add (side-aware).
+	// Determine if we are opening equity triggered trade or attempting a pyramid add (side-aware).
 	isAdd := len(book.Lots) > 0 && allowPyramiding() && (d.Signal == Buy || d.Signal == Sell)
 	// --- NEW: skip pyramiding gates for equity-triggered paths (minimal) ---
 	skipPyramidGates := equityTriggerSell || equityTriggerBuy
@@ -856,7 +857,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		reasonElapsedHr float64
 	)
 
-	// Gating for pyramiding adds — spacing + adverse move (with optional time-decay), side-aware.
+	// GATE2 Gating for pyramiding adds — spacing + adverse move (with optional time-decay), side-aware.
 	if isAdd && !skipPyramidGates {
 		// Choose side-aware anchor set
 		var lastAddSide time.Time
@@ -873,7 +874,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		if time.Since(lastAddSide) < time.Duration(psb)*time.Second {
 			t.mu.Unlock()
 			hrs := time.Since(lastAddSide).Hours()
-			log.Printf("[DEBUG] pyramid: blocked by spacing; since_last=%vHours need>=%ds", fmt.Sprintf("%.1f", hrs), psb)
+			log.Printf("[DEBUG] GATE2 pyramid: blocked by spacing; since_last=%vHours need>=%ds", fmt.Sprintf("%.1f", hrs), psb)
 			return "HOLD", nil
 		}
 
@@ -1437,7 +1438,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --- NEW: side-biased Lot reason (without winLow) ---
 	d = decide(c, t.model, t.mdlExt) // for reason payload reuse
 	var gatesReason string
-	if side == SideBuy {
+	// --- NEW: override sizing for equity scalp to use the entire spare base as the order size (SELL only) ---
+	if equityTriggerSell && side == SideSell && equitySpareBase > 0 {
+		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquitySell=%.2f pct_diff_sell=%.6f equitySpareBase=%.8f ", t.equityUSD, t.lastAddEquitySell, t.equityUSD/t.lastAddEquitySell, equitySpareBase)
+	}else if equityTriggerBuy && side == SideBuy && equitySpareQuote > 0 {
+		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquityBuy=%.2f pct_diff_buy=%.6f equitySpareQuote=%.2f", t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, equitySpareQuote)
+	}else if side == SideBuy {
 		gatesReason = fmt.Sprintf(
 			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|PriceDownGoingUp=%v|LowBottom=%v",
 			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr,

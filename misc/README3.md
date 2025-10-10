@@ -70,7 +70,8 @@ docker compose logs -f --since "15m" bot_hitbtc \
 | GREP_COLOR='01;32' grep --line-buffered -E --color=always 'MA Signalled|Decision=(BUY|SELL)|LIVE ORDER|^PAPER|^EXIT|reason=|entry_reason=|$' \
 | GREP_COLOR='01;36' grep --line-buffered -E --color=always 'pUp=|gatePrice=|latched=|effPct=|basePct=|elapsedHr=|HighPeak=|PriceDownGoingUp=|LowBottom=|PriceUpGoingDown=|$' \
 | GREP_COLOR='01;35' grep --line-buffered -E --color=always 'TRACE exit\.classify|$' \
-| GREP_COLOR='01;31' grep --line-buffered -E --color=always 'pyramid: blocked|GATE (BUY|SELL)|partial fill|commission missing|ERR step|$'
+| GREP_COLOR='01;31' grep --line-buffered -E --color=always 'lot cap reached|pyramid: blocked|GATE (BUY|SELL)|partial fill|commission missing|ERR step|$'
+
 
 
 
@@ -78,14 +79,16 @@ docker compose logs -f --since "15m" bot_binance \
 | GREP_COLOR='01;32' grep --line-buffered -E --color=always 'MA Signalled|Decision=(BUY|SELL)|LIVE ORDER|^PAPER|^EXIT|reason=|entry_reason=|$' \
 | GREP_COLOR='01;36' grep --line-buffered -E --color=always 'pUp=|gatePrice=|latched=|effPct=|basePct=|elapsedHr=|HighPeak=|PriceDownGoingUp=|LowBottom=|PriceUpGoingDown=|$' \
 | GREP_COLOR='01;35' grep --line-buffered -E --color=always 'TRACE exit\.classify|$' \
-| GREP_COLOR='01;31' grep --line-buffered -E --color=always 'pyramid: blocked|GATE (BUY|SELL)|partial fill|commission missing|ERR step|$'
+| GREP_COLOR='01;31' grep --line-buffered -E --color=always 'lot cap reached|pyramid: blocked|GATE (BUY|SELL)|partial fill|commission missing|ERR step|$'
+
 
 
 docker compose logs -f --since "15m" bot \
 | GREP_COLOR='01;32' grep --line-buffered -E --color=always 'MA Signalled|Decision=(BUY|SELL)|LIVE ORDER|^PAPER|^EXIT|reason=|entry_reason=|$' \
 | GREP_COLOR='01;36' grep --line-buffered -E --color=always 'pUp=|gatePrice=|latched=|effPct=|basePct=|elapsedHr=|HighPeak=|PriceDownGoingUp=|LowBottom=|PriceUpGoingDown=|$' \
 | GREP_COLOR='01;35' grep --line-buffered -E --color=always 'TRACE exit\.classify|$' \
-| GREP_COLOR='01;31' grep --line-buffered -E --color=always 'pyramid: blocked|GATE (BUY|SELL)|partial fill|commission missing|ERR step|$'
+| GREP_COLOR='01;31' grep --line-buffered -E --color=always 'lot cap reached|pyramid: blocked|GATE (BUY|SELL)|partial fill|commission missing|ERR step|$'
+
 
 
 =====================================================
@@ -129,13 +132,17 @@ nohup bash -c 'docker compose logs -f --no-color bot_hitbtc  >> /opt/coinbase/lo
 nohup bash -c 'docker compose logs -f --no-color bot         >> /opt/coinbase/logs/bot_coinbase.log 2>&1' &
 
 =========================================================================================================
+# Capturing into logs for later veiwing 
 mkdir -p /opt/coinbase/logs/audit
 
 # Binance
-nohup bash -c \
-"docker compose logs -f --no-color bot_binance \
- | grep -E --line-buffered 'pyramid\.baseline\.met|pyramid\.latch\.set|trail\.(activate|raise|trigger)|\[WARN\] FUNDS_EXHAUSTED' \
- >> /opt/coinbase/logs/audit/binance_audit.log 2>&1" &
+nohup bash -c '
+  cd /home/chidi/coinbase/monitoring &&
+  exec docker compose logs -f --no-color bot_binance |
+  grep -E --line-buffered -A5 -B5 "(pyramid: .*baseline met|pyramid\.latch\.set|trail\.(activate|raise|trigger)|\[WARN\] FUNDS_EXHAUSTED|equity\.baseline\.set|lot\.take_pnl_est|runner\.assign|panic:|runtime error:|fatal error|SIGSEGV|stack trace|level=error|ERROR|FATAL|panic recovered)" \
+  >> /opt/coinbase/logs/audit/binance_audit.log 2>&1
+' >/dev/null 2>&1 &
+disown
 
 # HitBTC
 nohup bash -c \
@@ -144,10 +151,97 @@ nohup bash -c \
  >> /opt/coinbase/logs/audit/hitbtc_audit.log 2>&1" &
 
 # Coinbase
-nohup bash -c \
-"docker compose logs -f --no-color bot \
- | grep -E --line-buffered '(pyramid: .*baseline met|pyramid\.latch\.set|trail\.(activate|raise|trigger)|\[WARN\] FUNDS_EXHAUSTED|equity\.baseline\.set|lot\.take_pnl_est|runner\.assign)' \
- >> /opt/coinbase/logs/audit/coinbase_audit.log 2>&1" &
+nohup bash -c '
+  cd /home/chidi/coinbase/monitoring &&
+  exec docker compose logs -f --no-color bot |
+  grep -E --line-buffered -A5 -B5 "(pyramid: .*baseline met|pyramid\.latch\.set|trail\.(activate|raise|trigger)|\[WARN\] FUNDS_EXHAUSTED|equity\.baseline\.set|lot\.take_pnl_est|runner\.assign|panic:|runtime error:|fatal error|SIGSEGV|stack trace|level=error|ERROR|FATAL|panic recovered)" \
+  >> /opt/coinbase/logs/audit/coinbase_audit.log 2>&1
+' >/dev/null 2>&1 &
+disown
+
+# Here are handy one-liners you can stash and reuse (all work with your audit-grep):
+
+# Core patterns (Coinbase)
+
+# Trailing activity with context:
+
+audit-grep coinbase 'trail\.(activate|raise|trigger)' -n -A2 -B2
+
+
+# Funding + min-notional skips (highlighted):
+
+audit-grep coinbase 'FUNDS_EXHAUSTED|CLOSE-SKIP' -n --color
+
+# Runner assignment + TP/PNL estimates:
+
+audit-grep coinbase 'runner\.assign|lot\.take_pnl_est' -n -A1
+
+
+# Pyramid gates (baseline met + latch set):
+
+audit-grep coinbase 'pyramid: .*baseline met|pyramid\.latch\.set' -n -B1
+
+# Equity baseline updates:
+
+audit-grep coinbase 'equity\.baseline\.set' -n
+
+# Errors / crashes
+
+# Hard errors & panics with 5 lines of context:
+
+audit-grep coinbase 'panic:|runtime error:|fatal error|SIGSEGV|stack trace|level=error|ERROR|FATAL|panic recovered' -n -A5 -B5 --color
+
+# Side/exit specifics
+
+# Exit reasons (take_profit / stop_loss / trailing_stop):
+
+audit-grep coinbase 'EXIT .*reason=(take_profit|stop_loss|trailing_stop)' -n
+
+# Close-skip with notional details:
+
+# audit-grep coinbase '\[CLOSE-SKIP\].*notional=.*< ORDER_MIN_USD' -n
+
+# Time-scoped quick filters (rough by minute)
+
+# Look at a specific minute (e.g., 2025-10-10T09:45):
+
+audit-grep coinbase '2025-10-10T09:45' -n
+
+# Case-insensitive scans / summaries
+
+# Case-insensitive scan for “hold” decisions with counts:
+
+audit-grep coinbase '^\S+ HOLD$' -ni | wc -l
+
+
+# Count each exit reason frequency:
+
+audit-grep coinbase 'EXIT .*reason=' -n \
+  | sed -n 's/.*reason=\(\w\+\).*/\1/p' \
+  | sort | uniq -c | sort -nr
+
+# Last-N style peeks
+
+# Show last 50 trailing events across archives:
+
+audit-grep coinbase 'trail\.(activate|raise|trigger)' -n | tail -50
+
+
+# Last 100 equity/PNL signals:
+
+audit-grep coinbase 'equity\.baseline\.set|lot\.take_pnl_est' -n | tail -100
+
+# Swap service target
+
+# Just replace coinbase with binance or hitbtc, e.g.:
+
+audit-grep binance 'FUNDS_EXHAUSTED|CLOSE-SKIP' -n --color
+audit-grep hitbtc  'runner\.assign|lot\.take_pnl_est' -n -A1
+
+
+If you want, I can bundle these into a tiny cheat-sheet file under /usr/local/share/audit-grep-examples.txt for quick copy/paste later.
+
+Thinking
 
 
 
