@@ -6,24 +6,24 @@
 #   Take an investment fund amount and service (coinbase|binance|hitbtc), then:
 #     1) Poll the bot state file every second until EquityUSD increases by ~<amount> (±tolerance).
 #     2) Stop the docker compose service.
-#     3) Increase LastAddEquitySell by <amount> in the state file (with a backup).
+#     3) Increase LastAddEquitySell AND LastAddEquityBuy by <amount> in the state file (with a backup).
 #     4) Show updated values and ask to restart the service.
 #
-# Quick usage (after you copy this into /usr/local/bin and make executable):
-#   sudo install -m 0755 ./tools/equity-wait-and-apply.sh /usr/local/bin/equity-wait-and-apply.sh
+# Quick usage:
+#   sudo install -m 0755 /home/chidi/coinbase/tools/equity-wait-and-apply.sh /usr/local/bin/equity-wait-and-apply.sh
 #   equity-wait-and-apply.sh 200 coinbase
 #
 # Options:
 #   equity-wait-and-apply.sh <amount> <coinbase|binance|hitbtc> [state_file] [--tolerance 1.0] [--timeout 0]
 #
 # Notes:
-#   - Uses JSON keys with proper case: EquityUSD and LastAddEquitySell.
+#   - Uses JSON keys with proper case: EquityUSD, LastAddEquitySell, LastAddEquityBuy.
 #   - Default tolerance is ±1.0; default timeout is 0 (no timeout).
 #   - Auto-elevates to root so it can stop services and edit files under /opt/coinbase/state/.
 
 set -Eeuo pipefail
 
-# --- auto-elevate to root for file edits and docker compose control ---
+# --- auto-elevate to root ---
 if [[ $EUID -ne 0 ]]; then
   exec sudo /bin/bash "$0" "$@"
 fi
@@ -56,7 +56,7 @@ usage() {
 Usage: $0 <amount> <coinbase|binance|hitbtc> [state_file] [--tolerance 1.0] [--timeout 0]
 
 Waits until EquityUSD increases by approximately <amount> (±tolerance),
-then stops the service, increases LastAddEquitySell by <amount>, and prompts to restart.
+then stops the service, increases LastAddEquitySell and LastAddEquityBuy by <amount>, and prompts to restart.
 
 Examples:
   $0 200 coinbase
@@ -98,7 +98,7 @@ if ! command -v docker >/dev/null; then
 fi
 
 compose_cmd() {
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  if docker compose version >/dev/null 2>&1; then
     echo "docker compose"
   elif command -v docker-compose >/dev/null 2>&1; then
     echo "docker-compose"
@@ -142,7 +142,6 @@ while true; do
     if [[ "$within" == "yes" ]]; then
       echo -e "\nTarget met: EquityUSD in band [${TARGET_LOW}, ${TARGET_HIGH}] (current=${CUR_EQ})"
       break
-    end_if=true
     fi
   fi
 
@@ -159,19 +158,22 @@ pushd "$COMPOSE_DIR" >/dev/null
 $COMPOSE_BIN stop "$COMPOSE_SVC"
 popd >/dev/null
 
-# --- Apply LastAddEquitySell += AMOUNT ---
-echo "Updating LastAddEquitySell += ${AMOUNT} in ${STATE_FILE}"
+# --- Apply LastAddEquitySell += AMOUNT and LastAddEquityBuy += AMOUNT ---
+echo "Updating LastAddEquitySell and LastAddEquityBuy by +${AMOUNT} in ${STATE_FILE}"
 cp -a "$STATE_FILE" "${STATE_FILE}.bak.$(date +%Y%m%d%H%M%S)"
 
-# If key is missing/null, coalesce to 0 before adding.
-edit_json_inplace "$STATE_FILE" ".LastAddEquitySell = ((.LastAddEquitySell // 0) + (${AMOUNT}|tonumber))"
+edit_json_inplace "$STATE_FILE" \
+  ".LastAddEquitySell = ((.LastAddEquitySell // 0) + (${AMOUNT}|tonumber)) |
+   .LastAddEquityBuy  = ((.LastAddEquityBuy  // 0) + (${AMOUNT}|tonumber))"
 
 NEW_EQ="$(read_json_key "$STATE_FILE" "EquityUSD" || true)"
 NEW_LAES="$(read_json_key "$STATE_FILE" "LastAddEquitySell" || true)"
+NEW_LAEB="$(read_json_key "$STATE_FILE" "LastAddEquityBuy"  || true)"
 
 echo "Updated values:"
-echo "  EquityUSD:          ${NEW_EQ}"
-echo "  LastAddEquitySell:  ${NEW_LAES}"
+echo "  EquityUSD:           ${NEW_EQ}"
+echo "  LastAddEquitySell:   ${NEW_LAES}"
+echo "  LastAddEquityBuy:    ${NEW_LAEB}"
 
 # --- Prompt restart ---
 read -r -p "Restart service '${COMPOSE_SVC}' now? [y/N]: " ans
