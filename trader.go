@@ -1442,7 +1442,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	if equityTriggerSell && side == SideSell && equitySpareBase > 0 {
 		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquitySell=%.2f pct_diff_sell=%.6f equitySpareBase=%.8f ", t.equityUSD, t.lastAddEquitySell, t.equityUSD/t.lastAddEquitySell, equitySpareBase)
 	}else if equityTriggerBuy && side == SideBuy && equitySpareQuote > 0 {
-		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquityBuy=%.2f pct_diff_buy=%.6f equitySpareQuote=%.2f", t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, equitySpareQuote)
+		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquityBuy=%.2f pct_diff_buy=%.6f equitySpareQuote=%.2f",  t.equityUSD, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, equitySpareQuote)
 	}else if side == SideBuy {
 		gatesReason = fmt.Sprintf(
 			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|PriceDownGoingUp=%v|LowBottom=%v",
