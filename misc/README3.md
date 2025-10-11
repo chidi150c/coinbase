@@ -237,11 +237,53 @@ audit-grep coinbase 'equity\.baseline\.set|lot\.take_pnl_est' -n | tail -100
 
 audit-grep binance 'FUNDS_EXHAUSTED|CLOSE-SKIP' -n --color
 audit-grep hitbtc  'runner\.assign|lot\.take_pnl_est' -n -A1
+===============================================================================
+# BACK UP RESTORE
+# 0) Paths (adjust if yours differ)
+STATE_DIR="/opt/coinbase/state"
+STATE="${STATE_DIR}/bot_state.newcoinbase.json"
 
+# 1) Stop the service before touching state
+cd /home/chidi/coinbase/monitoring
+docker compose stop bot
 
-If you want, I can bundle these into a tiny cheat-sheet file under /usr/local/share/audit-grep-examples.txt for quick copy/paste later.
+# 2) See what backups you have (script-made backups look like *.bak.YYYYMMDDHHMMSS)
+ls -lt ${STATE}.bak* 2>/dev/null || true
+# If none show up, list other probable backups you had earlier:
+ls -lt ${STATE_DIR}/bot_state.*coinbase*.json* 2>/dev/null || true
+ls -lt ${STATE_DIR}/backup/ 2>/dev/null || true
 
-Thinking
+# 3) Pick the backup you want to restore (EDIT THIS to the correct file from the listing)
+BK="$(ls -t ${STATE}.bak.* 2>/dev/null | head -n1)"
+
+# If the above didn't find one, manually set BK to a known-good backup, e.g.:
+# BK="/opt/coinbase/state/bot_state.coinbase.json.bak"
+# BK="/opt/coinbase/state/bot_state.coinbase.json.pre-restore.2025-09-29T19:51:33-05:00"
+
+# Make sure BK is set
+[[ -n "$BK" && -r "$BK" ]] || { echo "Backup not found or unreadable: $BK"; exit 1; }
+echo "Restoring from: $BK"
+
+# 4) Quick sanity on backup (lots present? keys look right?)
+jq -r '.EquityUSD, .LastAddEquitySell, .LastAddEquityBuy' "$BK"
+jq -r '((.BookBuy.lots // [])|length) as $b | ((.BookSell.lots // [])|length) as $s | "BookBuy.lots=\($b)  BookSell.lots=\($s)"' "$BK"
+
+# 5) Snapshot the CURRENT (bad) file before overwrite
+sudo cp -a "$STATE" "${STATE}.bad.$(date +%Y%m%d%H%M%S)"
+
+# 6) Restore the backup, ensuring ownership 65532:65532
+sudo install -m 0644 -o 65532 -g 65532 "$BK" "$STATE"
+
+# 7) Verify restored values
+jq -r '.EquityUSD, .LastAddEquitySell, .LastAddEquityBuy' "$STATE"
+jq -r '((.BookBuy.lots // [])|length) as $b | ((.BookSell.lots // [])|length) as $s | "BookBuy.lots=\($b)  BookSell.lots=\($s)"' "$STATE"
+
+# 8) If everything looks correct, start the service again
+docker compose start bot
+
+# 9) Watch it come up
+docker compose logs -f --no-color bot | sed -u -n '1,120p'
+================================================================================================
 
 
 

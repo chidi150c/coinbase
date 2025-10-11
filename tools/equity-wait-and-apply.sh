@@ -1,24 +1,36 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # equity-wait-and-apply.sh
-# ---
-# Wait until EquityUSD increases by <amount> (±tolerance), then stop the service,
-# update LastAddEquitySell and LastAddEquityBuy by +<amount>, and (optionally) restart.
 #
-# Usage:
+# Purpose:
+#   Take an investment fund amount and service (coinbase|binance|hitbtc), then:
+#     1) Poll the bot state file every second until EquityUSD increases by ~<amount> (±tolerance).
+#     2) Stop the docker compose service.
+#     3) Increase LastAddEquitySell AND LastAddEquityBuy by <amount> in the state file (with a backup).
+#     4) Show updated values and ask to restart the service.
+#
+# Quick usage:
+#   sudo install -m 0755 ./tools/equity-wait-and-apply.sh /usr/local/bin/equity-wait-and-apply.sh
+#   equity-wait-and-apply.sh 200 coinbase
+#
+# Options:
 #   equity-wait-and-apply.sh <amount> <coinbase|binance|hitbtc> [state_file] [--tolerance 1.0] [--timeout 0]
 #
-# Example:
-#   equity-wait-and-apply.sh 50 coinbase
-#
-# Install (later):
-#   sudo install -m 0755 ./tools/equity-wait-and-apply.sh /usr/local/bin/equity-wait-and-apply.sh
+# Notes:
+#   - Uses JSON keys with proper case: EquityUSD, LastAddEquitySell, LastAddEquityBuy.
+#   - Default tolerance is ±1.0; default timeout is 0 (no timeout).
+#   - Auto-elevates to root so it can stop services and edit files under /opt/coinbase/state/.
 
 set -Eeuo pipefail
 
-# Where docker-compose.yml lives
+# --- auto-elevate to root ---
+if [[ $EUID -ne 0 ]]; then
+  exec sudo /bin/bash "$0" "$@"
+fi
+
+# --- PATHS / SETTINGS ---
 COMPOSE_DIR="/home/chidi/coinbase/monitoring"
 
-# Map service -> docker compose service name
+# Map service name -> docker compose service
 svc_compose() {
   case "$1" in
     coinbase) echo "bot" ;;
@@ -28,7 +40,7 @@ svc_compose() {
   esac
 }
 
-# Map service -> default state file (your bot uses *.new*.json)
+# Map service name -> default state file path
 svc_statefile() {
   case "$1" in
     coinbase) echo "/opt/coinbase/state/bot_state.newcoinbase.json" ;;
@@ -43,11 +55,10 @@ usage() {
 Usage: $0 <amount> <coinbase|binance|hitbtc> [state_file] [--tolerance 1.0] [--timeout 0]
 
 Waits until EquityUSD increases by approximately <amount> (±tolerance),
-then stops the service, increases LastAddEquitySell and LastAddEquityBuy by <amount>,
-and prompts to restart.
+then stops the service, increases LastAddEquitySell and LastAddEquityBuy by <amount>, and prompts to restart.
 
 Examples:
-  $0 50 coinbase
+  $0 200 coinbase
   $0 50 binance /opt/coinbase/state/bot_state.newbinance.json --tolerance 0.5 --timeout 600
 EOF
   exit 1
@@ -81,40 +92,42 @@ done
 
 # --- Requirements ---
 command -v jq >/dev/null || { echo "jq is required (sudo apt-get install -y jq)"; exit 3; }
-command -v docker >/dev/null || { echo "docker is required"; exit 3; }
-command -v awk >/dev/null || { echo "awk is required"; exit 3; }
-
-# Prefer docker compose plugin if present, else docker-compose
-if command -v docker compose >/dev/null 2>&1; then
-  COMPOSE_CMD="docker compose"
-elif command -v docker-compose >/dev/null 2>&1; then
-  COMPOSE_CMD="docker-compose"
-else
-  echo "docker compose plugin (or docker-compose) required"
-  exit 3
+if ! command -v docker >/dev/null; then
+  echo "docker is required"; exit 3
 fi
+
+compose_cmd() {
+  if docker compose version >/dev/null 2>&1; then
+    echo "docker compose"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    echo "docker-compose"
+  else
+    echo ""
+  fi
+}
+COMPOSE_BIN="$(compose_cmd)"
+[[ -z "$COMPOSE_BIN" ]] && { echo "docker compose plugin (or docker-compose) required"; exit 3; }
 
 # --- Helpers ---
 read_json_key() { jq -r ".$2 // empty" "$1"; }
 
-edit_json_inplace_preserve_meta() {
-  # Write via temp, then restore owner/perms and atomically move over
-  local file="$1" expr="$2" tmp owner group mode
-  owner=$(stat -c '%u' "$file")
-  group=$(stat -c '%g' "$file")
-  mode=$(stat -c '%a' "$file")
-  tmp="$(mktemp --suffix=.json "$(dirname "$file")/.$(basename "$file").XXXX")"
-  jq "$expr" "$file" > "$tmp"
-  # Restore metadata before replace
-  chown "$owner:$group" "$tmp"
-  chmod "$mode" "$tmp"
+# Minimal change: write via temp, set ownership (65532:65532), then mv to preserve original ownership for the bot user.
+edit_json_inplace() {
+  local file="$1" expr="$2" tmp
+  tmp="$(mktemp "${file}.XXXX")"
+  jq "${expr}" "$file" >"$tmp"
+  chown 65532:65532 "$tmp"
   mv -f "$tmp" "$file"
-  sync
+}
+
+# Helper to count lots (treats null/missing as zero)
+lots_count() {
+  local file="$1" side="$2"
+  jq -r "((.${side}.lots // []) | length)" "$file"
 }
 
 # --- Validate & baseline ---
 [[ -r "$STATE_FILE" ]] || { echo "State file not readable: $STATE_FILE"; exit 4; }
-
 BASE_EQ="$(read_json_key "$STATE_FILE" "EquityUSD")"
 [[ -n "$BASE_EQ" ]] || { echo "EquityUSD not found in $STATE_FILE"; exit 5; }
 
@@ -147,27 +160,21 @@ while true; do
   sleep 1
 done
 
+# Capture pre-edit lots counts for sanity check (minimal change to enforce restart safety)
+PRE_BUY_LOTS="$(lots_count "$STATE_FILE" "BookBuy")"
+PRE_SELL_LOTS="$(lots_count "$STATE_FILE" "BookSell")"
+
 # --- Stop service ---
 echo "Stopping service: ${COMPOSE_SVC}"
 pushd "$COMPOSE_DIR" >/dev/null
-$COMPOSE_CMD stop "$COMPOSE_SVC"
+$COMPOSE_BIN stop "$COMPOSE_SVC"
 popd >/dev/null
 
-# --- Backup (preserve owner/perms) ---
-ts="$(date +%Y%m%d%H%M%S)"
-owner=$(stat -c '%u' "$STATE_FILE")
-group=$(stat -c '%g' "$STATE_FILE")
-mode=$(stat -c '%a' "$STATE_FILE")
-backup="${STATE_FILE}.bak.${ts}"
-
-cp -a "$STATE_FILE" "$backup" || { echo "Backup failed (need permissions?). Aborting."; exit 7; }
-chown "$owner:$group" "$backup"
-chmod "$mode" "$backup"
-echo "Backup created: $backup"
-
-# --- Apply both bumps ---
+# --- Apply LastAddEquitySell += AMOUNT and LastAddEquityBuy += AMOUNT ---
 echo "Updating LastAddEquitySell and LastAddEquityBuy by +${AMOUNT} in ${STATE_FILE}"
-edit_json_inplace_preserve_meta "$STATE_FILE" \
+cp -a "$STATE_FILE" "${STATE_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+
+edit_json_inplace "$STATE_FILE" \
   ".LastAddEquitySell = ((.LastAddEquitySell // 0) + (${AMOUNT}|tonumber)) |
    .LastAddEquityBuy  = ((.LastAddEquityBuy  // 0) + (${AMOUNT}|tonumber))"
 
@@ -180,16 +187,34 @@ echo "  EquityUSD:           ${NEW_EQ}"
 echo "  LastAddEquitySell:   ${NEW_LAES}"
 echo "  LastAddEquityBuy:    ${NEW_LAEB}"
 
+# Minimal change: re-check lots after edit; abort restart if non-zero -> zero drop detected.
+POST_BUY_LOTS="$(lots_count "$STATE_FILE" "BookBuy")"
+POST_SELL_LOTS="$(lots_count "$STATE_FILE" "BookSell")"
+
+ABORT_RESTART="no"
+if { [[ "$PRE_BUY_LOTS" =~ ^[1-9][0-9]*$ ]] && [[ "$POST_BUY_LOTS" == "0" ]]; } || \
+   { [[ "$PRE_SELL_LOTS" =~ ^[1-9][0-9]*$ ]] && [[ "$POST_SELL_LOTS" == "0" ]]; }; then
+  echo "WARNING: Detected lots drop from non-zero to zero (BookBuy: ${PRE_BUY_LOTS}→${POST_BUY_LOTS}, BookSell: ${PRE_SELL_LOTS}→${POST_SELL_LOTS})."
+  echo "Aborting automatic restart to prevent strategy reset. Inspect ${STATE_FILE} and backups before starting the service."
+  ABORT_RESTART="yes"
+fi
+
 # --- Prompt restart ---
+if [[ "$ABORT_RESTART" == "yes" ]]; then
+  echo "Service NOT restarted. Start later with:"
+  echo "  (cd ${COMPOSE_DIR} && $COMPOSE_BIN start ${COMPOSE_SVC})"
+  exit 0
+fi
+
 read -r -p "Restart service '${COMPOSE_SVC}' now? [y/N]: " ans
 if [[ "${ans}" =~ ^[Yy]$ ]]; then
   pushd "$COMPOSE_DIR" >/dev/null
-  $COMPOSE_CMD start "$COMPOSE_SVC"
+  $COMPOSE_BIN start "$COMPOSE_SVC"
   popd >/dev/null
   echo "Service restarted."
 else
   echo "Service NOT restarted. Start later with:"
-  echo "  (cd ${COMPOSE_DIR} && $COMPOSE_CMD start ${COMPOSE_SVC})"
+  echo "  (cd ${COMPOSE_DIR} && $COMPOSE_BIN start ${COMPOSE_SVC})"
 fi
 
 

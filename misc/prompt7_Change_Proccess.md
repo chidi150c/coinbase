@@ -1,169 +1,190 @@
 Generate a full copy of {{
-// FILE: config.go
-// Package main – Runtime configuration model and loader.
-//
-// This file defines the Config struct (all the knobs your bot uses) and a
-// helper to populate it from environment variables. The .env file is read
-// by loadBotEnv() (see env.go), so you can tune behavior without exports.
-//
-// Typical flow (see main.go):
-//   loadBotEnv()
-//   initThresholdsFromEnv()
-//   cfg := loadConfigFromEnv()
-package main
+	#!/bin/bash
+# equity-wait-and-apply.sh
+#
+# Purpose:
+#   Take an investment fund amount and service (coinbase|binance|hitbtc), then:
+#     1) Poll the bot state file every second until EquityUSD increases by ~<amount> (±tolerance).
+#     2) Stop the docker compose service.
+#     3) Increase LastAddEquitySell AND LastAddEquityBuy by <amount> in the state file (with a backup).
+#     4) Show updated values and ask to restart the service.
+#
+# Quick usage:
+#   sudo install -m 0755 ./tools/equity-wait-and-apply.sh /usr/local/bin/equity-wait-and-apply.sh
+#   equity-wait-and-apply.sh 200 coinbase
+#
+# Options:
+#   equity-wait-and-apply.sh <amount> <coinbase|binance|hitbtc> [state_file] [--tolerance 1.0] [--timeout 0]
+#
+# Notes:
+#   - Uses JSON keys with proper case: EquityUSD, LastAddEquitySell, LastAddEquityBuy.
+#   - Default tolerance is ±1.0; default timeout is 0 (no timeout).
+#   - Auto-elevates to root so it can stop services and edit files under /opt/coinbase/state/.
 
-// NOTE: All knobs here are now read from UNPREFIXED env keys. Broker-specific
-// API creds remain broker-prefixed (e.g., BINANCE_API_KEY/SECRET, HITBTC_API_KEY/SECRET)
-// and are consumed by the respective broker clients, not here.
+set -Eeuo pipefail
 
-import "strings"
+# --- auto-elevate to root ---
+if [[ $EUID -ne 0 ]]; then
+  exec sudo /bin/bash "$0" "$@"
+fi
 
-// Config holds all runtime knobs for trading and operations.
-type Config struct {
-	// Trading target
-	ProductID   string // e.g., "BTC-USD" or "BTCUSDT"
-	Granularity string // e.g., "ONE_MINUTE"
+# --- PATHS / SETTINGS ---
+COMPOSE_DIR="/home/chidi/coinbase/monitoring"
 
-	// Safety & sizing
-	DryRun          bool
-	MaxDailyLossPct float64
-	RiskPerTradePct float64
-	USDEquity       float64
-	TakeProfitPct   float64
-	StopLossPct     float64
-	OrderMinUSD     float64
-	LongOnly        bool    // prevent SELL entries when flat on spot
-	FeeRatePct      float64 // % fee applied on entry/exit trades
-
-	// Ops
-	Port              int
-	BridgeURL         string // optional: http://127.0.0.1:8787 (only when using the bridge)
-	MaxHistoryCandles int    // plural: loaded from MAX_HISTORY_CANDLES
-	StateFile         string // path to persist bot state
-
-	// Loop control (unprefixed; universal)
-	UseTickPrice    bool // enable tick-driven loop
-	TickIntervalSec int  // per-tick cadence
-	CandleResyncSec int  // periodic candle resync in tick loop
-
-	// Live equity gating (unprefixed; universal)
-	LiveEquity bool // if true, rebase & refresh equity from live balances
-
-	// Order entry (unprefixed; universal)
-	OrderType            string // "market" or "limit"
-	LimitPriceOffsetBps  int    // maker price offset from mid in bps
-	SpreadMinBps         int    // minimum spread (bps) to attempt maker entry
-	LimitTimeoutSec      int    // cancel-and-market fallback timeout (seconds)
+# Map service name -> docker compose service
+svc_compose() {
+  case "$1" in
+    coinbase) echo "bot" ;;
+    binance)  echo "bot_binance" ;;
+    hitbtc)   echo "bot_hitbtc" ;;
+    *)        echo "unknown" ;;
+  esac
 }
 
-// loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
-// and returns a Config with sane defaults if keys are missing.
-func loadConfigFromEnv() Config {
-	cfg := Config{
-		ProductID:         getEnv("PRODUCT_ID", "BTC-USD"),
-		Granularity:       getEnv("GRANULARITY", "ONE_MINUTE"),
-
-		// Universal, unprefixed knobs
-		DryRun:            getEnvBool("DRY_RUN", true),
-		MaxDailyLossPct:   getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
-		RiskPerTradePct:   getEnvFloat("RISK_PER_TRADE_PCT", 0.25),
-		USDEquity:         getEnvFloat("USD_EQUITY", 1000.0),
-		TakeProfitPct:     getEnvFloat("TAKE_PROFIT_PCT", 0.8),
-		StopLossPct:       getEnvFloat("STOP_LOSS_PCT", 0.4),
-		OrderMinUSD:       getEnvFloat("ORDER_MIN_USD", 5.00),
-		LongOnly:          getEnvBool("LONG_ONLY", true),
-		FeeRatePct:        getEnvFloat("FEE_RATE_PCT", 0.3),
-
-		Port:              getEnvInt("PORT", 8080),
-		BridgeURL:         getEnv("BRIDGE_URL", ""),
-		MaxHistoryCandles: getEnvInt("MAX_HISTORY_CANDLES", 5000),
-		StateFile:         getEnv("STATE_FILE", "/opt/coinbase/state/bot_state.json"),
-
-		// Loop control
-		UseTickPrice:    getEnvBool("USE_TICK_PRICE", false),
-		TickIntervalSec: getEnvInt("TICK_INTERVAL_SEC", 1),
-		CandleResyncSec: getEnvInt("CANDLE_RESYNC_SEC", 60),
-
-		// Live equity
-		LiveEquity: getEnvBool("USE_LIVE_EQUITY", false),
-
-		// Order entry
-		OrderType:           getEnv("ORDER_TYPE", "market"),
-		LimitPriceOffsetBps: getEnvInt("LIMIT_PRICE_OFFSET_BPS", 5),
-		SpreadMinBps:        getEnvInt("SPREAD_MIN_BPS", 2),
-		LimitTimeoutSec:     getEnvInt("LIMIT_TIMEOUT_SEC", 5),
-	}
-
-	// Historical carry-over: if someone still sets BROKER=X, we may still
-	// want to validate it's present, but we no longer use it to select knobs.
-	_ = strings.TrimSpace(getEnv("BROKER", ""))
-
-	return cfg
+# Map service name -> default state file path
+svc_statefile() {
+  case "$1" in
+    coinbase) echo "/opt/coinbase/state/bot_state.newcoinbase.json" ;;
+    binance)  echo "/opt/coinbase/state/bot_state.newbinance.json" ;;
+    hitbtc)   echo "/opt/coinbase/state/bot_state.hitbtc.json" ;;
+    *)        echo "" ;;
+  esac
 }
 
-// ---- cfg helpers (getter methods) ----
-// These fetch from env at call-time (falling back to the struct's initial values).
-// This lets you tweak knobs live IF your process env is refreshed.
+usage() {
+  cat <<EOF
+Usage: $0 <amount> <coinbase|binance|hitbtc> [state_file] [--tolerance 1.0] [--timeout 0]
 
-func (c *Config) UseLiveEquity() bool {
-	return getEnvBool("USE_LIVE_EQUITY", c.LiveEquity)
+Waits until EquityUSD increases by approximately <amount> (±tolerance),
+then stops the service, increases LastAddEquitySell and LastAddEquityBuy by <amount>, and prompts to restart.
+
+Examples:
+  $0 200 coinbase
+  $0 50 binance /opt/coinbase/state/bot_state.newbinance.json --tolerance 0.5 --timeout 600
+EOF
+  exit 1
 }
 
-func (c *Config) UseTick() bool {
-	return getEnvBool("USE_TICK_PRICE", c.UseTickPrice)
+# --- Parse args ---
+[[ $# -lt 2 ]] && usage
+AMOUNT="$1"; shift
+SERVICE="$1"; shift
+
+COMPOSE_SVC="$(svc_compose "$SERVICE")"
+[[ "$COMPOSE_SVC" == "unknown" ]] && { echo "Unknown service: ${SERVICE}"; exit 2; }
+
+STATE_FILE_DEFAULT="$(svc_statefile "$SERVICE")"
+STATE_FILE="${STATE_FILE_DEFAULT}"
+
+if [[ $# -gt 0 && "${1:-}" != --* ]]; then
+  STATE_FILE="$1"; shift
+fi
+[[ -z "$STATE_FILE" ]] && { echo "No default state file known for ${SERVICE}; pass it explicitly."; exit 2; }
+
+TOL=1.0
+TIMEOUT=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tolerance) shift; TOL="${1:-1.0}"; shift ;;
+    --timeout)   shift; TIMEOUT="${1:-0}"; shift ;;
+    *) echo "Unknown option: $1"; usage ;;
+  esac
+done
+
+# --- Requirements ---
+command -v jq >/dev/null || { echo "jq is required (sudo apt-get install -y jq)"; exit 3; }
+if ! command -v docker >/dev/null; then
+  echo "docker is required"; exit 3
+fi
+
+compose_cmd() {
+  if docker compose version >/dev/null 2>&1; then
+    echo "docker compose"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    echo "docker-compose"
+  else
+    echo ""
+  fi
+}
+COMPOSE_BIN="$(compose_cmd)"
+[[ -z "$COMPOSE_BIN" ]] && { echo "docker compose plugin (or docker-compose) required"; exit 3; }
+
+# --- Helpers ---
+read_json_key() { jq -r ".$2 // empty" "$1"; }
+edit_json_inplace() {
+  local file="$1" expr="$2" tmp
+  tmp="$(mktemp "${file}.XXXX")"
+  jq "${expr}" "$file" >"$tmp"
+  mv -f "$tmp" "$file"
 }
 
-func (c *Config) TickInterval() int {
-	// Default to initial value; clamp to >=1
-	ti := getEnvInt("TICK_INTERVAL_SEC", c.TickIntervalSec)
-	if ti <= 0 {
-		ti = 1
-	}
-	return ti
-}
+# --- Validate & baseline ---
+[[ -r "$STATE_FILE" ]] || { echo "State file not readable: $STATE_FILE"; exit 4; }
+BASE_EQ="$(read_json_key "$STATE_FILE" "EquityUSD")"
+[[ -n "$BASE_EQ" ]] || { echo "EquityUSD not found in $STATE_FILE"; exit 5; }
 
-func (c *Config) CandleResync() int {
-	cr := getEnvInt("CANDLE_RESYNC_SEC", c.CandleResyncSec)
-	if cr <= 0 {
-		cr = 60
-	}
-	return cr
-}
+TARGET_LOW=$(awk -v b="$BASE_EQ" -v a="$AMOUNT" -v t="$TOL" 'BEGIN{printf "%.6f", b + a - t}')
+TARGET_HIGH=$(awk -v b="$BASE_EQ" -v a="$AMOUNT" -v t="$TOL" 'BEGIN{printf "%.6f", b + a + t}')
 
-// ---- Phase-7 toggles (append-only; no behavior changes unless envs set) ----
+echo "Monitoring ${STATE_FILE} every 1s until EquityUSD rises by ~${AMOUNT} (±${TOL})."
+echo "Baseline EquityUSD=${BASE_EQ}. Target band: [${TARGET_LOW}, ${TARGET_HIGH}]"
+echo
 
-// ModelMode selects the prediction path; baseline is the default.
-type ModelMode string
+# --- Poll loop ---
+start_ts=$(date +%s)
+while true; do
+  CUR_EQ="$(read_json_key "$STATE_FILE" "EquityUSD" || true)"
+  [[ -z "$CUR_EQ" ]] && CUR_EQ="NaN"
+  printf "\r%(%F %T)T EquityUSD=%s  (looking for ~ +%s)" -1 "$CUR_EQ" "$AMOUNT" >&2
 
-const (
-	ModelModeBaseline ModelMode = "baseline"
-	ModelModeExtended ModelMode = "extended"
-)
+  if [[ "$CUR_EQ" != "NaN" ]]; then
+    within=$(awk -v x="$CUR_EQ" -v lo="$TARGET_LOW" -v hi="$TARGET_HIGH" 'BEGIN{print (x>=lo && x<=hi) ? "yes" : "no"}')
+    if [[ "$within" == "yes" ]]; then
+      echo -e "\nTarget met: EquityUSD in band [${TARGET_LOW}, ${TARGET_HIGH}] (current=${CUR_EQ})"
+      break
+    fi
+  fi
 
-// ExtendedToggles exposes optional Phase-7 features without altering existing behavior.
-type ExtendedToggles struct {
-	ModelMode      ModelMode // baseline (default) or extended
-	WalkForwardMin int       // minutes between live refits; 0 disables
-	VolRiskAdjust  bool      // enable volatility-aware risk sizing
-	UseDirectSlack bool      // true if SLACK_WEBHOOK is set (optional direct pings)
-}
+  if (( TIMEOUT > 0 )) && (( $(date +%s) - start_ts >= TIMEOUT )); then
+    echo -e "\nTimeout (${TIMEOUT}s) reached without meeting target band. Exiting."
+    exit 6
+  fi
+  sleep 1
+done
 
-// Extended reads optional Phase-7 toggles from env. Defaults preserve baseline behavior.
-func (c *Config) Extended() ExtendedToggles {
-	mm := ModelMode(getEnv("MODEL_MODE", string(ModelModeBaseline)))
-	if mm != ModelModeExtended {
-		mm = ModelModeBaseline
-	}
-	return ExtendedToggles{
-		ModelMode:      mm,
-		WalkForwardMin: getEnvInt("WALK_FORWARD_MIN", 0),
-		VolRiskAdjust:  getEnvBool("VOL_RISK_ADJUST", false),
-		UseDirectSlack: getEnv("SLACK_WEBHOOK", "") != "",
-	}
-}
+# --- Stop service ---
+echo "Stopping service: ${COMPOSE_SVC}"
+pushd "$COMPOSE_DIR" >/dev/null
+$COMPOSE_BIN stop "$COMPOSE_SVC"
+popd >/dev/null
 
-// --- trailing env accessors (unchanged; universal) ---
-func (c *Config) TrailActivatePct() float64 { return getEnvFloat("TRAIL_ACTIVATE_PCT", 1.2) }
-func (c *Config) TrailDistancePct() float64 { return getEnvFloat("TRAIL_DISTANCE_PCT", 0.6) }
+# --- Apply LastAddEquitySell += AMOUNT and LastAddEquityBuy += AMOUNT ---
+echo "Updating LastAddEquitySell and LastAddEquityBuy by +${AMOUNT} in ${STATE_FILE}"
+cp -a "$STATE_FILE" "${STATE_FILE}.bak.$(date +%Y%m%d%H%M%S)"
 
-}} with only the necessary minimal changes to implement {{add EXCHANGE_MIN_NOTIONAL_USD environment variable (default 10.00) in env.go/config.go}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{add EXCHANGE_MIN_NOTIONAL_USD environment variable (default 10.00) in env.go/config.go}}. Return the complete file, copy-paste ready, in IDE.
+edit_json_inplace "$STATE_FILE" \
+  ".LastAddEquitySell = ((.LastAddEquitySell // 0) + (${AMOUNT}|tonumber)) |
+   .LastAddEquityBuy  = ((.LastAddEquityBuy  // 0) + (${AMOUNT}|tonumber))"
+
+NEW_EQ="$(read_json_key "$STATE_FILE" "EquityUSD" || true)"
+NEW_LAES="$(read_json_key "$STATE_FILE" "LastAddEquitySell" || true)"
+NEW_LAEB="$(read_json_key "$STATE_FILE" "LastAddEquityBuy"  || true)"
+
+echo "Updated values:"
+echo "  EquityUSD:           ${NEW_EQ}"
+echo "  LastAddEquitySell:   ${NEW_LAES}"
+echo "  LastAddEquityBuy:    ${NEW_LAEB}"
+
+# --- Prompt restart ---
+read -r -p "Restart service '${COMPOSE_SVC}' now? [y/N]: " ans
+if [[ "${ans}" =~ ^[Yy]$ ]]; then
+  pushd "$COMPOSE_DIR" >/dev/null
+  $COMPOSE_BIN start "$COMPOSE_SVC"
+  popd >/dev/null
+  echo "Service restarted."
+else
+  echo "Service NOT restarted. Start later with:"
+  echo "  (cd ${COMPOSE_DIR} && $COMPOSE_BIN start ${COMPOSE_SVC})"
+fi
+
+}} with only the necessary minimal changes to implement {{replace state file update to write via temp file and preserve original ownership (65532:65532) using chown before mv, and abort service restart if BookBuy/BookSell lots drop from non-zero to zero}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{replace state file update to write via temp file and preserve original ownership (65532:65532) using chown before mv, and abort service restart if BookBuy/BookSell lots drop from non-zero to zero}}. Return the complete file, copy-paste ready, in IDE.
