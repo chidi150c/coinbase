@@ -1,43 +1,88 @@
-name: Deploy (force replace)
+name: Deploy to Linode
 
 on:
-  push:
-    branches: [ main ]
+  workflow_run:
+    workflows: ["Build & Push Images"]
+    types: [completed]
+    branches: ["main"]
 
 jobs:
   deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    env:
-      COMPOSE_FILE: docker-compose.yml
-      IMAGE_SHA: ${{ github.sha }}
+    concurrency:
+      group: prod-deploy
+      cancel-in-progress: false
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Prepare SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf "%s" "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
 
-      - name: SSH deploy (force replace)
-        uses: appleboy/ssh-action@v1.2.2
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          script_stop: true
-          script: |
-            set -euo pipefail
-            cd "$DEPLOY_DIR"
+      - name: Add host to known_hosts
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          set -euo pipefail
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
 
-            # fetch repo & write IMAGE_SHA env if your compose uses it
-            if [ -d .git ]; then git fetch --all --prune; fi
-            git reset --hard "${GITHUB_SHA:-${IMAGE_SHA}}"
+      - name: Deploy (git sync + compose rollout)
+        env:
+          SSH_HOST:   ${{ secrets.SSH_HOST }}
+          SSH_USER:   ${{ secrets.SSH_USER }}
+          DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}   # e.g. /home/chidi/coinbase/monitoring
+          REPO_URL:   https://github.com/${{ github.repository }}.git
+          GIT_SHA:    ${{ github.sha }}
+          HUMAN_TAG:  ${{ github.ref_name }}
+          GHCR_NS:    ${{ vars.GHCR_NS }}
+        run: |
+          ssh -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" bash -s -- "$DEPLOY_DIR" "$REPO_URL" "$GIT_SHA" "$HUMAN_TAG" "$GHCR_NS" <<'EOF'
+          set -euo pipefail
 
-            # Pull newest images (tagged by SHA or latest as defined in compose)
-            docker compose -f "$COMPOSE_FILE" pull
+          DEPLOY_DIR="${1:-/home/chidi/coinbase/monitoring}"
+          REPO_URL="$2"
+          GIT_SHA_IN="$3"
+          HUMAN_TAG_IN="$4"
+          GHCR_NS_IN="${5:-}"
+          REPO_DIR="$(dirname "$DEPLOY_DIR")"
 
-            # Hard replace: stop & remove old containers, then recreate
-            docker compose -f "$COMPOSE_FILE" down --remove-orphans
-            docker compose -f "$COMPOSE_FILE" rm -sf
+          # Sync repo
+          if [ ! -d "$REPO_DIR/.git" ]; then
+            mkdir -p "$REPO_DIR"
+            git clone "$REPO_URL" "$REPO_DIR"
+          else
+            git -C "$REPO_DIR" remote set-url origin "$REPO_URL"
+            git -C "$REPO_DIR" fetch --all
+            git -C "$REPO_DIR" reset --hard origin/main
+          fi
 
-            # Recreate everything with fresh containers
-            IMAGE_SHA="${IMAGE_SHA}" docker compose -f "$COMPOSE_FILE" up -d --force-recreate
+          cd "$DEPLOY_DIR"
 
-            # Optional: clean dangling images/containers
-            docker system prune -f
+          # Optional: patch image namespace/tags to use GHCR_NS and IMAGE_SHA if present
+          if [ -f docker-compose.yml ]; then
+            sed -i 's#ghcr.io/chidi150c/#ghcr.io/${GHCR_NS:-chidi150c}/#g' docker-compose.yml || true
+            sed -i 's#\(ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot\):latest#\1:${IMAGE_SHA}#g' docker-compose.yml || true
+          fi
+
+          # Inject CI identifiers for compose
+          cat > .env.ci <<ENVVARS
+          GIT_SHA=${GIT_SHA_IN}
+          IMAGE_SHA=${GIT_SHA_IN}
+          HUMAN_TAG=${HUMAN_TAG_IN}
+          GHCR_NS=${GHCR_NS_IN}
+          ENVVARS
+
+          # Rollout with guaranteed full replace
+          docker compose --env-file .env.ci down --remove-orphans
+          docker compose --env-file .env.ci rm -sf
+          docker compose --env-file .env.ci pull --ignore-pull-failures
+          docker compose --env-file .env.ci up -d --force-recreate
+
+          # Cleanup dangling images
+          docker image prune -f
+          EOF
