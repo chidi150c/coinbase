@@ -36,7 +36,7 @@ last_ts_ms: Optional[int] = None
 candles: Dict[int, List[float]] = {}  # minuteStartMs -> [o,h,l,c,vol]
 _first_tick_logged: bool = False  # TRACE: first-tick marker
 
-# Simple cache for symbol metadata (LOT_SIZE.stepSize, quotePrecision → quote step)
+# Simple cache for symbol metadata (LOT_SIZE.stepSize, quotePrecision → quote step, and PRICE_FILTER.tickSize)
 _symbol_meta_cache: Dict[str, Dict[str, str]] = {}
 
 # ---- Helpers ----
@@ -215,6 +215,44 @@ def _get_symbol_steps(sym: str) -> Tuple[str, str]:
 
     _symbol_meta_cache[key] = {"base_step": base_step, "quote_step": quote_step}
     return base_step, quote_step
+
+# --- NEW: helper to get LOT_SIZE.stepSize and PRICE_FILTER.tickSize (with cache) ---
+def _get_symbol_filters(sym: str) -> Tuple[str, str]:
+    """
+    Return (step_size, tick_size) strings for given Binance symbol:
+      step_size := LOT_SIZE.stepSize
+      tick_size := PRICE_FILTER.tickSize
+    """
+    key = sym.upper()
+    meta = _symbol_meta_cache.get(key) or {}
+    if meta.get("step_size") and meta.get("tick_size"):
+        return meta["step_size"], meta["tick_size"]
+
+    url = f"{BINANCE_BASE_URL}/api/v3/exchangeInfo?symbol={key}"
+    info = _http_get(url)
+
+    step_size, tick_size = "0", "0"
+    try:
+        symbols = info.get("symbols") or []
+        if symbols:
+            s = symbols[0]
+            for f in (s.get("filters") or []):
+                ft = f.get("filterType")
+                if ft == "LOT_SIZE":
+                    v = str(f.get("stepSize") or "0").strip()
+                    if v and v != "0":
+                        step_size = v
+                elif ft == "PRICE_FILTER":
+                    v = str(f.get("tickSize") or "0").strip()
+                    if v and v != "0":
+                        tick_size = v
+    except Exception:
+        pass
+
+    # Merge into cache without breaking existing fields
+    meta.update({"step_size": step_size, "tick_size": tick_size})
+    _symbol_meta_cache[key] = meta
+    return step_size, tick_size
 
 # ---- WS consumer ----
 async def _ws_loop():
@@ -491,6 +529,17 @@ def balance_quote(product_id: str = Query(...)):
 @app.get("/product/{product_id}")
 def product_info(product_id: str = Path(...)):
     return price(product_id)
+
+# --- NEW: Exchange filters endpoint for broker snapping (LOT_SIZE + PRICE_FILTER) ---
+@app.get("/exchange/filters")
+def exchange_filters(product_id: str = Query(..., description="e.g., BTCUSDT or BTC-USDT")):
+    sym = _normalize_symbol(product_id)
+    if not sym:
+        raise HTTPException(status_code=400, detail="empty product_id")
+    step_size, tick_size = _get_symbol_filters(sym)
+    if step_size == "0" or tick_size == "0":
+        raise HTTPException(status_code=404, detail="missing LOT_SIZE.stepSize or PRICE_FILTER.tickSize")
+    return {"product_id": product_id, "step_size": step_size, "tick_size": tick_size}
 
 # --- Order endpoints (market by quote size), with partial-fill enrichment ---
 def _my_trades(symbol: str, order_id: int) -> List[Dict]:

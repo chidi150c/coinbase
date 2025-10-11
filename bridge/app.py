@@ -666,6 +666,29 @@ def order_limit_post_only(payload: LimitPostOnly):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.get("/exchange/filters")
+def exchange_filters(product_id: str):
+    """
+    Return Binance-style filters for Coinbase products so the Go broker can snap
+    size/price before submission.
+      - step_size  := base_increment (quantity lot size)
+      - tick_size  := quote_increment (price tick size)
+    """
+    try:
+        _base, _quote, base_step, quote_step = _product_symbols_and_steps(product_id)
+        # Ensure non-empty strings; broker treats 0 as "unavailable"
+        step = str(base_step or "0").strip()
+        tick = str(quote_step or "0").strip()
+        if not step or step == "0":
+            raise RuntimeError("missing base_increment")
+        if not tick or tick == "0":
+            raise RuntimeError("missing quote_increment")
+        return {"product_id": product_id, "step_size": step, "tick_size": tick}
+    except Exception as e:
+        # Match your broker expectation: non-2xx yields an error
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=str(e))
+
 @app.delete("/order/{order_id}")
 def cancel_order(order_id: str, product_id: Optional[str] = Query(None)):
     """
