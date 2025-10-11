@@ -39,6 +39,71 @@ def health():
 from decimal import Decimal
 from fastapi import HTTPException
 
+# --- add near the top (after env load) ---
+BRIDGE_BASE_STEP = os.getenv("BRIDGE_BASE_STEP", "").strip()   # e.g. "0.00000001"
+BRIDGE_TICK_SIZE = os.getenv("BRIDGE_TICK_SIZE", "").strip()   # e.g. "0.01"
+
+_COMMON_QUOTES = ["FDUSD","USDT","USDC","BUSD","TUSD","EUR","GBP","TRY","BRL","BTC","ETH","BNB","USD"]
+
+def _normalize_product_id(product_id: str | None = None, symbol: str | None = None) -> str:
+    s = (product_id or symbol or "").strip().upper()
+    if not s:
+        return ""
+    if "-" in s:
+        return s
+    for q in _COMMON_QUOTES:
+        if s.endswith(q) and len(s) > len(q):
+            return s[:-len(q)] + "-" + q
+    if len(s) > 3:
+        return s[:-3] + "-" + s[-3:]
+    return s
+
+def _is_pos_decimal(val: str) -> bool:
+    try:
+        return Decimal(str(val)) > 0
+    except Exception:
+        return False
+
+# --- replace ONLY this endpoint ---
+from typing import Optional
+from fastapi import Query
+
+@app.get("/exchange/filters")
+def exchange_filters(
+    product_id: Optional[str] = Query(None),
+    symbol: Optional[str] = Query(None),
+):
+    """
+    Return Binance-style filters for Coinbase products so the Go broker can snap size/price.
+      - step_size := base_increment OR BRIDGE_BASE_STEP
+      - tick_size := quote_increment OR BRIDGE_TICK_SIZE
+    Hard-fails (404) if neither source yields positive values.
+    """
+    try:
+        pid = _normalize_product_id(product_id=product_id, symbol=symbol)
+        if not pid:
+            raise RuntimeError("missing product_id/symbol")
+        _base, _quote, base_step, quote_step = _product_symbols_and_steps(pid)
+
+        step = (base_step or "").strip()
+        tick = (quote_step or "").strip()
+
+        if not _is_pos_decimal(step) and _is_pos_decimal(BRIDGE_BASE_STEP):
+            step = BRIDGE_BASE_STEP
+        if not _is_pos_decimal(tick) and _is_pos_decimal(BRIDGE_TICK_SIZE):
+            tick = BRIDGE_TICK_SIZE
+
+        if not _is_pos_decimal(step):
+            raise RuntimeError("missing base_increment and BRIDGE_BASE_STEP")
+        if not _is_pos_decimal(tick):
+            raise RuntimeError("missing quote_increment and BRIDGE_TICK_SIZE")
+
+        return {"product_id": pid, "step_size": str(step), "tick_size": str(tick)}
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @app.get("/accounts")
 def accounts(limit: int = 250):
     try:
@@ -665,29 +730,6 @@ def order_limit_post_only(payload: LimitPostOnly):
         raise last_err or RuntimeError("No suitable limit order method found on RESTClient")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-@app.get("/exchange/filters")
-def exchange_filters(product_id: str):
-    """
-    Return Binance-style filters for Coinbase products so the Go broker can snap
-    size/price before submission.
-      - step_size  := base_increment (quantity lot size)
-      - tick_size  := quote_increment (price tick size)
-    """
-    try:
-        _base, _quote, base_step, quote_step = _product_symbols_and_steps(product_id)
-        # Ensure non-empty strings; broker treats 0 as "unavailable"
-        step = str(base_step or "0").strip()
-        tick = str(quote_step or "0").strip()
-        if not step or step == "0":
-            raise RuntimeError("missing base_increment")
-        if not tick or tick == "0":
-            raise RuntimeError("missing quote_increment")
-        return {"product_id": product_id, "step_size": step, "tick_size": tick}
-    except Exception as e:
-        # Match your broker expectation: non-2xx yields an error
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail=str(e))
 
 @app.delete("/order/{order_id}")
 def cancel_order(order_id: str, product_id: Optional[str] = Query(None)):
