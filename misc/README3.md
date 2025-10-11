@@ -196,6 +196,7 @@ audit-grep coinbase 'panic:|runtime error:|fatal error|SIGSEGV|stack trace|level
 # Exit reasons (take_profit / stop_loss / trailing_stop):
 
 audit-grep coinbase 'EXIT .*reason=(take_profit|stop_loss|trailing_stop)' -n
+audit-grep binance 'EXIT .*reason=(take_profit|stop_loss|trailing_stop)' -n
 
 # Close-skip with notional details:
 

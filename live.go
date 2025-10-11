@@ -65,6 +65,11 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 		}
 	}
 
+	_, err := trader.broker.GetExchangeFilters(ctx, trader.cfg.ProductID) // best-effort preload
+	if err != nil{
+		log.Fatalf("[BOOT] exchange filters unavailable for %s; refusing to trade without LOT_SIZE.stepSize and PRICE_FILTER.tickSize (post-only limits disabled) — ensure bridge /exchange/filters is populated or provide valid overrides: error: %v", trader.cfg.ProductID, err)			
+	}
+
 	// Warmup candles (paged backfill from bridge to MaxHistoryCandles; else large single fetch from the broker)
 	var history []Candle
 	target := trader.cfg.MaxHistoryCandles

@@ -32,10 +32,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -369,18 +371,85 @@ func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, si
 		CreateTime:    time.Now().UTC(),
 	}, nil
 }
+// Cache-only lookup used by the hot path (no network).
+func (bb *BridgeBroker) getExchangeFiltersCached(product string) ExFilters {
+	key := strings.TrimSpace(product)
+	fMuCoinbase.Lock()
+	v := fCacheCoinbase[key]
+	fMuCoinbase.Unlock()
+	return v
+}
 
+// getExchangeFilters calls a best-effort sidecar endpoint to fetch filters.
+// If the endpoint is missing or fails, it returns zero values so baseline behavior is preserved.
+func (bb *BridgeBroker) GetExchangeFilters(ctx context.Context, product string) (ExFilters, error) {
+	key := strings.TrimSpace(product)
+
+	// cache hit
+	fMuCoinbase.Lock()
+	if v, ok := fCacheCoinbase[key]; ok && (v.StepSize > 0 || v.TickSize > 0) {
+		fMuCoinbase.Unlock()
+		return v, nil
+	}
+	fMuCoinbase.Unlock()
+
+	// try: GET /exchange/filters?product_id=<product>
+	u := fmt.Sprintf("%s/exchange/filters?product_id=%s", bb.base, url.QueryEscape(product))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return ExFilters{}, err
+	}
+	req.Header.Set("User-Agent", "coinbot/bridge")
+
+	res, err := bb.hc.Do(req)
+	if err != nil {
+		return ExFilters{}, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode >= 300 {
+		// best-effort: do not treat as fatal
+		io.Copy(io.Discard, res.Body)
+		return ExFilters{}, fmt.Errorf("filters %d", res.StatusCode)
+	}
+	var payload struct {
+		StepSize string `json:"step_size"` // LOT_SIZE.StepSize
+		TickSize string `json:"tick_size"` // PRICE_FILTER.TickSize
+	}
+	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		return ExFilters{}, err
+	}
+	f := ExFilters{
+		StepSize: parsePosFloat(payload.StepSize),
+		TickSize: parsePosFloat(payload.TickSize),
+	}
+
+	// cache store
+	fMuCoinbase.Lock()
+	fCacheCoinbase[key] = f
+	fMuCoinbase.Unlock()
+
+	return f, nil
+}
 // --- Maker-first additions (post-only limit) ---
 
 // PlaceLimitPostOnly places a post-only limit order and returns the bridge order_id.
 // The bridge is expected to enforce maker-only semantics (post_only) and reject/adjust as needed.
 func (bb *BridgeBroker) PlaceLimitPostOnly(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64) (string, error) {
+	// Best-effort: apply exchange LOT_SIZE.StepSize and PRICE_FILTER.TickSize if the bridge exposes them.
+	f := bb.getExchangeFiltersCached(product) // ignore error to preserve baseline behavior
+	if f.StepSize > 0 {
+		baseSize = snapDownCoinbase(baseSize, f.StepSize)
+	}
+	if f.TickSize > 0 {
+		limitPrice = snapDownCoinbase(limitPrice, f.TickSize)
+	}
+
 	u := bb.base + "/order/limit_post_only"
 	body := map[string]any{
 		"product_id":      product,
 		"side":            strings.ToUpper(string(side)),
-		"limit_price":     fmt.Sprintf("%.10f", limitPrice),
-		"base_size":       fmt.Sprintf("%.10f", baseSize),
+		"limit_price":     formatWithStepCoinbase(limitPrice, f.TickSize, 10),
+		"base_size":       formatWithStepCoinbase(baseSize, f.StepSize, 10),
 		"client_order_id": uuid.New().String(),
 	}
 	bs, _ := json.Marshal(body)
@@ -570,4 +639,58 @@ func (bb *BridgeBroker) tryFetchOrderFill(ctx context.Context, orderID string) (
 	fs, _ := strconv.ParseFloat(strings.TrimSpace(out.FilledSize), 64)
 	cu, _ := strconv.ParseFloat(strings.TrimSpace(out.CommissionTotalUSD), 64)
 	return fp, fs, cu, nil
+}
+
+// --- MINIMAL ADD: exchange filters cache & formatting helpers (best-effort; no behavior changes if unavailable) ---
+
+var (
+	fMuCoinbase    sync.Mutex
+	fCacheCoinbase = map[string]ExFilters{} // key: product/symbol
+)
+
+func parsePosFloat(s string) float64 {
+    s = strings.TrimSpace(s)
+    if s == "" {
+        return 0
+    }
+    v, err := strconv.ParseFloat(s, 64)
+    if err != nil || v <= 0 {
+        return 0
+    }
+    return v
+}
+
+
+func snapDownCoinbase(x, step float64) float64 {
+	if step <= 0 {
+		return x
+	}
+	n := math.Floor(x/step + 1e-12)
+	return n * step
+}
+
+// formatWithStepCoinbase formats x using the decimal precision implied by step.
+// If step <= 0, it falls back to a fixed maximum precision given by fallbackDec.
+func formatWithStepCoinbase(x, step float64, fallbackDec int) string {
+	if step > 0 {
+		// derive decimals from step (e.g., 0.001000 -> 3)
+		s := strconv.FormatFloat(step, 'f', -1, 64)
+		dec := 0
+		if i := strings.IndexByte(s, '.'); i >= 0 {
+			dec = len(s) - i - 1
+			// trim trailing zeros
+			for dec > 0 && s[len(s)-1] == '0' {
+				s = s[:len(s)-1]
+				dec--
+			}
+		}
+		if dec < 0 {
+			dec = 0
+		}
+		return strconv.FormatFloat(x, 'f', dec, 64)
+	}
+	if fallbackDec < 0 {
+		fallbackDec = 0
+	}
+	return strconv.FormatFloat(x, 'f', fallbackDec, 64)
 }

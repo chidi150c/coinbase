@@ -71,6 +71,10 @@ func (p *PaperBroker) GetRecentCandles(ctx context.Context, product string, gran
 	return nil, errors.New("paper broker has no candles (use bridge or CSV)")
 }
 
+func (p *PaperBroker) GetExchangeFilters(ctx context.Context, product string)(ExFilters, error){
+	return ExFilters{}, nil
+}
+
 // GetAvailableBase returns env-driven paper balances for the base asset.
 // - asset: parsed from product "BASE-QUOTE" (fallback to BASE_ASSET env if parsing fails)
 // - available: PAPER_BASE_BALANCE

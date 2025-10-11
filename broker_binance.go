@@ -12,7 +12,9 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,10 +29,11 @@ func NewBinanceBridge(base string) *BinanceBridge {
 		base = "http://bridge_binance:8789"
 	}
 	base = strings.TrimRight(base, "/")
-	return &BinanceBridge{
+	b := &BinanceBridge{
 		base: base,
 		hc:   &http.Client{Timeout: 15 * time.Second},
 	}
+	return b
 }
 
 func (b *BinanceBridge) Name() string { return "binance-bridge" }
@@ -185,10 +188,12 @@ func (b *BinanceBridge) PlaceMarketQuote(ctx context.Context, product string, si
 		return nil, fmt.Errorf("bridge order/market %d: %s", resp.StatusCode, string(xb))
 	}
 
-	var ord PlacedOrder
-	if err := json.NewDecoder(resp.Body).Decode(&ord); err != nil {
+	// Decode into stringly-typed JSON and then build PlacedOrder to tolerate string-number fields.
+	var ordJSON placedOrderJSON
+	if err := json.NewDecoder(resp.Body).Decode(&ordJSON); err != nil {
 		return nil, err
 	}
+	ord := toPlacedOrder(ordJSON)
 
 	// Enrich via GET /order/{order_id}, identical to broker_bridge.go
 	deadline := time.Now().Add(5 * time.Second)
@@ -199,10 +204,10 @@ func (b *BinanceBridge) PlaceMarketQuote(ctx context.Context, product string, si
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return &ord, nil
+	return ord, nil
 }
 
-// --- NEW: Post-only limit (LIMIT_MAKER) with size snapping to lot step ---
+// --- NEW: Post-only limit (LIMIT_MAKER) with size/price snapping to exchange filters ---
 // Returns the created order ID (best-effort), or an error.
 func (b *BinanceBridge) PlaceLimitPostOnly(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64) (string, error) {
 	// Snap base size to step (floor) using the bridge's balance endpoint (same as broker_bridge.go style).
@@ -215,11 +220,30 @@ func (b *BinanceBridge) PlaceLimitPostOnly(ctx context.Context, product string, 
 		return "", fmt.Errorf("base size after snap is zero")
 	}
 
+	// --- MINIMAL ADD: use cache-only exchange filters (LOT_SIZE.StepSize, PRICE_FILTER.TickSize) and apply snapping ---
+	f := b.getExchangeFiltersCached(product) // zero-latency cache lookup
+	if f.StepSize > 0 {
+		baseSize = snapDownBinance(baseSize, f.StepSize)
+	}
+	if f.TickSize > 0 {
+		limitPrice = snapDownBinance(limitPrice, f.TickSize)
+	}
+	if baseSize <= 0 {
+		return "", fmt.Errorf("base size after exchange step snap is zero")
+	}
+	if limitPrice <= 0 {
+		return "", fmt.Errorf("limit price after tick snap is zero")
+	}
+
+	// Format numbers with decimals derived from step/tick (falls back to previous behavior when unknown).
+	priceStr := formatWithStepBinance(limitPrice, f.TickSize, 12)
+	sizeStr := formatWithStepBinance(baseSize, f.StepSize, 12)
+
 	body := map[string]any{
 		"product_id":  product,
 		"side":        side, // "BUY" or "SELL"
-		"limit_price": fmt.Sprintf("%.12f", limitPrice),
-		"base_size":   fmt.Sprintf("%.12f", baseSize),
+		"limit_price": priceStr,
+		"base_size":   sizeStr,
 	}
 	data, _ := json.Marshal(body)
 	u := fmt.Sprintf("%s/order/limit_post_only", b.base)
@@ -287,11 +311,14 @@ func (b *BinanceBridge) fetchOrder(ctx context.Context, product, orderID string)
 		xb, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("bridge order get %d: %s", resp.StatusCode, string(xb))
 	}
-	var ord PlacedOrder
-	if err := json.NewDecoder(resp.Body).Decode(&ord); err != nil {
+
+	// Decode into tolerant JSON (string fields) then convert to PlacedOrder.
+	var ordJSON placedOrderJSON
+	if err := json.NewDecoder(resp.Body).Decode(&ordJSON); err != nil {
 		return nil, err
 	}
-	return &ord, nil
+	ord := toPlacedOrder(ordJSON)
+	return ord, nil
 }
 
 // --- helpers (EXACTLY like broker_bridge.go) ---
@@ -331,4 +358,141 @@ func parseFloat(s string) float64 {
 	var f float64
 	fmt.Sscanf(s, "%f", &f)
 	return f
+}
+
+// --- MINIMAL ADD: exchange filters cache & formatting helpers (best-effort; no behavior changes if unavailable) ---
+
+var (
+	fMuBinance    sync.Mutex
+	fCacheBinance = map[string]ExFilters{} // key: product/symbol
+)
+
+// getExchangeFilters calls a best-effort sidecar endpoint to fetch Binance filters.
+// If the endpoint is missing or fails, it returns zero values so baseline behavior is preserved.
+func (b *BinanceBridge) GetExchangeFilters(ctx context.Context, product string) (ExFilters, error) {
+	key := strings.TrimSpace(product)
+
+	// cache hit
+	fMuBinance.Lock()
+	if v, ok := fCacheBinance[key]; ok && (v.StepSize > 0 || v.TickSize > 0) {
+		fMuBinance.Unlock()
+		return v, nil
+	}
+	fMuBinance.Unlock()
+
+	// try: GET /exchange/filters?product_id=<product>
+	u := fmt.Sprintf("%s/exchange/filters?product_id=%s", b.base, url.QueryEscape(product))
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return ExFilters{}, err
+	}
+	resp, err := b.hc.Do(req)
+	if err != nil {
+		return ExFilters{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		// best-effort: do not treat as fatal
+		io.Copy(io.Discard, resp.Body)
+		return ExFilters{}, fmt.Errorf("filters %d", resp.StatusCode)
+	}
+	var payload struct {
+		StepSize string `json:"step_size"` // LOT_SIZE.StepSize
+		TickSize string `json:"tick_size"` // PRICE_FILTER.TickSize
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return ExFilters{}, err
+	}
+	f := ExFilters{
+		StepSize: parseFloat(payload.StepSize),
+		TickSize: parseFloat(payload.TickSize),
+	}
+
+	// cache store
+	fMuBinance.Lock()
+	fCacheBinance[key] = f
+	fMuBinance.Unlock()
+
+	return f, nil
+}
+
+// Cache-only lookup used by the hot path (no network).
+func (b *BinanceBridge) getExchangeFiltersCached(product string) ExFilters {
+	key := strings.TrimSpace(product)
+	fMuBinance.Lock()
+	v := fCacheBinance[key]
+	fMuBinance.Unlock()
+	return v
+}
+
+func snapDownBinance(x, step float64) float64 {
+	if step <= 0 {
+		return x
+	}
+	n := math.Floor(x/step + 1e-12)
+	return n * step
+}
+
+// formatWithStepBinance formats x using the decimal precision implied by step.
+// If step <= 0, it falls back to a fixed maximum precision given by fallbackDec.
+func formatWithStepBinance(x, step float64, fallbackDec int) string {
+	if step > 0 {
+		// derive decimals from step (e.g., 0.001000 -> 3)
+		s := strconv.FormatFloat(step, 'f', -1, 64)
+		dec := 0
+		if i := strings.IndexByte(s, '.'); i >= 0 {
+			dec = len(s) - i - 1
+			// trim trailing zeros
+			for dec > 0 && s[len(s)-1] == '0' {
+				s = s[:len(s)-1]
+				dec--
+			}
+		}
+		if dec < 0 {
+			dec = 0
+		}
+		return strconv.FormatFloat(x, 'f', dec, 64)
+	}
+	if fallbackDec < 0 {
+		fallbackDec = 0
+	}
+	return strconv.FormatFloat(x, 'f', fallbackDec, 64)
+}
+
+// --- MINIMAL ADD: tolerant JSON types for order/fill, and converter to PlacedOrder ---
+
+type fillJSON struct {
+	Price           string `json:"price"`
+	Qty             string `json:"qty"`
+	Commission      string `json:"commission"`
+	CommissionAsset string `json:"commissionAsset"`
+}
+
+type placedOrderJSON struct {
+	ID            string     `json:"id"`
+	Price         string     `json:"price"`
+	BaseSize      string     `json:"base_size"`
+	QuoteSpent    string     `json:"quote_spent"`
+	CommissionUSD string     `json:"commission_usd"`
+	Fills         []fillJSON `json:"fills"`
+}
+
+// toPlacedOrder converts a tolerant JSON struct (string fields) into the strongly-typed PlacedOrder.
+func toPlacedOrder(j placedOrderJSON) *PlacedOrder {
+	out := &PlacedOrder{
+		ID:            j.ID,
+		Price:         parseFloat(j.Price),
+		BaseSize:      parseFloat(j.BaseSize),
+		QuoteSpent:    parseFloat(j.QuoteSpent),
+		CommissionUSD: parseFloat(j.CommissionUSD),
+	}
+	// If the API provided only fills, sum commission best-effort if CommissionUSD is empty.
+	if out.CommissionUSD == 0 && len(j.Fills) > 0 {
+		var sum float64
+		for _, f := range j.Fills {
+			sum += parseFloat(f.Commission)
+		}
+		out.CommissionUSD = sum
+	}
+	return out
 }

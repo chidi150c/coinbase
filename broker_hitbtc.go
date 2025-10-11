@@ -206,6 +206,9 @@ func (h *HitbtcBridge) PlaceMarketQuote(ctx context.Context, product string, sid
 	return &ord, nil
 }
 
+func (h *HitbtcBridge) GetExchangeFilters(ctx context.Context, product string)(ExFilters, error){
+	return ExFilters{}, nil
+}
 // --- Maker-first additions ---
 
 // PlaceLimitPostOnly places a post-only limit order via the HitBTC bridge.

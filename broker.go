@@ -43,7 +43,7 @@ type PlacedOrder struct {
 	Price         float64   `json:"price,omitempty"`                // avg/exec price
 	BaseSize      float64   `json:"base_size,omitempty"`            // filled base
 	QuoteSpent    float64   `json:"quote_spent,omitempty"`          // spent quote
-	CommissionUSD float64   `json:"commission_total_usd,omitempty"` // total commission
+	CommissionUSD float64   `json:"commission_total_usd,string,omitempty"`
 	Liquidity     string    `json:"liquidity,omitempty"`            // "M" or "T"
 	Fills         []Fill    `json:"fills,omitempty"`
 	CreateTime    time.Time `json:"-"` // optional client-side timestamp; not from bridge
@@ -52,12 +52,15 @@ type PlacedOrder struct {
 
 // Fill is optional detail for post-trade analysis.
 type Fill struct {
-	Price         float64 `json:"price,omitempty"`
-	BaseSize      float64 `json:"size,omitempty"`
-	CommissionUSD float64 `json:"commission_usd,omitempty"`
+    Price         float64 `json:"price,string,omitempty"`
+    BaseSize      float64 `json:"size,string,omitempty"`
+    CommissionUSD float64 `json:"commission_usd,string,omitempty"`
 	Liquidity     string  `json:"liquidity,omitempty"` // "M" or "T"
 }
-
+type ExFilters struct {
+	StepSize  float64 // LOT_SIZE.stepSize (quantity)
+	TickSize  float64 // PRICE_FILTER.tickSize (price)
+}
 // Broker is the minimal surface the bot needs to operate.
 type Broker interface {
 	Name() string
@@ -71,4 +74,5 @@ type Broker interface {
 	PlaceLimitPostOnly(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64) (orderID string, err error)
 	GetOrder(ctx context.Context, product, orderID string) (*PlacedOrder, error)
 	CancelOrder(ctx context.Context, product, orderID string) error
+	GetExchangeFilters(ctx context.Context, product string) (ExFilters, error)
 }
