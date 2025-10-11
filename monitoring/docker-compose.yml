@@ -1,6 +1,8 @@
+version: "3.9"
+
 services:
   bridge_hitbtc:
-    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge-hitbtc:${IMAGE_SHA}  # pinned to CI SHA
+    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge-hitbtc:${IMAGE_SHA}
     container_name: bridge_hitbtc
     env_file:
       - /opt/coinbase/env/hitbtc.env   # includes PORT, STALE_MS, optional SYMBOL
@@ -11,7 +13,7 @@ services:
     restart: unless-stopped
 
   bridge_binance:
-    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge-binance:${IMAGE_SHA} # pinned to CI SHA
+    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge-binance:${IMAGE_SHA}
     container_name: bridge_binance
     env_file:
       - /opt/coinbase/env/binance.env  # includes PORT, STALE_MS, optional SYMBOL
@@ -36,7 +38,6 @@ services:
         aliases: [bridge]
     restart: unless-stopped
 
-
   bot_hitbtc:
     depends_on: [bridge_hitbtc]
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
@@ -45,7 +46,7 @@ services:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
     env_file:
-      - /opt/coinbase/env/bot_hitbtc.env      # broker/product/state overrides for HitBTC
+      - /opt/coinbase/env/bot_hitbtc.env
     restart: unless-stopped
     expose:
       - "8080"
@@ -60,7 +61,6 @@ services:
       monitoring_network:
         aliases: [bot-hitbtc]
 
-  # second bot instance for Binance
   bot_binance:
     depends_on: [bridge_binance]
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
@@ -69,7 +69,7 @@ services:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
     env_file:
-      - /opt/coinbase/env/bot_binance.env     # broker/product/state overrides for Binance
+      - /opt/coinbase/env/bot_binance.env
     restart: unless-stopped
     expose:
       - "8080"
@@ -85,6 +85,7 @@ services:
         aliases: [bot-binance]
 
   bot:
+    depends_on: [bridge]
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
     command: ["-live", "-interval", "1"]
     volumes:
