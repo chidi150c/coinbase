@@ -25,7 +25,7 @@ services:
 
   bridge:
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge:latest
-    command: uvicorn bridge.app:app --host 0.0.0.0 --port 8787
+    command: uvicorn app:app --host 0.0.0.0 --port 8787
     env_file:
       - /opt/coinbase/env/bridge.env
     expose:
