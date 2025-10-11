@@ -22,24 +22,21 @@ services:
     restart: unless-stopped
 
   bridge:
-    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge:latest
+    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge:${IMAGE_SHA}
+    command: uvicorn bridge.app:app --host 0.0.0.0 --port 8787
     env_file:
       - /opt/coinbase/env/bridge.env
-    expose:
-      - "8787"
-    restart: unless-stopped
-    healthcheck:
-      test: ["NONE"]   # image may not include wget/curl
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "5"
+    environment:
+      BRIDGE_BASE_STEP: "0.00000001"   # optional override
+      BRIDGE_TICK_SIZE: "0.01"         # optional override
     ports:
       - "8787:8787"
     networks:
       monitoring_network:
         aliases: [bridge]
+    restart: unless-stopped
+    pull_policy: always
+
 
   bot_hitbtc:
     depends_on: [bridge_hitbtc]
