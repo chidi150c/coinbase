@@ -19,6 +19,9 @@
 #   - Uses JSON keys with proper case: EquityUSD, LastAddEquitySell, LastAddEquityBuy.
 #   - Default tolerance is ±1.0; default timeout is 0 (no timeout).
 #   - Auto-elevates to root so it can stop services and edit files under /opt/coinbase/state/.
+#   - Minimal edits from baseline:
+#       * Write updates via a temp file and preserve original ownership (65532:65532 or actual owner) using chown before mv.
+#       * Abort service restart if BookBuy/BookSell lots drop from non-zero to zero.
 
 set -Eeuo pipefail
 
@@ -111,12 +114,13 @@ COMPOSE_BIN="$(compose_cmd)"
 # --- Helpers ---
 read_json_key() { jq -r ".$2 // empty" "$1"; }
 
-# Minimal change: write via temp, set ownership (65532:65532), then mv to preserve original ownership for the bot user.
+# Minimal change: write via temp, set ownership to original owner, then mv to replace atomically.
 edit_json_inplace() {
   local file="$1" expr="$2" tmp
   tmp="$(mktemp "${file}.XXXX")"
   jq "${expr}" "$file" >"$tmp"
-  chown 65532:65532 "$tmp"
+  # Preserve original ownership
+  chown "${OWNER_UID}:${OWNER_GID}" "$tmp"
   mv -f "$tmp" "$file"
 }
 
@@ -137,6 +141,10 @@ TARGET_HIGH=$(awk -v b="$BASE_EQ" -v a="$AMOUNT" -v t="$TOL" 'BEGIN{printf "%.6f
 echo "Monitoring ${STATE_FILE} every 1s until EquityUSD rises by ~${AMOUNT} (±${TOL})."
 echo "Baseline EquityUSD=${BASE_EQ}. Target band: [${TARGET_LOW}, ${TARGET_HIGH}]"
 echo
+
+# Capture original ownership for preservation on write
+OWNER_UID="$(stat -c '%u' "$STATE_FILE")"
+OWNER_GID="$(stat -c '%g' "$STATE_FILE")"
 
 # --- Poll loop ---
 start_ts=$(date +%s)
@@ -160,7 +168,7 @@ while true; do
   sleep 1
 done
 
-# Capture pre-edit lots counts for sanity check (minimal change to enforce restart safety)
+# Capture pre-edit lots counts for sanity check (enforce restart safety)
 PRE_BUY_LOTS="$(lots_count "$STATE_FILE" "BookBuy")"
 PRE_SELL_LOTS="$(lots_count "$STATE_FILE" "BookSell")"
 
@@ -187,7 +195,7 @@ echo "  EquityUSD:           ${NEW_EQ}"
 echo "  LastAddEquitySell:   ${NEW_LAES}"
 echo "  LastAddEquityBuy:    ${NEW_LAEB}"
 
-# Minimal change: re-check lots after edit; abort restart if non-zero -> zero drop detected.
+# Re-check lots after edit; abort restart if non-zero -> zero drop detected.
 POST_BUY_LOTS="$(lots_count "$STATE_FILE" "BookBuy")"
 POST_SELL_LOTS="$(lots_count "$STATE_FILE" "BookSell")"
 
