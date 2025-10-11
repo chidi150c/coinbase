@@ -755,7 +755,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --- NEW (minimal): equity strategy trigger detection (SELL runner add of entire spare base)
 	equityTriggerSell := false
 	var equitySpareBase float64
-	if t.lastAddEquitySell > 0 && t.equityUSD >= t.lastAddEquitySell*1.01 {
+
+	if t.lastAddEquitySell > 0 && t.equityUSD >= t.lastAddEquitySell*1.01 && d.Signal == Sell {
 		// Only proceed if not long-only; respect existing guard
 		if t.cfg.LongOnly {
 			t.mu.Unlock()
@@ -789,7 +790,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --- NEW (minimal): BUY equity-trigger flag ---(Buy runner of entire spare quote on dip)
 	equityTriggerBuy := false
 	var equitySpareQuote float64
-	if t.lastAddEquityBuy > 0 && t.equityUSD <= t.lastAddEquityBuy*0.99 {
+	if t.lastAddEquityBuy > 0 && t.equityUSD <= t.lastAddEquityBuy*0.99 && d.Signal == Buy {
 		// reserve quote needed to close all SELL lots at current price INCLUDING FEES
 		var reservedShortQuote float64
 		feeMult := 1.0 + (t.cfg.FeeRatePct / 100.0)
@@ -835,12 +836,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 	// Determine the side and its book
 	side := d.SignalToSide()
-	if equityTriggerSell {
-		side = SideSell // force SELL for equity scalp add
-	}
-	if equityTriggerBuy {
-		side = SideBuy // force BUY for equity dip runner
-	}
 	book := t.book(side)
 
 	// Determine if we are opening equity triggered trade or attempting a pyramid add (side-aware).
