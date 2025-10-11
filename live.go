@@ -65,7 +65,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 		}
 	}
 
-	// Warmup candles (paged backfill from bridge to MaxHistoryCandles; else large single fetch from broker)
+	// Warmup candles (paged backfill from bridge to MaxHistoryCandles; else large single fetch from the broker)
 	var history []Candle
 	target := trader.cfg.MaxHistoryCandles
 	if target <= 0 {
@@ -434,6 +434,7 @@ type bridgeAmount struct {
 type bridgeAccount struct {
 	Currency         string       `json:"currency"`
 	AvailableBalance bridgeAmount `json:"available_balance"`
+	LockedBalance    bridgeAmount `json:"locked_balance"` // optional; may be absent in some bridges
 	Type             string       `json:"type"`
 	Platform         string       `json:"platform"`
 }
@@ -466,7 +467,10 @@ func fetchBridgeAccounts(ctx context.Context, bridgeURL string) (map[string]floa
 	}
 	out := make(map[string]float64, len(payload.Accounts))
 	for _, r := range payload.Accounts {
-		v, _ := strconv.ParseFloat(strings.TrimSpace(r.AvailableBalance.Value), 64)
+		// Sum available + locked if locked is provided; treat missing/empty as zero.
+		avail, _ := strconv.ParseFloat(strings.TrimSpace(r.AvailableBalance.Value), 64)
+		locked, _ := strconv.ParseFloat(strings.TrimSpace(r.LockedBalance.Value), 64)
+		v := avail + locked
 		out[strings.ToUpper(strings.TrimSpace(r.Currency))] = v
 	}
 	return out, nil

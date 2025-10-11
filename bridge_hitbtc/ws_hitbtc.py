@@ -493,9 +493,12 @@ def accounts(limit: int = 250):
     for r in rows:
         cur = str(r.get("currency", "")).upper()
         avail = str(r.get("available", r.get("cash", "0")))
+        # Minimal change: expose optional locked_balance alongside available_balance.
+        locked = str(r.get("reserved", r.get("locked", "0")))
         out.append({
             "currency": cur,
             "available_balance": {"value": avail, "currency": cur},
+            "locked_balance": {"value": locked, "currency": cur},
             "type": "spot",
             "platform": "hitbtc",
         })

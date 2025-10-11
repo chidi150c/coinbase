@@ -36,12 +36,71 @@ app = FastAPI(title="coinbase-bridge", version="0.1")
 def health():
     return {"ok": True}
 
+from decimal import Decimal
+from fastapi import HTTPException
+
 @app.get("/accounts")
-def accounts(limit: int = 1):
+def accounts(limit: int = 250):
     try:
-        return client.get_accounts(limit=limit).to_dict()
+        raw = client.get_accounts(limit=limit).to_dict()
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
+
+    # Coinbase Advanced Trade commonly returns:
+    # {
+    #   "accounts": [
+    #     {
+    #       "uuid": "...",
+    #       "currency": "USDC",
+    #       "available_balance": {"value": "12.34", "currency": "USDC"},
+    #       "hold": {"value": "1.00", "currency": "USDC"}  # sometimes present
+    #       ...
+    #     }, ...
+    #   ],
+    #   "has_next": false, "cursor": "", "size": N
+    # }
+    #
+    # But shapes can vary. We normalize to include:
+    # - available_balance (string value)
+    # - hold_balance      (string value; from "hold" or 0 if missing)
+    # - locked_balance    (alias of hold_balance for clients that look for 'locked')
+    # - total_balance     (available + hold, as string)
+    # - currency (uppercased)
+    # - type, platform (for consistency/debug)
+
+    rows = (raw.get("accounts") or []) if isinstance(raw, dict) else []
+    out = []
+    for a in rows:
+        cur = str(a.get("currency", "")).upper()
+
+        # available (string)
+        ab = (a.get("available_balance") or {})
+        av = str(ab.get("value", "0"))
+
+        # hold/locked (may be under "hold" or absent)
+        hb = (a.get("hold") or a.get("hold_balance") or {})
+        hd = str(hb.get("value", "0"))
+
+        # compute total precisely
+        total = str(Decimal(av) + Decimal(hd))
+
+        out.append({
+            "currency": cur,
+            "available_balance": {"value": av, "currency": cur},
+            "hold_balance":      {"value": hd, "currency": cur},
+            "locked_balance":    {"value": hd, "currency": cur},  # <-- added alias for clients expecting 'locked_balance'
+            "total_balance":     {"value": total, "currency": cur},
+            "type": "spot",
+            "platform": "coinbase",
+        })
+
+    return {
+        "accounts": out,
+        "has_next": bool(raw.get("has_next")) if isinstance(raw, dict) else False,
+        "cursor":   str(raw.get("cursor") or ""),
+        "size":     len(out),
+    }
+
 
 @app.get("/product/{product_id}")
 def product(product_id: str):
@@ -641,4 +700,4 @@ def cancel_order(order_id: str, product_id: Optional[str] = Query(None)):
         # If we reached here, cancellation call(s) failed but we still return best-effort ack.
         return {"order_id": order_id, "status": "cancel_attempted"}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(sta

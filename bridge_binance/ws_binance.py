@@ -450,11 +450,13 @@ def accounts(limit: int = 250):
     bals = payload.get("balances") or []
     out = []
     for b in bals:
-        asset = str(b.get("asset","")).upper()
-        free  = str(b.get("free","0"))
+        asset  = str(b.get("asset","")).upper()
+        free   = str(b.get("free","0"))
+        locked = str(b.get("locked","0"))  # <-- include optional locked (hold) amount
         out.append({
             "currency": asset,
             "available_balance": {"value": free, "currency": asset},
+            "locked_balance":    {"value": locked, "currency": asset},  # <-- new optional field
             "type": "spot",
             "platform": "binance",
         })
