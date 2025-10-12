@@ -288,13 +288,24 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 					}
 					if err == nil {
 						base, quote := splitProductID(trader.cfg.ProductID)
-						eq := computeLiveEquity(bal, base, quote, history[len(history)-1].Close)
+						px := history[len(history)-1].Close
+					    if traceOn() {
+					        // print a compact map snapshot for base/quote/USDC/USB
+					        lb := bal[strings.ToUpper(base)]
+					        lq := bal[strings.ToUpper(quote)]
+					        lusd  := bal["USD"]
+					        lusdc := bal["USDC"]
+					        log.Printf("[TRACE] equity: balances base=%s=%.8f | quote=%s=%.8f | USD=%.8f | USDC=%.8f | lastPrice=%.8f",
+					            strings.ToUpper(base), lb, strings.ToUpper(quote), lq, lusd, lusdc, px)
+					    }
+					    eq := computeLiveEquity(bal, base, quote, px)
 						if eq > 0 {
 							if !eqReady {
 								log.Printf("[EQUITY] live balances received; rebased equity to %.2f", eq)
 							}
 							trader.SetEquityUSD(eq)
 							eqReady = true
+							if traceOn() { log.Printf("[TRACE] equity: computed=%.8f (ready=%v)", eq, eqReady) }
 						} else if !eqReady {
 							// TRACE: break down balances and price to see why eq<=0
 							lb := bal[strings.ToUpper(base)]
@@ -447,39 +458,51 @@ type bridgeAccount struct {
 // Sentinel error for missing bridge /accounts endpoint
 var errBridgeAccountsNotFound = errors.New("bridge accounts endpoint not found") // <-- added
 
-func fetchBridgeAccounts(ctx context.Context, bridgeURL string) (map[string]float64, error) {
-	u := strings.TrimRight(bridgeURL, "/") + "/accounts?limit=250"
-	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		io.Copy(io.Discard, resp.Body)
-		return nil, errBridgeAccountsNotFound // <-- added
-	}
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("bridge /accounts %d: %s", resp.StatusCode, string(b))
-	}
-	var payload bridgeAccountsResp
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, err
-	}
-	out := make(map[string]float64, len(payload.Accounts))
-	for _, r := range payload.Accounts {
-		// Sum available + locked if locked is provided; treat missing/empty as zero.
-		avail, _ := strconv.ParseFloat(strings.TrimSpace(r.AvailableBalance.Value), 64)
-		locked, _ := strconv.ParseFloat(strings.TrimSpace(r.LockedBalance.Value), 64)
-		v := avail + locked
-		out[strings.ToUpper(strings.TrimSpace(r.Currency))] = v
-	}
-	return out, nil
-}
+ func fetchBridgeAccounts(ctx context.Context, bridgeURL string) (map[string]float64, error) {
+     u := strings.TrimRight(bridgeURL, "/") + "/accounts?limit=250"
+    if traceOn() { log.Printf("[TRACE] equity: calling %s", u) }
+     req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+     if err != nil {
+         return nil, err
+     }
+     resp, err := http.DefaultClient.Do(req)
+     if err != nil {
+         return nil, err
+     }
+     defer resp.Body.Close()
+    if traceOn() { log.Printf("[TRACE] equity: /accounts status=%d", resp.StatusCode) }
+     if resp.StatusCode == http.StatusNotFound {
+         io.Copy(io.Discard, resp.Body)
+        if traceOn() { log.Printf("[TRACE] equity: /accounts 404 -> will fallback to broker balances") }
+        return nil, errBridgeAccountsNotFound
+     }
+     if resp.StatusCode >= 300 {
+         b, _ := io.ReadAll(resp.Body)
+         return nil, fmt.Errorf("bridge /accounts %d: %s", resp.StatusCode, string(b))
+     }
+     var payload bridgeAccountsResp
+     if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+        if traceOn() { log.Printf("[TRACE] equity: /accounts decode error: %v (will fallback)", err) }
+         return nil, err
+     }
+     out := make(map[string]float64, len(payload.Accounts))
+     for _, r := range payload.Accounts {
+         // Sum available + locked if locked is provided; treat missing/empty as zero.
+         avail, _ := strconv.ParseFloat(strings.TrimSpace(r.AvailableBalance.Value), 64)
+         locked, _ := strconv.ParseFloat(strings.TrimSpace(r.LockedBalance.Value), 64)
+         v := avail + locked
+         out[strings.ToUpper(strings.TrimSpace(r.Currency))] = v
+        if traceOn() {
+            log.Printf("[TRACE] equity: acct %s available=%.8f locked=%.8f total=%.8f",
+                strings.ToUpper(strings.TrimSpace(r.Currency)), avail, locked, v)
+        }
+     }
+    if traceOn() { log.Printf("[TRACE] equity: total currencies parsed=%d", len(out)) }
+     return out, nil
+ }
+
+// live.go
+func traceOn() bool { return getEnvBool("TRACE_EQUITY", false) }
 
 func splitProductID(pid string) (base, quote string) {
 	p := strings.ToUpper(strings.TrimSpace(pid))
