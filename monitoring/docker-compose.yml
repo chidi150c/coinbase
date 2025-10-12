@@ -1,8 +1,6 @@
-version: "3.9"
-
 services:
   bridge_hitbtc:
-    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge-hitbtc:${IMAGE_SHA}
+    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge-hitbtc:${IMAGE_SHA}  # pinned to CI SHA
     container_name: bridge_hitbtc
     env_file:
       - /opt/coinbase/env/hitbtc.env   # includes PORT, STALE_MS, optional SYMBOL
@@ -13,7 +11,7 @@ services:
     restart: unless-stopped
 
   bridge_binance:
-    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge-binance:${IMAGE_SHA}
+    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge-binance:${IMAGE_SHA} # pinned to CI SHA
     container_name: bridge_binance
     env_file:
       - /opt/coinbase/env/binance.env  # includes PORT, STALE_MS, optional SYMBOL
@@ -25,14 +23,13 @@ services:
 
   bridge:
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge:latest
-    command: uvicorn app:app --host 0.0.0.0 --port 8787
     env_file:
       - /opt/coinbase/env/bridge.env
     expose:
       - "8787"
     restart: unless-stopped
     healthcheck:
-      test: ["NONE"]
+      test: ["NONE"]   # image may not include wget/curl
     logging:
       driver: "json-file"
       options:
@@ -52,7 +49,7 @@ services:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
     env_file:
-      - /opt/coinbase/env/bot_hitbtc.env
+      - /opt/coinbase/env/bot_hitbtc.env      # broker/product/state overrides for HitBTC
     restart: unless-stopped
     expose:
       - "8080"
@@ -67,6 +64,7 @@ services:
       monitoring_network:
         aliases: [bot-hitbtc]
 
+  # second bot instance for Binance
   bot_binance:
     depends_on: [bridge_binance]
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
@@ -75,7 +73,7 @@ services:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
     env_file:
-      - /opt/coinbase/env/bot_binance.env
+      - /opt/coinbase/env/bot_binance.env     # broker/product/state overrides for Binance
     restart: unless-stopped
     expose:
       - "8080"
@@ -91,7 +89,6 @@ services:
         aliases: [bot-binance]
 
   bot:
-    depends_on: [bridge]
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
     command: ["-live", "-interval", "1"]
     volumes:

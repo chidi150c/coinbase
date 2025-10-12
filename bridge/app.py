@@ -39,71 +39,6 @@ def health():
 from decimal import Decimal
 from fastapi import HTTPException
 
-# --- add near the top (after env load) ---
-BRIDGE_BASE_STEP = os.getenv("BRIDGE_BASE_STEP", "").strip()   # e.g. "0.00000001"
-BRIDGE_TICK_SIZE = os.getenv("BRIDGE_TICK_SIZE", "").strip()   # e.g. "0.01"
-
-_COMMON_QUOTES = ["FDUSD","USDT","USDC","BUSD","TUSD","EUR","GBP","TRY","BRL","BTC","ETH","BNB","USD"]
-
-def _normalize_product_id(product_id: str | None = None, symbol: str | None = None) -> str:
-    s = (product_id or symbol or "").strip().upper()
-    if not s:
-        return ""
-    if "-" in s:
-        return s
-    for q in _COMMON_QUOTES:
-        if s.endswith(q) and len(s) > len(q):
-            return s[:-len(q)] + "-" + q
-    if len(s) > 3:
-        return s[:-3] + "-" + s[-3:]
-    return s
-
-def _is_pos_decimal(val: str) -> bool:
-    try:
-        return Decimal(str(val)) > 0
-    except Exception:
-        return False
-
-# --- replace ONLY this endpoint ---
-from typing import Optional
-from fastapi import Query
-
-@app.get("/exchange/filters")
-def exchange_filters(
-    product_id: Optional[str] = Query(None),
-    symbol: Optional[str] = Query(None),
-):
-    """
-    Return Binance-style filters for Coinbase products so the Go broker can snap size/price.
-      - step_size := base_increment OR BRIDGE_BASE_STEP
-      - tick_size := quote_increment OR BRIDGE_TICK_SIZE
-    Hard-fails (404) if neither source yields positive values.
-    """
-    try:
-        pid = _normalize_product_id(product_id=product_id, symbol=symbol)
-        if not pid:
-            raise RuntimeError("missing product_id/symbol")
-        _base, _quote, base_step, quote_step = _product_symbols_and_steps(pid)
-
-        step = (base_step or "").strip()
-        tick = (quote_step or "").strip()
-
-        if not _is_pos_decimal(step) and _is_pos_decimal(BRIDGE_BASE_STEP):
-            step = BRIDGE_BASE_STEP
-        if not _is_pos_decimal(tick) and _is_pos_decimal(BRIDGE_TICK_SIZE):
-            tick = BRIDGE_TICK_SIZE
-
-        if not _is_pos_decimal(step):
-            raise RuntimeError("missing base_increment and BRIDGE_BASE_STEP")
-        if not _is_pos_decimal(tick):
-            raise RuntimeError("missing quote_increment and BRIDGE_TICK_SIZE")
-
-        return {"product_id": pid, "step_size": str(step), "tick_size": str(tick)}
-    except Exception as e:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail=str(e))
-
-
 @app.get("/accounts")
 def accounts(limit: int = 250):
     try:
@@ -765,4 +700,4 @@ def cancel_order(order_id: str, product_id: Optional[str] = Query(None)):
         # If we reached here, cancellation call(s) failed but we still return best-effort ack.
         return {"order_id": order_id, "status": "cancel_attempted"}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(sta

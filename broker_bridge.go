@@ -35,6 +35,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -380,10 +381,12 @@ func (bb *BridgeBroker) getExchangeFiltersCached(product string) ExFilters {
 	return v
 }
 
-// getExchangeFilters calls a best-effort sidecar endpoint to fetch filters.
-// If the endpoint is missing or fails, it returns zero values so baseline behavior is preserved.
+// GetExchangeFilters returns lot/price steps for a product with robust fallbacks:
+// 1) Cache (fast path)
+// 2) Env overrides (BASE_STEP, TICK_SIZE) -> seeds cache, returns non-zero
+// 3) HTTP best-effort against several endpoint variants/params
 func (bb *BridgeBroker) GetExchangeFilters(ctx context.Context, product string) (ExFilters, error) {
-	key := strings.TrimSpace(product)
+    key := strings.TrimSpace(product)
 
 	// cache hit
 	fMuCoinbase.Lock()
@@ -393,42 +396,84 @@ func (bb *BridgeBroker) GetExchangeFilters(ctx context.Context, product string) 
 	}
 	fMuCoinbase.Unlock()
 
-	// try: GET /exchange/filters?product_id=<product>
-	u := fmt.Sprintf("%s/exchange/filters?product_id=%s", bb.base, url.QueryEscape(product))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return ExFilters{}, err
-	}
-	req.Header.Set("User-Agent", "coinbot/bridge")
+	 // 1) ENV OVERRIDES (fast, no network). Accepts BASE_STEP, TICK_SIZE.
+    // These map to ExFilters.StepSize and ExFilters.TickSize respectively.
+    if bs := strings.TrimSpace(os.Getenv("BASE_STEP")); bs != "" {
+        if ts := strings.TrimSpace(os.Getenv("TICK_SIZE")); ts != "" {
+            f := ExFilters{
+                StepSize: parsePosFloat(bs),
+                TickSize: parsePosFloat(ts),
+            }
+            if f.StepSize > 0 || f.TickSize > 0 {
+                fMuCoinbase.Lock()
+                fCacheCoinbase[key] = f
+                fMuCoinbase.Unlock()
+                return f, nil
+            }
+        }
+    }
 
-	res, err := bb.hc.Do(req)
-	if err != nil {
-		return ExFilters{}, err
-	}
-	defer res.Body.Close()
-	if res.StatusCode >= 300 {
-		// best-effort: do not treat as fatal
-		io.Copy(io.Discard, res.Body)
-		return ExFilters{}, fmt.Errorf("filters %d", res.StatusCode)
-	}
-	var payload struct {
-		StepSize string `json:"step_size"` // LOT_SIZE.StepSize
-		TickSize string `json:"tick_size"` // PRICE_FILTER.TickSize
-	}
-	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
-		return ExFilters{}, err
-	}
-	f := ExFilters{
-		StepSize: parsePosFloat(payload.StepSize),
-		TickSize: parsePosFloat(payload.TickSize),
-	}
+    // 2) HTTP best-effort: try multiple routes/params.
+    // Normalize symbol (BTC-USD -> BTCUSD) for symbol-style endpoints.
+    sym := strings.ReplaceAll(key, "-", "")
+    candidates := []string{
+        fmt.Sprintf("%s/exchange/filters?product_id=%s", bb.base, url.QueryEscape(key)),
+        fmt.Sprintf("%s/exchange/filters?symbol=%s", bb.base, url.QueryEscape(sym)),
+        fmt.Sprintf("%s/filters?product_id=%s", bb.base, url.QueryEscape(key)), // legacy
+        fmt.Sprintf("%s/filters?symbol=%s", bb.base, url.QueryEscape(sym)),     // legacy
+    }
 
-	// cache store
-	fMuCoinbase.Lock()
-	fCacheCoinbase[key] = f
-	fMuCoinbase.Unlock()
+    var lastErr error
+    for _, u := range candidates {
+        req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+        if err != nil {
+            lastErr = err
+            continue
+        }
+        req.Header.Set("User-Agent", "coinbot/bridge")
 
-	return f, nil
+        res, err := bb.hc.Do(req)
+        if err != nil {
+            lastErr = err
+            continue
+        }
+        func() {
+            defer res.Body.Close()
+            if res.StatusCode >= 300 {
+                io.Copy(io.Discard, res.Body)
+                lastErr = fmt.Errorf("filters %d", res.StatusCode)
+                return
+            }
+            var payload struct {
+                StepSize string `json:"step_size"` // LOT_SIZE.StepSize
+                TickSize string `json:"tick_size"` // PRICE_FILTER.TickSize
+            }
+            if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+                lastErr = err
+                return
+            }
+            f := ExFilters{
+                StepSize: parsePosFloat(payload.StepSize),
+                TickSize: parsePosFloat(payload.TickSize),
+            }
+            // Accept only non-zero
+            if f.StepSize > 0 || f.TickSize > 0 {
+                fMuCoinbase.Lock()
+                fCacheCoinbase[key] = f
+                fMuCoinbase.Unlock()
+                lastErr = nil
+            } else {
+                lastErr = fmt.Errorf("filters empty from %s", u)
+            }
+        }()
+        if lastErr == nil {
+            // success
+            return fCacheCoinbase[key], nil
+        }
+    }
+
+    // 3) Nothing worked; preserve current behavior but with clearer error.
+    return ExFilters{}, fmt.Errorf("filters unavailable for %s: %v", key, lastErr)
 }
 // --- Maker-first additions (post-only limit) ---
 
