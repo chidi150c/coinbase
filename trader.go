@@ -86,7 +86,11 @@ type BotState struct {
 
 	// --- NEW: equity-at-last-add snapshots (SELL persisted; legacy fallback supported) ---
 	LastAddEquitySell float64
-	LastAddEquityBuy float64
+	LastAddEquityBuy  float64
+
+	// --- NEW: persist equity trigger staging indices per side ---
+	EquityStageBuy  int
+	EquityStageSell int
 }
 
 type Trader struct {
@@ -124,6 +128,10 @@ type Trader struct {
 	// --- NEW: equity-at-last-add snapshots for equity strategy trading ---
 	lastAddEquitySell float64 // replaces legacy lastAddEquity (SELL path)
 	lastAddEquityBuy  float64 // BUY-side dip trigger baseline (not persisted)
+
+	// --- NEW: equity trigger staging indices per side (0..3 for 25/50/75/100) ---
+	equityStageBuy  int
+	equityStageSell int
 
 	// daily
 	dailyStart time.Time
@@ -297,6 +305,30 @@ func clamp(x, lo, hi float64) float64 {
 	return x
 }
 
+// --- NEW: equity trigger staging helpers ---
+func equityStagesSell() []float64 { return []float64{0.25, 0.50, 0.75, 1.00} }
+func equityStagesBuy() []float64  { return []float64{0.25, 0.50, 0.75, 1.00} }
+
+func snapToStep(x, step float64) float64 {
+	if step <= 0 {
+		return x
+	}
+	n := math.Floor(x / step)
+	if n <= 0 {
+		return 0
+	}
+	return n * step
+}
+func clampStage(idx, n int) int {
+	if idx < 0 {
+		return 0
+	}
+	if idx >= n {
+		return n - 1
+	}
+	return idx
+}
+
 // latestEntry returns the most recent long lot entry price, or 0 if none.
 // NOTE: maintained for compatibility; now uses SideBook(BUY).
 func (t *Trader) latestEntry() float64 {
@@ -422,12 +454,11 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	notional := quote
 	if notional < t.cfg.OrderMinUSD {
 		log.Printf("[CLOSE-SKIP] lotSide=%s closeSide=%s base=%.8f price=%.2f notional=%.2f < ORDER_MIN_USD %.2f; deferring",
-		lot.Side, closeSide, baseRequested, price, notional, t.cfg.OrderMinUSD)
+			lot.Side, closeSide, baseRequested, price, notional, t.cfg.OrderMinUSD)
 		msg := fmt.Sprintf("EXIT-SKIP %s side=%s→%s notional=%.2f < min=%.2f reason=%s",
 			c[len(c)-1].Time.Format(time.RFC3339), lot.Side, closeSide, notional, t.cfg.OrderMinUSD, exitReason)
 		return msg, nil
 	}
-
 
 	// unlock for I/O
 	t.mu.Unlock()
@@ -579,6 +610,26 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		}
 	}
 
+	// --- NEW: Back-step & Reset for equity stages (side-aware) ---
+	if removedWasRunner {
+		if lot.Side == SideBuy {
+			if t.equityStageBuy > 0 {
+				t.equityStageBuy--
+			}
+		} else {
+			if t.equityStageSell > 0 {
+				t.equityStageSell--
+			}
+		}
+	}
+	if len(book.Lots) == 0 {
+		if lot.Side == SideBuy {
+			t.equityStageBuy = 0
+		} else {
+			t.equityStageSell = 0
+		}
+	}
+
 	// Include reason in message for operator visibility
 	msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
 		c[len(c)-1].Time.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, lot.EntryFee+exitFee)
@@ -636,9 +687,13 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		now.Format(time.RFC3339), c[len(c)-1].Close, lsb, lss,
 		t.lastAddBuy.Format(time.RFC3339), t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell)
 
+	price := c[len(c)-1].Close
+
+	// --------------------------------------------------------------------------------------------------------
 	// --- EXIT path: if any lots are open, evaluate TP/SL and trailing for each side; close one at a time.
+	// --------------------------------------------------------------------------------------------------------
 	if (lsb > 0) || (lss > 0) {
-		price := c[len(c)-1].Close
+
 		nearestTakeBuy := 0.0
 		nearestTakeSell := 0.0
 
@@ -665,7 +720,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 							i++
 							continue
 						}
-						
+
 						msg, err := t.closeLot(ctx, c, side, i, "trailing_stop")
 						if err != nil {
 							t.mu.Unlock()
@@ -730,7 +785,27 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		log.Printf("[DEBUG] Nearest Take (to close a buy lot)=%.2f, (to close a sell lot)=%.2f, across %d BuyLots, and %d SellLots", nearestTakeBuy, nearestTakeSell, lsb, lss)
 	}
 
+	feeMult := 1.0 + (t.cfg.FeeRatePct/100.0)
+	// Sum reserved base for long lots (BUY side)
+	var reservedLongBase float64
+	if bb := t.book(SideBuy); bb != nil {
+		for _, lot := range bb.Lots {
+			reservedLongBase += lot.SizeBase
+		}
+	}
+	// Compute reserved quote for shorts in Lots exit
+	var reservedShortQuoteWithFee float64
+	if sb := t.book(SideSell); sb != nil {
+		// Sum reserved quote for short lots (SELL side)
+		for _, lot := range sb.Lots {
+			q := lot.SizeBase * price
+			reservedShortQuoteWithFee += q * feeMult
+		}
+	}
+
+	// --------------------------------------------------------------------------------------------------------
 	//---ADD path continues-----
+	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt)
 	totalLots := lsb + lss
 	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v",
@@ -738,7 +813,63 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
 
-	price := c[len(c)-1].Close
+	// Determine the side and its book
+	side := d.SignalToSide()
+	book := t.book(side)
+
+	//Required spare inventory
+	var spare float64
+	var symB string
+	var availBase, baseStep float64
+	var errB error
+	var symQ string
+	var availQuote, quoteStep float64
+	var errQ error
+
+	// If BUY, required spare quote inventory
+	if side == SideBuy {
+		// Reserve quote needed to close shorts (includes fees).
+		// Release lock for broker I/O to avoid stalls.
+		t.mu.Unlock()
+		symQ, availQuote, quoteStep, errQ = t.broker.GetAvailableQuote(ctx, t.cfg.ProductID)
+		t.mu.Lock()
+		if errQ != nil || strings.TrimSpace(symQ) == "" {
+			t.mu.Unlock()
+			log.Fatalf("BUY blocked: GetAvailableQuote failed: %v", errQ)
+		}
+		if quoteStep <= 0 {
+			t.mu.Unlock()
+			log.Fatalf("BUY blocked: missing/invalid QUOTE step for %s (step=%.8f)", t.cfg.ProductID, quoteStep)
+		}
+		spare = availQuote - reservedShortQuoteWithFee
+	}
+
+	// If SELL, required spare base inventory (spot safe)
+	if side == SideSell {
+		// Ask broker for base balance/step (release lock for I/O).
+		t.mu.Unlock()
+		symB, availBase, baseStep, errB = t.broker.GetAvailableBase(ctx, t.cfg.ProductID)
+		t.mu.Lock()
+		if errB != nil || strings.TrimSpace(symB) == "" {
+			t.mu.Unlock()
+			log.Fatalf("SELL blocked: GetAvailableBase failed: %v", errB)
+		}
+		if baseStep <= 0 {
+			t.mu.Unlock()
+			log.Fatalf("SELL blocked: missing/invalid BASE step for %s (step=%.8f)", t.cfg.ProductID, baseStep)
+		}
+		// Only enforce spare-base gating if we actually require base to short.
+		if requireBaseForShort() {
+			spare = availBase - reservedLongBase
+		} else {
+			// When shorting without spot requirement, "spare" for equity-trigger SELL
+			// can be computed as available base (for step snapping) but we don't gate on it.
+			spare = availBase - reservedLongBase
+			if spare < 0 {
+				spare = 0
+			}
+		}
+	}
 
 	// --- track lowest price since last add (BUY path) and highest price (SELL path) ---
 	if !t.lastAddBuy.IsZero() {
@@ -755,34 +886,20 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --- NEW (minimal): equity strategy trigger detection (SELL runner add of entire spare base)
 	equityTriggerSell := false
 	var equitySpareBase float64
-
 	if t.lastAddEquitySell > 0 && t.equityUSD >= t.lastAddEquitySell*1.01 && d.Signal == Sell {
 		// Only proceed if not long-only; respect existing guard
 		if t.cfg.LongOnly {
 			t.mu.Unlock()
 			return "FLAT (long-only) [equity-scalp]", nil
 		}
-		// Compute spare base = available base - reserved long base
-		var reservedLong float64
-		if bb := t.book(SideBuy); bb != nil {
-			for _, lot := range bb.Lots {
-				reservedLong += lot.SizeBase
-			}
+		if spare < 0 {
+			spare = 0
 		}
-		// Ask broker for base availability/step (uniform: live & DryRun).
-		sym, availBase, step, err := t.broker.GetAvailableBase(ctx, t.cfg.ProductID)
-		_ = sym
-		if err == nil && step > 0 {
-			spare := availBase - reservedLong
-			if spare < 0 {
-				spare = 0
-			}
-			// Floor to step
-			if spare > 0 {
-				equitySpareBase = math.Floor(spare/step) * step
-				if equitySpareBase > 0 {
-					equityTriggerSell = true
-				}
+		// Floor to step
+		if spare > 0 {
+			equitySpareBase = math.Floor(spare/baseStep) * baseStep
+			if equitySpareBase > 0 {
+				equityTriggerSell = true
 			}
 		}
 	}
@@ -791,33 +908,19 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	equityTriggerBuy := false
 	var equitySpareQuote float64
 	if t.lastAddEquityBuy > 0 && t.equityUSD <= t.lastAddEquityBuy*0.99 && d.Signal == Buy {
-		// reserve quote needed to close all SELL lots at current price INCLUDING FEES
-		var reservedShortQuote float64
-		feeMult := 1.0 + (t.cfg.FeeRatePct / 100.0)
-		if sb := t.book(SideSell); sb != nil {
-			for _, lot := range sb.Lots {
-				// include fees in quote needed to close shorts
-				reservedShortQuote += (lot.SizeBase * price) * feeMult
-			}
+		if spare < 0 {
+			spare = 0
 		}
-		// Ask broker for quote availability/step
-		sym, availQuote, qstep, err := t.broker.GetAvailableQuote(ctx, t.cfg.ProductID)
-		_ = sym
-		if err == nil && qstep > 0 {
-			spare := availQuote - reservedShortQuote
-			if spare < 0 {
-				spare = 0
-			}
-			if spare > 0 {
-				equitySpareQuote = math.Floor(spare/qstep) * qstep
-				if equitySpareQuote > 0 {
-					equityTriggerBuy = true
-				}
+		if spare > 0 {
+			equitySpareQuote = math.Floor(spare/quoteStep) * quoteStep
+			if equitySpareQuote > 0 {
+				equityTriggerBuy = true
 			}
 		}
 	}
 
-	log.Printf("[DEBUG] EQUITY Trading: equityUSD=%.2f lastAddEquitySell=%.2f pct_diff_sell=%.6f lastAddEquityBuy=%.2f pct_diff_buy=%.6f v", t.equityUSD, t.lastAddEquitySell, t.equityUSD/t.lastAddEquitySell, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy)
+	log.Printf("[DEBUG] EQUITY Trading: equityUSD=%.2f lastAddEquitySell=%.2f pct_diff_sell=%.6f lastAddEquityBuy=%.2f pct_diff_buy=%.6f", t.equityUSD, t.lastAddEquitySell, t.equityUSD/t.lastAddEquitySell, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy)
+
 	// Long-only veto for SELL when flat; unchanged behavior.
 	if d.Signal == Sell && t.cfg.LongOnly {
 		t.mu.Unlock()
@@ -834,9 +937,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", maxConcurrentLots())
 		return "HOLD", nil
 	}
-	// Determine the side and its book
-	side := d.SignalToSide()
-	book := t.book(side)
 
 	// Determine if we are opening equity triggered trade or attempting a pyramid add (side-aware).
 	isAdd := len(book.Lots) > 0 && allowPyramiding() && (d.Signal == Buy || d.Signal == Sell)
@@ -1019,7 +1119,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	// --- NEW: side-aware risk ramping (optional) ---
-	if rampEnable() {
+	if rampEnable() && !(equityTriggerSell || equityTriggerBuy) {
 		k := len(book.Lots) // number of existing lots on THIS SIDE
 		switch rampMode() {
 		case "exp":
@@ -1055,15 +1155,58 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 	base := quote / price
 
-	// --- NEW: override sizing for equity scalp to use the entire spare base as the order size (SELL only) ---
+	// --- NEW: staged sizing for EQUITY triggers (SELL in BASE, BUY in QUOTE) ---
+	// --- NEW: override sizing for normal Sell using stage function of spare base as the order size (SELL only) ---
 	if equityTriggerSell && side == SideSell && equitySpareBase > 0 {
-		base = equitySpareBase
-		quote = base * price
+		stagesSell := equityStagesSell()
+		startStage := clampStage(t.equityStageSell, len(stagesSell))
+		chosen := -1
+		var targetBase float64
+		for s := startStage; s < len(stagesSell); s++ {
+			tb := equitySpareBase * stagesSell[s]
+			tb = snapToStep(tb, baseStep)
+			if tb <= 0 || tb > equitySpareBase {
+				continue
+			}
+			if tb*price >= t.cfg.OrderMinUSD {
+				targetBase = tb
+				chosen = s
+				break
+			}
+		}
+		if chosen >= 0 {
+			base = targetBase
+			quote = base * price
+			t.equityStageSell = clampStage(chosen+1, len(stagesSell))
+		} else {
+			equityTriggerSell = false
+		}
 	}
 	// --- NEW: override sizing for BUY equity dip to use entire spare quote ---
 	if equityTriggerBuy && side == SideBuy && equitySpareQuote > 0 {
-		quote = equitySpareQuote
-		base = quote / price
+		stagesBuy := equityStagesBuy()
+		startStage := clampStage(t.equityStageBuy, len(stagesBuy))
+		chosen := -1
+		var targetQuote float64
+		for s := startStage; s < len(stagesBuy); s++ {
+			tq := equitySpareQuote * stagesBuy[s]
+			tq = snapToStep(tq, quoteStep)
+			if tq <= 0 || tq > equitySpareQuote {
+				continue
+			}
+			if tq >= t.cfg.OrderMinUSD {
+				targetQuote = tq
+				chosen = s
+				break
+			}
+		}
+		if chosen >= 0 {
+			quote = targetQuote
+			base = quote / price
+			t.equityStageBuy = clampStage(chosen+1, len(stagesBuy))
+		} else {
+			equityTriggerBuy = false
+		}
 	}
 
 	// TODO: remove TRACE
@@ -1074,51 +1217,28 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// --- BUY gating (require spare quote after reserving open shorts) ---
 	if side == SideBuy {
-		// Reserve quote needed to close all existing short lots at current price.
-		var reservedShortQuote float64
-		if sb := t.book(SideSell); sb != nil {
-			for _, lot := range sb.Lots {
-				reservedShortQuote += lot.SizeBase * price
-			}
-		}
-
-		// Ask broker for quote balance/step (uniform: live & DryRun).
-		sym, aq, qs, err := t.broker.GetAvailableQuote(ctx, t.cfg.ProductID)
-		if err != nil || strings.TrimSpace(sym) == "" {
-			t.mu.Unlock()
-			log.Fatalf("BUY blocked: GetAvailableQuote failed: %v", err)
-		}
-		availQuote := aq
-		qstep := qs
-		if qstep <= 0 {
-			t.mu.Unlock()
-			log.Fatalf("BUY blocked: missing/invalid QUOTE step for %s (step=%.8f)", t.cfg.ProductID, qstep)
-		}
-
 		// TODO: remove TRACE
-		log.Printf("TRACE buy.gate.pre availQuote=%.2f reservedShort=%.2f needQuoteRaw=%.2f qstep=%.8f",
-			availQuote, reservedShortQuote, quote, qstep)
+		log.Printf("TRACE buy.gate.pre availQuote=%.2f reservedShort=%.2f needQuoteRaw=%.2f quoteStep=%.8f",
+			availQuote, reservedShortQuoteWithFee, quote, quoteStep)
 
 		// Floor the needed quote to step.
 		neededQuote := quote
-		if qstep > 0 {
-			n := math.Floor(neededQuote/qstep) * qstep
+		if quoteStep > 0 {
+			n := math.Floor(neededQuote/quoteStep) * quoteStep
 			if n > 0 {
 				neededQuote = n
 			}
 		}
-
-		spare := availQuote - reservedShortQuote
 		if spare < 0 {
 			spare = 0
 		}
 		if spare+spareEps < neededQuote {
 			// --- breadcrumb ---
 			log.Printf("[WARN] FUNDS_EXHAUSTED BUY need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
-				neededQuote, spare, availQuote, reservedShortQuote, qstep)
+				neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
 			t.mu.Unlock()
 			log.Printf("[DEBUG] GATE BUY: need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
-				neededQuote, spare, availQuote, reservedShortQuote, qstep)
+				neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
 			// TODO: remove TRACE
 			log.Printf("TRACE buy.gate.block need=%.2f spare=%.2f", neededQuote, spare)
 			return "HOLD", nil
@@ -1127,17 +1247,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		// Enforce exchange minimum notional after snapping, then snap UP to step to keep >= min; re-check spare.
 		if neededQuote < t.cfg.OrderMinUSD {
 			neededQuote = t.cfg.OrderMinUSD
-			if qstep > 0 {
-				steps := math.Ceil(neededQuote / qstep)
-				neededQuote = steps * qstep
+			if quoteStep > 0 {
+				steps := math.Ceil(neededQuote / quoteStep)
+				neededQuote = steps * quoteStep
 			}
 			if spare+spareEps < neededQuote {
 				// --- breadcrumb ---
 				log.Printf("[WARN] FUNDS_EXHAUSTED BUY need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
-					neededQuote, spare, availQuote, reservedShortQuote, qstep)
+					neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
 				t.mu.Unlock()
 				log.Printf("[DEBUG] GATE BUY: need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
-					neededQuote, spare, availQuote, reservedShortQuote, qstep)
+					neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
 				// TODO: remove TRACE
 				log.Printf("TRACE buy.gate.block minNotional need=%.2f spare=%.2f", neededQuote, spare)
 				return "HOLD", nil
@@ -1154,50 +1274,29 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// If SELL, require spare base inventory (spot safe)
 	if side == SideSell && requireBaseForShort() {
-		// Sum reserved base for long lots (BUY side)
-		var reservedLong float64
-		if bb := t.book(SideBuy); bb != nil {
-			for _, lot := range bb.Lots {
-				reservedLong += lot.SizeBase
-			}
-		}
-
-		// Ask broker for base balance/step (uniform: live & DryRun).
-		sym, ab, stp, err := t.broker.GetAvailableBase(ctx, t.cfg.ProductID)
-		if err != nil || strings.TrimSpace(sym) == "" {
-			t.mu.Unlock()
-			log.Fatalf("SELL blocked: GetAvailableBase failed: %v", err)
-		}
-		availBase := ab
-		step := stp
-		if step <= 0 {
-			t.mu.Unlock()
-			log.Fatalf("SELL blocked: missing/invalid BASE step for %s (step=%.8f)", t.cfg.ProductID, step)
-		}
-
 		// TODO: remove TRACE
-		log.Printf("TRACE sell.gate.pre availBase=%.8f reservedLong=%.8f needBaseRaw=%.8f step=%.8f",
-			availBase, reservedLong, base, step)
+		log.Printf("TRACE sell.gate.pre availBase=%.8f reservedLong=%.8f needBaseRaw=%.8f baseStep=%.8f",
+			availBase, reservedLongBase, base, baseStep)
 
-		// Floor the *needed* base to step (if known) and cap by spare availability
+		// Floor the *needed* base to baseStep (if known) and cap by spare availability
 		neededBase := base
-		if step > 0 {
-			n := math.Floor(neededBase/step) * step
+		if baseStep > 0 {
+			n := math.Floor(neededBase/baseStep) * baseStep
 			if n > 0 {
 				neededBase = n
 			}
 		}
-		spare := availBase - reservedLong
+
 		if spare < 0 {
 			spare = 0
 		}
 		if spare+spareEps < neededBase {
 			// --- breadcrumb ---
-			log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
-				neededBase, spare, availBase, reservedLong, step)
+			log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
+				neededBase, spare, availBase, reservedLongBase, baseStep)
 			t.mu.Unlock()
-			log.Printf("[DEBUG] GATE SELL: need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
-				neededBase, spare, availBase, reservedLong, step)
+			log.Printf("[DEBUG] GATE SELL: need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
+				neededBase, spare, availBase, reservedLongBase, baseStep)
 			// TODO: remove TRACE
 			log.Printf("TRACE sell.gate.block need=%.8f spare=%.8f", neededBase, spare)
 			return "HOLD", nil
@@ -1211,8 +1310,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		if quote < t.cfg.OrderMinUSD {
 			quote = t.cfg.OrderMinUSD
 			base = quote / price
-			if step > 0 {
-				b := math.Floor(base/step) * step
+			if baseStep > 0 {
+				b := math.Floor(base/baseStep) * baseStep
 				if b > 0 {
 					base = b
 					quote = base * price
@@ -1221,11 +1320,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			// >>> Symmetry: re-check spare after min-notional snap <<<
 			if spare+spareEps < base {
 				// --- breadcrumb ---
-				log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
-					base, spare, availBase, reservedLong, step)
+				log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
+					base, spare, availBase, reservedLongBase, baseStep)
 				t.mu.Unlock()
-				log.Printf("[DEBUG] GATE SELL: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, step=%.8f)",
-					base, spare, availBase, reservedLong, step)
+				log.Printf("[DEBUG] GATE SELL: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
+					base, spare, availBase, reservedLongBase, baseStep)
 				// TODO: remove TRACE
 				log.Printf("TRACE sell.gate.block minNotional need=%.8f spare=%.8f", base, spare)
 				return "HOLD", nil
@@ -1593,7 +1692,11 @@ func (t *Trader) saveState() error {
 
 		// Persist SELL equity baseline; keep legacy field for older state compatibility.
 		LastAddEquitySell: t.lastAddEquitySell,
-		LastAddEquityBuy: t.lastAddEquityBuy,
+		LastAddEquityBuy:  t.lastAddEquityBuy,
+
+		// Persist equity stages
+		EquityStageBuy:  t.equityStageBuy,
+		EquityStageSell: t.equityStageSell,
 	}
 	bs, err := json.MarshalIndent(st, "", " ")
 	if err != nil {
@@ -1651,6 +1754,10 @@ func (t *Trader) loadState() error {
 	t.latchedGateSell = st.LatchedGateSell
 	t.lastAddEquitySell = st.LastAddEquitySell
 	t.lastAddEquityBuy = st.LastAddEquityBuy
+
+	// Restore equity stages (defaults to 0 if absent)
+	t.equityStageBuy = st.EquityStageBuy
+	t.equityStageSell = st.EquityStageSell
 
 	// Initialize runner trailing baseline for current runners if not already set
 	for _, side := range []OrderSide{SideBuy, SideSell} {
