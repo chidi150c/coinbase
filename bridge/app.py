@@ -39,6 +39,24 @@ def health():
 from decimal import Decimal
 from fastapi import HTTPException
 
+# --- minimal addition for /accounts normalization ---
+def _dec_str(any_val: Any) -> str:
+    """
+    Normalize a Coinbase 'money' field into a decimal string.
+    Accepts dicts like {"value":"1.23"}, or plain str/number/Decimal; defaults to "0".
+    """
+    try:
+        if any_val is None:
+            return "0"
+        if isinstance(any_val, dict):
+            v = any_val.get("value")
+            if v is None:
+                return "0"
+            return str(Decimal(str(v)))
+        return str(Decimal(str(any_val)))
+    except Exception:
+        return "0"
+
 @app.get("/accounts")
 def accounts(limit: int = 250):
     try:
@@ -73,13 +91,16 @@ def accounts(limit: int = 250):
     for a in rows:
         cur = str(a.get("currency", "")).upper()
 
-        # available (string)
-        ab = (a.get("available_balance") or {})
-        av = str(ab.get("value", "0"))
+        # available (dict OR scalar)
+        av = _dec_str(a.get("available_balance"))
 
-        # hold/locked (may be under "hold" or absent)
-        hb = (a.get("hold") or a.get("hold_balance") or {})
-        hd = str(hb.get("value", "0"))
+        # hold/locked (may be dict OR scalar; check common keys)
+        hold_raw = (
+            a.get("hold") or
+            a.get("hold_balance") or
+            a.get("locked_balance")
+        )
+        hd = _dec_str(hold_raw)
 
         # compute total precisely
         total = str(Decimal(av) + Decimal(hd))
@@ -88,7 +109,9 @@ def accounts(limit: int = 250):
             "currency": cur,
             "available_balance": {"value": av, "currency": cur},
             "hold_balance":      {"value": hd, "currency": cur},
-            "locked_balance":    {"value": hd, "currency": cur},  # <-- added alias for clients expecting 'locked_balance'
+            "locked_balance":    {"value": hd, "currency": cur},  # alias for clients expecting 'locked_balance'
+            "available":         av,                               # string convenience field
+            "locked":            hd,                               # string convenience field
             "total_balance":     {"value": total, "currency": cur},
             "type": "spot",
             "platform": "coinbase",
@@ -498,7 +521,7 @@ def get_order(order_id: str):
                 commission = Decimal(commission_str)
             except Exception:
                 commission = Decimal("0")
-            total_commission += commission
+            total_commission a+= commission
 
             size_in_quote = bool(f.get("size_in_quote"))
             if size_in_quote:
