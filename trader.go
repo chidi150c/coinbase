@@ -112,7 +112,7 @@ type BotState struct {
 	// --- NEW: persist equity trigger staging indices per side ---
 	EquityStageBuy  int
 	EquityStageSell int
-	Exits []ExitRecord
+	Exits           []ExitRecord
 }
 
 type Trader struct {
@@ -158,7 +158,7 @@ type Trader struct {
 	// daily
 	dailyStart time.Time
 	dailyPnL   float64
-	lastExits []ExitRecord
+	lastExits  []ExitRecord
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -329,13 +329,11 @@ func trailDistancePct() float64 {
 	return getEnvFloat("TRAIL_DISTANCE_PCT", 0.0)
 }
 
-
 // --- NEW: post-only entry env tunables (0/disabled by default) ---
 func limitPriceOffsetBps() float64 { return getEnvFloat("LIMIT_PRICE_OFFSET_BPS", 0.0) } // e.g., 5 = 0.05%
 func spreadMinBps() float64        { return getEnvFloat("SPREAD_MIN_BPS", 0.0) }         // gate; 0 disables
 func limitTimeoutSec() int         { return getEnvInt("LIMIT_TIMEOUT_SEC", 0) }          // wait window; 0 disables
 func orderType() string            { return strings.ToLower(strings.TrimSpace(getEnv("ORDER_TYPE", "market"))) }
-
 
 // --- NEW: Profit-gate + USD-based trailing knobs (added; old % knobs remain available but unused for arming) ---
 func profitGateUSD() float64                 { return getEnvFloat("PROFIT_GATE_USD", 0.50) }
@@ -704,9 +702,6 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 
 	// Normalize/sanitize reason and side label for metrics
 	reasonLbl := exitReason
-	if reasonLbl == "" {
-		return "", nil
-	}
 	sideLbl := "buy"
 	if lot.Side == SideSell {
 		sideLbl = "sell"
@@ -1065,7 +1060,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		t.mu.Lock()
 		if errQ != nil || strings.TrimSpace(symQ) == "" {
 			t.mu.Unlock()
-			log.Fatalf("BUY blocked: GetAvailableQuote failed: %v", errQ)
+			log.Fatalf("BUY blocked: GetAvailableQuote failed: error %v, symQ %s", errQ, symQ)
 		}
 		if quoteStep <= 0 {
 			t.mu.Unlock()
@@ -1082,7 +1077,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		t.mu.Lock()
 		if errB != nil || strings.TrimSpace(symB) == "" {
 			t.mu.Unlock()
-			log.Fatalf("SELL blocked: GetAvailableBase failed: %v", errB)
+			log.Fatalf("SELL blocked: GetAvailableBase failed: error %v, symB %s", errB, symB)
 		}
 		if baseStep <= 0 {
 			t.mu.Unlock()
@@ -1928,7 +1923,7 @@ func (t *Trader) saveState() error {
 		// Persist equity stages
 		EquityStageBuy:  t.equityStageBuy,
 		EquityStageSell: t.equityStageSell,
-		Exits: t.lastExits,
+		Exits:           t.lastExits,
 	}
 	bs, err := json.MarshalIndent(st, "", " ")
 	if err != nil {
