@@ -285,6 +285,11 @@ docker compose start bot
 # 9) Watch it come up
 docker compose logs -f --no-color bot | sed -u -n '1,120p'
 ================================================================================================
+# how to rebiuld the bridge appy.py
+docker compose -f docker-compose.yml -f docker-compose.override.yml build --no-cache bridge
+docker compose -f docker-compose.yml -f docker-compose.override.yml up -d --force-recreate --no-deps bridge
+
+
 
 
 

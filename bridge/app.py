@@ -521,7 +521,7 @@ def get_order(order_id: str):
                 commission = Decimal(commission_str)
             except Exception:
                 commission = Decimal("0")
-            total_commission a+= commission
+            total_commission += commission
 
             size_in_quote = bool(f.get("size_in_quote"))
             if size_in_quote:
