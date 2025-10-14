@@ -644,6 +644,28 @@ def order_limit_post_only(payload: LimitPostOnly):
         # Try multiple method shapes to be robust to SDK versions.
         candidates = []
 
+        # New: side-specific and generic GTC methods your SDK exposes
+        if hasattr(client, "limit_order_gtc_buy") and payload.side == "BUY":
+            def _gtc_buy():
+                return client.limit_order_gtc_buy(post_only=True, **kwargs)
+            candidates.append(_gtc_buy)
+
+        if hasattr(client, "limit_order_gtc_sell") and payload.side == "SELL":
+            def _gtc_sell():
+                return client.limit_order_gtc_sell(post_only=True, **kwargs)
+            candidates.append(_gtc_sell)
+
+        if hasattr(client, "limit_order_gtc"):
+            def _gtc_generic():
+                return client.limit_order_gtc(
+                    side=payload.side,
+                    post_only=True,
+                    time_in_force=payload.time_in_force or "GTC",
+                    **kwargs
+                )
+            candidates.append(_gtc_generic)
+
+        # Existing: older SDK naming
         if hasattr(client, "limit_order_buy") and payload.side == "BUY":
             def _buy():
                 return client.limit_order_buy(post_only=True, time_in_force=payload.time_in_force or "GTC", **kwargs)
@@ -666,6 +688,24 @@ def order_limit_post_only(payload: LimitPostOnly):
                     time_in_force=payload.time_in_force or "GTC",
                 )
             candidates.append(_generic)
+
+        # Final fallback: create_order with limit_limit_gtc config
+        if hasattr(client, "create_order"):
+            def _create_order():
+                return client.create_order(
+                    client_order_id=payload.client_order_id,
+                    product_id=payload.product_id,
+                    side=payload.side,
+                    order_configuration={
+                        "limit_limit_gtc": {
+                            "base_size": payload.base_size,
+                            "limit_price": payload.limit_price,
+                            "post_only": True,
+                            "time_in_force": payload.time_in_force or "GTC",
+                        }
+                    },
+                )
+            candidates.append(_create_order)
 
         last_err: Optional[Exception] = None
         for fn in candidates:
