@@ -36,6 +36,14 @@ import (
 
 // ---- Position & Trader ----
 
+type ExitMode string
+
+const (
+	ExitModeRunnerTrailing ExitMode = "RunnerTrailing"
+	ExitModeScalpTrailing  ExitMode = "ScalpTrailing"
+	ExitModeScalpFixedTP   ExitMode = "ScalpFixedTP"
+)
+
 type Position struct {
 	OpenPrice float64
 	Side      OrderSide
@@ -47,12 +55,23 @@ type Position struct {
 	EntryFee float64
 
 	// --- NEW (runner-only trailing fields; used only when this lot is the runner) ---
-	TrailActive bool    // becomes true after TRAIL_ACTIVATE_PCT threshold
+	TrailActive bool    // becomes true after TRAIL_ACTIVATE_PCT threshold (legacy flag; now also used by USD-activate)
 	TrailPeak   float64 // best favorable price since activation (peak for long; trough for short)
 	TrailStop   float64 // current trailing stop level derived from TrailPeak and TRAIL_DISTANCE_PCT
 
 	// --- NEW: human-readable gates/why string captured at entry time ---
 	Reason string `json:"reason,omitempty"`
+
+	// --- NEW (profit-gate data model) ---
+	EstExitFeeUSD     float64  `json:"est_exit_fee_usd,omitempty"` // recomputed each tick from mark
+	UnrealizedPnLUSD  float64  `json:"unrealized_pnl_usd"`         // NET = gross - entry - estExit
+	ExitMode          ExitMode `json:"exit_mode,omitempty"`         // RunnerTrailing | ScalpTrailing | ScalpFixedTP
+	Version           int      `json:"version"`
+	FixedTPWorking    bool     `json:"-"` // internal flag: emulate a posted TP (re-post each tick while gate holds)
+
+	TrailActivateGateUSD float64 `json:"activate_gate_usd"` // from TRAIL_ACTIVATE_USD (runner/scalp)
+	TrailDistancePct     float64 `json:"distance_pct"`      // from TRAIL_DISTANCE_PCT (runner/scalp)
+		
 }
 
 // --- NEW: per-side book (authoritative store) ---
@@ -274,7 +293,8 @@ const runnerStopMult = 1.0
 // Minimal "runner gap" guard (disabled)
 const runnerMinGapPct = 0.0
 
-// --- NEW: runner-only trailing env tunables (0 disables) ---
+// --- NEW: runner-only trailing env tunables (0 disables legacy %) ---
+// (Keep legacy trailActivatePct()/trailDistancePct() intact; new USD-based gates below.)
 func trailActivatePct() float64 {
 	return getEnvFloat("TRAIL_ACTIVATE_PCT", 0.0)
 }
@@ -282,11 +302,21 @@ func trailDistancePct() float64 {
 	return getEnvFloat("TRAIL_DISTANCE_PCT", 0.0)
 }
 
+
 // --- NEW: post-only entry env tunables (0/disabled by default) ---
 func limitPriceOffsetBps() float64 { return getEnvFloat("LIMIT_PRICE_OFFSET_BPS", 0.0) } // e.g., 5 = 0.05%
 func spreadMinBps() float64        { return getEnvFloat("SPREAD_MIN_BPS", 0.0) }         // gate; 0 disables
 func limitTimeoutSec() int         { return getEnvInt("LIMIT_TIMEOUT_SEC", 0) }          // wait window; 0 disables
 func orderType() string            { return strings.ToLower(strings.TrimSpace(getEnv("ORDER_TYPE", "market"))) }
+
+
+// --- NEW: Profit-gate + USD-based trailing knobs (added; old % knobs remain available but unused for arming) ---
+func profitGateUSD() float64                 { return getEnvFloat("PROFIT_GATE_USD", 0.50) }
+func trailActivateUSDRunner() float64        { return getEnvFloat("TRAIL_ACTIVATE_USD_RUNNER", 1.00) } // example default
+func trailActivateUSDScalp() float64         { return getEnvFloat("TRAIL_ACTIVATE_USD_SCALP", 0.50) }  // example default
+func trailDistancePctRunner() float64        { return getEnvFloat("TRAIL_DISTANCE_PCT_RUNNER", 0.40) } // percent
+func trailDistancePctScalp() float64         { return getEnvFloat("TRAIL_DISTANCE_PCT_SCALP", 0.25) }  // percent
+func makerTickOffsetBps() float64            { return getEnvFloat("TP_MAKER_OFFSET_BPS", 0.0) }        // optional maker offset for fixed TP
 
 // --- NEW: risk ramping envs (side-aware) ---
 func rampEnable() bool          { return getEnvBool("RAMP_ENABLE", false) }
@@ -363,33 +393,58 @@ func (t *Trader) applyRunnerTargets(p *Position) {
 	}
 }
 
-// --- NEW: runner trailing updater (no-ops if env not set or lot not runner).
+// --- NEW: USD-based trailing updater for runner/scalp trailing.
+// Uses lot.UnrealizedPnLUSD populated earlier this tick.
 // Returns (shouldExit, newTrailStopIfAny).
 func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64) {
 	if lot == nil {
 		return false, 0
 	}
-	act := trailActivatePct()
-	dist := trailDistancePct()
-	if act <= 0 || dist <= 0 {
+	// Profit gate: do nothing until net ≥ gate
+	if lot.UnrealizedPnLUSD < profitGateUSD() {
+		lot.TrailActive = false
+		lot.TrailPeak = 0
+		lot.TrailStop = 0
 		return false, 0
 	}
 
-	switch lot.Side {
-	case SideBuy:
-		activateAt := lot.OpenPrice * (1.0 + act/100.0)
-		if !lot.TrailActive {
-			if price >= activateAt {
-				lot.TrailActive = true
-				lot.TrailPeak = price
-				lot.TrailStop = price * (1.0 - dist/100.0)
-				// --- breadcrumb ---
-				log.Printf("TRACE trail.activate side=BUY activate_at=%.8f price=%.8f peak=%.8f stop=%.8f", activateAt, price, lot.TrailPeak, lot.TrailStop)
-			}
+	// Determine trailing parameters by ExitMode
+	actUSD := trailActivateUSDRunner()
+	distPct := trailDistancePctRunner()
+	switch lot.ExitMode {
+	case ExitModeScalpTrailing:
+		actUSD = trailActivateUSDScalp()
+		distPct = trailDistancePctScalp()
+	case ExitModeRunnerTrailing:
+		// default as set
+	default:
+		// Non-trailing modes should not be routed here
+		return false, 0
+	}
+
+	// Activation when Net PnL ≥ TRAIL_ACTIVATE_USD
+	if !lot.TrailActive && lot.UnrealizedPnLUSD >= actUSD {
+		lot.TrailActive = true
+		lot.TrailDistancePct = distPct
+		lot.TrailActivateGateUSD = actUSD
+		if lot.Side == SideBuy {
+			lot.TrailPeak = price
+			lot.TrailStop = price * (1.0 - distPct/100.0)
 		} else {
+			lot.TrailPeak = price // trough for short
+			lot.TrailStop = price * (1.0 + distPct/100.0)
+		}
+		// --- breadcrumb ---
+		log.Printf("TRACE trail.activate side=%s activate_usd=%.2f net=%.2f price=%.8f peak=%.8f stop=%.8f",
+			lot.Side, actUSD, lot.UnrealizedPnLUSD, price, lot.TrailPeak, lot.TrailStop)
+	}
+
+	// Maintain peak/stop while activated
+	if lot.TrailActive {
+		if lot.Side == SideBuy {
 			if price > lot.TrailPeak {
 				lot.TrailPeak = price
-				ts := lot.TrailPeak * (1.0 - dist/100.0)
+				ts := lot.TrailPeak * (1.0 - distPct/100.0)
 				if ts > lot.TrailStop {
 					lot.TrailStop = ts
 					// --- breadcrumb ---
@@ -401,21 +456,10 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 				log.Printf("TRACE trail.trigger lotSide=BUY price=%.8f stop=%.8f", price, lot.TrailStop)
 				return true, lot.TrailStop
 			}
-		}
-	case SideSell:
-		activateAt := lot.OpenPrice * (1.0 - act/100.0)
-		if !lot.TrailActive {
-			if price <= activateAt {
-				lot.TrailActive = true
-				lot.TrailPeak = price // trough for short
-				lot.TrailStop = price * (1.0 + dist/100.0)
-				// --- breadcrumb ---
-				log.Printf("TRACE trail.activate side=SELL activate_at=%.8f price=%.8f trough=%.8f stop=%.8f", activateAt, price, lot.TrailPeak, lot.TrailStop)
-			}
-		} else {
+		} else { // SELL
 			if price < lot.TrailPeak {
 				lot.TrailPeak = price
-				lot.TrailStop = lot.TrailPeak * (1.0 + dist/100.0)
+				lot.TrailStop = lot.TrailPeak * (1.0 + distPct/100.0)
 				// --- breadcrumb ---
 				log.Printf("TRACE trail.raise lotSide=SELL trough=%.8f stop=%.8f", lot.TrailPeak, lot.TrailStop)
 			}
@@ -426,6 +470,7 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 			}
 		}
 	}
+
 	return false, lot.TrailStop
 }
 
@@ -690,23 +735,84 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	price := c[len(c)-1].Close
 
 	// --------------------------------------------------------------------------------------------------------
-	// --- EXIT path: if any lots are open, evaluate TP/SL and trailing for each side; close one at a time.
+	// --- EXIT path: evaluate profit gate and trailing/TP logic per lot (side-aware) and close at most one.
 	// --------------------------------------------------------------------------------------------------------
 	if (lsb > 0) || (lss > 0) {
 
 		nearestTakeBuy := 0.0
 		nearestTakeSell := 0.0
 
+		// Helper: compute net PnL and gate state for one lot, update EstExitFeeUSD/UnrealizedPnLUSD
+		computeGate := func(lot *Position) (netPnL float64, gate bool) {
+			feeRate := t.cfg.FeeRatePct
+			estExit := (lot.SizeBase * price) * (feeRate / 100.0)
+			lot.EstExitFeeUSD = estExit
+
+			gross := (price - lot.OpenPrice) * lot.SizeBase
+			if lot.Side == SideSell {
+				gross = (lot.OpenPrice - price) * lot.SizeBase
+			}
+			net := gross - lot.EntryFee - estExit
+			lot.UnrealizedPnLUSD = net
+			return net, net >= profitGateUSD()
+		}
+
+		// Helper to classify ExitMode (idempotent, done each tick to keep simple/minimal)
+		setExitMode := func(book *SideBook, idx int, lot *Position) {
+			if idx == book.RunnerID {
+				lot.ExitMode = ExitModeRunnerTrailing
+				lot.TrailDistancePct = trailDistancePctRunner()
+				lot.TrailActivateGateUSD = trailActivateUSDRunner()
+				return
+			}
+			// scalp index: 1..4 => trailing, >4 => fixed TP (1-based)
+			n := idx + 1
+			if n >= 1 && n <= 4 {
+				lot.ExitMode = ExitModeScalpTrailing
+				lot.TrailDistancePct = trailDistancePctScalp()
+				lot.TrailActivateGateUSD = trailActivateUSDScalp()
+			} else {
+				lot.ExitMode = ExitModeScalpFixedTP
+				// fixed TP, no trailing params required
+			}
+		}
+
 		// Helper to scan a side book
 		scanSide := func(side OrderSide) (string, bool, error) {
 			book := t.book(side)
 			for i := 0; i < len(book.Lots); {
 				lot := book.Lots[i]
+				// classify per spec
+				setExitMode(book, i, lot)
 
-				// runner trailing for this side
-				if i == book.RunnerID {
+				// compute gate
+				net, pass := computeGate(lot)
+
+				// reset arming when gate not passed
+				if !pass {
+					// strict gating: no exit arms
+					lot.TrailActive = false
+					lot.TrailPeak = 0
+					lot.TrailStop = 0
+					lot.FixedTPWorking = false
+					// also neutralize Stop/Take so legacy checks won't trigger
+					lot.Stop = 0
+					lot.Take = 0
+					i++
+					continue
+				} else {
+					// first pass breadcrumb
+					if lot.Take == 0 && !lot.TrailActive && !lot.FixedTPWorking {
+						log.Printf("TRACE GATE_PASS side=%s net=%.6f gate=%.6f", lot.Side, net, profitGateUSD())
+					}
+				}
+
+				// --- EXIT arming when profit gate passed ---
+				switch lot.ExitMode {
+				case ExitModeRunnerTrailing, ExitModeScalpTrailing:
+					// trailing path (USD activate)
 					if trigger, tstop := t.updateRunnerTrail(lot, price); trigger {
-						lot.Stop = tstop
+						lot.Stop = tstop // mirror for legacy trigger check
 						// --- MINIMAL CHANGE: skip trailing-stop close if notional < ORDER_MIN_USD and CONTINUE ---
 						closeSide := SideSell
 						if lot.Side == SideSell {
@@ -716,11 +822,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 						if notional < t.cfg.OrderMinUSD {
 							log.Printf("[CLOSE-SKIP] lotSide=%s closeSide=%s base=%.8f price=%.2f notional=%.2f < ORDER_MIN_USD %.2f; deferring",
 								lot.Side, closeSide, lot.SizeBase, price, notional, t.cfg.OrderMinUSD)
-							// Do NOT return; continue normal step flow so decision(...) still runs.
 							i++
 							continue
 						}
-
 						msg, err := t.closeLot(ctx, c, side, i, "trailing_stop")
 						if err != nil {
 							t.mu.Unlock()
@@ -729,27 +833,54 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 						t.mu.Unlock()
 						return msg, true, nil
 					}
+					// Keep Stop in sync with trail for the legacy trigger block below (and summaries)
+					lot.Stop = lot.TrailStop
+
+				case ExitModeScalpFixedTP:
+					// emulate a maker-friendly TP "post" at/near mark
+					offBps := makerTickOffsetBps()
+					tp := price
+					if lot.Side == SideBuy && offBps > 0 {
+						tp = price * (1.0 + offBps/10000.0)
+					}
+					if lot.Side == SideSell && offBps > 0 {
+						tp = price * (1.0 - offBps/10000.0)
+					}
+					// place/re-post every tick while gate holds (minimal emulation)
+					if !lot.FixedTPWorking || (lot.Side == SideBuy && tp < lot.Take) || (lot.Side == SideSell && tp > lot.Take) {
+						lot.Take = tp
+						lot.FixedTPWorking = true
+						log.Printf("TRACE tp.post side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
+					} else {
+						log.Printf("TRACE tp.repost side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
+					}
+					// No trailing for fixed TP; ensure Stop doesn't accidentally trigger
+					lot.Stop = 0
 				}
 
+				// --- Legacy trigger block (now governed by our gated Stop/Take) ---
 				trigger := false
 				exitReason := ""
-				if lot.Side == SideBuy && (price <= lot.Stop || price >= lot.Take) {
+				if lot.Side == SideBuy && (lot.Stop > 0 && price <= lot.Stop || lot.Take > 0 && price >= lot.Take) {
 					trigger = true
-					if price <= lot.Stop {
+					if lot.Stop > 0 && price <= lot.Stop {
 						exitReason = "stop_loss"
 					} else {
 						exitReason = "take_profit"
 					}
 				}
-				if lot.Side == SideSell && (price >= lot.Stop || price <= lot.Take) {
+				if lot.Side == SideSell && (lot.Stop > 0 && price >= lot.Stop || lot.Take > 0 && price <= lot.Take) {
 					trigger = true
-					if price >= lot.Stop {
+					if lot.Stop > 0 && price >= lot.Stop {
 						exitReason = "stop_loss"
 					} else {
 						exitReason = "take_profit"
 					}
 				}
 				if trigger {
+					if lot.ExitMode == ExitModeScalpFixedTP {
+						log.Printf("TRACE tp.filled side=%s idx=%d mark=%.8f take=%.8f", lot.Side, i, price, lot.Take)
+					}
 					msg, err := t.closeLot(ctx, c, side, i, exitReason)
 					if err != nil {
 						t.mu.Unlock()
@@ -759,13 +890,13 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					return msg, true, nil
 				}
 
-				// nearest summary
+				// nearest summary (unchanged)
 				if lot.Side == SideBuy {
-					if nearestTakeBuy == 0 || lot.Take < nearestTakeBuy {
+					if lot.Take > 0 && (nearestTakeBuy == 0 || lot.Take < nearestTakeBuy) {
 						nearestTakeBuy = lot.Take
 					}
 				} else {
-					if nearestTakeSell == 0 || lot.Take > nearestTakeSell {
+					if lot.Take > 0 && (nearestTakeSell == 0 || lot.Take > nearestTakeSell) {
 						nearestTakeSell = lot.Take
 					}
 				}
@@ -1335,7 +1466,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		log.Printf("TRACE sell.gate.post needBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
 	}
 
-	// Stops/takes (baseline for scalps)
+	// Stops/takes baseline (legacy calc for logs/backcompat; actual arming/triggers are gated later)
 	stop := price * (1.0 - t.cfg.StopLossPct/100.0)
 	take := price * (1.0 + t.cfg.TakeProfitPct/100.0)
 	if side == SideSell {
@@ -1555,11 +1686,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		OpenPrice: priceToUse,
 		Side:      side,
 		SizeBase:  baseToUse,
-		Stop:      stop,
-		Take:      take,
+		Stop:      stop, // legacy placeholders; arming/triggers will be gated next ticks
+		Take:      take, // legacy placeholders; arming/triggers will be gated next ticks
 		OpenTime:  now,
 		EntryFee:  entryFee,
 		Reason:    gatesReason, // side-biased; no winLow
+		Version:   1,
 	}
 	book.Lots = append(book.Lots, newLot)
 	// Use wall clock for lastAdd to drive spacing/decay even if candle time is zero.
@@ -1583,7 +1715,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquityBuy)
 	}
 
-	// gross PnL at take
+	// gross PnL at take (legacy estimation)
 	pnlGross := (newLot.Take - newLot.OpenPrice) * newLot.SizeBase
 	if side == SideSell {
 		pnlGross = (newLot.OpenPrice - newLot.Take) * newLot.SizeBase
@@ -1744,7 +1876,45 @@ func (t *Trader) loadState() error {
 	// Restore per-side books
 	t.books[SideBuy] = &SideBook{RunnerID: st.BookBuy.RunnerID, Lots: st.BookBuy.Lots}
 	t.books[SideSell] = &SideBook{RunnerID: st.BookSell.RunnerID, Lots: st.BookSell.Lots}
-
+// --- MIGRATION/BACKFILL for new trailing params on Position ---
+	for _, side := range []OrderSide{SideBuy, SideSell} {
+		book := t.book(side)
+		for i, lot := range book.Lots {
+			// Determine exit class to pick defaults
+			if i == book.RunnerID {
+				// Runner → trailing (runner params)
+				if lot.TrailDistancePct == 0 {
+					lot.TrailDistancePct = trailDistancePctRunner()
+				}
+				if lot.TrailActivateGateUSD == 0 {
+					lot.TrailActivateGateUSD = trailActivateUSDRunner()
+				}
+				if lot.ExitMode == "" {
+					lot.ExitMode = ExitModeRunnerTrailing
+				}
+			} else {
+				n := i + 1 // 1-based scalp index
+				if n >= 1 && n <= 4 {
+					// Scalp 1..4 → trailing (scalp params)
+					if lot.TrailDistancePct == 0 {
+						lot.TrailDistancePct = trailDistancePctScalp()
+					}
+					if lot.TrailActivateGateUSD == 0 {
+						lot.TrailActivateGateUSD = trailActivateUSDScalp()
+					}
+					if lot.ExitMode == "" {
+						lot.ExitMode = ExitModeScalpTrailing
+					}
+				} else {
+					// Scalp >4 → fixed TP
+					if lot.ExitMode == "" {
+						lot.ExitMode = ExitModeScalpFixedTP
+					}
+					// trailing params not required for fixed-TP scalps
+				}
+			}
+		}
+	}
 	// Side-aware pyramiding persisted state
 	t.lastAddBuy = st.LastAddBuy
 	t.lastAddSell = st.LastAddSell
