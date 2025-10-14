@@ -9,7 +9,7 @@ WORKDIR /app/bridge
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# copy the FastAPI app (safe even if you also mount it as a volume)
+# copy the FastAPI app (safe even if you also mount it as a volume)...
 COPY . .
 
 EXPOSE 8787
