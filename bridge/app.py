@@ -723,4 +723,4 @@ def cancel_order(order_id: str, product_id: Optional[str] = Query(None)):
         # If we reached here, cancellation call(s) failed but we still return best-effort ack.
         return {"order_id": order_id, "status": "cancel_attempted"}
     except Exception as e:
-        raise HTTPException(sta
+        raise HTTPException(status_code=400, detail=str(e))
