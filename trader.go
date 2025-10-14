@@ -71,7 +71,9 @@ type Position struct {
 
 	TrailActivateGateUSD float64 `json:"activate_gate_usd"` // from TRAIL_ACTIVATE_USD (runner/scalp)
 	TrailDistancePct     float64 `json:"distance_pct"`      // from TRAIL_DISTANCE_PCT (runner/scalp)
-		
+
+	// --- NEW: track maker-first TP exit order id (post-only limit attempt) ---
+	FixedTPOrderID string `json:"-"`
 }
 
 // --- NEW: per-side book (authoritative store) ---
@@ -110,6 +112,7 @@ type BotState struct {
 	// --- NEW: persist equity trigger staging indices per side ---
 	EquityStageBuy  int
 	EquityStageSell int
+	Exits []ExitRecord
 }
 
 type Trader struct {
@@ -155,6 +158,7 @@ type Trader struct {
 	// daily
 	dailyStart time.Time
 	dailyPnL   float64
+	lastExits []ExitRecord
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -198,6 +202,29 @@ func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
 	// Initialize legacy aggregate view for logs/compat.
 	// t.refreshAggregateFromBooks()
 	return t
+}
+
+// ExitRecord captures a compact snapshot for an exited lot.
+type ExitRecord struct {
+	Time        time.Time `json:"time"`
+	Side        OrderSide `json:"side"`
+	OpenPrice   float64   `json:"open_price"`
+	ClosePrice  float64   `json:"close_price"`
+	SizeBase    float64   `json:"size_base"`
+	EntryFeeUSD float64   `json:"entry_fee_usd"`
+	ExitFeeUSD  float64   `json:"exit_fee_usd"`
+	PNLUSD      float64   `json:"pnl_usd"`
+	Reason      string    `json:"reason"`
+	ExitMode    ExitMode  `json:"exit_mode,omitempty"`
+	WasRunner   bool      `json:"was_runner"`
+}
+
+func exitHistorySize() int {
+	n := getEnvInt("EXIT_HISTORY_SIZE", 8)
+	if n <= 0 {
+		n = 8
+	}
+	return n
 }
 
 func (t *Trader) EquityUSD() float64 {
@@ -505,31 +532,82 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		return msg, nil
 	}
 
+	// --- NEW: maker-first post-only limit attempt for ScalpFixedTP exits using lot.Take ---
+	wantLimitExit := (lot.ExitMode == ExitModeScalpFixedTP && exitReason == "take_profit" && limitTimeoutSec() > 0 && lot.Take > 0)
+
 	// unlock for I/O
 	t.mu.Unlock()
 	var placed *PlacedOrder
+	// --- locals to capture limit attempt state while unlocked ---
+	var exitOrderID string
+	var exitLimitPlaced bool
+	var exitLimitFilled bool
+
 	if !t.cfg.DryRun {
-		// TODO: remove TRACE
-		log.Printf("TRACE order.close request side=%s baseReq=%.8f quoteEst=%.2f priceSnap=%.8f", closeSide, baseRequested, quote, price)
-		var err error
-		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote)
-		if err != nil {
-			if t.cfg.Extended().UseDirectSlack {
-				postSlack(fmt.Sprintf("ERR step: %v", err))
+		if wantLimitExit {
+			limitPx := lot.Take
+			baseAtLimit := baseRequested
+			// best-effort maker-first exit
+			oid, err := t.broker.PlaceLimitPostOnly(ctx, t.cfg.ProductID, closeSide, limitPx, baseAtLimit)
+			if err == nil && strings.TrimSpace(oid) != "" {
+				exitOrderID = oid
+				exitLimitPlaced = true
+				deadline := time.Now().Add(time.Duration(limitTimeoutSec()) * time.Second)
+				for time.Now().Before(deadline) {
+					ord, gErr := t.broker.GetOrder(ctx, t.cfg.ProductID, oid)
+					if gErr == nil && ord != nil && (ord.BaseSize > 0 || ord.QuoteSpent > 0) {
+						placed = ord
+						exitLimitFilled = true
+						log.Printf("TRACE postonly.exit.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
+							oid, placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
+						mtxOrders.WithLabelValues("live", string(closeSide)).Inc()
+						break
+					}
+					time.Sleep(200 * time.Millisecond)
+				}
+				if !exitLimitFilled {
+					_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, oid)
+					log.Printf("TRACE postonly.exit.timeout fallback=market order_id=%s", oid)
+				}
+			} else if err != nil {
+				log.Printf("TRACE postonly.exit.error fallback=market err=%v", err)
 			}
-			// Re-lock before returning so caller's Unlock matches.
-			t.mu.Lock()
-			return "", fmt.Errorf("close order failed: %w", err)
 		}
-		// TODO: remove TRACE
-		if placed != nil {
-			log.Printf("TRACE order.close placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
-				placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
+
+		// If maker exit did not fill, fall back to market close (baseline behavior).
+		if placed == nil {
+			// TODO: remove TRACE
+			log.Printf("TRACE order.close request side=%s baseReq=%.8f quoteEst=%.2f priceSnap=%.8f", closeSide, baseRequested, quote, price)
+			var err error
+			placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote)
+			if err != nil {
+				if t.cfg.Extended().UseDirectSlack {
+					postSlack(fmt.Sprintf("ERR step: %v", err))
+				}
+				// Re-lock before returning so caller's Unlock matches.
+				t.mu.Lock()
+				return "", fmt.Errorf("close order failed: %w", err)
+			}
+			// TODO: remove TRACE
+			if placed != nil {
+				log.Printf("TRACE order.close placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
+					placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
+			}
+			mtxOrders.WithLabelValues("live", string(closeSide)).Inc()
 		}
-		mtxOrders.WithLabelValues("live", string(closeSide)).Inc()
 	}
 	// re-lock
 	t.mu.Lock()
+
+	// --- NEW: attach/clear FixedTPOrderID tracking on the lot (only for the TP limit attempt) ---
+	if wantLimitExit {
+		if exitLimitPlaced {
+			lot.FixedTPOrderID = exitOrderID
+		}
+		if exitLimitPlaced && !exitLimitFilled {
+			lot.FixedTPOrderID = ""
+		}
+	}
 
 	// --- NEW: check if the lot being closed is the most recent add for that side ---
 	wasNewest := (localIdx == len(book.Lots)-1)
@@ -596,6 +674,27 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	t.dailyPnL += pl
 	t.equityUSD += pl
 
+	// Build ExitRecord (use exec price/size actually filled)
+	rec := ExitRecord{
+		Time:        c[len(c)-1].Time,
+		Side:        lot.Side,
+		OpenPrice:   lot.OpenPrice,
+		ClosePrice:  priceExec,
+		SizeBase:    baseFilled,
+		EntryFeeUSD: lot.EntryFee,
+		ExitFeeUSD:  exitFee,
+		PNLUSD:      pl,
+		Reason:      exitReason,
+		ExitMode:    lot.ExitMode,
+		WasRunner:   (localIdx == book.RunnerID),
+	}
+
+	// Append with cap semantics (ring buffer behavior)
+	t.lastExits = append(t.lastExits, rec)
+	if capN := exitHistorySize(); len(t.lastExits) > capN {
+		t.lastExits = t.lastExits[len(t.lastExits)-capN:]
+	}
+
 	// --- NEW: increment win/loss trades ---
 	if pl >= 0 {
 		mtxTrades.WithLabelValues("win").Inc()
@@ -606,7 +705,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	// Normalize/sanitize reason and side label for metrics
 	reasonLbl := exitReason
 	if reasonLbl == "" {
-		reasonLbl = "other"
+		return "", nil
 	}
 	sideLbl := "buy"
 	if lot.Side == SideSell {
@@ -1666,9 +1765,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --- NEW: override sizing for equity scalp to use the entire spare base as the order size (SELL only) ---
 	if equityTriggerSell && side == SideSell && equitySpareBase > 0 {
 		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquitySell=%.2f pct_diff_sell=%.6f equitySpareBase=%.8f ", t.equityUSD, t.lastAddEquitySell, t.equityUSD/t.lastAddEquitySell, equitySpareBase)
-	}else if equityTriggerBuy && side == SideBuy && equitySpareQuote > 0 {
-		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquityBuy=%.2f pct_diff_buy=%.6f equitySpareQuote=%.2f",  t.equityUSD, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, equitySpareQuote)
-	}else if side == SideBuy {
+	} else if equityTriggerBuy && side == SideBuy && equitySpareQuote > 0 {
+		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquityBuy=%.2f pct_diff_buy=%.6f equitySpareQuote=%.2f", t.equityUSD, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, equitySpareQuote)
+	} else if side == SideBuy {
 		gatesReason = fmt.Sprintf(
 			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|PriceDownGoingUp=%v|LowBottom=%v",
 			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr,
@@ -1829,6 +1928,7 @@ func (t *Trader) saveState() error {
 		// Persist equity stages
 		EquityStageBuy:  t.equityStageBuy,
 		EquityStageSell: t.equityStageSell,
+		Exits: t.lastExits,
 	}
 	bs, err := json.MarshalIndent(st, "", " ")
 	if err != nil {
@@ -1876,7 +1976,7 @@ func (t *Trader) loadState() error {
 	// Restore per-side books
 	t.books[SideBuy] = &SideBook{RunnerID: st.BookBuy.RunnerID, Lots: st.BookBuy.Lots}
 	t.books[SideSell] = &SideBook{RunnerID: st.BookSell.RunnerID, Lots: st.BookSell.Lots}
-// --- MIGRATION/BACKFILL for new trailing params on Position ---
+	// --- MIGRATION/BACKFILL for new trailing params on Position ---
 	for _, side := range []OrderSide{SideBuy, SideSell} {
 		book := t.book(side)
 		for i, lot := range book.Lots {
@@ -1924,6 +2024,7 @@ func (t *Trader) loadState() error {
 	t.latchedGateSell = st.LatchedGateSell
 	t.lastAddEquitySell = st.LastAddEquitySell
 	t.lastAddEquityBuy = st.LastAddEquityBuy
+	t.lastExits = st.Exits
 
 	// Restore equity stages (defaults to 0 if absent)
 	t.equityStageBuy = st.EquityStageBuy
@@ -1956,6 +2057,15 @@ func (t *Trader) loadState() error {
 	// Rebuild legacy aggregate view
 	// t.refreshAggregateFromBooks()
 	return nil
+}
+
+func (t *Trader) LastExits() []ExitRecord {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// return a copy to avoid external mutation
+	out := make([]ExitRecord, len(t.lastExits))
+	copy(out, t.lastExits)
+	return out
 }
 
 // ---- Phase-7 helpers ----

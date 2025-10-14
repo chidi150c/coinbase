@@ -252,8 +252,7 @@ RAMP_STEP_PCT=1.0        # linear growth per add on that side
  "LastAddEquitySell": 990.4810752997747,
  "LastAddEquityBuy": 987.5348955472499
 }
-
-
+====================================================================
 # === Broker wiring (Binance direct) ===
 BROKER=binance
 PRODUCT_ID=BTCUSDT
@@ -285,7 +284,7 @@ MAX_CONCURRENT_LOTS=8
 SCALP_TP_DECAY_ENABLE=true
 SCALP_TP_DEC_MODE=exp
 SCALP_TP_DEC_PCT=0.20
-SCALP_TP_DECAY_FACTOR=0.9850      # ↑ slightly stronger decay on later adds
+SCALP_TP_DECAY_FACTOR=0.9852      # ↑ slightly stronger decay on later adds
 SCALP_TP_MIN_PCT=1.9              # floor for later adds
 
 # === Exits (TP/SL + runner trailing) ===

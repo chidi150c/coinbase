@@ -252,7 +252,7 @@ RAMP_STEP_PCT=1.0        # linear growth per add on that side
  "LastAddEquity": 0,
  "LastAddEquityBuy": 990.4810752997747
 }
-
+====================================================================
 # === Broker wiring (Binance direct) ===
 BROKER=binance
 PRODUCT_ID=BTCUSDT
@@ -280,18 +280,27 @@ PYRAMID_MIN_ADVERSE_PCT=1.5
 PYRAMID_DECAY_MIN_PCT=0.4
 MAX_CONCURRENT_LOTS=8
 
-# --- Optional: per-add TP decay for scalp lots ---
+# --- Optional: per-add TP decay for scalp lots (legacy; kept for logs/estimates) ---
 SCALP_TP_DECAY_ENABLE=true
 SCALP_TP_DEC_MODE=exp
 SCALP_TP_DEC_PCT=0.20
 SCALP_TP_DECAY_FACTOR=0.9850
 SCALP_TP_MIN_PCT=0.6
 
-# === Exits (TP/SL + runner trailing) ===
-TAKE_PROFIT_PCT=1.9
-STOP_LOSS_PCT=1000.00
-TRAIL_ACTIVATE_PCT=1.9
-TRAIL_DISTANCE_PCT=0.4
+# === Exits (USD profit-gate + USD trailing) ===
+# Exits will not arm/trigger until per-lot NET PnL ≥ PROFIT_GATE_USD
+PROFIT_GATE_USD=0.50
+
+# Trailing activation thresholds (USD, per lot NET PnL)
+TRAIL_ACTIVATE_USD_RUNNER=1.00
+TRAIL_ACTIVATE_USD_SCALP=0.50
+
+# Trailing distances (percent, post-activation)
+TRAIL_DISTANCE_PCT_RUNNER=0.40
+TRAIL_DISTANCE_PCT_SCALP=0.25
+
+# Optional: maker-friendly offset (bps) for fixed-TP scalps (>4th lot on a side)
+TP_MAKER_OFFSET_BPS=3
 
 # === Fees & exchange minimums ===
 FEE_RATE_PCT=0.10
@@ -326,17 +335,25 @@ USE_LIVE_EQUITY=true
 
 # === Order entry mode ===
 ORDER_TYPE=limit                 # or "market" (default)
-LIMIT_PRICE_OFFSET_BPS=5         # 5 bps (0.05%) improvement from mid toward maker
-SPREAD_MIN_BPS=0                 # require ≥2 bps spread to attempt maker
-LIMIT_TIMEOUT_SEC=5              # cancel-and-market after 5 seconds if not filled
+LIMIT_PRICE_OFFSET_BPS=5         # 5 bps improvement to bias maker
+SPREAD_MIN_BPS=0                 # require ≥N bps spread to attempt maker
+LIMIT_TIMEOUT_SEC=5              # cancel-and-market after 5s if unfilled
 
+# --- Risk ramping (per-side; you already enabled it) ---
 RAMP_ENABLE=true
 RAMP_MODE=linear         # or exp
-RAMP_START_PCT=3.0       # starts smaller than 6%
-RAMP_STEP_PCT=1.0        # linear growth per add on that side
+RAMP_START_PCT=3.0
+RAMP_STEP_PCT=1.0
 # For exp mode:
 # RAMP_GROWTH=1.25
 # RAMP_MAX_PCT=6.0
+
+# === Legacy exit knobs (kept for back-compat/logging only; USD gate governs arming) ===
+TAKE_PROFIT_PCT=1.9
+STOP_LOSS_PCT=1000.00
+TRAIL_ACTIVATE_PCT=1.9
+TRAIL_DISTANCE_PCT=0.4
+
 ==========================================
 
 # === Broker wiring (Coinbase via the bridge) ===
