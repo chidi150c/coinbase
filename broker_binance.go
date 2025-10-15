@@ -367,6 +367,18 @@ var (
 	fCacheBinance = map[string]ExFilters{} // key: product/symbol
 )
 
+// helper: derive quote step from precision (e.g., precision=2 -> 0.01)
+func quoteStepFromPrecision(p int) float64 {
+	if p <= 0 {
+		return 0
+	}
+	f := 1.0
+	for i := 0; i < p; i++ {
+		f /= 10.0
+	}
+	return f
+}
+
 // getExchangeFilters calls a best-effort sidecar endpoint to fetch Binance filters.
 // If the endpoint is missing or fails, it returns zero values so baseline behavior is preserved.
 func (b *BinanceBridge) GetExchangeFilters(ctx context.Context, product string) (ExFilters, error) {
@@ -374,7 +386,7 @@ func (b *BinanceBridge) GetExchangeFilters(ctx context.Context, product string) 
 
 	// cache hit
 	fMuBinance.Lock()
-	if v, ok := fCacheBinance[key]; ok && (v.StepSize > 0 || v.TickSize > 0) {
+	if v, ok := fCacheBinance[key]; ok && (v.StepSize > 0 || v.TickSize > 0 || v.PriceTick > 0 || v.BaseStep > 0 || v.QuoteStep > 0 || v.MinNotional > 0) {
 		fMuBinance.Unlock()
 		return v, nil
 	}
@@ -396,16 +408,61 @@ func (b *BinanceBridge) GetExchangeFilters(ctx context.Context, product string) 
 		io.Copy(io.Discard, resp.Body)
 		return ExFilters{}, fmt.Errorf("filters %d", resp.StatusCode)
 	}
+
+	// Accept BOTH legacy keys (step_size/tick_size) and normalized keys (price_tick/base_step/quote_step/min_notional).
 	var payload struct {
+		// legacy (already supported)
 		StepSize string `json:"step_size"` // LOT_SIZE.StepSize
 		TickSize string `json:"tick_size"` // PRICE_FILTER.TickSize
+
+		// normalized (preferred)
+		PriceTick   string `json:"price_tick"`   // normalized price tick
+		BaseStep    string `json:"base_step"`    // normalized base step
+		QuoteStep   string `json:"quote_step"`   // normalized quote step
+		MinNotional string `json:"min_notional"` // normalized min notional
+
+		// optional hint if sidecar exposes precision for quoteOrderQty fallback
+		QuotePrecision int `json:"quote_precision"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return ExFilters{}, err
 	}
+
+	// Build ExFilters with robust fallbacks.
 	f := ExFilters{
+		// legacy
 		StepSize: parseFloat(payload.StepSize),
 		TickSize: parseFloat(payload.TickSize),
+
+		// normalized (preferred)
+		PriceTick:   parseFloat(payload.PriceTick),
+		BaseStep:    parseFloat(payload.BaseStep),
+		QuoteStep:   parseFloat(payload.QuoteStep),
+		MinNotional: parseFloat(payload.MinNotional),
+	}
+
+	// If normalized fields are missing, alias from legacy where it makes sense.
+	if f.PriceTick <= 0 && f.TickSize > 0 {
+		f.PriceTick = f.TickSize
+	}
+	if f.BaseStep <= 0 && f.StepSize > 0 {
+		f.BaseStep = f.StepSize
+	}
+
+	// Derive quote step from precision if not present.
+	if f.QuoteStep <= 0 && payload.QuotePrecision > 0 {
+		f.QuoteStep = quoteStepFromPrecision(payload.QuotePrecision)
+	}
+
+	// As a last resort, apply a conservative default for common stablecoin quotes (USDT, USDC, USD, BUSD, FDUSD).
+	if f.QuoteStep <= 0 {
+		upper := strings.ToUpper(strings.TrimSpace(product))
+		for _, q := range []string{"USDT", "USDC", "USD", "BUSD", "FDUSD"} {
+			if strings.HasSuffix(upper, q) {
+				f.QuoteStep = 0.01
+				break
+			}
+		}
 	}
 
 	// cache store

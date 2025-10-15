@@ -24,15 +24,22 @@ type Config struct {
 	Granularity string // e.g., "ONE_MINUTE"
 
 	// Safety & sizing
-	DryRun          bool
-	MaxDailyLossPct float64
-	RiskPerTradePct float64
-	USDEquity       float64
-	TakeProfitPct   float64
-	StopLossPct     float64
-	OrderMinUSD     float64
-	LongOnly        bool    // prevent SELL entries when flat on spot
-	FeeRatePct      float64 // % fee applied on entry/exit trades
+	DryRun              bool
+	MaxDailyLossPct     float64
+	RiskPerTradePct     float64
+	USDEquity           float64
+	TakeProfitPct       float64
+	StopLossPct         float64
+	OrderMinUSD         float64
+	LongOnly            bool    // prevent SELL entries when flat on spot
+	FeeRatePct          float64 // % fee applied on entry/exit trades
+	RequireBaseForShort bool    // require base inventory for SELL on spot
+
+	// Venue filters (optional; filled from env/sidecar when available)
+	PriceTick   float64 // PRICE_TICK: minimum price increment
+	BaseStep    float64 // BASE_STEP: base-asset quantity step (LOT_SIZE.stepSize)
+	QuoteStep   float64 // QUOTE_STEP: quote-amount spend step
+	MinNotional float64 // MIN_NOTIONAL: minimum order notional in quote currency
 
 	// Ops
 	Port              int
@@ -49,18 +56,18 @@ type Config struct {
 	LiveEquity bool // if true, rebase & refresh equity from live balances
 
 	// Order entry (unprefixed; universal)
-	OrderType            string // "market" or "limit"
-	LimitPriceOffsetBps  int    // maker price offset from mid in bps
-	SpreadMinBps         int    // minimum spread (bps) to attempt maker entry
-	LimitTimeoutSec      int    // cancel-and-market fallback timeout (seconds)
+	OrderType           string // "market" or "limit"
+	LimitPriceOffsetBps int    // maker price offset from mid in bps
+	SpreadMinBps        int    // minimum spread (bps) to attempt maker entry
+	LimitTimeoutSec     int    // cancel-and-market fallback timeout (seconds)
 }
 
 // loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
 // and returns a Config with sane defaults if keys are missing.
 func loadConfigFromEnv() Config {
 	cfg := Config{
-		ProductID:         getEnv("PRODUCT_ID", "BTC-USD"),
-		Granularity:       getEnv("GRANULARITY", "ONE_MINUTE"),
+		ProductID:   getEnv("PRODUCT_ID", "BTC-USD"),
+		Granularity: getEnv("GRANULARITY", "ONE_MINUTE"),
 
 		// Universal, unprefixed knobs
 		DryRun:            getEnvBool("DRY_RUN", true),
@@ -72,6 +79,13 @@ func loadConfigFromEnv() Config {
 		OrderMinUSD:       getEnvFloat("ORDER_MIN_USD", 5.00),
 		LongOnly:          getEnvBool("LONG_ONLY", true),
 		FeeRatePct:        getEnvFloat("FEE_RATE_PCT", 0.3),
+		RequireBaseForShort: getEnvBool("REQUIRE_BASE_FOR_SHORT", true),
+
+		// Venue filters (optional)
+		PriceTick:   getEnvFloat("PRICE_TICK", 0.0),
+		BaseStep:    getEnvFloat("BASE_STEP", 0.0),
+		QuoteStep:   getEnvFloat("QUOTE_STEP", 0.0),
+		MinNotional: getEnvFloat("MIN_NOTIONAL", 0.0),
 
 		Port:              getEnvInt("PORT", 8080),
 		BridgeURL:         getEnv("BRIDGE_URL", ""),

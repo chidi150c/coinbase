@@ -413,7 +413,7 @@ async def _ws_consume():
                             events = ev.get("events") or []
                             if events and isinstance(events, list):
                                 e0 = events[0]
-                                if isinstance(e0, dict) and "tickers" in e0 and e0["tickers"]:
+                                if isinstance(e0, dict) and "tickers" in e0 and e0["tickers"] and isinstance(e0["tickers"], list):
                                     t0 = e0["tickers"][0]
                                     pid = t0.get("product_id") or t0.get("productId")
                                     price = t0.get("price")
@@ -764,3 +764,72 @@ def cancel_order(order_id: str, product_id: Optional[str] = Query(None)):
         return {"order_id": order_id, "status": "cancel_attempted"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+# === NEW: /exchange/filters — normalized venue filters ===
+
+def _product_for_filters(pid_or_sym: str) -> Dict[str, Any]:
+    """
+    Fetch the coinbase product and return as dict.
+    Accepts 'BTC-USD' or other Coinbase product ids; returns dict or raises HTTPException.
+    """
+    try:
+        p = client.get_product(pid_or_sym)
+        return p.to_dict() if hasattr(p, "to_dict") else p
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"get_product error: {e}")
+
+@app.get("/exchange/filters")
+def exchange_filters(
+    product_id: Optional[str] = Query(None, description="Coinbase product id, e.g., BTC-USD"),
+    symbol: Optional[str] = Query(None, description="Alias for product_id"),
+):
+    """
+    Returns normalized filter fields used by the Go bot:
+      - price_tick   (string): minimum price increment
+      - base_step    (string): minimum base quantity increment
+      - quote_step   (string): minimum quote amount increment
+      - min_notional (string): minimum order notional in quote currency
+
+    All values are returned as strings to preserve precision.
+    """
+    pid = (product_id or symbol or "").strip()
+    if not pid:
+        raise HTTPException(status_code=400, detail="missing product_id")
+
+    p = _product_for_filters(pid)
+
+    # Attempt to derive increments from common Coinbase fields.
+    # Fallbacks default to "0" so the Go side can apply its env-based overrides if needed.
+    price_tick = str(
+        p.get("price_increment")
+        or p.get("price_increment_value")
+        or p.get("quote_increment")  # last-resort approximation
+        or "0"
+    )
+    base_step = str(
+        p.get("base_increment")
+        or p.get("base_increment_value")
+        or "0"
+    )
+    quote_step = str(
+        p.get("quote_increment")
+        or p.get("quote_increment_value")
+        or "0"
+    )
+
+    # Min notional: Coinbase often exposes min_market_funds (quote currency).
+    min_notional = str(
+        p.get("min_market_funds")
+        or p.get("min_market_value")
+        or p.get("min_funds")
+        or p.get("min_order_value")
+        or "0"
+    )
+
+    out = {
+        "price_tick":   price_tick,
+        "base_step":    base_step,
+        "quote_step":   quote_step,
+        "min_notional": min_notional,
+    }
+    return out

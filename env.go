@@ -70,14 +70,21 @@ func getEnvInt(key string, def int) int {
 
 // --------- .env loader (bot-only) ---------
 
-// loadBotEnv reads /opt/coinbase/env/bot.env and sets ONLY the keys the Go bot needs.
+// loadBotEnv reads the env file at BOT_ENV_PATH (must be set and exist) and sets ONLY the keys the Go bot needs.
 // It won't override variables already in the environment and ignores secrets not required.
 func loadBotEnv() {
-	path := "/opt/coinbase/env/bot.env"
+	// Require BOT_ENV_PATH to be set and file to exist
+	path := strings.TrimSpace(os.Getenv("BOT_ENV_PATH"))
+	if path == "" {
+		log.Fatalf("env: BOT_ENV_PATH not set")
+	}
+	if fi, err := os.Stat(path); err != nil || fi.IsDir() {
+		log.Fatalf("env: BOT_ENV_PATH set but file not found: %s", path)
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
-		log.Printf("env: %s not found, relying on process env", path)
-		return
+		log.Fatalf("env: failed to open %s: %v", path, err)
 	}
 	defer f.Close()
 
@@ -86,17 +93,19 @@ func loadBotEnv() {
 		"RISK_PER_TRADE_PCT": {}, "USD_EQUITY": {}, "TAKE_PROFIT_PCT": {},
 		"STOP_LOSS_PCT": {}, "ORDER_MIN_USD": {}, "LONG_ONLY": {}, "PORT": {}, "BRIDGE_URL": {},
 		"BUY_THRESHOLD": {}, "SELL_THRESHOLD": {}, "USE_MA_FILTER": {}, "BACKTEST_SLEEP_MS": {},
-		
+
 		// ---- pyramiding/env-driven knobs ----
 		"ALLOW_PYRAMIDING":            {},
 		"PYRAMID_MIN_SECONDS_BETWEEN": {},
 		"PYRAMID_MIN_ADVERSE_PCT":     {},
 		// time-based exponential decay
 		"PYRAMID_DECAY_LAMBDA":  {},
-		"PYRAMID_DECAY_MIN_PCT": {}, // tick/candle sync & risk
-		"USE_TICK_PRICE":            {},
-		"TICK_INTERVAL_SEC":         {},
-		"CANDLE_RESYNC_SEC":         {},
+		"PYRAMID_DECAY_MIN_PCT": {},
+
+		// tick/candle sync & risk
+		"USE_TICK_PRICE":        {},
+		"TICK_INTERVAL_SEC":     {},
+		"CANDLE_RESYNC_SEC":     {},
 		"DAILY_BREAKER_MARK_TO_MARKET": {},
 		"FEE_RATE_PCT":                 {},
 		"MAX_CONCURRENT_LOTS":          {},
@@ -122,14 +131,18 @@ func loadBotEnv() {
 		"PAPER_QUOTE_BALANCE":    {},
 		"QUOTE_STEP":             {},
 
+		// normalized venue filters (added)
+		"PRICE_TICK":   {},
+		"MIN_NOTIONAL": {},
+
 		// broker selection + Binance keys
-		"BROKER":                  {}, // "binance" selects direct Binance broker; empty keeps current path
-		"BINANCE_API_KEY":         {},
-		"BINANCE_API_SECRET":      {},
-		"BINANCE_API_BASE":        {},  // default https://api.binance.com
-		"BINANCE_RECV_WINDOW_MS":  {},  // default 5000
-		"BINANCE_USE_TESTNET":     {},  // ignored unless you opt-in
-		"BINANCE_FEE_RATE_PCT":    {},  // NEW: per-exchange fee override for binance
+		"BROKER":                 {}, // "binance" selects direct Binance broker; empty keeps current path
+		"BINANCE_API_KEY":        {},
+		"BINANCE_API_SECRET":     {},
+		"BINANCE_API_BASE":       {}, // default https://api.binance.com
+		"BINANCE_RECV_WINDOW_MS": {}, // default 5000
+		"BINANCE_USE_TESTNET":    {}, // ignored unless you opt-in
+		"BINANCE_FEE_RATE_PCT":   {}, // NEW: per-exchange fee override for binance
 	}
 
 	s := bufio.NewScanner(f)

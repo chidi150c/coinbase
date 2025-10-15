@@ -65,9 +65,36 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 		}
 	}
 
-	_, err := trader.broker.GetExchangeFilters(ctx, trader.cfg.ProductID) // best-effort preload
-	if err != nil{
-		log.Fatalf("[BOOT] exchange filters unavailable for %s; refusing to trade without LOT_SIZE.stepSize and PRICE_FILTER.tickSize (post-only limits disabled) — ensure bridge /exchange/filters is populated or provide valid overrides: error: %v", trader.cfg.ProductID, err)			
+	filters, err := trader.broker.GetExchangeFilters(ctx, trader.cfg.ProductID) // best-effort preload
+	if err != nil {
+		log.Fatalf("[BOOT] exchange filters unavailable for %s; refusing to trade without LOT_SIZE.stepSize and PRICE_FILTER.tickSize (post-only limits disabled) — ensure bridge /exchange/filters is populated or provide valid overrides: error: %v", trader.cfg.ProductID, err)
+	}
+	// Populate cfg fields from filters when available; keep existing cfg values if already set.
+	if trader.cfg.PriceTick <= 0 {
+		// Prefer PriceTick if present, else TickSize for backward compatibility.
+		if v := getFilterFloat(filters, "PriceTick"); v > 0 {
+			trader.cfg.PriceTick = v
+		} else if v := getFilterFloat(filters, "TickSize"); v > 0 {
+			trader.cfg.PriceTick = v
+		}
+	}
+	if trader.cfg.BaseStep <= 0 {
+		// Prefer BaseStep if present, else StepSize for backward compatibility.
+		if v := getFilterFloat(filters, "BaseStep"); v > 0 {
+			trader.cfg.BaseStep = v
+		} else if v := getFilterFloat(filters, "StepSize"); v > 0 {
+			trader.cfg.BaseStep = v
+		}
+	}
+	if trader.cfg.QuoteStep <= 0 {
+		if v := getFilterFloat(filters, "QuoteStep"); v > 0 {
+			trader.cfg.QuoteStep = v
+		}
+	}
+	if trader.cfg.MinNotional <= 0 {
+		if v := getFilterFloat(filters, "MinNotional"); v > 0 {
+			trader.cfg.MinNotional = v
+		}
 	}
 
 	// Warmup candles (paged backfill from bridge to MaxHistoryCandles; else large single fetch from the broker)
@@ -458,48 +485,58 @@ type bridgeAccount struct {
 // Sentinel error for missing bridge /accounts endpoint
 var errBridgeAccountsNotFound = errors.New("bridge accounts endpoint not found") // <-- added
 
- func fetchBridgeAccounts(ctx context.Context, bridgeURL string) (map[string]float64, error) {
-     u := strings.TrimRight(bridgeURL, "/") + "/accounts?limit=250"
-    if traceOn() { log.Printf("[TRACE] equity: calling %s", u) }
-     req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
-     if err != nil {
-         return nil, err
-     }
-     resp, err := http.DefaultClient.Do(req)
-     if err != nil {
-         return nil, err
-     }
-     defer resp.Body.Close()
-    if traceOn() { log.Printf("[TRACE] equity: /accounts status=%d", resp.StatusCode) }
-     if resp.StatusCode == http.StatusNotFound {
-         io.Copy(io.Discard, resp.Body)
-        if traceOn() { log.Printf("[TRACE] equity: /accounts 404 -> will fallback to broker balances") }
-        return nil, errBridgeAccountsNotFound
-     }
-     if resp.StatusCode >= 300 {
-         b, _ := io.ReadAll(resp.Body)
-         return nil, fmt.Errorf("bridge /accounts %d: %s", resp.StatusCode, string(b))
-     }
-     var payload bridgeAccountsResp
-     if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-        if traceOn() { log.Printf("[TRACE] equity: /accounts decode error: %v (will fallback)", err) }
-         return nil, err
-     }
-     out := make(map[string]float64, len(payload.Accounts))
-     for _, r := range payload.Accounts {
-         // Sum available + locked if locked is provided; treat missing/empty as zero.
-         avail, _ := strconv.ParseFloat(strings.TrimSpace(r.AvailableBalance.Value), 64)
-         locked, _ := strconv.ParseFloat(strings.TrimSpace(r.LockedBalance.Value), 64)
-         v := avail + locked
-         out[strings.ToUpper(strings.TrimSpace(r.Currency))] = v
-        if traceOn() {
-            log.Printf("[TRACE] equity: acct %s available=%.8f locked=%.8f total=%.8f",
-                strings.ToUpper(strings.TrimSpace(r.Currency)), avail, locked, v)
-        }
-     }
-    if traceOn() { log.Printf("[TRACE] equity: total currencies parsed=%d", len(out)) }
-     return out, nil
- }
+func fetchBridgeAccounts(ctx context.Context, bridgeURL string) (map[string]float64, error) {
+	u := strings.TrimRight(bridgeURL, "/") + "/accounts?limit=250"
+	if traceOn() {
+		log.Printf("[TRACE] equity: calling %s", u)
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if traceOn() {
+		log.Printf("[TRACE] equity: /accounts status=%d", resp.StatusCode)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		io.Copy(io.Discard, resp.Body)
+		if traceOn() {
+			log.Printf("[TRACE] equity: /accounts 404 -> will fallback to broker balances")
+		}
+		return nil, errBridgeAccountsNotFound
+	}
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("bridge /accounts %d: %s", resp.StatusCode, string(b))
+	}
+	var payload bridgeAccountsResp
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		if traceOn() {
+			log.Printf("[TRACE] equity: /accounts decode error: %v (will fallback)", err)
+		}
+		return nil, err
+	}
+	out := make(map[string]float64, len(payload.Accounts))
+	for _, r := range payload.Accounts {
+		// Sum available + locked if locked is provided; treat missing/empty as zero.
+		avail, _ := strconv.ParseFloat(strings.TrimSpace(r.AvailableBalance.Value), 64)
+		locked, _ := strconv.ParseFloat(strings.TrimSpace(r.LockedBalance.Value), 64)
+		v := avail + locked
+		out[strings.ToUpper(strings.TrimSpace(r.Currency))] = v
+		if traceOn() {
+			log.Printf("[TRACE] equity: acct %s available=%.8f locked=%.8f total=%.8f",
+				strings.ToUpper(strings.TrimSpace(r.Currency)), avail, locked, v)
+		}
+	}
+	if traceOn() {
+		log.Printf("[TRACE] equity: total currencies parsed=%d", len(out))
+	}
+	return out, nil
+}
 
 // live.go
 func traceOn() bool { return getEnvBool("TRACE_EQUITY", false) }
@@ -734,7 +771,7 @@ const (
 )
 
 var (
-	candleStyleMu      sync.Mutex
+	candleStyleMu       sync.Mutex
 	candleStyleByBridge = map[string]int{}
 )
 
@@ -799,7 +836,7 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 		start := end.Add(-time.Duration((pageLimit+5)*secPer) * time.Second)
 
 		var (
-			rows   []candleJSON
+			rows    []candleJSON
 			lastErr error
 		)
 
@@ -1043,4 +1080,29 @@ func waitBrokerHealthy(ctx context.Context, trader *Trader, timeout time.Duratio
 		time.Sleep(2 * time.Second)
 	}
 	return false
+}
+
+// getFilterFloat is a tiny helper to safely read optional fields from ExFilters
+// without altering any public interfaces; it uses a switch on known field names
+// to avoid introducing new types here.
+func getFilterFloat(f any, field string) float64 {
+	// We rely on the concrete type having these fields; use a type switch to access them safely.
+	switch v := f.(type) {
+	case ExFilters:
+		switch field {
+		case "PriceTick":
+			return v.PriceTick
+		case "TickSize":
+			return v.TickSize
+		case "BaseStep":
+			return v.BaseStep
+		case "StepSize":
+			return v.StepSize
+		case "QuoteStep":
+			return v.QuoteStep
+		case "MinNotional":
+			return v.MinNotional
+		}
+	}
+	return 0
 }

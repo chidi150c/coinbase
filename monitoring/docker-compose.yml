@@ -1,14 +1,14 @@
 services:
-  bridge_hitbtc:
-    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge-hitbtc:${IMAGE_SHA}  # pinned to CI SHA
-    container_name: bridge_hitbtc
-    env_file:
-      - /opt/coinbase/env/hitbtc.env   # includes PORT, STALE_MS, optional SYMBOL
-    ports:
-      - "8788:8788"
-    networks:
-      - monitoring_network
-    restart: unless-stopped
+  # bridge_hitbtc:
+  #   image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge-hitbtc:${IMAGE_SHA}  # pinned to CI SHA
+  #   container_name: bridge_hitbtc
+  #   env_file:
+  #     - /opt/coinbase/env/hitbtc.env   # includes PORT, STALE_MS, optional SYMBOL
+  #   ports:
+  #     - "8788:8788"
+  #   networks:
+  #     - monitoring_network
+  #   restart: unless-stopped
 
   bridge_binance:
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge-binance:${IMAGE_SHA} # pinned to CI SHA
@@ -41,34 +41,36 @@ services:
       monitoring_network:
         aliases: [bridge]
 
-  bot_hitbtc:
-    depends_on: [bridge_hitbtc]
-    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
-    command: ["-live", "-interval", "1"]
-    volumes:
-      - /opt/coinbase/env:/opt/coinbase/env:ro
-      - /opt/coinbase/state:/opt/coinbase/state
-    env_file:
-      - /opt/coinbase/env/bot_hitbtc.env      # broker/product/state overrides for HitBTC
-    restart: unless-stopped
-    expose:
-      - "8080"
-    healthcheck:
-      test: ["NONE"]
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "5"
-    networks:
-      monitoring_network:
-        aliases: [bot-hitbtc]
+  # bot_hitbtc:
+  #   depends_on: [bridge_hitbtc]
+  #   image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
+  #   command: ["-live", "-interval", "1"]
+  #   volumes:
+  #     - /opt/coinbase/env:/opt/coinbase/env:ro
+  #     - /opt/coinbase/state:/opt/coinbase/state
+  #   env_file:
+  #     - /opt/coinbase/env/bot_hitbtc.env      # broker/product/state overrides for HitBTC
+  #   restart: unless-stopped
+  #   expose:
+  #     - "8080"
+  #   healthcheck:
+  #     test: ["NONE"]
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "10m"
+  #       max-file: "5"
+  #   networks:
+  #     monitoring_network:
+  #       aliases: [bot-hitbtc]
 
   # second bot instance for Binance
   bot_binance:
     depends_on: [bridge_binance]
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
     command: ["-live", "-interval", "1"]
+    environment:
+      - BOT_ENV_PATH=/opt/coinbase/env/bot_binance.env
     volumes:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state
@@ -91,6 +93,8 @@ services:
   bot:
     image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
     command: ["-live", "-interval", "1"]
+    environment:
+      - BOT_ENV_PATH=/opt/coinbase/env/bot_coinbase.env
     volumes:
       - /opt/coinbase/env:/opt/coinbase/env:ro
       - /opt/coinbase/state:/opt/coinbase/state

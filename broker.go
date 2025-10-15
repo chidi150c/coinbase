@@ -52,15 +52,22 @@ type PlacedOrder struct {
 
 // Fill is optional detail for post-trade analysis.
 type Fill struct {
-    Price         float64 `json:"price,string,omitempty"`
-    BaseSize      float64 `json:"size,string,omitempty"`
-    CommissionUSD float64 `json:"commission_usd,string,omitempty"`
+	Price         float64 `json:"price,string,omitempty"`
+	BaseSize      float64 `json:"size,string,omitempty"`
+	CommissionUSD float64 `json:"commission_usd,string,omitempty"`
 	Liquidity     string  `json:"liquidity,omitempty"` // "M" or "T"
 }
+
+// ExFilters holds venue filter information (best-effort; any field may be zero when unavailable).
 type ExFilters struct {
-	StepSize  float64 // LOT_SIZE.stepSize (quantity)
-	TickSize  float64 // PRICE_FILTER.tickSize (price)
+	StepSize    float64 // LOT_SIZE.stepSize (quantity)
+	TickSize    float64 // PRICE_FILTER.tickSize (price)
+	PriceTick   float64 // normalized price tick (preferred over TickSize if provided)
+	BaseStep    float64 // normalized base-asset step (preferred over StepSize if provided)
+	QuoteStep   float64 // normalized quote-amount step (e.g., 0.01 for USDT quoteOrderQty)
+	MinNotional float64 // normalized minimum notional in quote currency
 }
+
 // Broker is the minimal surface the bot needs to operate.
 type Broker interface {
 	Name() string

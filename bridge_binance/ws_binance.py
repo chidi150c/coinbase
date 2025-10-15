@@ -36,7 +36,11 @@ last_ts_ms: Optional[int] = None
 candles: Dict[int, List[float]] = {}  # minuteStartMs -> [o,h,l,c,vol]
 _first_tick_logged: bool = False  # TRACE: first-tick marker
 
-# Simple cache for symbol metadata (LOT_SIZE.stepSize, quotePrecision → quote step, and PRICE_FILTER.tickSize)
+# Simple cache for symbol metadata:
+#   - LOT_SIZE.stepSize        -> base_step / step_size
+#   - PRICE_FILTER.tickSize    -> price_tick / tick_size
+#   - NOTIONAL.minNotional     -> min_notional
+#   - quotePrecision           -> quote_step (10^-precision)
 _symbol_meta_cache: Dict[str, Dict[str, str]] = {}
 
 # ---- Helpers ----
@@ -150,7 +154,8 @@ def _binance_signed_post(path: str, params: Dict[str,str]) -> Dict:
 def _binance_signed_delete(path: str, params: Dict[str,str]) -> Dict:
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         raise HTTPException(status_code=401, detail="Missing BINANCE_API_KEY/SECRET")
-    p = dict(params or {})
+    p = dict(params or {}
+    )
     p.setdefault("timestamp", str(_now_ms()))
     p.setdefault("recvWindow", BINANCE_RECV_WINDOW)
     q = urlparse.urlencode(p, doseq=True)
@@ -213,15 +218,18 @@ def _get_symbol_steps(sym: str) -> Tuple[str, str]:
     except Exception:
         pass
 
-    _symbol_meta_cache[key] = {"base_step": base_step, "quote_step": quote_step}
+    meta = _symbol_meta_cache.get(key, {})
+    meta.update({"base_step": base_step, "quote_step": quote_step})
+    _symbol_meta_cache[key] = meta
     return base_step, quote_step
 
-# --- NEW: helper to get LOT_SIZE.stepSize and PRICE_FILTER.tickSize (with cache) ---
+# --- NEW: helper to get LOT_SIZE.stepSize, PRICE_FILTER.tickSize, NOTIONAL.minNotional, quotePrecision (with cache) ---
 def _get_symbol_filters(sym: str) -> Tuple[str, str]:
     """
     Return (step_size, tick_size) strings for given Binance symbol:
       step_size := LOT_SIZE.stepSize
       tick_size := PRICE_FILTER.tickSize
+    (Legacy helper preserved for backward compatibility; cache is also enriched with min_notional and precision.)
     """
     key = sym.upper()
     meta = _symbol_meta_cache.get(key) or {}
@@ -232,27 +240,81 @@ def _get_symbol_filters(sym: str) -> Tuple[str, str]:
     info = _http_get(url)
 
     step_size, tick_size = "0", "0"
+    min_notional = meta.get("min_notional", "0")
+    quote_precision = meta.get("quote_precision", None)
+
     try:
         symbols = info.get("symbols") or []
         if symbols:
             s = symbols[0]
+            # precision
+            qp = s.get("quotePrecision")
+            if isinstance(qp, int) and qp >= 0:
+                quote_precision = str(qp)
+                # also derive and cache quote_step
+                if qp == 0:
+                    meta["quote_step"] = "1"
+                else:
+                    meta["quote_step"] = f"{1/(10**qp):.{qp}f}"
+
+            # filters
             for f in (s.get("filters") or []):
                 ft = f.get("filterType")
                 if ft == "LOT_SIZE":
                     v = str(f.get("stepSize") or "0").strip()
                     if v and v != "0":
                         step_size = v
+                        meta["base_step"] = v  # normalized alias
                 elif ft == "PRICE_FILTER":
                     v = str(f.get("tickSize") or "0").strip()
                     if v and v != "0":
                         tick_size = v
+                        meta["price_tick"] = v  # normalized alias
+                elif ft in ("NOTIONAL", "MIN_NOTIONAL"):
+                    v = str((f.get("minNotional") or f.get("notional") or "0")).strip()
+                    if v and v != "0":
+                        min_notional = v
     except Exception:
         pass
 
     # Merge into cache without breaking existing fields
-    meta.update({"step_size": step_size, "tick_size": tick_size})
+    meta.update({
+        "step_size": step_size,
+        "tick_size": tick_size,
+        "min_notional": min_notional,
+    })
+    if quote_precision is not None:
+        meta["quote_precision"] = quote_precision
     _symbol_meta_cache[key] = meta
     return step_size, tick_size
+
+# --- NEW: full normalized filter fetcher (preferred by /exchange/filters) ---
+def _get_symbol_filters_normalized(sym: str) -> Dict[str, str]:
+    key = sym.upper()
+    # Ensure cache is populated (this also infers min_notional and precision)
+    step_size, tick_size = _get_symbol_filters(sym)
+    base_step, quote_step = _get_symbol_steps(sym)
+    meta = _symbol_meta_cache.get(key, {})  # now enriched
+
+    # Resolve normalized fields with fallbacks
+    price_tick   = meta.get("price_tick", tick_size) or "0"
+    base_step    = (BASE_STEP_FALLBACK or base_step or meta.get("base_step") or meta.get("step_size") or "0")
+    quote_step   = (QUOTE_STEP_FALLBACK or quote_step or meta.get("quote_step") or "0")
+    min_notional = meta.get("min_notional", "0")
+
+    # As a last resort for quote_step, assume stablecoin increment 0.01
+    if (not quote_step) or quote_step == "0":
+        if key.endswith(("USDT","USDC","BUSD","FDUSD","USD")):
+            quote_step = "0.01"
+
+    return {
+        "step_size": step_size,       # legacy
+        "tick_size": tick_size,       # legacy
+        "price_tick": price_tick,     # normalized
+        "base_step": base_step,       # normalized
+        "quote_step": quote_step,     # normalized
+        "min_notional": min_notional, # normalized
+    }
 
 # ---- WS consumer ----
 async def _ws_loop():
@@ -335,7 +397,7 @@ async def _ws_loop():
             backoff = min(backoff*2, 15)
 
 # ---- FastAPI app ----
-app = FastAPI(title="bridge-binance", version="0.3")
+app = FastAPI(title="bridge-binance", version="0.4")
 
 # Map Coinbase granularities → Binance intervals
 GRAN_MAP = {
@@ -410,7 +472,7 @@ def get_candles(
     st_ms = _to_ms(st_s if legacy_mode else (startTime if startTime is not None else None))
     et_ms = _to_ms(et_s if legacy_mode else (endTime if endTime is not None else None))
 
-    # ✅ define lim before using it
+    # define lim before using it
     lim = max(1, min(int(limit), 1000))
 
     params = urlparse.urlencode(
@@ -530,16 +592,29 @@ def balance_quote(product_id: str = Query(...)):
 def product_info(product_id: str = Path(...)):
     return price(product_id)
 
-# --- NEW: Exchange filters endpoint for broker snapping (LOT_SIZE + PRICE_FILTER) ---
+# --- Exchange filters endpoint for broker snapping (legacy + normalized fields) ---
 @app.get("/exchange/filters")
 def exchange_filters(product_id: str = Query(..., description="e.g., BTCUSDT or BTC-USDT")):
     sym = _normalize_symbol(product_id)
     if not sym:
         raise HTTPException(status_code=400, detail="empty product_id")
-    step_size, tick_size = _get_symbol_filters(sym)
-    if step_size == "0" or tick_size == "0":
+
+    # Populate cache and compute normalized fields
+    normalized = _get_symbol_filters_normalized(sym)
+    # Legacy minimum: require LOT_SIZE and PRICE_FILTER
+    if normalized.get("step_size", "0") == "0" or normalized.get("tick_size", "0") == "0":
         raise HTTPException(status_code=404, detail="missing LOT_SIZE.stepSize or PRICE_FILTER.tickSize")
-    return {"product_id": product_id, "step_size": step_size, "tick_size": tick_size}
+
+    # Return both legacy and normalized keys for maximum client compatibility
+    return {
+        "product_id": product_id,
+        "step_size": normalized["step_size"],     # legacy LOT_SIZE.stepSize
+        "tick_size": normalized["tick_size"],     # legacy PRICE_FILTER.tickSize
+        "price_tick": normalized["price_tick"],   # normalized price tick
+        "base_step": normalized["base_step"],     # normalized base step
+        "quote_step": normalized["quote_step"],   # normalized quote step
+        "min_notional": normalized["min_notional"]# normalized minimum notional
+    }
 
 # --- Order endpoints (market by quote size), with partial-fill enrichment ---
 def _my_trades(symbol: str, order_id: int) -> List[Dict]:
@@ -613,7 +688,7 @@ def order_market(
         pass
     return resp
 
-# --- NEW: Post-only limit (LIMIT_MAKER). Body or query accepted. Returns {order_id} ---
+# --- Post-only limit (LIMIT_MAKER). Body or query accepted. Returns {order_id} ---
 @app.post("/order/limit_post_only")
 def order_limit_post_only(
     product_id: Optional[str] = Query(default=None),
@@ -698,7 +773,7 @@ def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
         pass
     return resp
 
-# --- NEW: Cancel order endpoint (DELETE) to align with broker.CancelOrder ---
+# --- Cancel order endpoint (DELETE) to align with broker.CancelOrder ---
 @app.delete("/order/{order_id}")
 def order_cancel(order_id: str, product_id: str = Query(default=SYMBOL)):
     sym = _normalize_symbol(product_id)

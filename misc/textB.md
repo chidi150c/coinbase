@@ -353,8 +353,8 @@ TAKE_PROFIT_PCT=1.9
 STOP_LOSS_PCT=1000.00
 TRAIL_ACTIVATE_PCT=1.9
 TRAIL_DISTANCE_PCT=0.4
-
 ==========================================
+
 
 # === Broker wiring (Coinbase via the bridge) ===
 # This mirrors your coinbase example: the bot talks to the Coinbase bridge for price/equity.
