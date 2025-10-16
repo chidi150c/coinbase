@@ -64,7 +64,8 @@ func main() {
 
 	// ---- Broker wiring ----
 	var broker Broker
-	switch strings.ToLower(getEnv("BROKER", "")) {
+	br := getEnv("BROKER", "")
+	switch strings.ToLower(br) {
 	case "binance":
 		broker = NewBinanceBridge(cfg.BridgeURL)
 	case "hitbtc":
@@ -72,7 +73,7 @@ func main() {
 	case "bridge":
 		broker = NewBridgeBroker(cfg.BridgeURL)
 	default:
-		broker = NewPaperBroker()	
+		log.Fatalf("No Broker %s !!!!!!!!!", br)
 	}
 
 	model := newModel()

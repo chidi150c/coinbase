@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -379,22 +381,83 @@ func quoteStepFromPrecision(p int) float64 {
 	return f
 }
 
-// getExchangeFilters calls a best-effort sidecar endpoint to fetch Binance filters.
-// If the endpoint is missing or fails, it returns zero values so baseline behavior is preserved.
+// GetExchangeFilters fetches Binance product filters with explicit source logging and optional cache/env bypass.
+// Sources (in order unless FORCE_FILTERS_REMOTE=1): cache -> env -> bridge HTTP.
+// Set FORCE_FILTERS_REMOTE=1 to force bridge HTTP fetch and log source=bridge-http.
 func (b *BinanceBridge) GetExchangeFilters(ctx context.Context, product string) (ExFilters, error) {
 	key := strings.TrimSpace(product)
 
-	// cache hit
-	fMuBinance.Lock()
-	if v, ok := fCacheBinance[key]; ok && (v.StepSize > 0 || v.TickSize > 0 || v.PriceTick > 0 || v.BaseStep > 0 || v.QuoteStep > 0 || v.MinNotional > 0) {
-		fMuBinance.Unlock()
-		return v, nil
+	// Helper to log a consistent line with the resolved source.
+	logFilters := func(source, urlHint string, f ExFilters) {
+		if urlHint == "" {
+			log.Printf("TRACE exch.filters source=%s product=%s step=%.10f tick=%.10f price_tick=%.10f base_step=%.10f quote_step=%.10f min_notional=%.10f",
+				source, product, f.StepSize, f.TickSize, f.PriceTick, f.BaseStep, f.QuoteStep, f.MinNotional)
+		} else {
+			log.Printf("TRACE exch.filters source=%s url=%s product=%s step=%.10f tick=%.10f price_tick=%.10f base_step=%.10f quote_step=%.10f min_notional=%.10f",
+				source, urlHint, product, f.StepSize, f.TickSize, f.PriceTick, f.BaseStep, f.QuoteStep, f.MinNotional)
+		}
 	}
-	fMuBinance.Unlock()
 
-	// try: GET /exchange/filters?product_id=<product>
+	// Opt-in: force remote (bridge HTTP) and bypass cache/env
+	forceRemote := func() bool {
+		v := strings.ToLower(strings.TrimSpace(os.Getenv("FORCE_FILTERS_REMOTE")))
+		return v == "1" || v == "true" || v == "yes"
+	}()
+
+	// 1) Cache (unless forced remote)
+	if !forceRemote {
+		fMuBinance.Lock()
+		if v, ok := fCacheBinance[key]; ok && (v.StepSize > 0 || v.TickSize > 0 || v.PriceTick > 0 || v.BaseStep > 0 || v.QuoteStep > 0 || v.MinNotional > 0) {
+			fMuBinance.Unlock()
+			logFilters("cache", "", v)
+			return v, nil
+		}
+		fMuBinance.Unlock()
+	}
+
+	// 2) ENV overrides (unless forced remote): BASE_STEP, TICK_SIZE (legacy), plus optional PRICE_TICK, QUOTE_STEP, MIN_NOTIONAL
+	if !forceRemote {
+		envStep := parseFloat(strings.TrimSpace(os.Getenv("BASE_STEP")))
+		envTick := parseFloat(strings.TrimSpace(os.Getenv("TICK_SIZE")))
+		envPriceTick := parseFloat(strings.TrimSpace(os.Getenv("PRICE_TICK")))
+		envQuoteStep := parseFloat(strings.TrimSpace(os.Getenv("QUOTE_STEP")))
+		envMinNotional := parseFloat(strings.TrimSpace(os.Getenv("MIN_NOTIONAL")))
+
+		if envStep > 0 || envTick > 0 || envPriceTick > 0 || envQuoteStep > 0 || envMinNotional > 0 {
+			f := ExFilters{
+				StepSize:    envStep,
+				TickSize:    envTick,
+				PriceTick:   envPriceTick,
+				BaseStep:    envStep,       // alias
+				QuoteStep:   envQuoteStep,  // may be 0
+				MinNotional: envMinNotional,
+			}
+			// If price_tick missing but tick_size present, alias
+			if f.PriceTick <= 0 && f.TickSize > 0 {
+				f.PriceTick = f.TickSize
+			}
+			// Stable default for quote step if quote-like symbol and no env provided
+			if f.QuoteStep <= 0 {
+				up := strings.ToUpper(key)
+				for _, q := range []string{"USDT", "USDC", "USD", "BUSD", "FDUSD"} {
+					if strings.HasSuffix(up, q) {
+						f.QuoteStep = 0.01
+						break
+					}
+				}
+			}
+			// Cache + log
+			fMuBinance.Lock()
+			fCacheBinance[key] = f
+			fMuBinance.Unlock()
+			logFilters("env", "", f)
+			return f, nil
+		}
+	}
+
+	// 3) Bridge HTTP (forced or fallback)
 	u := fmt.Sprintf("%s/exchange/filters?product_id=%s", b.base, url.QueryEscape(product))
-	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return ExFilters{}, err
 	}
@@ -409,67 +472,57 @@ func (b *BinanceBridge) GetExchangeFilters(ctx context.Context, product string) 
 		return ExFilters{}, fmt.Errorf("filters %d", resp.StatusCode)
 	}
 
-	// Accept BOTH legacy keys (step_size/tick_size) and normalized keys (price_tick/base_step/quote_step/min_notional).
+	// Accept BOTH legacy keys and normalized keys from the bridge.
 	var payload struct {
-		// legacy (already supported)
-		StepSize string `json:"step_size"` // LOT_SIZE.StepSize
-		TickSize string `json:"tick_size"` // PRICE_FILTER.TickSize
-
-		// normalized (preferred)
-		PriceTick   string `json:"price_tick"`   // normalized price tick
-		BaseStep    string `json:"base_step"`    // normalized base step
-		QuoteStep   string `json:"quote_step"`   // normalized quote step
-		MinNotional string `json:"min_notional"` // normalized min notional
-
-		// optional hint if sidecar exposes precision for quoteOrderQty fallback
+		// legacy
+		StepSize string `json:"step_size"` // LOT_SIZE.stepSize
+		TickSize string `json:"tick_size"` // PRICE_FILTER.tickSize
+		// normalized
+		PriceTick   string `json:"price_tick"`
+		BaseStep    string `json:"base_step"`
+		QuoteStep   string `json:"quote_step"`
+		MinNotional string `json:"min_notional"`
+		// optional: precision hint for quote step
 		QuotePrecision int `json:"quote_precision"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return ExFilters{}, err
 	}
 
-	// Build ExFilters with robust fallbacks.
+	// Build and normalize
 	f := ExFilters{
-		// legacy
-		StepSize: parseFloat(payload.StepSize),
-		TickSize: parseFloat(payload.TickSize),
-
-		// normalized (preferred)
+		StepSize:    parseFloat(payload.StepSize),
+		TickSize:    parseFloat(payload.TickSize),
 		PriceTick:   parseFloat(payload.PriceTick),
 		BaseStep:    parseFloat(payload.BaseStep),
 		QuoteStep:   parseFloat(payload.QuoteStep),
 		MinNotional: parseFloat(payload.MinNotional),
 	}
-
-	// If normalized fields are missing, alias from legacy where it makes sense.
 	if f.PriceTick <= 0 && f.TickSize > 0 {
 		f.PriceTick = f.TickSize
 	}
 	if f.BaseStep <= 0 && f.StepSize > 0 {
 		f.BaseStep = f.StepSize
 	}
-
-	// Derive quote step from precision if not present.
 	if f.QuoteStep <= 0 && payload.QuotePrecision > 0 {
 		f.QuoteStep = quoteStepFromPrecision(payload.QuotePrecision)
 	}
-
-	// As a last resort, apply a conservative default for common stablecoin quotes (USDT, USDC, USD, BUSD, FDUSD).
+	// Stable default for quote step if quote-like symbol and not provided
 	if f.QuoteStep <= 0 {
-		upper := strings.ToUpper(strings.TrimSpace(product))
+		up := strings.ToUpper(key)
 		for _, q := range []string{"USDT", "USDC", "USD", "BUSD", "FDUSD"} {
-			if strings.HasSuffix(upper, q) {
+			if strings.HasSuffix(up, q) {
 				f.QuoteStep = 0.01
 				break
 			}
 		}
 	}
 
-	// cache store
+	// Cache + explicit source log
 	fMuBinance.Lock()
 	fCacheBinance[key] = f
 	fMuBinance.Unlock()
-
+	logFilters("bridge-http", u, f)
 	return f, nil
 }
 

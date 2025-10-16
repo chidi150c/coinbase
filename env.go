@@ -4,15 +4,15 @@
 // This file provides:
 //   1) Small helpers to read environment variables with sane defaults
 //      (strings, ints, floats, bools).
-//   2) A safe loader (loadBotEnv) that reads /opt/coinbase/env/bot.env only,
-//      ignoring secrets meant for the Python bridge.
+//   2) A safe loader (loadBotEnv) that reads the env file pointed to by
+//      BOT_ENV_PATH and sets only the keys the Go bot needs.
 //   3) Strategy threshold knobs (buyThreshold, sellThreshold, useMAFilter) and an
 //      initializer (initThresholdsFromEnv) so you can tune behavior via env
 //      without recompiling.
 //
 // Notes:
 //   • The bot never requires `export $(cat .env ...)`.
-//   • The Python FastAPI sidecar uses its own /opt/coinbase/env/bridge.env.
+//   • The Python FastAPI sidecar uses its own bridge env file.
 
 package main
 
@@ -87,8 +87,10 @@ func loadBotEnv() {
 		log.Fatalf("env: failed to open %s: %v", path, err)
 	}
 	defer f.Close()
+	log.Printf("env: using BOT_ENV_PATH: %s", path)
 
 	needed := map[string]struct{}{
+		// Core trading target & ops
 		"PRODUCT_ID": {}, "GRANULARITY": {}, "DRY_RUN": {}, "MAX_DAILY_LOSS_PCT": {},
 		"RISK_PER_TRADE_PCT": {}, "USD_EQUITY": {}, "TAKE_PROFIT_PCT": {},
 		"STOP_LOSS_PCT": {}, "ORDER_MIN_USD": {}, "LONG_ONLY": {}, "PORT": {}, "BRIDGE_URL": {},
@@ -120,6 +122,34 @@ func loadBotEnv() {
 		"SCALP_TP_DECAY_FACTOR": {},
 		"SCALP_TP_MIN_PCT":      {},
 
+		// extended USD-based trailing/profit-gate (additive)
+		"TRAIL_ACTIVATE_USD_RUNNER": {},
+		"TRAIL_ACTIVATE_USD_SCALP":  {},
+		"TRAIL_DISTANCE_PCT_RUNNER": {},
+		"TRAIL_DISTANCE_PCT_SCALP":  {},
+		"PROFIT_GATE_USD":           {},
+
+		// order routing (maker-first)
+		"ORDER_TYPE":             {},
+		"LIMIT_PRICE_OFFSET_BPS": {},
+		"SPREAD_MIN_BPS":         {},
+		"LIMIT_TIMEOUT_SEC":      {},
+		"TP_MAKER_OFFSET_BPS":    {},
+
+		// ramping
+		"RAMP_ENABLE":    {},
+		"RAMP_MODE":      {},
+		"RAMP_START_PCT": {},
+		"RAMP_STEP_PCT":  {},
+		"RAMP_GROWTH":    {},
+		"RAMP_MAX_PCT":   {},
+
+		// equity/reporting/runtime
+		"EXIT_HISTORY_SIZE": {},
+		"PERSIST_STATE":     {},
+		"USE_LIVE_EQUITY":   {},
+		"SLACK_WEBHOOK":     {},
+
 		// history depth
 		"MAX_HISTORY_CANDLES": {},
 
@@ -142,7 +172,7 @@ func loadBotEnv() {
 		"BINANCE_API_BASE":       {}, // default https://api.binance.com
 		"BINANCE_RECV_WINDOW_MS": {}, // default 5000
 		"BINANCE_USE_TESTNET":    {}, // ignored unless you opt-in
-		"BINANCE_FEE_RATE_PCT":   {}, // NEW: per-exchange fee override for binance
+		"BINANCE_FEE_RATE_PCT":   {}, // per-exchange fee override for binance
 	}
 
 	s := bufio.NewScanner(f)

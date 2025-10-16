@@ -24,17 +24,17 @@ type Config struct {
 	Granularity string // e.g., "ONE_MINUTE"
 
 	// Safety & sizing
-	DryRun             bool
-	MaxDailyLossPct    float64
-	RiskPerTradePct    float64
-	USDEquity          float64
-	TakeProfitPct      float64
-	StopLossPct        float64
-	OrderMinUSD        float64 // legacy floor; still honored if MinNotional <= 0
-	MinNotional        float64 // preferred exchange min notional (QUOTE); if >0, use this instead of OrderMinUSD
-	LongOnly           bool    // prevent SELL entries when flat on spot
-	RequireBaseForShort bool   // spot safety: require base inventory to short (default true)
-	FeeRatePct         float64 // % fee applied on entry/exit trades
+	DryRun              bool
+	MaxDailyLossPct     float64
+	RiskPerTradePct     float64
+	USDEquity           float64
+	TakeProfitPct       float64
+	StopLossPct         float64
+	OrderMinUSD         float64 // legacy floor; still honored if MinNotional <= 0
+	MinNotional         float64 // preferred exchange min notional (QUOTE); if >0, use this instead of OrderMinUSD
+	LongOnly            bool    // prevent SELL entries when flat on spot
+	RequireBaseForShort bool    // spot safety: require base inventory to short (default true)
+	FeeRatePct          float64 // % fee applied on entry/exit trades
 
 	// Normalized venue filters (optionally populated via env or bridge)
 	PriceTick float64 // price tick size (QUOTE)
@@ -56,10 +56,52 @@ type Config struct {
 	LiveEquity bool // if true, rebase & refresh equity from live balances
 
 	// Order entry (unprefixed; universal)
-	OrderType            string // "market" or "limit"
-	LimitPriceOffsetBps  int    // maker price offset from mid in bps
-	SpreadMinBps         int    // minimum spread (bps) to attempt maker entry
-	LimitTimeoutSec      int    // cancel-and-market fallback timeout (seconds)
+	OrderType           string // "market" or "limit"
+	LimitPriceOffsetBps float64    // maker price offset from mid in bps
+	SpreadMinBps        int    // minimum spread (bps) to attempt maker entry
+	LimitTimeoutSec     int    // cancel-and-market fallback timeout (seconds)
+
+	// ---------- Migrated (Bucket B) knobs ----------
+
+	// Pyramiding
+	AllowPyramiding          bool
+	PyramidMinSecondsBetween int
+	PyramidMinAdversePct     float64
+	PyramidDecayLambda       float64 // per-minute
+	PyramidDecayMinPct       float64
+
+	// TP-decay
+	ScalpTPDecayEnable bool
+	ScalpTPDecMode     string
+	ScalpTPDecPct      float64
+	ScalpTPDecayFactor float64
+	ScalpTPMinPct      float64
+
+	// USD trailing / profit gates
+	TrailActivateUSDRunner  float64
+	TrailActivateUSDScalp   float64
+	TrailDistancePctRunner  float64
+	TrailDistancePctScalp   float64
+	ProfitGateUSD           float64
+	TPMakerOffsetBps        float64 // maker offset for fixed-TP exits
+
+	// Ramping
+	RampEnable  bool
+	RampMode    string
+	RampStartPct float64
+	RampStepPct  float64
+	RampGrowth   float64
+	RampMaxPct   float64
+
+	// Equity/reporting/runtime
+	ExitHistorySize  int
+	PersistState     bool
+	MaxConcurrentLots int
+
+	// Paper/override helpers
+	PaperBaseBalance float64
+	BaseAsset        string
+	PaperQuoteBalance float64
 }
 
 // loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
@@ -70,17 +112,17 @@ func loadConfigFromEnv() Config {
 		Granularity: getEnv("GRANULARITY", "ONE_MINUTE"),
 
 		// Universal, unprefixed knobs
-		DryRun:          getEnvBool("DRY_RUN", true),
-		MaxDailyLossPct: getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
-		RiskPerTradePct: getEnvFloat("RISK_PER_TRADE_PCT", 0.25),
-		USDEquity:       getEnvFloat("USD_EQUITY", 1000.0),
-		TakeProfitPct:   getEnvFloat("TAKE_PROFIT_PCT", 0.8),
-		StopLossPct:     getEnvFloat("STOP_LOSS_PCT", 0.4),
-		OrderMinUSD:     getEnvFloat("ORDER_MIN_USD", 5.00),
-		MinNotional:     getEnvFloat("MIN_NOTIONAL", 0.0),          // preferred when > 0
-		LongOnly:        getEnvBool("LONG_ONLY", true),
+		DryRun:              getEnvBool("DRY_RUN", true),
+		MaxDailyLossPct:     getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
+		RiskPerTradePct:     getEnvFloat("RISK_PER_TRADE_PCT", 0.25),
+		USDEquity:           getEnvFloat("USD_EQUITY", 1000.0),
+		TakeProfitPct:       getEnvFloat("TAKE_PROFIT_PCT", 0.8),
+		StopLossPct:         getEnvFloat("STOP_LOSS_PCT", 0.4),
+		OrderMinUSD:         getEnvFloat("ORDER_MIN_USD", 5.00),
+		MinNotional:         getEnvFloat("MIN_NOTIONAL", 0.0), // preferred when > 0
+		LongOnly:            getEnvBool("LONG_ONLY", true),
 		RequireBaseForShort: getEnvBool("REQUIRE_BASE_FOR_SHORT", true),
-		FeeRatePct:      getEnvFloat("FEE_RATE_PCT", 0.3),
+		FeeRatePct:          getEnvFloat("FEE_RATE_PCT", 0.3),
 
 		// Venue filters (can be hydrated by bridge and/or env file)
 		PriceTick: getEnvFloat("PRICE_TICK", 0.0),
@@ -102,9 +144,50 @@ func loadConfigFromEnv() Config {
 
 		// Order entry
 		OrderType:           getEnv("ORDER_TYPE", "market"),
-		LimitPriceOffsetBps: getEnvInt("LIMIT_PRICE_OFFSET_BPS", 5),
+		LimitPriceOffsetBps: getEnvFloat("LIMIT_PRICE_OFFSET_BPS", 5.0),
 		SpreadMinBps:        getEnvInt("SPREAD_MIN_BPS", 2),
 		LimitTimeoutSec:     getEnvInt("LIMIT_TIMEOUT_SEC", 5),
+
+		// ---------- Migrated (Bucket B) defaults ----------
+		// Pyramiding
+		AllowPyramiding:          getEnvBool("ALLOW_PYRAMIDING", false),
+		PyramidMinSecondsBetween: getEnvInt("PYRAMID_MIN_SECONDS_BETWEEN", 0),
+		PyramidMinAdversePct:     getEnvFloat("PYRAMID_MIN_ADVERSE_PCT", 0.0),
+		PyramidDecayLambda:       getEnvFloat("PYRAMID_DECAY_LAMBDA", 0.0),
+		PyramidDecayMinPct:       getEnvFloat("PYRAMID_DECAY_MIN_PCT", 0.0),
+
+		// TP-decay
+		ScalpTPDecayEnable: getEnvBool("SCALP_TP_DECAY_ENABLE", false),
+		ScalpTPDecMode:     getEnv("SCALP_TP_DEC_MODE", "linear"),
+		ScalpTPDecPct:      getEnvFloat("SCALP_TP_DEC_PCT", 0.0),
+		ScalpTPDecayFactor: getEnvFloat("SCALP_TP_DECAY_FACTOR", 1.0),
+		ScalpTPMinPct:      getEnvFloat("SCALP_TP_MIN_PCT", 0.0),
+
+		// USD trailing / profit gates
+		TrailActivateUSDRunner: getEnvFloat("TRAIL_ACTIVATE_USD_RUNNER", 1.00),
+		TrailActivateUSDScalp:  getEnvFloat("TRAIL_ACTIVATE_USD_SCALP", 0.50),
+		TrailDistancePctRunner: getEnvFloat("TRAIL_DISTANCE_PCT_RUNNER", 0.40),
+		TrailDistancePctScalp:  getEnvFloat("TRAIL_DISTANCE_PCT_SCALP", 0.25),
+		ProfitGateUSD:          getEnvFloat("PROFIT_GATE_USD", 0.50),
+		TPMakerOffsetBps:       getEnvFloat("TP_MAKER_OFFSET_BPS", 0.0),
+
+		// Ramping
+		RampEnable:  getEnvBool("RAMP_ENABLE", false),
+		RampMode:    getEnv("RAMP_MODE", "linear"),
+		RampStartPct: getEnvFloat("RAMP_START_PCT", 0.0),
+		RampStepPct:  getEnvFloat("RAMP_STEP_PCT", 0.0),
+		RampGrowth:   getEnvFloat("RAMP_GROWTH", 1.0),
+		RampMaxPct:   getEnvFloat("RAMP_MAX_PCT", 0.0),
+
+		// Equity/reporting/runtime
+		ExitHistorySize:   getEnvInt("EXIT_HISTORY_SIZE", 8),
+		PersistState:      getEnvBool("PERSIST_STATE", true),
+		MaxConcurrentLots: getEnvInt("MAX_CONCURRENT_LOTS", 1_000_000),
+
+		// Paper/override helpers
+		PaperBaseBalance:  getEnvFloat("PAPER_BASE_BALANCE", 0.0),
+		BaseAsset:         getEnv("BASE_ASSET", ""),
+		PaperQuoteBalance: getEnvFloat("PAPER_QUOTE_BALANCE", 0.0),
 	}
 
 	// Historical carry-over: if someone still sets BROKER=X, we may still
@@ -138,7 +221,7 @@ func (c *Config) TickInterval() int {
 func (c *Config) CandleResync() int {
 	cr := getEnvInt("CANDLE_RESYNC_SEC", c.CandleResyncSec)
 	if cr <= 0 {
-		cr = 60
+		return 60
 	}
 	return cr
 }
