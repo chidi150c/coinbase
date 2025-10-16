@@ -384,43 +384,50 @@ func (bb *BridgeBroker) getExchangeFiltersCached(product string) ExFilters {
 
 // GetExchangeFilters returns lot/price steps for a product with robust fallbacks:
 // 1) Cache (fast path)
-// 2) Env overrides (BASE_STEP, QUOTE_STEP, TICK_SIZE, MIN_NOTIONAL) -> seeds cache, returns non-zero
+// 2) Env overrides (BASE_STEP, TICK_SIZE) -> seeds cache, returns non-zero
 // 3) HTTP best-effort against several endpoint variants/params
 func (bb *BridgeBroker) GetExchangeFilters(ctx context.Context, product string) (ExFilters, error) {
 	key := strings.TrimSpace(product)
+	forceRemote := strings.EqualFold(strings.TrimSpace(os.Getenv("FORCE_FILTERS_REMOTE")), "1")
 
-	// cache hit (accept any known non-zero field)
+	// cache hit (skip if forced remote)
 	fMuCoinbase.Lock()
-	if v, ok := fCacheCoinbase[key]; ok && (v.StepSize > 0 || v.TickSize > 0 || v.PriceTick > 0 || v.BaseStep > 0 || v.QuoteStep > 0 || v.MinNotional > 0) {
-		fMuCoinbase.Unlock()
-		return v, nil
+	if !forceRemote {
+		if v, ok := fCacheCoinbase[key]; ok && (v.StepSize > 0 || v.TickSize > 0 || v.PriceTick > 0 || v.BaseStep > 0 || v.QuoteStep > 0 || v.MinNotional > 0) {
+			fMuCoinbase.Unlock()
+			log.Printf("TRACE exch.filters source=cache product=%s step=%.10f tick=%.10f price_tick=%.10f base_step=%.10f quote_step=%.10f min_notional=%.10f",
+				key, v.StepSize, v.TickSize, v.PriceTick, v.BaseStep, v.QuoteStep, v.MinNotional)
+			return v, nil
+		}
 	}
 	fMuCoinbase.Unlock()
 
-	// 1) ENV OVERRIDES (fast, no network). Accepts BASE_STEP, QUOTE_STEP, TICK_SIZE, MIN_NOTIONAL.
-	envBase := parsePosFloat(os.Getenv("BASE_STEP"))
-	envQuote := parsePosFloat(os.Getenv("QUOTE_STEP"))
-	envTick := parsePosFloat(os.Getenv("TICK_SIZE"))
-	envMinNotional := parsePosFloat(os.Getenv("MIN_NOTIONAL"))
-	if envBase > 0 || envQuote > 0 || envTick > 0 || envMinNotional > 0 {
+	// ENV OVERRIDES (skip if forced remote). Accepts BASE_STEP, TICK_SIZE; extended keys optional.
+	if !forceRemote {
+		bs := strings.TrimSpace(os.Getenv("BASE_STEP"))
+		ts := strings.TrimSpace(os.Getenv("TICK_SIZE"))
+		pt := strings.TrimSpace(os.Getenv("PRICE_TICK"))
+		qs := strings.TrimSpace(os.Getenv("QUOTE_STEP"))
+		mn := strings.TrimSpace(os.Getenv("MIN_NOTIONAL"))
 		f := ExFilters{
-			// legacy compatibility
-			StepSize: envBase,
-			TickSize: envTick,
-			// extended fields
-			PriceTick:   envTick,
-			BaseStep:    envBase,
-			QuoteStep:   envQuote,
-			MinNotional: envMinNotional,
+			StepSize:   parsePosFloat(bs),
+			TickSize:   parsePosFloat(ts),
+			PriceTick:  parsePosFloat(pt),
+			BaseStep:   parsePosFloat(bs),
+			QuoteStep:  parsePosFloat(qs),
+			MinNotional: func() float64 { v := parsePosFloat(mn); if v <= 0 { return 0 } ; return v }(),
 		}
-		fMuCoinbase.Lock()
-		fCacheCoinbase[key] = f
-		fMuCoinbase.Unlock()
-		return f, nil
+		if f.StepSize > 0 || f.TickSize > 0 || f.PriceTick > 0 || f.BaseStep > 0 || f.QuoteStep > 0 || f.MinNotional > 0 {
+			fMuCoinbase.Lock()
+			fCacheCoinbase[key] = f
+			fMuCoinbase.Unlock()
+			log.Printf("TRACE exch.filters source=env product=%s step=%.10f tick=%.10f price_tick=%.10f base_step=%.10f quote_step=%.10f min_notional=%.10f",
+				key, f.StepSize, f.TickSize, f.PriceTick, f.BaseStep, f.QuoteStep, f.MinNotional)
+			return f, nil
+		}
 	}
 
-	// 2) HTTP best-effort: try multiple routes/params.
-	// Normalize symbol (BTC-USD -> BTCUSD) for symbol-style endpoints.
+	// HTTP best-effort: try multiple routes/params (this is the “from exchange” path via the bridge).
 	sym := strings.ReplaceAll(key, "-", "")
 	candidates := []string{
 		fmt.Sprintf("%s/exchange/filters?product_id=%s", bb.base, url.QueryEscape(key)),
@@ -450,72 +457,45 @@ func (bb *BridgeBroker) GetExchangeFilters(ctx context.Context, product string) 
 				lastErr = fmt.Errorf("filters %d", res.StatusCode)
 				return
 			}
-			// Support both new and legacy shapes
 			var payload struct {
-				// New normalized keys from bridge/app.py:/exchange/filters
+				StepSize    string `json:"step_size"`
+				TickSize    string `json:"tick_size"`
 				PriceTick   string `json:"price_tick"`
 				BaseStep    string `json:"base_step"`
 				QuoteStep   string `json:"quote_step"`
 				MinNotional string `json:"min_notional"`
-				// Legacy (Binance-style) fallbacks
-				StepSize string `json:"step_size"` // LOT_SIZE.StepSize
-				TickSize string `json:"tick_size"` // PRICE_FILTER.TickSize
 			}
 			if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
 				lastErr = err
 				return
 			}
-			// Parse with precedence: new fields first, fallback to legacy
-			priceTick := parsePosFloat(payload.PriceTick)
-			if priceTick == 0 {
-				priceTick = parsePosFloat(payload.TickSize)
-			}
-			baseStep := parsePosFloat(payload.BaseStep)
-			if baseStep == 0 {
-				baseStep = parsePosFloat(payload.StepSize)
-			}
-			quoteStep := parsePosFloat(payload.QuoteStep)
-			minNotional := parsePosFloat(payload.MinNotional)
-
-			// Legacy fields retained for compatibility
-			stepSize := parsePosFloat(payload.StepSize)
-			tickSize := parsePosFloat(payload.TickSize)
-
-			// If legacy present but new missing, mirror to extended fields to keep downstream consistent
-			if priceTick == 0 && tickSize > 0 {
-				priceTick = tickSize
-			}
-			if baseStep == 0 && stepSize > 0 {
-				baseStep = stepSize
-			}
-
 			f := ExFilters{
-				StepSize:    stepSize,
-				TickSize:    tickSize,
-				PriceTick:   priceTick,
-				BaseStep:    baseStep,
-				QuoteStep:   quoteStep,
-				MinNotional: minNotional,
+				StepSize:    parsePosFloat(payload.StepSize),
+				TickSize:    parsePosFloat(payload.TickSize),
+				PriceTick:   parsePosFloat(payload.PriceTick),
+				BaseStep:    parsePosFloat(payload.BaseStep),
+				QuoteStep:   parsePosFloat(payload.QuoteStep),
+				MinNotional: parsePosFloat(payload.MinNotional),
 			}
-			// Accept if any useful field is non-zero
 			if f.StepSize > 0 || f.TickSize > 0 || f.PriceTick > 0 || f.BaseStep > 0 || f.QuoteStep > 0 || f.MinNotional > 0 {
 				fMuCoinbase.Lock()
 				fCacheCoinbase[key] = f
 				fMuCoinbase.Unlock()
+				log.Printf("TRACE exch.filters source=bridge-http url=%s product=%s step=%.10f tick=%.10f price_tick=%.10f base_step=%.10f quote_step=%.10f min_notional=%.10f",
+					u, key, f.StepSize, f.TickSize, f.PriceTick, f.BaseStep, f.QuoteStep, f.MinNotional)
 				lastErr = nil
 			} else {
 				lastErr = fmt.Errorf("filters empty from %s", u)
 			}
 		}()
 		if lastErr == nil {
-			// success
 			return fCacheCoinbase[key], nil
 		}
 	}
 
-	// 3) Nothing worked; preserve current behavior but with clearer error.
 	return ExFilters{}, fmt.Errorf("filters unavailable for %s: %v", key, lastErr)
 }
+
 
 // --- Maker-first additions (post-only limit) ---
 
