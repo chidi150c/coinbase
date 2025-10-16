@@ -24,22 +24,22 @@ type Config struct {
 	Granularity string // e.g., "ONE_MINUTE"
 
 	// Safety & sizing
-	DryRun              bool
-	MaxDailyLossPct     float64
-	RiskPerTradePct     float64
-	USDEquity           float64
-	TakeProfitPct       float64
-	StopLossPct         float64
-	OrderMinUSD         float64
-	LongOnly            bool    // prevent SELL entries when flat on spot
-	FeeRatePct          float64 // % fee applied on entry/exit trades
-	RequireBaseForShort bool    // require base inventory for SELL on spot
+	DryRun             bool
+	MaxDailyLossPct    float64
+	RiskPerTradePct    float64
+	USDEquity          float64
+	TakeProfitPct      float64
+	StopLossPct        float64
+	OrderMinUSD        float64 // legacy floor; still honored if MinNotional <= 0
+	MinNotional        float64 // preferred exchange min notional (QUOTE); if >0, use this instead of OrderMinUSD
+	LongOnly           bool    // prevent SELL entries when flat on spot
+	RequireBaseForShort bool   // spot safety: require base inventory to short (default true)
+	FeeRatePct         float64 // % fee applied on entry/exit trades
 
-	// Venue filters (optional; filled from env/sidecar when available)
-	PriceTick   float64 // PRICE_TICK: minimum price increment
-	BaseStep    float64 // BASE_STEP: base-asset quantity step (LOT_SIZE.stepSize)
-	QuoteStep   float64 // QUOTE_STEP: quote-amount spend step
-	MinNotional float64 // MIN_NOTIONAL: minimum order notional in quote currency
+	// Normalized venue filters (optionally populated via env or bridge)
+	PriceTick float64 // price tick size (QUOTE)
+	BaseStep  float64 // base asset step (BASE)
+	QuoteStep float64 // quote asset step (QUOTE)
 
 	// Ops
 	Port              int
@@ -56,10 +56,10 @@ type Config struct {
 	LiveEquity bool // if true, rebase & refresh equity from live balances
 
 	// Order entry (unprefixed; universal)
-	OrderType           string // "market" or "limit"
-	LimitPriceOffsetBps int    // maker price offset from mid in bps
-	SpreadMinBps        int    // minimum spread (bps) to attempt maker entry
-	LimitTimeoutSec     int    // cancel-and-market fallback timeout (seconds)
+	OrderType            string // "market" or "limit"
+	LimitPriceOffsetBps  int    // maker price offset from mid in bps
+	SpreadMinBps         int    // minimum spread (bps) to attempt maker entry
+	LimitTimeoutSec      int    // cancel-and-market fallback timeout (seconds)
 }
 
 // loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
@@ -70,22 +70,22 @@ func loadConfigFromEnv() Config {
 		Granularity: getEnv("GRANULARITY", "ONE_MINUTE"),
 
 		// Universal, unprefixed knobs
-		DryRun:            getEnvBool("DRY_RUN", true),
-		MaxDailyLossPct:   getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
-		RiskPerTradePct:   getEnvFloat("RISK_PER_TRADE_PCT", 0.25),
-		USDEquity:         getEnvFloat("USD_EQUITY", 1000.0),
-		TakeProfitPct:     getEnvFloat("TAKE_PROFIT_PCT", 0.8),
-		StopLossPct:       getEnvFloat("STOP_LOSS_PCT", 0.4),
-		OrderMinUSD:       getEnvFloat("ORDER_MIN_USD", 5.00),
-		LongOnly:          getEnvBool("LONG_ONLY", true),
-		FeeRatePct:        getEnvFloat("FEE_RATE_PCT", 0.3),
+		DryRun:          getEnvBool("DRY_RUN", true),
+		MaxDailyLossPct: getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
+		RiskPerTradePct: getEnvFloat("RISK_PER_TRADE_PCT", 0.25),
+		USDEquity:       getEnvFloat("USD_EQUITY", 1000.0),
+		TakeProfitPct:   getEnvFloat("TAKE_PROFIT_PCT", 0.8),
+		StopLossPct:     getEnvFloat("STOP_LOSS_PCT", 0.4),
+		OrderMinUSD:     getEnvFloat("ORDER_MIN_USD", 5.00),
+		MinNotional:     getEnvFloat("MIN_NOTIONAL", 0.0),          // preferred when > 0
+		LongOnly:        getEnvBool("LONG_ONLY", true),
 		RequireBaseForShort: getEnvBool("REQUIRE_BASE_FOR_SHORT", true),
+		FeeRatePct:      getEnvFloat("FEE_RATE_PCT", 0.3),
 
-		// Venue filters (optional)
-		PriceTick:   getEnvFloat("PRICE_TICK", 0.0),
-		BaseStep:    getEnvFloat("BASE_STEP", 0.0),
-		QuoteStep:   getEnvFloat("QUOTE_STEP", 0.0),
-		MinNotional: getEnvFloat("MIN_NOTIONAL", 0.0),
+		// Venue filters (can be hydrated by bridge and/or env file)
+		PriceTick: getEnvFloat("PRICE_TICK", 0.0),
+		BaseStep:  getEnvFloat("BASE_STEP", 0.0),
+		QuoteStep: getEnvFloat("QUOTE_STEP", 0.0),
 
 		Port:              getEnvInt("PORT", 8080),
 		BridgeURL:         getEnv("BRIDGE_URL", ""),
