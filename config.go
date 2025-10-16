@@ -58,7 +58,7 @@ type Config struct {
 	// Order entry (unprefixed; universal)
 	OrderType           string // "market" or "limit"
 	LimitPriceOffsetBps float64    // maker price offset from mid in bps
-	SpreadMinBps        int    // minimum spread (bps) to attempt maker entry
+	SpreadMinBps        float64    // minimum spread (bps) to attempt maker entry
 	LimitTimeoutSec     int    // cancel-and-market fallback timeout (seconds)
 
 	// ---------- Migrated (Bucket B) knobs ----------
@@ -145,7 +145,7 @@ func loadConfigFromEnv() Config {
 		// Order entry
 		OrderType:           getEnv("ORDER_TYPE", "market"),
 		LimitPriceOffsetBps: getEnvFloat("LIMIT_PRICE_OFFSET_BPS", 5.0),
-		SpreadMinBps:        getEnvInt("SPREAD_MIN_BPS", 2),
+		SpreadMinBps:        getEnvFloat("SPREAD_MIN_BPS", 2.0),
 		LimitTimeoutSec:     getEnvInt("LIMIT_TIMEOUT_SEC", 5),
 
 		// ---------- Migrated (Bucket B) defaults ----------

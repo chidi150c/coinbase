@@ -81,8 +81,8 @@ USE_LIVE_EQUITY=true
 
 # === Order entry mode ===
 ORDER_TYPE=limit                 # or "market" (default)
-LIMIT_PRICE_OFFSET_BPS=5         # 5 bps improvement to bias maker
-SPREAD_MIN_BPS=0                 # require ≥N bps spread to attempt maker
+LIMIT_PRICE_OFFSET_BPS=5.0         # 5 bps improvement to bias maker
+SPREAD_MIN_BPS=0.0                 # require ≥N bps spread to attempt maker
 LIMIT_TIMEOUT_SEC=5              # cancel-and-market after 5s if unfilled
 
 # --- Risk ramping (per-side; you already enabled it) ---
@@ -193,8 +193,8 @@ USE_LIVE_EQUITY=true
 
 # === Order entry mode ===
 ORDER_TYPE=limit                 # or "market" (default)
-LIMIT_PRICE_OFFSET_BPS=5         # 5 bps (0.05%) improvement from last/side
-SPREAD_MIN_BPS=0                 # require ≥1 bps spread to attempt maker
+LIMIT_PRICE_OFFSET_BPS=5.0         # 5 bps (0.05%) improvement from last/side
+SPREAD_MIN_BPS=0.0                 # require ≥1 bps spread to attempt maker
 LIMIT_TIMEOUT_SEC=5              # cancel-and-market after 5 seconds if not filled
 
 # === Risk ramp (side-aware) ===
