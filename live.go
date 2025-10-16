@@ -458,10 +458,6 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 
 // --- time helpers for model.go indirection ---
 
-func monotonicNowSeconds() float64 {
-	return float64(time.Now().UnixNano()) / 1e9
-}
-
 // ===== Minimal helpers for live-equity =====
 
 type bridgeAccountsResp struct {
@@ -573,16 +569,6 @@ func computeLiveEquity(bal map[string]float64, base, quote string, lastPrice flo
 	q := bal[strings.ToUpper(quote)]
 	b := bal[strings.ToUpper(base)]
 	return q + b*lastPrice
-}
-
-func initLiveEquity(ctx context.Context, cfg Config, trader *Trader, lastPrice float64) {
-	if lastPrice <= 0 {
-		log.Printf("[EQUITY] waiting for accounts (last price unavailable)")
-		return
-	}
-	if ok := attemptLiveEquityRebase(ctx, cfg, trader, lastPrice); !ok {
-		log.Printf("[EQUITY] waiting for accounts (initial rebase pending)")
-	}
 }
 
 func attemptLiveEquityRebase(ctx context.Context, cfg Config, trader *Trader, lastPrice float64) bool {
