@@ -432,13 +432,20 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	}
 	baseRequested := lot.SizeBase
 	quote := baseRequested * price
+
+	// --- Effective min-notional: prefer cfg.MinNotional, fallback to cfg.OrderMinUSD ---
+	minNotional := t.cfg.MinNotional
+	if minNotional <= 0 {
+		minNotional = t.cfg.OrderMinUSD
+	}
+
 	// --- Guard: skip close if quote is below our policy floor (exchange-agnostic) ---
 	notional := quote
-	if notional < t.cfg.OrderMinUSD {
+	if notional < minNotional {
 		log.Printf("[CLOSE-SKIP] lotSide=%s closeSide=%s base=%.8f price=%.2f notional=%.2f < ORDER_MIN_USD %.2f; deferring",
-			lot.Side, closeSide, baseRequested, price, notional, t.cfg.OrderMinUSD)
+			lot.Side, closeSide, baseRequested, price, notional, minNotional)
 		msg := fmt.Sprintf("EXIT-SKIP %s side=%s→%s notional=%.2f < min=%.2f reason=%s",
-			c[len(c)-1].Time.Format(time.RFC3339), lot.Side, closeSide, notional, t.cfg.OrderMinUSD, exitReason)
+			c[len(c)-1].Time.Format(time.RFC3339), lot.Side, closeSide, notional, minNotional, exitReason)
 		return msg, nil
 	}
 
@@ -736,6 +743,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	price := c[len(c)-1].Close
 
+	// --- Effective min-notional for this tick: prefer cfg.MinNotional, fallback to cfg.OrderMinUSD ---
+	minNotional := t.cfg.MinNotional
+	if minNotional <= 0 {
+		minNotional = t.cfg.OrderMinUSD
+	}
+
 	// --------------------------------------------------------------------------------------------------------
 	// --- EXIT path: evaluate profit gate and trailing/TP logic per lot (side-aware) and close at most one.
 	// --------------------------------------------------------------------------------------------------------
@@ -834,9 +847,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 							closeSide = SideBuy
 						}
 						notional := lot.SizeBase * price
-						if notional < t.cfg.OrderMinUSD {
+						if notional < minNotional {
 							log.Printf("[CLOSE-SKIP] lotSide=%s closeSide=%s base=%.8f price=%.2f notional=%.2f < ORDER_MIN_USD %.2f; deferring",
-								lot.Side, closeSide, lot.SizeBase, price, notional, t.cfg.OrderMinUSD)
+								lot.Side, closeSide, lot.SizeBase, price, notional, minNotional)
 							i++
 							continue
 						}
@@ -1282,8 +1295,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	quote := (riskPct / 100.0) * t.equityUSD
-	if quote < t.cfg.OrderMinUSD {
-		quote = t.cfg.OrderMinUSD
+	if quote < minNotional {
+		quote = minNotional
 	}
 	base := quote / price
 
@@ -1300,7 +1313,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			if tb <= 0 || tb > equitySpareBase {
 				continue
 			}
-			if tb*price >= t.cfg.OrderMinUSD {
+			if tb*price >= minNotional {
 				targetBase = tb
 				chosen = s
 				break
@@ -1326,7 +1339,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			if tq <= 0 || tq > equitySpareQuote {
 				continue
 			}
-			if tq >= t.cfg.OrderMinUSD {
+			if tq >= minNotional {
 				targetQuote = tq
 				chosen = s
 				break
@@ -1380,8 +1393,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		}
 
 		// Enforce exchange minimum notional after snapping, then snap UP to step to keep >= min; re-check spare.
-		if neededQuote < t.cfg.OrderMinUSD {
-			neededQuote = t.cfg.OrderMinUSD
+		if neededQuote < minNotional {
+			neededQuote = minNotional
 			if quoteStep > 0 {
 				steps := math.Ceil(neededQuote / quoteStep)
 				neededQuote = steps * quoteStep
@@ -1442,8 +1455,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		base = neededBase
 
 		// Ensure SELL meets exchange min funds and step rules (and re-check spare symmetry)
-		if quote < t.cfg.OrderMinUSD {
-			quote = t.cfg.OrderMinUSD
+		if quote < minNotional {
+			quote = minNotional
 			base = quote / price
 			if baseStep > 0 {
 				b := math.Floor(base/baseStep) * baseStep
@@ -1582,9 +1595,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			if err != nil {
 				// Retry once with ORDER_MIN_USD on insufficient-funds style failures.
 				e := strings.ToLower(err.Error())
-				if quote > t.cfg.OrderMinUSD && (strings.Contains(e, "insufficient") || strings.Contains(e, "funds") || strings.Contains(e, "400")) {
-					log.Printf("[WARN] open order %.2f USD failed (%v); retrying with ORDER_MIN_USD=%.2f", quote, err, t.cfg.OrderMinUSD)
-					quote = t.cfg.OrderMinUSD
+				if quote > minNotional && (strings.Contains(e, "insufficient") || strings.Contains(e, "funds") || strings.Contains(e, "400")) {
+					log.Printf("[WARN] open order %.2f USD failed (%v); retrying with ORDER_MIN_USD=%.2f", quote, err, minNotional)
+					quote = minNotional
 					base = quote / price
 					// TODO: remove TRACE
 					log.Printf("TRACE order.open retry side=%s quote=%.2f baseEst=%.8f", side, quote, base)
@@ -2097,4 +2110,3 @@ func isMounted(dir string) (bool, error) {
 	}
 	return false, nil
 }
-
