@@ -289,6 +289,16 @@ docker compose logs -f --no-color bot | sed -u -n '1,120p'
 docker compose -f docker-compose.yml -f docker-compose.override.yml build --no-cache bridge
 docker compose -f docker-compose.yml -f docker-compose.override.yml up -d --force-recreate --no-deps bridge
 
+==============================
+# cleanup and retrieve space
+
+# Reclaim dangling images/layers and build cache
+docker system prune -f
+docker builder prune -af
+
+# Remove old/unused images but keep running ones
+docker image prune -a
+
 
 
 
