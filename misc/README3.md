@@ -301,5 +301,72 @@ docker image prune -a
 
 
 
+===================================================================
+
+Perfect — here’s a clean, copy-paste setup to back up all your state files daily with rotation.
+
+1) Install a daily backup script
+sudo tee /usr/local/bin/backup_all_state.sh >/dev/null <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+SRC="/opt/coinbase/state"
+DST="$SRC/backup"
+STAMP="$(date -u +%Y%m%d-%H%M%SZ)"
+RETENTION_DAYS="${RETENTION_DAYS:-14}"   # keep last 14 days; override via env if you want
+
+mkdir -p "$DST"
+exec 9>"/tmp/backup_all_state.lock"; flock -n 9 || exit 0
+
+# backup every state json (coinbase, binance, hitbtc, etc.)
+for f in "$SRC"/bot_state.*.json; do
+  [ -s "$f" ] || continue
+  # validate JSON (skip corrupt files)
+  if jq empty "$f" 2>/dev/null; then
+    base="$(basename "$f")"
+    cp -a "$f" "$DST/${base}.${STAMP}" && gzip -f "$DST/${base}.${STAMP}"
+    echo "Backed up: $base -> ${base}.${STAMP}.gz"
+  else
+    echo "WARN: invalid JSON, skipping $f" >&2
+  fi
+done
+
+# rotate: delete older than N days
+find "$DST" -type f -name 'bot_state.*.json.*' -mtime +"$RETENTION_DAYS" -print -delete || true
+SH
+sudo chmod +x /usr/local/bin/backup_all_state.sh
+
+2) Schedule it daily via cron (00:07 UTC)
+( crontab -l 2>/dev/null; echo '7 0 * * * /usr/local/bin/backup_all_state.sh >> /var/log/backup_all_state.log 2>&1' ) | crontab -
+
+3) Run once now to seed backups (optional)
+RETENTION_DAYS=30 /usr/local/bin/backup_all_state.sh
+ls -ltr /opt/coinbase/state/backup
+
+4) Restore example
+# list available backups
+ls -ltr /opt/coinbase/state/backup/bot_state.newcoinbase.json.*.gz
+
+# restore a chosen timestamp
+sudo gunzip -c /opt/coinbase/state/backup/bot_state.newcoinbase.json.20251010-151856Z.gz \
+  | sudo tee /opt/coinbase/state/bot_state.newcoinbase.json >/dev/null
+sudo chown chidi:chidi /opt/coinbase/state/bot_state.newcoinbase.json
+
+# sanity check
+jq '{buy: .BookBuy.Lots|length, sell: .BookSell.Lots|length}' /opt/coinbase/state/bot_state.newcoinbase.json
+
+Notes
+
+Works for all venues (any bot_state.*.json in /opt/coinbase/state).
+
+Uses jq to ensure you never archive corrupt JSON.
+
+Rotation via RETENTION_DAYS (change in cron env or before manual runs).
+
+flock prevents overlapping runs.
+
+Make sure /opt/coinbase/state is a host-mounted volume for all your services so backups persist.
+
+
 
 
