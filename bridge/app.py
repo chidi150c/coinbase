@@ -817,7 +817,7 @@ def exchange_filters(
         or "0"
     )
 
-    # Min notional: Coinbase often exposes min_market_funds (quote currency).
+    # Min notional: Coinbase often exposes min_market_funds (quote currency)...
     min_notional = str(
         p.get("min_market_funds")
         or p.get("min_market_value")
