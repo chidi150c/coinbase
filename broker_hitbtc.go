@@ -22,7 +22,7 @@ import (
 
 type HitbtcBridge struct {
 	base string
-	hc   *http.Client
+	hc   *http.Client 
 }
 
 func NewHitbtcBridge(base string) *HitbtcBridge {
