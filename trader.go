@@ -584,6 +584,12 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		priceExec = c[len(c)-1].Close
 	}
 
+	// --- Phase 3: pro-rate entry fee for the exited portion ---
+	entryPortion := 0.0
+	if baseRequested > 0 {
+		entryPortion = lot.EntryFee * (baseFilled / baseRequested)
+	}
+
 	// compute P/L using actual fill size and execution price
 	pl := (priceExec - lot.OpenPrice) * baseFilled
 	if lot.Side == SideSell {
@@ -601,7 +607,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 			log.Printf("[WARN] commission missing (exit); falling back to FEE_RATE_PCT=%.4f%%", feeRate)
 		}
 	}
-	pl -= lot.EntryFee // subtract entry fee recorded
+	pl -= entryPortion // subtract only the proportional entry fee for the exited size
 	pl -= exitFee      // subtract exit fee now
 
 	// --- TRACE: classification breakdown ---
@@ -617,7 +623,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		kind = "runner"
 	}
 	log.Printf("TRACE exit.classify side=%s kind=%s reason=%s open=%.8f exec=%.8f baseFilled=%.8f rawPL=%.6f entryFee=%.6f exitFee=%.6f finalPL=%.6f",
-		lot.Side, kind, exitReason, lot.OpenPrice, priceExec, baseFilled, rawPL, lot.EntryFee, exitFee, pl)
+		lot.Side, kind, exitReason, lot.OpenPrice, priceExec, baseFilled, rawPL, entryPortion, exitFee, pl)
 
 	t.dailyPnL += pl
 	t.equityUSD += pl
@@ -629,7 +635,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		OpenPrice:   lot.OpenPrice,
 		ClosePrice:  priceExec,
 		SizeBase:    baseFilled,
-		EntryFeeUSD: lot.EntryFee,
+		EntryFeeUSD: entryPortion, // Phase 3: record proportional entry fee
 		ExitFeeUSD:  exitFee,
 		PNLUSD:      pl,
 		Reason:      exitReason,
@@ -662,6 +668,34 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		sideLbl = "sell"
 	}
 	mtxExitReasons.WithLabelValues(reasonLbl, sideLbl).Inc()
+
+	// --- Phase 3: handle partial vs full exit ---
+	const tolExit = 1e-9
+	isPartial := baseFilled+tolExit < baseRequested
+
+	if isPartial {
+		// Reduce remaining lot size and carry forward remaining entry fee
+		lot.SizeBase = baseRequested - baseFilled
+		lot.EntryFee = lot.EntryFee - entryPortion
+		if lot.EntryFee < 0 {
+			lot.EntryFee = 0 // safety clamp
+		}
+
+		// Do NOT remove the lot; do NOT shift RunnerID; do NOT re-anchor timers/stages
+		msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
+			c[len(c)-1].Time.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, entryPortion+exitFee)
+		if t.cfg.Extended().UseDirectSlack {
+			postSlack(msg)
+		}
+		// persist updated lot state
+		if err := t.saveState(); err != nil {
+			log.Printf("[WARN] saveState: %v", err)
+			log.Printf("TRACE state.save error=%v", err)
+		}
+		return msg, nil
+	}
+
+	// --- FULL EXIT path (unchanged semantics aside from entry fee portion already applied) ---
 
 	// Track if we removed the runner and adjust book.RunnerID accordingly after removal.
 	removedWasRunner := (localIdx == book.RunnerID)
@@ -705,7 +739,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	}
 
 	// --- NEW: Back-step & Reset for equity stages (side-aware) ---
-If removedWasRunner {
+	if removedWasRunner {
 		if lot.Side == SideBuy {
 			if t.equityStageBuy > 0 {
 				t.equityStageBuy--
@@ -726,7 +760,7 @@ If removedWasRunner {
 
 	// Include reason in message for operator visibility
 	msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
-		c[len(c)-1].Time.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, lot.EntryFee+exitFee)
+		c[len(c)-1].Time.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, entryPortion+exitFee)
 	if t.cfg.Extended().UseDirectSlack {
 		postSlack(msg)
 	}
@@ -2033,7 +2067,7 @@ func activationPrice(lot *Position, usdGate float64, feeRatePct float64) float64
 	// SELL: Net = B*(op - (1+fr)*P) - EntryFee = usdGate
 	den := 1.0 + fr
 	if den <= 0 {
-		den = 1e-9
+		return 1e-9
 	}
 	return (op - (usdGate+lot.EntryFee)/B) / den
 }
