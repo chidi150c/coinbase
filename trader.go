@@ -186,6 +186,10 @@ type Trader struct {
 	pendingResultCh chan OpenResult
 	pendingCtx      context.Context
 	pendingCancel   context.CancelFunc
+
+	// --- NEW (Phase 2): recheck flags for market fallback gating ---
+	pendingRecheckBuy  bool
+	pendingRecheckSell bool
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -701,7 +705,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	}
 
 	// --- NEW: Back-step & Reset for equity stages (side-aware) ---
-	if removedWasRunner {
+If removedWasRunner {
 		if lot.Side == SideBuy {
 			if t.equityStageBuy > 0 {
 				t.equityStageBuy--
@@ -831,6 +835,15 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if err := t.saveState(); err != nil {
 					log.Printf("[WARN] saveState: %v", err)
 					log.Printf("TRACE state.save error=%v", err)
+				}
+			} else {
+				// --- NEW (Phase 2): mark side for reassured market fallback on a later tick
+				if t.pending != nil {
+					if t.pending.Side == SideBuy {
+						t.pendingRecheckBuy = true
+					} else if t.pending.Side == SideSell {
+						t.pendingRecheckSell = true
+					}
 				}
 			}
 			// Clear pending state (both on fill and timeout/error)
@@ -1780,8 +1793,21 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			}
 		}
 
+		// --- NEW (Phase 2): gate market fallback by recheck flag after async timeout/error ---
+		allowMarket := true
+		if wantLimit {
+			if side == SideBuy {
+				allowMarket = t.pendingRecheckBuy
+			} else if side == SideSell {
+				allowMarket = t.pendingRecheckSell
+			}
+		}
+
 		// If maker path did not result in a fill (or was skipped), fall back to market path (baseline behavior).
 		if placed == nil {
+			if !allowMarket {
+				return "HOLD", nil
+			}
 			// TODO: remove TRACE
 			log.Printf("TRACE order.open request side=%s quote=%.2f baseEst=%.8f priceSnap=%.8f take=%.8f",
 				side, quote, base, price, take)
@@ -1819,6 +1845,23 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// Re-lock to mutate state (append new lot to THIS SIDE).
 	t.mu.Lock()
+
+	// --- NEW (Phase 2): reset recheck flag after successful market fallback open ---
+	if !t.cfg.DryRun {
+		// We only reset when a real order is being appended (placed != nil).
+		if placed != nil {
+			offsetBps := t.cfg.LimitPriceOffsetBps
+			limitWait := t.cfg.LimitTimeoutSec
+			wantLimit := strings.ToLower(strings.TrimSpace(t.cfg.OrderType)) == "limit" && offsetBps > 0 && limitWait > 0
+			if wantLimit {
+				if side == SideBuy {
+					t.pendingRecheckBuy = false
+				} else if side == SideSell {
+					t.pendingRecheckSell = false
+				}
+			}
+		}
+	}
 
 	// --- MINIMAL CHANGE: use actual filled size/price when available ---
 	priceToUse := price
@@ -1953,7 +1996,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			d.Signal, actualQuote, baseToUse, newLot.Take, entryFee, newLot.Reason, d.Reason)
 	} else {
 		msg = fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
-			d.Signal, actualQuote, newLot.Take, entryFee, newLot.Reason, d.Reason)
+			d.Signal, actualQuote, newLot.Reason, entryFee, newLot.Reason, d.Reason)
 	}
 	if t.cfg.Extended().UseDirectSlack {
 		postSlack(msg)
@@ -2102,7 +2145,7 @@ func (t *Trader) loadState() error {
 				if lot.TrailActivateGateUSD == 0 {
 					lot.TrailActivateGateUSD = t.cfg.TrailActivateUSDRunner
 				}
-				if lot.ExitMode == "" {
+				if lot.ExitMode == 0 {
 					lot.ExitMode = ExitModeRunnerTrailing
 				}
 			} else {
@@ -2115,12 +2158,12 @@ func (t *Trader) loadState() error {
 					if lot.TrailActivateGateUSD == 0 {
 						lot.TrailActivateGateUSD = t.cfg.TrailActivateUSDScalp
 					}
-					if lot.ExitMode == "" {
+					if lot.ExitMode == 0 {
 						lot.ExitMode = ExitModeScalpTrailing
 					}
 				} else {
 					// Scalp >4 → fixed TP
-					if lot.ExitMode == "" {
+					if lot.ExitMode == 0 {
 						lot.ExitMode = ExitModeScalpFixedTP
 					}
 					// trailing params not required for fixed-TP scalps
