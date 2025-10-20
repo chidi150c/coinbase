@@ -69,34 +69,42 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 	if err != nil {
 		log.Fatalf("[BOOT] exchange filters unavailable for %s; refusing to trade without LOT_SIZE.stepSize and PRICE_FILTER.tickSize (post-only limits disabled) — ensure bridge /exchange/filters is populated or provide valid overrides: error: %v", trader.cfg.ProductID, err)
 	}
-	// Populate cfg fields from filters when available; keep existing cfg values if already set.
-	if trader.cfg.PriceTick <= 0 {
-		// Prefer PriceTick if present, else TickSize for backward compatibility.
-		if v := getFilterFloat(filters, "PriceTick"); v > 0 {
-			trader.cfg.PriceTick = v
-		} else if v := getFilterFloat(filters, "TickSize"); v > 0 {
-			trader.cfg.PriceTick = v
-		}
-	}
-	if trader.cfg.BaseStep <= 0 {
-		// Prefer BaseStep if present, else StepSize for backward compatibility.
-		if v := getFilterFloat(filters, "BaseStep"); v > 0 {
-			trader.cfg.BaseStep = v
-		} else if v := getFilterFloat(filters, "StepSize"); v > 0 {
-			trader.cfg.BaseStep = v
-		}
-	}
-	if trader.cfg.QuoteStep <= 0 {
-		if v := getFilterFloat(filters, "QuoteStep"); v > 0 {
-			trader.cfg.QuoteStep = v
-		}
-	}
-	if trader.cfg.MinNotional <= 0 {
-		if v := getFilterFloat(filters, "MinNotional"); v > 0 {
-			trader.cfg.MinNotional = v
-		}
+	// Populate cfg fields from filters when available; otherwise set cfg values from env.
+	
+	// Prefer PriceTick if present, else TickSize for backward compatibility.
+	if v := getFilterFloat(filters, "PriceTick"); v > 0 {
+		trader.cfg.PriceTick = v
+	} else if v := getFilterFloat(filters, "TickSize"); v > 0 {
+		trader.cfg.PriceTick = v
+	}else{
+		trader.cfg.SetPriceTick()
 	}
 
+	// Prefer BaseStep if present, else StepSize for backward compatibility.
+	if v := getFilterFloat(filters, "BaseStep"); v > 0 {
+		trader.cfg.BaseStep = v
+	} else if v := getFilterFloat(filters, "StepSize"); v > 0 {
+		trader.cfg.BaseStep = v
+	} else{
+		trader.cfg.SetBaseStep()
+	}
+	
+	if v := getFilterFloat(filters, "QuoteStep"); v > 0 {
+		trader.cfg.QuoteStep = v
+	}else{
+		trader.cfg.SetQuoteStep()
+	}
+
+	if v := getFilterFloat(filters, "MinNotional"); v > 0 {
+		trader.cfg.MinNotional = v
+	}else{
+		trader.cfg.SetMinNotional()
+	}
+
+	if trader.cfg.PriceTick <= 0 || trader.cfg.BaseStep <= 0 || trader.cfg.QuoteStep <= 0 || trader.cfg.MinNotional <= 0{
+		log.Printf("PriceTick: %.8f, BaseStep: %.8f, QuoteStep: %.8f, MinNotional: %.8f", trader.cfg.PriceTick, trader.cfg.BaseStep, trader.cfg.QuoteStep, trader.cfg.MinNotional)
+		log.Fatalf("[BOOT] exchange filters unavailable for %s last Check; refusing to trade without LOT_SIZE.stepSize and PRICE_FILTER.tickSize (post-only limits disabled) — ensure bridge /exchange/filters is populated or provide valid overrides: error: %v", trader.cfg.ProductID, err)
+	}
 	// Warmup candles (paged backfill from bridge to MaxHistoryCandles; else large single fetch from the broker)
 	var history []Candle
 	target := trader.cfg.MaxHistoryCandles

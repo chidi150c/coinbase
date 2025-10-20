@@ -205,6 +205,26 @@ func (c *Config) UseLiveEquity() bool {
 	return getEnvBool("USE_LIVE_EQUITY", c.LiveEquity)
 }
 
+func (c *Config) SetPriceTick(){
+	pt := getEnvFloat("PRICE_TICK", 0.0)
+	c.PriceTick = pt
+}
+
+func (c *Config) SetBaseStep(){
+	pt :=  getEnvFloat("BASE_STEP", 0.0)
+	c.BaseStep = pt
+}
+
+func (c *Config) SetQuoteStep(){
+	pt := getEnvFloat("QUOTE_STEP", 0.0)
+	c.QuoteStep = pt
+}
+
+func (c *Config) SetMinNotional(){
+	pt := getEnvFloat("MIN_NOTIONAL", 0.0)
+	c.MinNotional = pt
+}
+
 func (c *Config) UseTick() bool {
 	return getEnvBool("USE_TICK_PRICE", c.UseTickPrice)
 }
