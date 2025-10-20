@@ -217,7 +217,9 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 	// -------------------------------------------------------------------
 
 	if useTick {
-		// Tick-driven loop with periodic candle resync
+		// Tick-driven loop with periodic candle resync.
+		// NOTE: async maker-first entry goroutines are spawned from trader.step(ctx, ...)
+		// and are cancelable via this ctx on shutdown.
 		lastCandleSync := time.Now().UTC()
 
 		for {
