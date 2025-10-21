@@ -79,6 +79,12 @@ func main() {
 	model := newModel()
 	trader := NewTrader(cfg, broker, model)
 
+	// ---- Pending rehydration (resume maker-first opens) ----
+	// Minimal addition: resume any persisted pending post-only orders BEFORE trading begins.
+	bootCtx, bootCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer bootCancel()
+	trader.RehydratePending(bootCtx, RehydrateModeResume)
+
 	// ---- HTTP metrics/health ----
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
