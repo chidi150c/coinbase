@@ -2163,15 +2163,15 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// Rebuild legacy aggregate view for logs/compat
 	// t.refreshAggregateFromBooks()
-
+ 
 	msg := ""
 	if t.cfg.DryRun {
 		mtxOrders.WithLabelValues("paper", string(side)).Inc()
 		msg = fmt.Sprintf("PAPER %s quote=%.2f base=%.6f take=%.2f fee=%.4f reason=%s [%s]",
-			d.Signal, actualQuote, baseToUse, newLot.Take, entryFee, newLot.Reason, d.Reason)
+			side, actualQuote, baseToUse, newLot.Take, entryFee, newLot.Reason, d.Reason)
 	} else {
 		msg = fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
-			d.Signal, actualQuote, newLot.Reason, entryFee, newLot.Reason, d.Reason)
+			side, actualQuote, newLot.Take, entryFee, newLot.Reason, d.Reason)
 	}
 	if t.cfg.Extended().UseDirectSlack {
 		postSlack(msg)
