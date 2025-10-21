@@ -1933,7 +1933,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 							case ch <- OpenResult{Filled: filled != nil, Placed: filled, OrderID: orderID}:
 							default:
 							}
-						}(orderID, side, time.Now().Add(time.Duration(limitWait)*time.Second), limitPx, baseAtLimit, pend, ch, pctxUse))
+						}(orderID, side, time.Now().Add(time.Duration(limitWait)*time.Second), limitPx, baseAtLimit, pend, ch, pctxUse)
 
 						// Build reason string now that all gates are known
 						// (We set it after spawning to minimize time outside the lock.)
