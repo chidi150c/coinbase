@@ -850,7 +850,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", book.RunnerID, side, r.OpenPrice, r.Take)
 				}
 				msg := fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
-					signalLabel(side), actualQuote, newLot.Take, entryFee, newLot.Reason, "async postonly filled")
+					side, actualQuote, newLot.Take, entryFee, newLot.Reason, "async postonly filled")
 				if t.cfg.Extended().UseDirectSlack {
 					postSlack(msg)
 				}
@@ -913,7 +913,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", book.RunnerID, side, r.OpenPrice, r.Take)
 				}
 				msg := fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
-					signalLabel(side), actualQuote, newLot.Take, entryFee, newLot.Reason, "async postonly filled")
+					side, actualQuote, newLot.Take, entryFee, newLot.Reason, "async postonly filled")
 				if t.cfg.Extended().UseDirectSlack {
 					postSlack(msg)
 				}
@@ -2326,7 +2326,7 @@ func (t *Trader) loadState() error {
 				if lot.TrailActivateGateUSD == 0 {
 					lot.TrailActivateGateUSD = t.cfg.TrailActivateUSDRunner
 				}
-				if lot.ExitMode == 0 {
+				if lot.ExitMode == "" {
 					lot.ExitMode = ExitModeRunnerTrailing
 				}
 			} else {
@@ -2339,12 +2339,12 @@ func (t *Trader) loadState() error {
 					if lot.TrailActivateGateUSD == 0 {
 						lot.TrailActivateGateUSD = t.cfg.TrailActivateUSDScalp
 					}
-					if lot.ExitMode == 0 {
+					if lot.ExitMode == "" {
 						lot.ExitMode = ExitModeScalpTrailing
 					}
 				} else {
 					// Scalp >4 → fixed TP
-					if lot.ExitMode == 0 {
+					if lot.ExitMode == "" {
 						lot.ExitMode = ExitModeScalpFixedTP
 					}
 					// trailing params not required for fixed-TP scalps
@@ -2491,15 +2491,18 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 	if mode != RehydrateModeResume {
 		return
 	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	rehydrateOne := func(pend **PendingOpen, ch *chan OpenResult, pctx *context.Context, cancel *context.CancelFunc) {
+		// No pending object → nothing to resume.
 		if pend == nil || *pend == nil {
 			return
 		}
 		p := *pend
-		// If deadline already passed, allow market fallback via recheck and clear pending.
+
+		// If deadline passed, allow market fallback via recheck and clear pending.
 		if !p.Deadline.IsZero() && time.Now().After(p.Deadline) {
 			if p.Side == SideBuy {
 				t.pendingRecheckBuy = true
@@ -2507,21 +2510,19 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 				t.pendingRecheckSell = true
 			}
 			*pend = nil
-			if t.saveState() != nil {
-				// best-effort; ignore error
-			}
+			_ = t.saveState() // best-effort
 			return
 		}
 
-		// Confirm order still exists / is open by GetOrder.
-		var ord *PlacedOrder
+		// Check current server-side status of the saved order (unlock for I/O).
+	var ord *PlacedOrder
 		if strings.TrimSpace(p.OrderID) != "" {
-			// release lock during I/O
+			b := t.broker // capture broker pointer for I/O while unlocked
 			t.mu.Unlock()
-			o, err := t.broker.GetOrder(ctx, p.ProductID, p.OrderID)
+			o, err := b.GetOrder(ctx, p.ProductID, p.OrderID)
 			t.mu.Lock()
 			if err == nil && o != nil {
-				// If already filled, emit to channel as filled and clear pending.
+				// If it already filled while we were down, emit completion and clear pending.
 				if o.BaseSize > 0 || o.QuoteSpent > 0 {
 					if *ch == nil {
 						cc := make(chan OpenResult, 1)
@@ -2532,73 +2533,76 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 					default:
 					}
 					*pend = nil
-					if t.saveState() != nil {
-					}
+					_ = t.saveState()
 					return
 				}
 				ord = o // still open
-			}
+		}
 		}
 
-		// If order not found, clear pending and set recheck to allow market fallback.
+		// If order not found (or nil), clear pending and enable market fallback on next tick.
 		if ord == nil {
 			if p.Side == SideBuy {
 				t.pendingRecheckBuy = true
 			} else {
 				t.pendingRecheckSell = true
 			}
-			*pend = nil
-			if t.saveState() != nil {
-			}
+			*pend = nil // FIX: was 'pend = nil' (no effect); must clear the caller's pointer
+			_ = t.saveState()
 			return
 		}
 
-		// Ensure channel exists.
+		// Ensure completion channel exists.
 		if *ch == nil {
 			cc := make(chan OpenResult, 1)
 			*ch = cc
 		}
 
-		// Create fresh context/cancel and spawn the same poller loop used at placement time.
+		// Create a fresh context+cancel used by the poller goroutine.
 		pc, cn := context.WithCancel(ctx)
 		*pctx = pc
 		*cancel = cn
 
-		offsetBps := t.cfg.LimitPriceOffsetBps
-		tick := t.cfg.PriceTick
-		minNotional := t.cfg.MinNotional
+		// Capture cfg fields locally to avoid concurrent reads from t inside the goroutine.
+		cfg := t.cfg
+		offsetBps := cfg.LimitPriceOffsetBps
+		tick := cfg.PriceTick
+		minNotional := cfg.MinNotional
 		if minNotional <= 0 {
-			minNotional = t.cfg.OrderMinUSD
+			minNotional = cfg.OrderMinUSD
 		}
-		baseStep := t.cfg.BaseStep
+		baseStep := cfg.BaseStep
+		productID := p.ProductID
+		side := p.Side
+		b := t.broker // capture broker
 
-		// Spawn poller (resume) without altering the existing order id until reprice loop runs.
+		// Spawn poller (resume) — reprice and watch for fill until deadline.
 		go func(pcopy *PendingOpen, chOut chan OpenResult, pc context.Context) {
 			orderID := pcopy.OrderID
 			lastLimitPx := pcopy.LimitPx
 			lastReprice := time.Now()
 			var filled *PlacedOrder
 			deadline := pcopy.Deadline
+
 			for time.Now().Before(deadline) {
-				ord, gErr := t.broker.GetOrder(pc, pcopy.ProductID, orderID)
-				if gErr == nil && ord != nil && (ord.BaseSize > 0 || ord.QuoteSpent > 0) {
+				// 1) Check for fill
+				if ord, gErr := b.GetOrder(pc, productID, orderID); gErr == nil && ord != nil && (ord.BaseSize > 0 || ord.QuoteSpent > 0) {
 					filled = ord
 					log.Printf("TRACE postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
 						orderID, filled.Price, filled.BaseSize, filled.QuoteSpent, filled.CommissionUSD)
-					mtxOrders.WithLabelValues("live", string(pcopy.Side)).Inc()
+					mtxOrders.WithLabelValues("live", string(side)).Inc()
 					mtxTrades.WithLabelValues("open").Inc()
 					break
 				}
 
+				// 2) Periodic reprice
 				if time.Since(lastReprice) >= 450*time.Millisecond {
-					// fetch price and potentially reprice
-					var px float64
 					ctxPx, cancelPx := context.WithTimeout(pc, 1*time.Second)
-					px, gErr = t.broker.GetNowPrice(ctxPx, pcopy.ProductID)
+					px, gErr := b.GetNowPrice(ctxPx, productID)
 					cancelPx()
 					if gErr == nil && px > 0 {
 						newLimitPx := px
-						if pcopy.Side == SideBuy {
+						if side == SideBuy {
 							newLimitPx = px * (1.0 - offsetBps/10000.0)
 						} else {
 							newLimitPx = px * (1.0 + offsetBps/10000.0)
@@ -2608,7 +2612,7 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 						}
 						shouldReprice := (tick > 0 && math.Abs(newLimitPx-lastLimitPx) >= tick) || (tick <= 0 && newLimitPx != lastLimitPx)
 						if shouldReprice {
-							_ = t.broker.CancelOrder(pc, pcopy.ProductID, orderID)
+							_ = b.CancelOrder(pc, productID, orderID)
 							newBase := pcopy.BaseAtLimit
 							if pcopy.Quote > 0 {
 								newBase = pcopy.Quote / newLimitPx
@@ -2617,10 +2621,9 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 								newBase = math.Floor(newBase/baseStep) * baseStep
 							}
 							if newBase > 0 && newBase*newLimitPx >= minNotional {
-								newID, perr := t.broker.PlaceLimitPostOnly(pc, pcopy.ProductID, pcopy.Side, newLimitPx, newBase)
-								if perr == nil && strings.TrimSpace(newID) != "" {
+								if newID, perr := b.PlaceLimitPostOnly(pc, productID, side, newLimitPx, newBase); perr == nil && strings.TrimSpace(newID) != "" {
 									log.Printf("TRACE postonly.reprice side=%s old_id=%s new_id=%s limit=%.8f baseReq=%.8f",
-										pcopy.Side, orderID, newID, newLimitPx, newBase)
+										side, orderID, newID, newLimitPx, newBase)
 									orderID = newID
 									lastLimitPx = newLimitPx
 								}
@@ -2631,17 +2634,22 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 				}
 				time.Sleep(200 * time.Millisecond)
 			}
+
+			// On timeout, cancel any resting order.
 			if filled == nil {
-				_ = t.broker.CancelOrder(pc, pcopy.ProductID, orderID)
+				_ = b.CancelOrder(pc, productID, orderID)
 				log.Printf("TRACE postonly.timeout order_id=%s", orderID)
 			}
+
+			// Non-blocking completion signal.
 			select {
 			case chOut <- OpenResult{Filled: filled != nil, Placed: filled, OrderID: orderID}:
 			default:
 			}
-		}(*p, *ch, *pctx)
+		}(p, *ch, *pctx)
 	}
 
+	// Resume both sides.
 	rehydrateOne(&t.pendingBuy, &t.pendingBuyCh, &t.pendingBuyCtx, &t.pendingBuyCancel)
 	rehydrateOne(&t.pendingSell, &t.pendingSellCh, &t.pendingSellCtx, &t.pendingSellCancel)
 }
