@@ -1,4 +1,4 @@
-Help me write a CHANGE_DESCRIPTION for the code you want to modify.
+Help me write a CHANGE_DESCRIPTION for the code you want to modify based on our agreed items currently.
 
 The CHANGE_DESCRIPTION must be:
 

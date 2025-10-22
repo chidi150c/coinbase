@@ -73,6 +73,10 @@ type Position struct {
 
 	// --- NEW: track maker-first TP exit order id (post-only limit attempt) ---
 	FixedTPOrderID string `json:"-"`
+
+	// --- NEW: stable lot identifier & entry order id (persisted) ---
+	LotID         int    `json:"lot_id,omitempty"`
+	EntryOrderID  string `json:"entry_order_id,omitempty"`
 }
 
 // --- NEW: per-side book (authoritative store) ---
@@ -118,6 +122,9 @@ type BotState struct {
 	PendingSell        *PendingOpen
 	PendingRecheckBuy  bool
 	PendingRecheckSell bool
+
+	// --- NEW: persist next lot sequence for stable LotIDs ---
+	NextLotSeq int
 }
 
 // --- NEW (Phase 1): pending async maker-first open support ---
@@ -202,6 +209,9 @@ type Trader struct {
 	// --- NEW (Phase 2): recheck flags for market fallback gating ---
 	pendingRecheckBuy  bool
 	pendingRecheckSell bool
+
+	// --- NEW: next lot sequence counter for stable LotIDs ---
+	NextLotSeq int
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -217,6 +227,7 @@ func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
 			SideBuy:  {RunnerID: -1, Lots: nil},
 			SideSell: {RunnerID: -1, Lots: nil},
 		},
+		NextLotSeq: 1,
 	}
 	// Persistence guard: backtests set PERSIST_STATE=false
 	persist := t.cfg.PersistState
@@ -259,6 +270,10 @@ type ExitRecord struct {
 	Reason      string    `json:"reason"`
 	ExitMode    ExitMode  `json:"exit_mode,omitempty"`
 	WasRunner   bool      `json:"was_runner"`
+	// --- NEW: identifiers for traceability ---
+	LotID        int    `json:"lot_id,omitempty"`
+	EntryOrderID string `json:"entry_order_id,omitempty"`
+	ExitOrderID  string `json:"exit_order_id,omitempty"`
 }
 
 func (t *Trader) EquityUSD() float64 {
@@ -653,6 +668,10 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		Reason:      exitReason,
 		ExitMode:    lot.ExitMode,
 		WasRunner:   (localIdx == book.RunnerID),
+		// NEW identifiers
+		LotID:        lot.LotID,
+		EntryOrderID: lot.EntryOrderID,
+		ExitOrderID:  exitOrderID,
 	}
 
 	// Append with cap semantics (ring buffer behavior)
@@ -824,15 +843,18 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					entryFee = actualQuote * (feeRate / 100.0)
 				}
 				newLot := &Position{
-					OpenPrice: priceToUse,
-					Side:      side,
-					SizeBase:  baseToUse,
-					OpenTime:  now,
-					EntryFee:  entryFee,
-					Reason:    t.pendingBuy.Reason,
-					Take:      t.pendingBuy.Take,
-					Version:   1,
+					OpenPrice:    priceToUse,
+					Side:         side,
+					SizeBase:     baseToUse,
+					OpenTime:     now,
+					EntryFee:     entryFee,
+					Reason:       t.pendingBuy.Reason,
+					Take:         t.pendingBuy.Take,
+					Version:      1,
+					LotID:        t.NextLotSeq,
+					EntryOrderID: res.OrderID,
 				}
+				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
 				t.lastAddBuy = wallNow
 				t.winLowBuy = priceToUse
@@ -887,15 +909,18 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					entryFee = actualQuote * (feeRate / 100.0)
 				}
 				newLot := &Position{
-					OpenPrice: priceToUse,
-					Side:      side,
-					SizeBase:  baseToUse,
-					OpenTime:  now,
-					EntryFee:  entryFee,
-					Reason:    t.pendingSell.Reason,
-					Take:      t.pendingSell.Take,
-					Version:   1,
+					OpenPrice:    priceToUse,
+					Side:         side,
+					SizeBase:     baseToUse,
+					OpenTime:     now,
+					EntryFee:     entryFee,
+					Reason:       t.pendingSell.Reason,
+					Take:         t.pendingSell.Take,
+					Version:      1,
+					LotID:        t.NextLotSeq,
+					EntryOrderID: res.OrderID,
 				}
+				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
 				t.lastAddSell = wallNow
 				t.winHighSell = priceToUse
@@ -1864,13 +1889,13 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 							// --- ENV GUARDRAILS (read once per poller) ---
 							repriceEnabled := getEnvBool("REPRICE_ENABLE", true)
-							repriceMaxCount := getEnvInt("REPRICE_MAX_COUNT", 50)
-							repriceMaxDriftBps := getEnvFloat("REPRICE_MAX_DRIFT_BPS", 0.0) // 0 = unlimited
+							repriceMaxCount := getEnvInt("REPRICE_MAX_COUNT", 10)
+							repriceMaxDriftBps := getEnvFloat("REPRICE_MAX_DRIFT_BPS", 3.0) // 0 = unlimited
 							repriceMinImproTicks := getEnvInt("REPRICE_MIN_IMPROV_TICKS", 1)
 							if repriceMinImproTicks < 1 {
 								repriceMinImproTicks = 1
 							}
-							repriceIntervalMs := getEnvInt("REPRICE_INTERVAL_MS", 450)
+							repriceIntervalMs := getEnvInt("REPRICE_INTERVAL_MS", 1000)
 							if repriceIntervalMs <= 0 {
 								repriceIntervalMs = 450
 							}
@@ -1878,17 +1903,44 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 							var repriceCount int
 
-							var filled *PlacedOrder
+						poll:
 							for time.Now().Before(deadline) {
+								// Check for cancellation before doing work
+								select {
+								case <-pctx.Done():
+									break poll
+								default:
+								}
+
 								// Check current order fill state first
 								ord, gErr := t.broker.GetOrder(pctx, t.cfg.ProductID, orderID)
 								if gErr == nil && ord != nil && (ord.BaseSize > 0 || ord.QuoteSpent > 0) {
-									filled = ord
+									placed := ord
 									log.Printf("TRACE postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
-										orderID, filled.Price, filled.BaseSize, filled.QuoteSpent, filled.CommissionUSD)
+										orderID, placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
 									mtxOrders.WithLabelValues("live", string(side)).Inc()
 									mtxTrades.WithLabelValues("open").Inc()
-									break
+
+									// Non-blocking completion signal
+									select {
+									case ch <- OpenResult{Filled: true, Placed: placed, OrderID: orderID}:
+									default:
+									}
+
+									// Clear pending and persist on exit
+									t.mu.Lock()
+									if side == SideBuy {
+										t.pendingBuy = nil
+										t.pendingBuyCtx = nil
+										t.pendingBuyCancel = nil
+									} else {
+										t.pendingSell = nil
+										t.pendingSellCtx = nil
+										t.pendingSellCancel = nil
+									}
+									_ = t.saveState()
+									t.mu.Unlock()
+									return
 								}
 
 								// Reprice loop (guarded)
@@ -1975,6 +2027,26 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 													orderID = newID
 													lastLimitPx = newLimitPx
 													repriceCount++
+
+													// --- PERSIST UPDATED PENDING STATE AFTER SUCCESSFUL REPRICE ---
+													t.mu.Lock()
+													if side == SideBuy && t.pendingBuy != nil {
+														t.pendingBuy.OrderID = newID
+														t.pendingBuy.LimitPx = newLimitPx
+														t.pendingBuy.BaseAtLimit = newBase
+													} else if side == SideSell && t.pendingSell != nil {
+														t.pendingSell.OrderID = newID
+														t.pendingSell.LimitPx = newLimitPx
+														t.pendingSell.BaseAtLimit = newBase
+													}
+													if pend != nil {
+														pend.OrderID = newID
+														pend.LimitPx = newLimitPx
+														pend.BaseAtLimit = newBase
+													}
+													_ = t.saveState()
+													t.mu.Unlock()
+													// -----------------------------------------------------------
 												}
 											}
 										}
@@ -1982,16 +2054,37 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 									lastReprice = time.Now()
 								}
 
-								time.Sleep(200 * time.Millisecond)
+								// Sleep-or-cancel wait
+								select {
+								case <-pctx.Done():
+									break poll
+								case <-time.After(200 * time.Millisecond):
+								}
 							}
-							if filled == nil {
-								_ = t.broker.CancelOrder(pctx, t.cfg.ProductID, orderID)
-								log.Printf("TRACE postonly.timeout order_id=%s", orderID)
-							}
+
+							// On timeout or cancellation, cancel any resting order if still open.
+							_ = t.broker.CancelOrder(pctx, t.cfg.ProductID, orderID)
+							log.Printf("TRACE postonly.timeout order_id=%s", orderID)
+
+							// Non-blocking completion signal (not filled)
 							select {
-							case ch <- OpenResult{Filled: filled != nil, Placed: filled, OrderID: orderID}:
+							case ch <- OpenResult{Filled: false, Placed: nil, OrderID: orderID}:
 							default:
 							}
+
+							// Clear pending and persist on exit
+							t.mu.Lock()
+							if side == SideBuy {
+								t.pendingBuy = nil
+								t.pendingBuyCtx = nil
+								t.pendingBuyCancel = nil
+							} else {
+								t.pendingSell = nil
+								t.pendingSellCtx = nil
+								t.pendingSellCancel = nil
+							}
+							_ = t.saveState()
+							t.mu.Unlock()
 						}(orderID, side, time.Now().Add(time.Duration(limitWait)*time.Second), limitPx, baseAtLimit, pend, ch, pctxUse)
 
 						// Build reason string now that all gates are known
@@ -2163,15 +2256,18 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	newLot := &Position{
-		OpenPrice: priceToUse,
-		Side:      side,
-		SizeBase:  baseToUse,
-		OpenTime:  now,
-		EntryFee:  entryFee,
-		Reason:    gatesReason, // side-biased; no winLow
-		Take:      take,
-		Version:   1,
+		OpenPrice:    priceToUse,
+		Side:         side,
+		SizeBase:     baseToUse,
+		OpenTime:     now,
+		EntryFee:     entryFee,
+		Reason:       gatesReason, // side-biased; no winLow
+		Take:         take,
+		Version:      1,
+		LotID:        t.NextLotSeq,
+		EntryOrderID: "", // market path has no known order id here
 	}
+	t.NextLotSeq++
 	book.Lots = append(book.Lots, newLot)
 	// Use wall clock for lastAdd to drive spacing/decay even if candle time is zero.
 	if side == SideBuy {
@@ -2325,6 +2421,9 @@ func (t *Trader) saveState() error {
 		PendingSell:        t.pendingSell,
 		PendingRecheckBuy:  t.pendingRecheckBuy,
 		PendingRecheckSell: t.pendingRecheckSell,
+
+		// NEW: persist next lot sequence
+		NextLotSeq: t.NextLotSeq,
 	}
 	bs, err := json.MarshalIndent(st, "", " ")
 	if err != nil {
@@ -2431,6 +2530,23 @@ func (t *Trader) loadState() error {
 	t.pendingSell = st.PendingSell
 	t.pendingRecheckBuy = st.PendingRecheckBuy
 	t.pendingRecheckSell = st.PendingRecheckSell
+
+	// Restore next lot sequence; if absent/zero, re-compute from existing lots (max+1), default 1.
+	t.NextLotSeq = st.NextLotSeq
+	if t.NextLotSeq <= 0 {
+		maxID := 0
+		for _, side := range []OrderSide{SideBuy, SideSell} {
+			for _, lot := range t.book(side).Lots {
+				if lot != nil && lot.LotID > maxID {
+					maxID = lot.LotID
+				}
+			}
+		}
+		t.NextLotSeq = maxID + 1
+		if t.NextLotSeq <= 0 {
+			t.NextLotSeq = 1
+		}
+	}
 
 	// Initialize runner trailing baseline for current runners if not already set
 	for _, side := range []OrderSide{SideBuy, SideSell} {
@@ -2660,7 +2776,15 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 
 			var repriceCount int
 
+		poll:
 			for time.Now().Before(deadline) {
+				// Cancellation check
+				select {
+				case <-pc.Done():
+					break poll
+				default:
+				}
+
 				// 1) Check for fill
 				if ord, gErr := b.GetOrder(pc, productID, orderID); gErr == nil && ord != nil && (ord.BaseSize > 0 || ord.QuoteSpent > 0) {
 					filled = ord
@@ -2724,7 +2848,7 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 							if shouldReprice && repriceMinEdgeUSD > 0 && newBase > 0 {
 								edgeUSD := math.Abs(newLimitPx-lastLimitPx) * newBase
 								if edgeUSD < repriceMinEdgeUSD {
-                                    shouldReprice = false
+									shouldReprice = false
 								}
 							}
 
@@ -2741,16 +2865,42 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 									orderID = newID
 									lastLimitPx = newLimitPx
 									repriceCount++
+
+									// --- PERSIST UPDATED PENDING STATE AFTER SUCCESSFUL REPRICE (REHYDRATE) ---
+									t.mu.Lock()
+									if side == SideBuy && t.pendingBuy != nil {
+										t.pendingBuy.OrderID = newID
+										t.pendingBuy.LimitPx = newLimitPx
+										t.pendingBuy.BaseAtLimit = newBase
+									} else if side == SideSell && t.pendingSell != nil {
+										t.pendingSell.OrderID = newID
+										t.pendingSell.LimitPx = newLimitPx
+										t.pendingSell.BaseAtLimit = newBase
+									}
+									if pcopy != nil {
+										pcopy.OrderID = newID
+										pcopy.LimitPx = newLimitPx
+										pcopy.BaseAtLimit = newBase
+									}
+									_ = t.saveState()
+									t.mu.Unlock()
+									// -----------------------------------------------------------------------
 								}
 							}
 						}
 					}
 					lastReprice = time.Now()
 				}
-				time.Sleep(200 * time.Millisecond)
+
+				// Sleep-or-cancel wait
+				select {
+				case <-pc.Done():
+					break poll
+				case <-time.After(200 * time.Millisecond):
+				}
 			}
 
-			// On timeout, cancel any resting order.
+			// On timeout or cancellation, cancel any resting order.
 			if filled == nil {
 				_ = b.CancelOrder(pc, productID, orderID)
 				log.Printf("TRACE postonly.timeout order_id=%s", orderID)
@@ -2761,6 +2911,20 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 			case chOut <- OpenResult{Filled: filled != nil, Placed: filled, OrderID: orderID}:
 			default:
 			}
+
+			// Clear pending and persist on exit
+			t.mu.Lock()
+			if side == SideBuy {
+				t.pendingBuy = nil
+				t.pendingBuyCtx = nil
+				t.pendingBuyCancel = nil
+			} else {
+				t.pendingSell = nil
+				t.pendingSellCtx = nil
+				t.pendingSellCancel = nil
+			}
+			_ = t.saveState()
+			t.mu.Unlock()
 		}(p, *ch, *pctx)
 	}
 
