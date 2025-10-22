@@ -284,13 +284,14 @@ func (t *Trader) EquityUSD() float64 {
 
 // SetEquityUSD safely updates trader equity and the equity metric.
 func (t *Trader) SetEquityUSD(v float64) {
+	// Minimal refactor: perform state mutation under lock, but move disk I/O outside.
 	t.mu.Lock()
 	t.equityUSD = v
 	t.mu.Unlock()
 
 	// update the metric with same naming style
 	mtxPnL.Set(v)
-	// persist new state (no-op if disabled)
+	// persist new state (no-op if disabled) — I/O explicitly outside the lock
 	if err := t.saveState(); err != nil {
 		log.Printf("[WARN] saveState: %v", err)
 		// TODO: remove TRACE
@@ -876,10 +877,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if t.cfg.Extended().UseDirectSlack {
 					postSlack(msg)
 				}
-				if err := t.saveState(); err != nil {
-					log.Printf("[WARN] saveState: %v", err)
-					log.Printf("TRACE state.save error=%v", err)
-				}
+				// queue persistence outside of lock
+				t.mu.Unlock()
+				go func() {
+					_ = t.saveState()
+				}()
+				t.mu.Lock()
 			} else {
 				if t.pendingBuy != nil {
 					t.pendingRecheckBuy = true
@@ -942,10 +945,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if t.cfg.Extended().UseDirectSlack {
 					postSlack(msg)
 				}
-				if err := t.saveState(); err != nil {
-					log.Printf("[WARN] saveState: %v", err)
-					log.Printf("TRACE state.save error=%v", err)
-				}
+				// queue persistence outside of lock
+				t.mu.Unlock()
+				go func() {
+					_ = t.saveState()
+				}()
+				t.mu.Lock()
 			} else {
 				if t.pendingSell != nil {
 					t.pendingRecheckSell = true
@@ -1938,8 +1943,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 										t.pendingSellCtx = nil
 										t.pendingSellCancel = nil
 									}
-									_ = t.saveState()
 									t.mu.Unlock()
+									// I/O outside lock
+									go func() {
+										_ = t.saveState()
+									}()
 									return
 								}
 
@@ -2044,8 +2052,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 														pend.LimitPx = newLimitPx
 														pend.BaseAtLimit = newBase
 													}
-													_ = t.saveState()
 													t.mu.Unlock()
+													// Save outside of lock to avoid stalls
+													go func() {
+														_ = t.saveState()
+													}()
 													// -----------------------------------------------------------
 												}
 											}
@@ -2083,8 +2094,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 								t.pendingSellCtx = nil
 								t.pendingSellCancel = nil
 							}
-							_ = t.saveState()
 							t.mu.Unlock()
+							// Save outside lock
+							go func() {
+								_ = t.saveState()
+							}()
 						}(orderID, side, time.Now().Add(time.Duration(limitWait)*time.Second), limitPx, baseAtLimit, pend, ch, pctxUse)
 
 						// Build reason string now that all gates are known
@@ -2106,9 +2120,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 								t.pendingSell.Reason = fmt.Sprintf("async postonly")
 							}
 						}
-						// persist pending state
-						_ = t.saveState()
+						// persist pending state outside lock
 						t.mu.Unlock()
+						go func() { _ = t.saveState() }()
 
 						// Re-lock and return early: do not fall back to market here.
 						t.mu.Lock()
@@ -2882,9 +2896,10 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 										pcopy.LimitPx = newLimitPx
 										pcopy.BaseAtLimit = newBase
 									}
-									_ = t.saveState()
 									t.mu.Unlock()
 									// -----------------------------------------------------------------------
+									// Save outside lock to avoid deadlocks/stalls
+									go func() { _ = t.saveState() }()
 								}
 							}
 						}
@@ -2923,8 +2938,8 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 				t.pendingSellCtx = nil
 				t.pendingSellCancel = nil
 			}
-			_ = t.saveState()
 			t.mu.Unlock()
+			go func() { _ = t.saveState() }()
 		}(p, *ch, *pctx)
 	}
 

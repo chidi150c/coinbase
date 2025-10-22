@@ -74,6 +74,10 @@ type Position struct {
 
 	// --- NEW: track maker-first TP exit order id (post-only limit attempt) ---
 	FixedTPOrderID string `json:"-"`
+
+	// --- NEW: stable lot identifier & entry order id (persisted) ---
+	LotID         int    `json:"lot_id,omitempty"`
+	EntryOrderID  string `json:"entry_order_id,omitempty"`
 }
 
 // --- NEW: per-side book (authoritative store) ---
@@ -119,6 +123,9 @@ type BotState struct {
 	PendingSell        *PendingOpen
 	PendingRecheckBuy  bool
 	PendingRecheckSell bool
+
+	// --- NEW: persist next lot sequence for stable LotIDs ---
+	NextLotSeq int
 }
 
 // --- NEW (Phase 1): pending async maker-first open support ---
@@ -203,6 +210,9 @@ type Trader struct {
 	// --- NEW (Phase 2): recheck flags for market fallback gating ---
 	pendingRecheckBuy  bool
 	pendingRecheckSell bool
+
+	// --- NEW: next lot sequence counter for stable LotIDs ---
+	NextLotSeq int
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -218,6 +228,7 @@ func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
 			SideBuy:  {RunnerID: -1, Lots: nil},
 			SideSell: {RunnerID: -1, Lots: nil},
 		},
+		NextLotSeq: 1,
 	}
 	// Persistence guard: backtests set PERSIST_STATE=false
 	persist := t.cfg.PersistState
@@ -260,6 +271,10 @@ type ExitRecord struct {
 	Reason      string    `json:"reason"`
 	ExitMode    ExitMode  `json:"exit_mode,omitempty"`
 	WasRunner   bool      `json:"was_runner"`
+	// --- NEW: identifiers for traceability ---
+	LotID        int    `json:"lot_id,omitempty"`
+	EntryOrderID string `json:"entry_order_id,omitempty"`
+	ExitOrderID  string `json:"exit_order_id,omitempty"`
 }
 
 func (t *Trader) EquityUSD() float64 {
@@ -654,6 +669,10 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		Reason:      exitReason,
 		ExitMode:    lot.ExitMode,
 		WasRunner:   (localIdx == book.RunnerID),
+		// NEW identifiers
+		LotID:        lot.LotID,
+		EntryOrderID: lot.EntryOrderID,
+		ExitOrderID:  exitOrderID,
 	}
 
 	// Append with cap semantics (ring buffer behavior)
@@ -825,15 +844,18 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					entryFee = actualQuote * (feeRate / 100.0)
 				}
 				newLot := &Position{
-					OpenPrice: priceToUse,
-					Side:      side,
-					SizeBase:  baseToUse,
-					OpenTime:  now,
-					EntryFee:  entryFee,
-					Reason:    t.pendingBuy.Reason,
-					Take:      t.pendingBuy.Take,
-					Version:   1,
+					OpenPrice:    priceToUse,
+					Side:         side,
+					SizeBase:     baseToUse,
+					OpenTime:     now,
+					EntryFee:     entryFee,
+					Reason:       t.pendingBuy.Reason,
+					Take:         t.pendingBuy.Take,
+					Version:      1,
+					LotID:        t.NextLotSeq,
+					EntryOrderID: res.OrderID,
 				}
+				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
 				t.lastAddBuy = wallNow
 				t.winLowBuy = priceToUse
@@ -888,15 +910,18 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					entryFee = actualQuote * (feeRate / 100.0)
 				}
 				newLot := &Position{
-					OpenPrice: priceToUse,
-					Side:      side,
-					SizeBase:  baseToUse,
-					OpenTime:  now,
-					EntryFee:  entryFee,
-					Reason:    t.pendingSell.Reason,
-					Take:      t.pendingSell.Take,
-					Version:   1,
+					OpenPrice:    priceToUse,
+					Side:         side,
+					SizeBase:     baseToUse,
+					OpenTime:     now,
+					EntryFee:     entryFee,
+					Reason:       t.pendingSell.Reason,
+					Take:         t.pendingSell.Take,
+					Version:      1,
+					LotID:        t.NextLotSeq,
+					EntryOrderID: res.OrderID,
 				}
+				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
 				t.lastAddSell = wallNow
 				t.winHighSell = priceToUse
@@ -2232,15 +2257,18 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	newLot := &Position{
-		OpenPrice: priceToUse,
-		Side:      side,
-		SizeBase:  baseToUse,
-		OpenTime:  now,
-		EntryFee:  entryFee,
-		Reason:    gatesReason, // side-biased; no winLow
-		Take:      take,
-		Version:   1,
+		OpenPrice:    priceToUse,
+		Side:         side,
+		SizeBase:     baseToUse,
+		OpenTime:     now,
+		EntryFee:     entryFee,
+		Reason:       gatesReason, // side-biased; no winLow
+		Take:         take,
+		Version:      1,
+		LotID:        t.NextLotSeq,
+		EntryOrderID: "", // market path has no known order id here
 	}
+	t.NextLotSeq++
 	book.Lots = append(book.Lots, newLot)
 	// Use wall clock for lastAdd to drive spacing/decay even if candle time is zero.
 	if side == SideBuy {
@@ -2394,6 +2422,9 @@ func (t *Trader) saveState() error {
 		PendingSell:        t.pendingSell,
 		PendingRecheckBuy:  t.pendingRecheckBuy,
 		PendingRecheckSell: t.pendingRecheckSell,
+
+		// NEW: persist next lot sequence
+		NextLotSeq: t.NextLotSeq,
 	}
 	bs, err := json.MarshalIndent(st, "", " ")
 	if err != nil {
@@ -2500,6 +2531,23 @@ func (t *Trader) loadState() error {
 	t.pendingSell = st.PendingSell
 	t.pendingRecheckBuy = st.PendingRecheckBuy
 	t.pendingRecheckSell = st.PendingRecheckSell
+
+	// Restore next lot sequence; if absent/zero, re-compute from existing lots (max+1), default 1.
+	t.NextLotSeq = st.NextLotSeq
+	if t.NextLotSeq <= 0 {
+		maxID := 0
+		for _, side := range []OrderSide{SideBuy, SideSell} {
+			for _, lot := range t.book(side).Lots {
+				if lot != nil && lot.LotID > maxID {
+					maxID = lot.LotID
+				}
+			}
+		}
+		t.NextLotSeq = maxID + 1
+		if t.NextLotSeq <= 0 {
+			t.NextLotSeq = 1
+		}
+	}
 
 	// Initialize runner trailing baseline for current runners if not already set
 	for _, side := range []OrderSide{SideBuy, SideSell} {
@@ -2945,4 +2993,4 @@ func isMounted(dir string) (bool, error) {
 	return false, nil
 }
 
-}} with only the necessary minimal changes to implement {{add LotID and EntryOrderID fields to Position, add LotID/EntryOrderID/ExitOrderID fields to ExitRecord, and add NextLotSeq to Trader and BotState to mint and persist stable lot IDs}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{add LotID and EntryOrderID fields to Position, add LotID/EntryOrderID/ExitOrderID fields to ExitRecord, and add NextLotSeq to Trader and BotState to mint and persist stable lot IDs}}. Fix any compile error(s). Return the complete file, copy-paste ready, in IDE.
+}} with only the necessary minimal changes to implement {{Refactor the Go trading bot to eliminate a hard lock deadlock on Trader’s mutex (seen blocking in SetEquityUSD and step.func4), which stalled SELL/EXIT processing and left a post-only pending order’s OrderID un-reassigned, by moving all network/disk I/O (place/reprice/cancel/save) outside the lock, centralizing state mutations in a single manager goroutine using snapshots/RWMutex, immediately updating/persisting pending IDs after reprice, and adding defer Unlock + panic-safe logging to guarantee timely unlocks.}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{Refactor the Go trading bot to eliminate a hard lock deadlock on Trader’s mutex (seen blocking in SetEquityUSD and step.func4), which stalled SELL/EXIT processing and left a post-only pending order’s OrderID un-reassigned, by moving all network/disk I/O (place/reprice/cancel/save) outside the lock, centralizing state mutations in a single manager goroutine using snapshots/RWMutex, immediately updating/persisting pending IDs after reprice, and adding defer Unlock + panic-safe logging to guarantee timely unlocks.}}. Fix any compile error(s). Return the complete file, copy-paste ready, in IDE.
