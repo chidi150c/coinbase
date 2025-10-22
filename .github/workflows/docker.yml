@@ -12,6 +12,7 @@ env:
   BOT_IMAGE: ghcr.io/${{ github.repository_owner }}/coinbase-bot
   BRIDGE_BINANCE_IMAGE: ghcr.io/${{ github.repository_owner }}/coinbase-bridge-binance
   BRIDGE_HITBTC_IMAGE: ghcr.io/${{ github.repository_owner }}/coinbase-bridge-hitbtc
+  PUSH_LATEST: ${{ github.ref == 'refs/heads/main' }}
 
 jobs:
   build:
@@ -36,7 +37,9 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # --------------------------
       # Bot image
+      # --------------------------
       - name: Build & push bot
         id: build_bot
         uses: docker/build-push-action@v5
@@ -50,6 +53,7 @@ jobs:
           tags: |
             ${{ env.BOT_IMAGE }}:${{ env.GIT_SHA }}
             ${{ env.BOT_IMAGE }}:${{ env.HUMAN_TAG }}
+            ${{ env.BOT_IMAGE }}:latest${{ env.PUSH_LATEST && '' || '-skip' }}
           labels: |
             org.opencontainers.image.source=${{ github.repository }}
             org.opencontainers.image.revision=${{ env.GIT_SHA }}
@@ -59,7 +63,15 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Trim bogus -skip tag for bot (no-op if not present)
+        if: ${{ always() }}
+        run: |
+          docker buildx imagetools inspect "${{ env.BOT_IMAGE }}:latest-skip" >/dev/null 2>&1 && \
+          docker buildx imagetools rm "${{ env.BOT_IMAGE }}:latest-skip" || true
+
+      # --------------------------
       # Bridge (Binance) image
+      # --------------------------
       - name: Build & push bridge (binance)
         id: build_binance
         uses: docker/build-push-action@v5
@@ -73,6 +85,7 @@ jobs:
           tags: |
             ${{ env.BRIDGE_BINANCE_IMAGE }}:${{ env.GIT_SHA }}
             ${{ env.BRIDGE_BINANCE_IMAGE }}:${{ env.HUMAN_TAG }}
+            ${{ env.BRIDGE_BINANCE_IMAGE }}:latest${{ env.PUSH_LATEST && '' || '-skip' }}
           labels: |
             org.opencontainers.image.source=${{ github.repository }}
             org.opencontainers.image.revision=${{ env.GIT_SHA }}
@@ -82,7 +95,15 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Trim bogus -skip tag for bridge (binance) (no-op if not present)
+        if: ${{ always() }}
+        run: |
+          docker buildx imagetools inspect "${{ env.BRIDGE_BINANCE_IMAGE }}:latest-skip" >/dev/null 2>&1 && \
+          docker buildx imagetools rm "${{ env.BRIDGE_BINANCE_IMAGE }}:latest-skip" || true
+
+      # --------------------------
       # Bridge (HitBTC) image
+      # --------------------------
       - name: Build & push bridge (hitbtc)
         id: build_hitbtc
         uses: docker/build-push-action@v5
@@ -96,6 +117,7 @@ jobs:
           tags: |
             ${{ env.BRIDGE_HITBTC_IMAGE }}:${{ env.GIT_SHA }}
             ${{ env.BRIDGE_HITBTC_IMAGE }}:${{ env.HUMAN_TAG }}
+            ${{ env.BRIDGE_HITBTC_IMAGE }}:latest${{ env.PUSH_LATEST && '' || '-skip' }}
           labels: |
             org.opencontainers.image.source=${{ github.repository }}
             org.opencontainers.image.revision=${{ env.GIT_SHA }}
@@ -104,3 +126,9 @@ jobs:
             GIT_SHA=${{ env.GIT_SHA }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Trim bogus -skip tag for bridge (hitbtc) (no-op if not present)
+        if: ${{ always() }}
+        run: |
+          docker buildx imagetools inspect "${{ env.BRIDGE_HITBTC_IMAGE }}:latest-skip" >/dev/null 2>&1 && \
+          docker buildx imagetools rm "${{ env.BRIDGE_HITBTC_IMAGE }}:latest-skip" || true

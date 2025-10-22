@@ -482,3 +482,29 @@ tail -n 20 /opt/coinbase/logs/audit/coinbase_audit.log
 Stop later
 pkill -f 'docker compose logs -f --no-color bot_binance'
 pkill -f 'docker compose logs -f --no-color bot($| )'
+
+===================================
+# (optional) grab a final goroutine dump for postmortem
+docker kill -s QUIT monitoring-bot_binance-1
+
+# hard restart the running container
+docker restart monitoring-bot_binance-1
+
+====================================
+# Backup Restore
+# 1) Pick the backup you want to restore
+BACKUP="/opt/coinbase/state/backup/bot_state.newbinance.json.20251021-011820Z.gz"
+# Decompress to a temp file
+zcat "$BACKUP" | sudo tee /opt/coinbase/state/bot_state.newbinance.json.tmp >/dev/null
+
+# Validate JSON (will exit non-zero if malformed)
+jq . /opt/coinbase/state/bot_state.newbinance.json.tmp >/dev/null
+
+# Make the restored file match the container’s user/group and perms
+sudo chown 65532:65532 /opt/coinbase/state/bot_state.newbinance.json.tmp
+sudo chmod 0644 /opt/coinbase/state/bot_state.newbinance.json.tmp
+
+# Atomic replace
+sudo mv /opt/coinbase/state/bot_state.newbinance.json.tmp \
+        /opt/coinbase/state/bot_state.newbinance.json
+

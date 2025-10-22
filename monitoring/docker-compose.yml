@@ -11,7 +11,7 @@ services:
   #   restart: unless-stopped
 
   bridge_binance:
-    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge-binance:${IMAGE_SHA} # pinned to CI SHA
+    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge-binance:${IMAGE_SHA:-latest} # tolerate missing IMAGE_SHA
     container_name: bridge_binance
     env_file:
       - /opt/coinbase/env/binance.env  # includes PORT, STALE_MS, optional SYMBOL
@@ -67,7 +67,7 @@ services:
   # second bot instance for Binance
   bot_binance:
     depends_on: [bridge_binance]
-    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
+    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA:-latest}  # tolerate missing IMAGE_SHA
     command: ["-live", "-interval", "1"]
     environment:
       - BOT_ENV_PATH=/opt/coinbase/env/bot_binance.env
@@ -91,7 +91,7 @@ services:
         aliases: [bot-binance]
 
   bot:
-    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA}
+    image: ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot:${IMAGE_SHA:-latest}  # tolerate missing IMAGE_SHA
     command: ["-live", "-interval", "1"]
     environment:
       - BOT_ENV_PATH=/opt/coinbase/env/bot_coinbase.env

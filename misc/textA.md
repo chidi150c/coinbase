@@ -22,7 +22,7 @@ RISK_PER_TRADE_PCT=15.0
 ALLOW_PYRAMIDING=true
 PYRAMID_DECAY_LAMBDA=0.02
 PYRAMID_MIN_SECONDS_BETWEEN=0
-PYRAMID_MIN_ADVERSE_PCT=0.8 # ↓ from 1.5 so adds can actually arm
+PYRAMID_MIN_ADVERSE_PCT=0.8 # lowered from 1.5 so adds can actually arm
 PYRAMID_DECAY_MIN_PCT=0.4
 MAX_CONCURRENT_LOTS=8
 
@@ -80,10 +80,10 @@ BASE_STEP=0.00000001
 USE_LIVE_EQUITY=true
 
 # === Order entry mode ===
-ORDER_TYPE=limi
-LIMIT_PRICE_OFFSET_BPS=2 # ↓ from 5 to sit closer to touch (less camping)
-SPREAD_MIN_BPS=1 # require at least 1 bps spread to attempt maker
-LIMIT_TIMEOUT_SEC=10 # ↓ from 60; cancel-and-market after 10s if unfilled
+ORDER_TYPE=limit
+LIMIT_PRICE_OFFSET_BPS=2 # lowered from 5 to sit closer to touch (less camping)
+SPREAD_MIN_BPS=0 # allow maker even when spread is 0; set >0 to gate maker attempts
+LIMIT_TIMEOUT_SEC=10 # lowered from 60; cancel-and-market after 10s if unfilled
 
 # --- Risk ramping (per-side; you already enabled it) ---
 RAMP_ENABLE=true
@@ -102,6 +102,7 @@ TRAIL_DISTANCE_PCT=0.4
 
 FORCE_FILTERS_REMOTE=1
 LOG_LEVEL=TRACE
+
 # =========== Reprice (maker-chase) ================
 REPRICE_ENABLE=true # ensure repricer is on
 REPRICE_INTERVAL_MS=2000 # slower cadence

@@ -12,7 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       IMAGE_SHA: ${{ github.sha }}
-      GHCR_NS: ${{ vars.GHCR_NS }}
+      # Default GHCR_NS to repo owner if org-level var isn't set (e.g., on forks/PRs)
+      GHCR_NS: ${{ vars.GHCR_NS || github.repository_owner }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,11 +22,12 @@ jobs:
         run: |
           set -euo pipefail
           f="monitoring/docker-compose.yml"
-          test -f "$f"
-          # Replace hard-coded namespace with ghcr.io/${GHCR_NS:-chidi150c}
-          sed -i 's#ghcr.io/chidi150c/#ghcr.io/${GHCR_NS:-chidi150c}/#g' "$f"
-          # Tag all bot services with ${IMAGE_SHA} instead of :latest
-          sed -i 's#\(ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot\):latest#\1:${IMAGE_SHA}#g' "$f"
+          if [[ -f "$f" ]]; then
+            # Replace hard-coded namespace with ghcr.io/${GHCR_NS:-chidi150c}
+            sed -i 's#ghcr.io/chidi150c/#ghcr.io/${GHCR_NS:-chidi150c}/#g' "$f"
+            # Tag all bot services with ${IMAGE_SHA} instead of :latest
+            sed -i 's#\(ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot\):latest#\1:${IMAGE_SHA}#g' "$f"
+          fi
       - name: Setup Go
         uses: actions/setup-go@v5
         with:

@@ -77,9 +77,38 @@ jobs:
           GHCR_NS=${GHCR_NS_IN}
           ENVVARS
 
-          # Rollout with fresh pulls and full recreate
-          docker compose --env-file .env.ci up -d --pull=always --force-recreate
+          # --- Minimal additions to guarantee clean rollout with fresh images ---
 
-          # Optional hygiene
-          docker image prune -f
+          # Selective services to bounce (do not touch prometheus/grafana)
+          SERVICES=(bot_binance bot bridge_binance bridge)
+
+          # Stop & remove the target services (containers only)
+          docker compose --env-file .env.ci stop "\${SERVICES[@]}" || true
+          docker compose --env-file .env.ci rm -f "\${SERVICES[@]}" || true
+
+          # Force-remove only our project images so we never reuse an old local image
+          REPO_BOT="ghcr.io/\${GHCR_NS:-chidi150c}/coinbase-bot"
+          REPO_BRIDGE="ghcr.io/\${GHCR_NS:-chidi150c}/coinbase-bridge"
+          REPO_BRIDGE_BN="ghcr.io/\${GHCR_NS:-chidi150c}/coinbase-bridge-binance"
+
+          for repo in "\$REPO_BOT" "\$REPO_BRIDGE" "\$REPO_BRIDGE_BN"; do
+            ids=\$(docker image ls "\$repo" --format '{{.ID}}' | sort -u)
+            if [ -n "\$ids" ]; then
+              echo "[deploy] removing local images for \$repo"
+              echo "\$ids" | xargs -r docker image rm -f || true
+            fi
+          done
+
+          # Clean dangling layers/cache (safe)
+          docker image prune -f || true
+          docker builder prune -f || true
+
+          # Pre-pull images for the target services (honors IMAGE_SHA)
+          docker compose --env-file .env.ci pull "\${SERVICES[@]}"
+
+          # Rollout with full recreate (guaranteed fresh images)
+          docker compose --env-file .env.ci up -d --force-recreate "\${SERVICES[@]}"
+
+          # Optional hygiene after rollout
+          docker image prune -f || true
           EOF
