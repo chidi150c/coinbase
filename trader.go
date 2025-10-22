@@ -1855,11 +1855,29 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 						}
 						t.mu.Unlock()
 
-						// Spawn poller (Phase 4: smart reprice loop)
+						// Spawn poller (Phase 4: smart reprice loop) with environment guardrails
 						go func(initOrderID string, side OrderSide, deadline time.Time, initLimitPx, initBaseAtLimit float64, pend *PendingOpen, ch chan OpenResult, pctx context.Context) {
 							orderID := initOrderID
 							lastLimitPx := initLimitPx
+							initLimit := initLimitPx
 							lastReprice := time.Now()
+
+							// --- ENV GUARDRAILS (read once per poller) ---
+							repriceEnabled := getEnvBool("REPRICE_ENABLE", true)
+							repriceMaxCount := getEnvInt("REPRICE_MAX_COUNT", 50)
+							repriceMaxDriftBps := getEnvFloat("REPRICE_MAX_DRIFT_BPS", 0.0) // 0 = unlimited
+							repriceMinImproTicks := getEnvInt("REPRICE_MIN_IMPROV_TICKS", 1)
+							if repriceMinImproTicks < 1 {
+								repriceMinImproTicks = 1
+							}
+							repriceIntervalMs := getEnvInt("REPRICE_INTERVAL_MS", 450)
+							if repriceIntervalMs <= 0 {
+								repriceIntervalMs = 450
+							}
+							repriceMinEdgeUSD := getEnvFloat("REPRICE_MIN_EDGE_USD", 0.0)
+
+							var repriceCount int
+
 							var filled *PlacedOrder
 							for time.Now().Before(deadline) {
 								// Check current order fill state first
@@ -1873,31 +1891,56 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 									break
 								}
 
-								// Reprice every ~450ms while still pending
-								if time.Since(lastReprice) >= 450*time.Millisecond {
-									// Fetch a fresh price snapshot
-									var px float64
-									ctxPx, cancelPx := context.WithTimeout(pctx, 1*time.Second)
-									px, gErr = t.broker.GetNowPrice(ctxPx, t.cfg.ProductID)
-									cancelPx()
-									if gErr == nil && px > 0 {
-										// Recompute target limit price using same offset
-										newLimitPx := px
-										if side == SideBuy {
-											newLimitPx = px * (1.0 - offsetBps/10000.0)
-										} else {
-											newLimitPx = px * (1.0 + offsetBps/10000.0)
-										}
-										// Snap to tick if configured
-										tick := t.cfg.PriceTick
-										if tick > 0 {
-											newLimitPx = math.Floor(newLimitPx/tick) * tick
-										}
-										// Only reprice if the snapped price changed
-										shouldReprice := (tick > 0 && math.Abs(newLimitPx-lastLimitPx) >= tick) || (tick <= 0 && newLimitPx != lastLimitPx)
-										if shouldReprice {
-											// Cancel current and re-place at the new price (recompute base size from original quote)
-											_ = t.broker.CancelOrder(pctx, t.cfg.ProductID, orderID)
+								// Reprice loop (guarded)
+								if time.Since(lastReprice) >= time.Duration(repriceIntervalMs)*time.Millisecond {
+									// Skip repricing entirely if disabled or max count reached
+									if repriceEnabled && (repriceMaxCount <= 0 || repriceCount < repriceMaxCount) {
+										// Fetch a fresh price snapshot
+										var px float64
+										ctxPx, cancelPx := context.WithTimeout(pctx, 1*time.Second)
+										px, gErr = t.broker.GetNowPrice(ctxPx, t.cfg.ProductID)
+										cancelPx()
+										if gErr == nil && px > 0 {
+											// Recompute target limit price using same offset
+											newLimitPx := px
+											if side == SideBuy {
+												newLimitPx = px * (1.0 - offsetBps/10000.0)
+											} else {
+												newLimitPx = px * (1.0 + offsetBps/10000.0)
+											}
+											// Snap to tick if configured
+											tick := t.cfg.PriceTick
+											if tick > 0 {
+												newLimitPx = math.Floor(newLimitPx/tick) * tick
+											}
+
+											// baseline: only reprice if snapped price changed
+											shouldReprice := (tick > 0 && math.Abs(newLimitPx-lastLimitPx) >= tick) || (tick <= 0 && newLimitPx != lastLimitPx)
+
+											// Guard: max drift from initial (bps)
+											if shouldReprice && repriceMaxDriftBps > 0 {
+												driftBps := math.Abs((newLimitPx-initLimit)/initLimit) * 10000.0
+												if driftBps > repriceMaxDriftBps {
+													shouldReprice = false
+												}
+											}
+
+											// Guard: minimum improvement in ticks (directional)
+											if shouldReprice && tick > 0 && repriceMinImproTicks > 1 {
+												improveTicks := int(math.Abs(newLimitPx-lastLimitPx) / tick)
+												// direction check: buy wants lower, sell wants higher
+												if side == SideBuy {
+													if !(newLimitPx < lastLimitPx && improveTicks >= repriceMinImproTicks) {
+														shouldReprice = false
+													}
+												} else {
+													if !(newLimitPx > lastLimitPx && improveTicks >= repriceMinImproTicks) {
+														shouldReprice = false
+													}
+												}
+											}
+
+											// Recompute base from original quote for edge calculation & placement
 											newBase := pend.BaseAtLimit
 											if pend != nil && pend.Quote > 0 {
 												newBase = pend.Quote / newLimitPx
@@ -1908,14 +1951,30 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 											if t.cfg.BaseStep > 0 {
 												newBase = math.Floor(newBase/t.cfg.BaseStep) * t.cfg.BaseStep
 											}
-											// Ensure min-notional
-											if newBase > 0 && newBase*newLimitPx >= t.cfg.MinNotional {
+
+											// Guard: min edge USD improvement
+											if shouldReprice && repriceMinEdgeUSD > 0 && newBase > 0 {
+												edgeUSD := math.Abs(newLimitPx-lastLimitPx) * newBase
+												if edgeUSD < repriceMinEdgeUSD {
+													shouldReprice = false
+												}
+											}
+
+											// Ensure min-notional for the reprice candidate
+											if shouldReprice && !(newBase > 0 && newBase*newLimitPx >= t.cfg.MinNotional) {
+												shouldReprice = false
+											}
+
+											if shouldReprice {
+												// Cancel current and re-place at the new price
+												_ = t.broker.CancelOrder(pctx, t.cfg.ProductID, orderID)
 												newID, perr := t.broker.PlaceLimitPostOnly(pctx, t.cfg.ProductID, side, newLimitPx, newBase)
 												if perr == nil && strings.TrimSpace(newID) != "" {
 													log.Printf("TRACE postonly.reprice side=%s old_id=%s new_id=%s limit=%.8f baseReq=%.8f",
 														side, orderID, newID, newLimitPx, newBase)
 													orderID = newID
 													lastLimitPx = newLimitPx
+													repriceCount++
 												}
 											}
 										}
@@ -2163,7 +2222,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// Rebuild legacy aggregate view for logs/compat
 	// t.refreshAggregateFromBooks()
- 
+
 	msg := ""
 	if t.cfg.DryRun {
 		mtxOrders.WithLabelValues("paper", string(side)).Inc()
@@ -2515,7 +2574,7 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 		}
 
 		// Check current server-side status of the saved order (unlock for I/O).
-	var ord *PlacedOrder
+		var ord *PlacedOrder
 		if strings.TrimSpace(p.OrderID) != "" {
 			b := t.broker // capture broker pointer for I/O while unlocked
 			t.mu.Unlock()
@@ -2537,7 +2596,7 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 					return
 				}
 				ord = o // still open
-		}
+			}
 		}
 
 		// If order not found (or nil), clear pending and enable market fallback on next tick.
@@ -2576,13 +2635,30 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 		side := p.Side
 		b := t.broker // capture broker
 
-		// Spawn poller (resume) — reprice and watch for fill until deadline.
+		// Spawn poller (resume) — reprice and watch for fill until deadline, with env guardrails
 		go func(pcopy *PendingOpen, chOut chan OpenResult, pc context.Context) {
 			orderID := pcopy.OrderID
 			lastLimitPx := pcopy.LimitPx
+			initLimit := lastLimitPx
 			lastReprice := time.Now()
 			var filled *PlacedOrder
 			deadline := pcopy.Deadline
+
+			// --- ENV GUARDRAILS (read once per poller) ---
+			repriceEnabled := getEnvBool("REPRICE_ENABLE", true)
+			repriceMaxCount := getEnvInt("REPRICE_MAX_COUNT", 50)
+			repriceMaxDriftBps := getEnvFloat("REPRICE_MAX_DRIFT_BPS", 0.0) // 0 = unlimited
+			repriceMinImproTicks := getEnvInt("REPRICE_MIN_IMPROV_TICKS", 1)
+			if repriceMinImproTicks < 1 {
+				repriceMinImproTicks = 1
+			}
+			repriceIntervalMs := getEnvInt("REPRICE_INTERVAL_MS", 450)
+			if repriceIntervalMs <= 0 {
+				repriceIntervalMs = 450
+			}
+			repriceMinEdgeUSD := getEnvFloat("REPRICE_MIN_EDGE_USD", 0.0)
+
+			var repriceCount int
 
 			for time.Now().Before(deadline) {
 				// 1) Check for fill
@@ -2595,24 +2671,47 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 					break
 				}
 
-				// 2) Periodic reprice
-				if time.Since(lastReprice) >= 450*time.Millisecond {
-					ctxPx, cancelPx := context.WithTimeout(pc, 1*time.Second)
-					px, gErr := b.GetNowPrice(ctxPx, productID)
-					cancelPx()
-					if gErr == nil && px > 0 {
-						newLimitPx := px
-						if side == SideBuy {
-							newLimitPx = px * (1.0 - offsetBps/10000.0)
-						} else {
-							newLimitPx = px * (1.0 + offsetBps/10000.0)
-						}
-						if tick > 0 {
-							newLimitPx = math.Floor(newLimitPx/tick) * tick
-						}
-						shouldReprice := (tick > 0 && math.Abs(newLimitPx-lastLimitPx) >= tick) || (tick <= 0 && newLimitPx != lastLimitPx)
-						if shouldReprice {
-							_ = b.CancelOrder(pc, productID, orderID)
+				// 2) Periodic reprice (guarded)
+				if time.Since(lastReprice) >= time.Duration(repriceIntervalMs)*time.Millisecond {
+					if repriceEnabled && (repriceMaxCount <= 0 || repriceCount < repriceMaxCount) {
+						ctxPx, cancelPx := context.WithTimeout(pc, 1*time.Second)
+						px, gErr := b.GetNowPrice(ctxPx, productID)
+						cancelPx()
+						if gErr == nil && px > 0 {
+							newLimitPx := px
+							if side == SideBuy {
+								newLimitPx = px * (1.0 - offsetBps/10000.0)
+							} else {
+								newLimitPx = px * (1.0 + offsetBps/10000.0)
+							}
+							if tick > 0 {
+								newLimitPx = math.Floor(newLimitPx/tick) * tick
+							}
+							shouldReprice := (tick > 0 && math.Abs(newLimitPx-lastLimitPx) >= tick) || (tick <= 0 && newLimitPx != lastLimitPx)
+
+							// Guard: max drift from initial (bps)
+							if shouldReprice && repriceMaxDriftBps > 0 {
+								driftBps := math.Abs((newLimitPx-initLimit)/initLimit) * 10000.0
+								if driftBps > repriceMaxDriftBps {
+									shouldReprice = false
+								}
+							}
+
+							// Guard: minimum improvement ticks (directional)
+							if shouldReprice && tick > 0 && repriceMinImproTicks > 1 {
+								improveTicks := int(math.Abs(newLimitPx-lastLimitPx) / tick)
+								if side == SideBuy {
+									if !(newLimitPx < lastLimitPx && improveTicks >= repriceMinImproTicks) {
+										shouldReprice = false
+									}
+								} else {
+									if !(newLimitPx > lastLimitPx && improveTicks >= repriceMinImproTicks) {
+										shouldReprice = false
+									}
+								}
+							}
+
+							// Recompute base from quote
 							newBase := pcopy.BaseAtLimit
 							if pcopy.Quote > 0 {
 								newBase = pcopy.Quote / newLimitPx
@@ -2620,12 +2719,28 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 							if baseStep > 0 {
 								newBase = math.Floor(newBase/baseStep) * baseStep
 							}
-							if newBase > 0 && newBase*newLimitPx >= minNotional {
+
+							// Guard: min edge USD
+							if shouldReprice && repriceMinEdgeUSD > 0 && newBase > 0 {
+								edgeUSD := math.Abs(newLimitPx-lastLimitPx) * newBase
+								if edgeUSD < repriceMinEdgeUSD {
+                                    shouldReprice = false
+								}
+							}
+
+							// Ensure min-notional
+							if shouldReprice && !(newBase > 0 && newBase*newLimitPx >= minNotional) {
+								shouldReprice = false
+							}
+
+							if shouldReprice {
+								_ = b.CancelOrder(pc, productID, orderID)
 								if newID, perr := b.PlaceLimitPostOnly(pc, productID, side, newLimitPx, newBase); perr == nil && strings.TrimSpace(newID) != "" {
 									log.Printf("TRACE postonly.reprice side=%s old_id=%s new_id=%s limit=%.8f baseReq=%.8f",
 										side, orderID, newID, newLimitPx, newBase)
 									orderID = newID
 									lastLimitPx = newLimitPx
+									repriceCount++
 								}
 							}
 						}
