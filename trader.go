@@ -284,14 +284,13 @@ func (t *Trader) EquityUSD() float64 {
 
 // SetEquityUSD safely updates trader equity and the equity metric.
 func (t *Trader) SetEquityUSD(v float64) {
-	// Minimal refactor: perform state mutation under lock, but move disk I/O outside.
 	t.mu.Lock()
 	t.equityUSD = v
 	t.mu.Unlock()
 
 	// update the metric with same naming style
 	mtxPnL.Set(v)
-	// persist new state (no-op if disabled) — I/O explicitly outside the lock
+	// persist new state (no-op if disabled)
 	if err := t.saveState(); err != nil {
 		log.Printf("[WARN] saveState: %v", err)
 		// TODO: remove TRACE
@@ -315,11 +314,16 @@ func (t *Trader) updateDaily(date time.Time) {
 	if midnightUTC(date) != t.dailyStart {
 		t.dailyStart = midnightUTC(date)
 		t.dailyPnL = 0
-		if err := t.saveState(); err != nil {
-			log.Printf("[WARN] saveState: %v", err)
-			// TODO: remove TRACE
-			log.Printf("TRACE state.save error=%v", err)
-		}
+		// move persistence out from under any caller lock:
+		// (capture a lightweight need-to-save flag and call after releasing, but since this
+		//  function can be used unlocked as well, just fire-and-forget outside the hot path)
+		go func() {
+			if err := t.saveState(); err != nil {
+				log.Printf("[WARN] saveState: %v", err)
+				// TODO: remove TRACE
+				log.Printf("TRACE state.save error=%v", err)
+			}
+		}()
 	}
 }
 
@@ -480,8 +484,19 @@ func (t *Trader) book(side OrderSide) *SideBook {
 	return b
 }
 
+// panic-safe unlock helper (used via defer)
+func safeUnlock(mu *sync.Mutex, where string) {
+	if r := recover(); r != nil {
+		log.Printf("[WARN] panic recovered at %s: %v", where, r)
+	}
+	mu.Unlock()
+}
+
 // --- NEW: side-aware lot closing (no global index) ---
 func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, localIdx int, exitReason string) (string, error) {
+	t.mu.Lock()
+	defer safeUnlock(&t.mu, "closeLot")
+
 	book := t.book(side)
 	price := c[len(c)-1].Close
 	lot := book.Lots[localIdx]
@@ -574,6 +589,15 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	}
 	// re-lock
 	t.mu.Lock()
+	defer func() {
+		// ensure we persist any changes after we leave the locked section
+		t.mu.Unlock()
+		if err := t.saveState(); err != nil {
+			log.Printf("[WARN] saveState: %v", err)
+			log.Printf("TRACE state.save error=%v", err)
+		}
+		t.mu.Lock()
+	}()
 
 	// --- NEW: attach/clear FixedTPOrderID tracking on the lot (only for the TP limit attempt) ---
 	if wantLimitExit {
@@ -719,11 +743,6 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		if t.cfg.Extended().UseDirectSlack {
 			postSlack(msg)
 		}
-		// persist updated lot state
-		if err := t.saveState(); err != nil {
-			log.Printf("[WARN] saveState: %v", err)
-			log.Printf("TRACE state.save error=%v", err)
-		}
 		return msg, nil
 	}
 
@@ -796,12 +815,6 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	if t.cfg.Extended().UseDirectSlack {
 		postSlack(msg)
 	}
-	// persist new state
-	if err := t.saveState(); err != nil {
-		log.Printf("[WARN] saveState: %v", err)
-		// TODO: remove TRACE
-		log.Printf("TRACE state.save error=%v", err)
-	}
 
 	_ = removedWasRunner // kept to emphasize runner path; no extra logs.
 	return msg, nil
@@ -818,6 +831,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// Acquire lock (no defer): we will release it around network calls.
 	t.mu.Lock()
+	defer safeUnlock(&t.mu, "step")
 
 	// Use wall clock as authoritative "now" for pyramiding timings; fall back for zero candle time.
 	wallNow := time.Now().UTC()
@@ -877,11 +891,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if t.cfg.Extended().UseDirectSlack {
 					postSlack(msg)
 				}
-				// queue persistence outside of lock
+				// persist out of lock
 				t.mu.Unlock()
-				go func() {
-					_ = t.saveState()
-				}()
+				if err := t.saveState(); err != nil {
+					log.Printf("[WARN] saveState: %v", err)
+					log.Printf("TRACE state.save error=%v", err)
+				}
 				t.mu.Lock()
 			} else {
 				if t.pendingBuy != nil {
@@ -945,11 +960,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if t.cfg.Extended().UseDirectSlack {
 					postSlack(msg)
 				}
-				// queue persistence outside of lock
+				// persist out of lock
 				t.mu.Unlock()
-				go func() {
-					_ = t.saveState()
-				}()
+				if err := t.saveState(); err != nil {
+					log.Printf("[WARN] saveState: %v", err)
+					log.Printf("TRACE state.save error=%v", err)
+				}
 				t.mu.Lock()
 			} else {
 				if t.pendingSell != nil {
@@ -1090,10 +1106,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 						}
 						msg, err := t.closeLot(ctx, c, side, i, "trailing_stop")
 						if err != nil {
-							t.mu.Unlock()
 							return "", true, err
 						}
-						t.mu.Unlock()
 						return msg, true, nil
 					}
 
@@ -1129,13 +1143,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if trigger {
 					msg, err := t.closeLot(ctx, c, side, i, exitReason)
 					if err != nil {
-						t.mu.Unlock()
 						return "", true, err
 					}
 					if lot.ExitMode == ExitModeScalpFixedTP {
 						log.Printf("TRACE tp.filled side=%s idx=%d mark=%.8f take=%.8f", lot.Side, i, price, lot.Take)
 					}
-					t.mu.Unlock()
 					return msg, true, nil
 				}
 
@@ -1207,7 +1219,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// --- NEW (Phase 4): prevent duplicate opens while pending on this side (exits already ran) ---
 	if (side == SideBuy && t.pendingBuy != nil) || (side == SideSell && t.pendingSell != nil) {
-		t.mu.Unlock()
 		return fmt.Sprintf("OPEN-PENDING side=%s", side), nil
 	}
 
@@ -1283,7 +1294,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	if t.lastAddEquitySell > 0 && t.equityUSD >= t.lastAddEquitySell*1.01 && d.Signal == Sell {
 		// Only proceed if not long-only; respect existing guard
 		if t.cfg.LongOnly {
-			t.mu.Unlock()
 			return "FLAT (long-only) [equity-scalp]", nil
 		}
 		if spare < 0 {
@@ -1317,17 +1327,14 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// Long-only veto for SELL when flat; unchanged behavior.
 	if d.Signal == Sell && t.cfg.LongOnly {
-		t.mu.Unlock()
 		return fmt.Sprintf("FLAT (long-only) [%s]", d.Reason), nil
 	}
 	if d.Signal == Flat && !equityTriggerSell && !equityTriggerBuy {
-		t.mu.Unlock()
 		return fmt.Sprintf("FLAT [%s]", d.Reason), nil
 	}
 
 	// GATE1 Respect lot cap (both sides)
 	if (lsb+lss) >= maxConcurrentLots() && !((equityTriggerBuy && d.Signal == Buy) || (equityTriggerSell && d.Signal == Sell)) {
-		t.mu.Unlock()
 		log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", maxConcurrentLots())
 		return "HOLD", nil
 	}
@@ -1361,7 +1368,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		// TODO: remove TRACE
 		log.Printf("TRACE pyramid.spacing since_last=%.1fs need>=%ds", time.Since(lastAddSide).Seconds(), psb)
 		if time.Since(lastAddSide) < time.Duration(psb)*time.Second {
-			t.mu.Unlock()
 			hrs := time.Since(lastAddSide).Hours()
 			log.Printf("[DEBUG] GATE2 pyramid: blocked by spacing; since_last=%vHours need>=%ds", fmt.Sprintf("%.1f", hrs), psb)
 			return "HOLD", nil
@@ -1446,7 +1452,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 
 				if !(price <= gatePrice) {
-					t.mu.Unlock()
 					log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
 						price, gatePrice, t.winLowBuy, effPct, basePct, reasonElapsedHr)
 					// TODO: remove TRACE
@@ -1493,7 +1498,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 
 				if !(price >= gatePrice) {
-					t.mu.Unlock()
 					log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
 						price, gatePrice, t.winHighSell, effPct, basePct, reasonElapsedHr)
 					// TODO: remove TRACE
@@ -1633,7 +1637,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			// --- breadcrumb ---
 			log.Printf("[WARN] FUNDS_EXHAUSTED BUY need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 				neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
-			t.mu.Unlock()
 			log.Printf("[DEBUG] GATE BUY: need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 				neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
 			// TODO: remove TRACE
@@ -1652,7 +1655,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				// --- breadcrumb ---
 				log.Printf("[WARN] FUNDS_EXHAUSTED BUY need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 					neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
-				t.mu.Unlock()
 				log.Printf("[DEBUG] GATE BUY: need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 					neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
 				// TODO: remove TRACE
@@ -1691,7 +1693,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			// --- breadcrumb ---
 			log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
 				neededBase, spare, availBase, reservedLongBase, baseStep)
-			t.mu.Unlock()
 			log.Printf("[DEBUG] GATE SELL: need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
 				neededBase, spare, availBase, reservedLongBase, baseStep)
 			// TODO: remove TRACE
@@ -1719,7 +1720,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				// --- breadcrumb ---
 				log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
 					base, spare, availBase, reservedLongBase, baseStep)
-				t.mu.Unlock()
 				log.Printf("[DEBUG] GATE SELL: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
 					base, spare, availBase, reservedLongBase, baseStep)
 				// TODO: remove TRACE
@@ -1944,10 +1944,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 										t.pendingSellCancel = nil
 									}
 									t.mu.Unlock()
-									// I/O outside lock
-									go func() {
-										_ = t.saveState()
-									}()
+									if err := t.saveState(); err != nil {
+										log.Printf("[WARN] saveState: %v", err)
+										log.Printf("TRACE state.save error=%v", err)
+									}
 									return
 								}
 
@@ -2053,10 +2053,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 														pend.BaseAtLimit = newBase
 													}
 													t.mu.Unlock()
-													// Save outside of lock to avoid stalls
-													go func() {
-														_ = t.saveState()
-													}()
+													// persist out of lock (immediate)
+													if err := t.saveState(); err != nil {
+														log.Printf("[WARN] saveState: %v", err)
+														log.Printf("TRACE state.save error=%v", err)
+													}
 													// -----------------------------------------------------------
 												}
 											}
@@ -2095,10 +2096,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 								t.pendingSellCancel = nil
 							}
 							t.mu.Unlock()
-							// Save outside lock
-							go func() {
-								_ = t.saveState()
-							}()
+							if err := t.saveState(); err != nil {
+								log.Printf("[WARN] saveState: %v", err)
+								log.Printf("TRACE state.save error=%v", err)
+							}
 						}(orderID, side, time.Now().Add(time.Duration(limitWait)*time.Second), limitPx, baseAtLimit, pend, ch, pctxUse)
 
 						// Build reason string now that all gates are known
@@ -2120,9 +2121,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 								t.pendingSell.Reason = fmt.Sprintf("async postonly")
 							}
 						}
-						// persist pending state outside lock
 						t.mu.Unlock()
-						go func() { _ = t.saveState() }()
+						// persist pending state out of lock
+						if err := t.saveState(); err != nil {
+							log.Printf("[WARN] saveState: %v", err)
+							log.Printf("TRACE state.save error=%v", err)
+						}
 
 						// Re-lock and return early: do not fall back to market here.
 						t.mu.Lock()
@@ -2186,6 +2190,16 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// Re-lock to mutate state (append new lot to THIS SIDE).
 	t.mu.Lock()
+	defer func() {
+		// persist new state outside lock
+		t.mu.Unlock()
+		if err := t.saveState(); err != nil {
+			log.Printf("[WARN] saveState: %v", err)
+			// TODO: remove TRACE
+			log.Printf("TRACE state.save error=%v", err)
+		}
+		t.mu.Lock()
+	}()
 
 	// --- NEW (Phase 2): reset recheck flag after successful market fallback open ---
 	if !t.cfg.DryRun {
@@ -2345,13 +2359,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	if t.cfg.Extended().UseDirectSlack {
 		postSlack(msg)
 	}
-	// persist new state
-	if err := t.saveState(); err != nil {
-		log.Printf("[WARN] saveState: %v", err)
-		// TODO: remove TRACE
-		log.Printf("TRACE state.save error=%v", err)
-	}
-	t.mu.Unlock()
 	return msg, nil
 }
 
@@ -2402,6 +2409,7 @@ func (t *Trader) saveState() error {
 		return nil
 	}
 	// Build persisted books snapshot
+	t.mu.Lock()
 	st := BotState{
 		EquityUSD:      t.equityUSD,
 		DailyStart:     t.dailyStart,
@@ -2439,6 +2447,8 @@ func (t *Trader) saveState() error {
 		// NEW: persist next lot sequence
 		NextLotSeq: t.NextLotSeq,
 	}
+	t.mu.Unlock()
+
 	bs, err := json.MarshalIndent(st, "", " ")
 	if err != nil {
 		return err
@@ -2699,7 +2709,13 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 				t.pendingRecheckSell = true
 			}
 			*pend = nil
-			_ = t.saveState() // best-effort
+			// persist out of lock
+			go func() {
+				if err := t.saveState(); err != nil {
+					log.Printf("[WARN] saveState: %v", err)
+					log.Printf("TRACE state.save error=%v", err)
+				}
+			}()
 			return
 		}
 
@@ -2722,7 +2738,13 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 					default:
 					}
 					*pend = nil
-					_ = t.saveState()
+					// persist out of lock
+					go func() {
+						if err := t.saveState(); err != nil {
+							log.Printf("[WARN] saveState: %v", err)
+							log.Printf("TRACE state.save error=%v", err)
+						}
+					}()
 					return
 				}
 				ord = o // still open
@@ -2737,7 +2759,13 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 				t.pendingRecheckSell = true
 			}
 			*pend = nil // FIX: was 'pend = nil' (no effect); must clear the caller's pointer
-			_ = t.saveState()
+			// persist out of lock
+			go func() {
+				if err := t.saveState(); err != nil {
+					log.Printf("[WARN] saveState: %v", err)
+					log.Printf("TRACE state.save error=%v", err)
+				}
+			}()
 			return
 		}
 
@@ -2897,9 +2925,12 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 										pcopy.BaseAtLimit = newBase
 									}
 									t.mu.Unlock()
+									// persist out of lock
+									if err := t.saveState(); err != nil {
+										log.Printf("[WARN] saveState: %v", err)
+										log.Printf("TRACE state.save error=%v", err)
+									}
 									// -----------------------------------------------------------------------
-									// Save outside lock to avoid deadlocks/stalls
-									go func() { _ = t.saveState() }()
 								}
 							}
 						}
@@ -2939,7 +2970,10 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 				t.pendingSellCancel = nil
 			}
 			t.mu.Unlock()
-			go func() { _ = t.saveState() }()
+			if err := t.saveState(); err != nil {
+				log.Printf("[WARN] saveState: %v", err)
+				log.Printf("TRACE state.save error=%v", err)
+			}
 		}(p, *ch, *pctx)
 	}
 
