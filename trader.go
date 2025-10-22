@@ -1920,17 +1920,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 							// --- ENV GUARDRAILS (read once per poller) ---
 							repriceEnabled := getEnvBool("REPRICE_ENABLE", true)
-							repriceMaxCount := getEnvInt("REPRICE_MAX_COUNT", 10)
-							repriceMaxDriftBps := getEnvFloat("REPRICE_MAX_DRIFT_BPS", 3.0) // 0 = unlimited
-							repriceMinImproTicks := getEnvInt("REPRICE_MIN_IMPROV_TICKS", 1)
+							repriceMaxCount := getEnvInt("REPRICE_MAX_COUNT", 3)
+							repriceMaxDriftBps := getEnvFloat("REPRICE_MAX_DRIFT_BPS", 1.5) // 0 = unlimited
+							repriceMinImproTicks := getEnvInt("REPRICE_MIN_IMPROV_TICKS", 2)
 							if repriceMinImproTicks < 1 {
 								repriceMinImproTicks = 1
 							}
-							repriceIntervalMs := getEnvInt("REPRICE_INTERVAL_MS", 1000)
+							repriceIntervalMs := getEnvInt("REPRICE_INTERVAL_MS", 2000)
 							if repriceIntervalMs <= 0 {
 								repriceIntervalMs = 450
 							}
-							repriceMinEdgeUSD := getEnvFloat("REPRICE_MIN_EDGE_USD", 0.0)
+							repriceMinEdgeUSD := getEnvFloat("REPRICE_MIN_EDGE_USD", 0.15)
 
 							var repriceCount int
 
@@ -2817,17 +2817,17 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 
 			// --- ENV GUARDRAILS (read once per poller) ---
 			repriceEnabled := getEnvBool("REPRICE_ENABLE", true)
-			repriceMaxCount := getEnvInt("REPRICE_MAX_COUNT", 50)
-			repriceMaxDriftBps := getEnvFloat("REPRICE_MAX_DRIFT_BPS", 0.0) // 0 = unlimited
-			repriceMinImproTicks := getEnvInt("REPRICE_MIN_IMPROV_TICKS", 1)
+			repriceMaxCount := getEnvInt("REPRICE_MAX_COUNT", 3)
+			repriceMaxDriftBps := getEnvFloat("REPRICE_MAX_DRIFT_BPS", 1.5) // 0 = unlimited
+			repriceMinImproTicks := getEnvInt("REPRICE_MIN_IMPROV_TICKS", 2)
 			if repriceMinImproTicks < 1 {
 				repriceMinImproTicks = 1
 			}
-			repriceIntervalMs := getEnvInt("REPRICE_INTERVAL_MS", 450)
+			repriceIntervalMs := getEnvInt("REPRICE_INTERVAL_MS", 2000)
 			if repriceIntervalMs <= 0 {
 				repriceIntervalMs = 450
 			}
-			repriceMinEdgeUSD := getEnvFloat("REPRICE_MIN_EDGE_USD", 0.0)
+			repriceMinEdgeUSD := getEnvFloat("REPRICE_MIN_EDGE_USD", 0.15)
 
 			var repriceCount int
 
