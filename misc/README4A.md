@@ -185,3 +185,136 @@ No functional change required since we already pass ctx into startPendingOpen(..
 Deliverable: Clean shutdown of any in-flight maker attempts.
 
 If you want, I can now generate Phase 1 as a ready-to-apply patch (exact diffs) for ./trader.go and then follow with the others.
+=========================================================================================================================================
+
+# Forensic playbook: Go trading bot stalls with pending order + halted SELL/EXIT
+
+Identify the container
+
+Auto-pick likely container, else list all:
+
+export C=$(docker ps --format '{{.Names}}\t{{.Image}}' | awk 'tolower($0) ~ /binance|coinbase|bot/ {print $1; exit}')
+[ -z "$C" ] && docker ps --format '{{.Names}}\t{{.Image}}' && echo "Set: export C=NAME"
+echo "Using container: $C"
+
+
+Establish key paths/vars
+
+State file and quick facts:
+
+export STATE=/opt/coinbase/state/bot_state.newbinance.json
+stat -c '%y  %n' "$STATE"
+jq -r '
+  "BUY lots=\((.BookBuy.lots|length)) runner_id=\(.BookBuy.runner_id) | SELL lots=\((.BookSell.lots|length)) runner_id=\(.BookSell.runner_id)",
+  "NextLotSeq=\(.NextLotSeq)",
+  "PendingBuy.id=\((.PendingBuy.OrderID//"nil")) recheck=\(.PendingRecheckBuy)",
+  "PendingSell.id=\((.PendingSell.OrderID//"nil")) recheck=\(.PendingRecheckSell)"
+' "$STATE"
+
+
+Confirm live heartbeat vs stall
+
+Trading loop heartbeat (should scroll every tick):
+
+docker logs -f --since=5m "$C" | grep -E 'TRACE step\.start| \[TICK\] |TRACE TARGET \[TICK\]'
+
+
+SELL-side opens path + post-only lifecycle:
+
+docker logs -f --since=10m "$C" | grep -E 'TRACE sell\.gate\.(pre|post)|postonly\.(place|reprice|timeout).*side=SELL|OPEN-PENDING side=SELL'
+
+
+Exits (both sides) path:
+
+docker logs -f --since=10m "$C" | grep -E 'exit\.classify|trailing_stop|^EXIT |tp\.filled'
+
+
+Narrow to the incident window
+
+Pick a tight range around the last postonly.place you see (±2–4 min):
+
+START='YYYY-MM-DDTHH:MM:SSZ'
+END='YYYY-MM-DDTHH:MM:SSZ'
+docker logs --since="$START" --until="$END" "$C" > /tmp/bot.window.log
+
+
+In-window timeline extraction
+
+Show state saves (did pending IDs persist?):
+
+grep -E '\[WARN\] saveState|TRACE state\.save' /tmp/bot.window.log
+
+
+Show opens/results around the event:
+
+grep -E 'postonly\.(place|reprice|timeout)|OPEN-PENDING|^EXIT |tp\.filled' /tmp/bot.window.log
+
+
+Count reprices (should advance OrderID each time):
+
+grep 'postonly.reprice' /tmp/bot.window.log | wc -l
+
+
+Correlate with on-disk state (consistency check)
+
+Inspect pending details & deadlines:
+
+jq -r '
+  "PendingBuy: id=\((.PendingBuy.OrderID//"nil")) created=\((.PendingBuy.CreatedAt//"nil")) deadline=\((.PendingBuy.Deadline//"nil"))",
+  "PendingSell: id=\((.PendingSell.OrderID//"nil")) created=\((.PendingSell.CreatedAt//"nil")) deadline=\((.PendingSell.Deadline//"nil"))",
+  "Recheck flags: buy=\(.PendingRecheckBuy) sell=\(.PendingRecheckSell)",
+  "Books: BUY=\((.BookBuy.lots|length)) SELL=\((.BookSell.lots|length))"
+' "$STATE"
+
+
+Check file mtime (did saves stop?):
+
+stat -c '%y  %n' "$STATE"
+
+
+Look for selective stalls (SELL/EXIT frozen while ticks continue)
+
+If ticks continue but SELL/EXIT greps are empty/stale, note a logic or lock-specific stall, not a global freeze.
+
+Capture a goroutine dump (golden evidence)
+
+Send SIGQUIT and extract stacks:
+
+docker kill -s QUIT "$C"
+docker logs --since=2m "$C" | sed -n '/^goroutine [0-9]\+ \[/{:a;n;/^goroutine [0-9]\+ \[/q;p;ba}' > /tmp/goroutines.txt
+tail -n +1 /tmp/goroutines.txt
+
+
+What to look for (flag any matches):
+
+goroutine 1 or step worker blocked on sync.Mutex.Lock (e.g., main.(*Trader).SetEquityUSD / step.func*).
+
+Long “minutes” annotations on a goroutine in sync.Mutex.Lock.
+
+Any network/disk I/O calls (place/reprice/cancel/save) inside a locked section.
+
+Diagnose the failure pattern
+
+If: postonly.reprice shows new IDs in logs but Pending*.OrderID in state is still the old ID → pending reassign not persisted or blocked by a lock.
+
+If: SELL/EXIT greps go quiet while ticks continue → likely a deadlock/lock convoy inside step around equity/state updates.
+
+If: Goroutine dump shows SetEquityUSD and step.func4 holding/contending the same Trader mutex for many minutes → confirm deadlock/lock contention as root cause.
+
+Prescribe fixes (to include in incident note)
+
+Move all network/disk I/O out of critical sections; keep locks only for in-memory mutations.
+
+Centralize state writes in a single manager goroutine (fan-in channel), or switch to RWMutex with short-lived Lock.
+
+On every postonly.reprice, update in-memory pending struct + persist state immediately (fire-and-forget channel).
+
+Add defer mu.Unlock() and panic-safe unlock/logging around each critical region.
+
+Add watchdogs/metrics: time a lock is held, and warn if >100ms; emit a heartbeat for SELL/EXIT pipelines.
+
+Artifacts to archive with the report
+
+/tmp/bot.window.log, /tmp/goroutines.txt, stat output for $STATE, and jq snapshots before/after.
+
+Use this playbook to (a) reproduce the timeline, (b) prove the stall is a mutex deadlock/lock convoy, and (c) tie the stale pending OrderID to state-save under lock contention—then propose the lock/IO refactor.

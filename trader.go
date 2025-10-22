@@ -1894,9 +1894,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 							// --- ENV GUARDRAILS (read once per poller) ---
 							repriceEnabled := getEnvBool("REPRICE_ENABLE", true)
-							repriceMaxCount := getEnvInt("REPRICE_MAX_COUNT", 10)
-							repriceMaxDriftBps := getEnvFloat("REPRICE_MAX_DRIFT_BPS", 3.0) // 0 = unlimited
-							repriceMinImproTicks := getEnvInt("REPRICE_MIN_IMPROV_TICKS", 1)
+							repriceMaxCount := getEnvInt("REPRICE_MAX_COUNT", 2)
+							repriceMaxDriftBps := getEnvFloat("REPRICE_MAX_DRIFT_BPS", 1.5) // 0 = unlimited
+							repriceMinImproTicks := getEnvInt("REPRICE_MIN_IMPROV_TICKS", 2)
 							if repriceMinImproTicks < 1 {
 								repriceMinImproTicks = 1
 							}
