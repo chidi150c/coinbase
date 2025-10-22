@@ -1919,19 +1919,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 							lastReprice := time.Now()
 
 							// --- ENV GUARDRAILS (read once per poller) ---
-							repriceEnabled := getEnvBool("REPRICE_ENABLE", true)
-							repriceMaxCount := getEnvInt("REPRICE_MAX_COUNT", 3)
-							repriceMaxDriftBps := getEnvFloat("REPRICE_MAX_DRIFT_BPS", 1.5) // 0 = unlimited
-							repriceMinImproTicks := getEnvInt("REPRICE_MIN_IMPROV_TICKS", 2)
-							if repriceMinImproTicks < 1 {
-								repriceMinImproTicks = 1
-							}
-							repriceIntervalMs := getEnvInt("REPRICE_INTERVAL_MS", 2000)
-							if repriceIntervalMs <= 0 {
-								repriceIntervalMs = 450
-							}
-							repriceMinEdgeUSD := getEnvFloat("REPRICE_MIN_EDGE_USD", 0.15)
-
+							
 							var repriceCount int
 
 						poll:
@@ -1975,9 +1963,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 								}
 
 								// Reprice loop (guarded)
-								if time.Since(lastReprice) >= time.Duration(repriceIntervalMs)*time.Millisecond {
+								if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
 									// Skip repricing entirely if disabled or max count reached
-									if repriceEnabled && (repriceMaxCount <= 0 || repriceCount < repriceMaxCount) {
+									if t.cfg.RepriceEnable && (t.cfg.RepriceMaxCount <= 0 || repriceCount < t.cfg.RepriceMaxCount) {
 										// Fetch a fresh price snapshot
 										var px float64
 										ctxPx, cancelPx := context.WithTimeout(pctx, 1*time.Second)
@@ -2001,23 +1989,23 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 											shouldReprice := (tick > 0 && math.Abs(newLimitPx-lastLimitPx) >= tick) || (tick <= 0 && newLimitPx != lastLimitPx)
 
 											// Guard: max drift from initial (bps)
-											if shouldReprice && repriceMaxDriftBps > 0 {
+											if shouldReprice && t.cfg.RepriceMaxDriftBps > 0 {
 												driftBps := math.Abs((newLimitPx-initLimit)/initLimit) * 10000.0
-												if driftBps > repriceMaxDriftBps {
+												if driftBps > t.cfg.RepriceMaxDriftBps {
 													shouldReprice = false
 												}
 											}
 
 											// Guard: minimum improvement in ticks (directional)
-											if shouldReprice && tick > 0 && repriceMinImproTicks > 1 {
+											if shouldReprice && tick > 0 && t.cfg.RepriceMinImprovTicks > 1 {
 												improveTicks := int(math.Abs(newLimitPx-lastLimitPx) / tick)
 												// direction check: buy wants lower, sell wants higher
 												if side == SideBuy {
-													if !(newLimitPx < lastLimitPx && improveTicks >= repriceMinImproTicks) {
+													if !(newLimitPx < lastLimitPx && improveTicks >= t.cfg.RepriceMinImprovTicks) {
 														shouldReprice = false
 													}
 												} else {
-													if !(newLimitPx > lastLimitPx && improveTicks >= repriceMinImproTicks) {
+													if !(newLimitPx > lastLimitPx && improveTicks >= t.cfg.RepriceMinImprovTicks) {
 														shouldReprice = false
 													}
 												}
@@ -2036,9 +2024,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 											}
 
 											// Guard: min edge USD improvement
-											if shouldReprice && repriceMinEdgeUSD > 0 && newBase > 0 {
+											if shouldReprice && t.cfg.RepriceMinEdgeUSD > 0 && newBase > 0 {
 												edgeUSD := math.Abs(newLimitPx-lastLimitPx) * newBase
-												if edgeUSD < repriceMinEdgeUSD {
+												if edgeUSD < t.cfg.RepriceMinEdgeUSD {
 													shouldReprice = false
 												}
 											}
@@ -2816,19 +2804,7 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 			deadline := pcopy.Deadline
 
 			// --- ENV GUARDRAILS (read once per poller) ---
-			repriceEnabled := getEnvBool("REPRICE_ENABLE", true)
-			repriceMaxCount := getEnvInt("REPRICE_MAX_COUNT", 3)
-			repriceMaxDriftBps := getEnvFloat("REPRICE_MAX_DRIFT_BPS", 1.5) // 0 = unlimited
-			repriceMinImproTicks := getEnvInt("REPRICE_MIN_IMPROV_TICKS", 2)
-			if repriceMinImproTicks < 1 {
-				repriceMinImproTicks = 1
-			}
-			repriceIntervalMs := getEnvInt("REPRICE_INTERVAL_MS", 2000)
-			if repriceIntervalMs <= 0 {
-				repriceIntervalMs = 450
-			}
-			repriceMinEdgeUSD := getEnvFloat("REPRICE_MIN_EDGE_USD", 0.15)
-
+			
 			var repriceCount int
 
 		poll:
@@ -2851,8 +2827,8 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 				}
 
 				// 2) Periodic reprice (guarded)
-				if time.Since(lastReprice) >= time.Duration(repriceIntervalMs)*time.Millisecond {
-					if repriceEnabled && (repriceMaxCount <= 0 || repriceCount < repriceMaxCount) {
+				if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
+					if t.cfg.RepriceEnable && (t.cfg.RepriceMaxCount <= 0 || repriceCount < t.cfg.RepriceMaxCount) {
 						ctxPx, cancelPx := context.WithTimeout(pc, 1*time.Second)
 						px, gErr := b.GetNowPrice(ctxPx, productID)
 						cancelPx()
@@ -2869,22 +2845,22 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 							shouldReprice := (tick > 0 && math.Abs(newLimitPx-lastLimitPx) >= tick) || (tick <= 0 && newLimitPx != lastLimitPx)
 
 							// Guard: max drift from initial (bps)
-							if shouldReprice && repriceMaxDriftBps > 0 {
+							if shouldReprice && t.cfg.RepriceMaxDriftBps > 0 {
 								driftBps := math.Abs((newLimitPx-initLimit)/initLimit) * 10000.0
-								if driftBps > repriceMaxDriftBps {
+								if driftBps > t.cfg.RepriceMaxDriftBps {
 									shouldReprice = false
 								}
 							}
 
 							// Guard: minimum improvement ticks (directional)
-							if shouldReprice && tick > 0 && repriceMinImproTicks > 1 {
+							if shouldReprice && tick > 0 && t.cfg.RepriceMinImprovTicks > 1 {
 								improveTicks := int(math.Abs(newLimitPx-lastLimitPx) / tick)
 								if side == SideBuy {
-									if !(newLimitPx < lastLimitPx && improveTicks >= repriceMinImproTicks) {
+									if !(newLimitPx < lastLimitPx && improveTicks >= t.cfg.RepriceMinImprovTicks) {
 										shouldReprice = false
 									}
 								} else {
-									if !(newLimitPx > lastLimitPx && improveTicks >= repriceMinImproTicks) {
+									if !(newLimitPx > lastLimitPx && improveTicks >= t.cfg.RepriceMinImprovTicks) {
 										shouldReprice = false
 									}
 								}
@@ -2900,9 +2876,9 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 							}
 
 							// Guard: min edge USD
-							if shouldReprice && repriceMinEdgeUSD > 0 && newBase > 0 {
+							if shouldReprice && t.cfg.RepriceMinEdgeUSD > 0 && newBase > 0 {
 								edgeUSD := math.Abs(newLimitPx-lastLimitPx) * newBase
-								if edgeUSD < repriceMinEdgeUSD {
+								if edgeUSD < t.cfg.RepriceMinEdgeUSD {
 									shouldReprice = false
 								}
 							}

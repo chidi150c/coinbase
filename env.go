@@ -105,13 +105,13 @@ func loadBotEnv() {
 		"PYRAMID_DECAY_MIN_PCT": {},
 
 		// tick/candle sync & risk
-		"USE_TICK_PRICE":        {},
-		"TICK_INTERVAL_SEC":     {},
-		"CANDLE_RESYNC_SEC":     {},
-		"DAILY_BREAKER_MARK_TO_MARKET": {},
-		"FEE_RATE_PCT":                 {},
-		"MAX_CONCURRENT_LOTS":          {},
-		"STATE_FILE":                   {},
+		"USE_TICK_PRICE":                 {},
+		"TICK_INTERVAL_SEC":              {},
+		"CANDLE_RESYNC_SEC":              {},
+		"DAILY_BREAKER_MARK_TO_MARKET":   {},
+		"FEE_RATE_PCT":                   {},
+		"MAX_CONCURRENT_LOTS":            {},
+		"STATE_FILE":                     {},
 
 		// trailing & tp-decay (optional)
 		"TRAIL_ACTIVATE_PCT":    {},
@@ -136,6 +136,14 @@ func loadBotEnv() {
 		"LIMIT_TIMEOUT_SEC":      {},
 		"TP_MAKER_OFFSET_BPS":    {},
 
+		// --- repricer (maker-chase) guardrails ---
+		"REPRICE_ENABLE":           {},
+		"REPRICE_INTERVAL_MS":      {},
+		"REPRICE_MIN_IMPROV_TICKS": {},
+		"REPRICE_MIN_EDGE_USD":     {},
+		"REPRICE_MAX_DRIFT_BPS":    {},
+		"REPRICE_MAX_COUNT":        {},
+
 		// ramping
 		"RAMP_ENABLE":    {},
 		"RAMP_MODE":      {},
@@ -149,6 +157,7 @@ func loadBotEnv() {
 		"PERSIST_STATE":     {},
 		"USE_LIVE_EQUITY":   {},
 		"SLACK_WEBHOOK":     {},
+		"LOG_LEVEL":         {},
 
 		// history depth
 		"MAX_HISTORY_CANDLES": {},
@@ -164,6 +173,7 @@ func loadBotEnv() {
 		// normalized venue filters (added)
 		"PRICE_TICK":   {},
 		"MIN_NOTIONAL": {},
+		"FORCE_FILTERS_REMOTE": {},
 
 		// broker selection + Binance keys
 		"BROKER":                 {}, // "binance" selects direct Binance broker; empty keeps current path

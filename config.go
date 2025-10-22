@@ -56,10 +56,10 @@ type Config struct {
 	LiveEquity bool // if true, rebase & refresh equity from live balances
 
 	// Order entry (unprefixed; universal)
-	OrderType           string // "market" or "limit"
-	LimitPriceOffsetBps float64    // maker price offset from mid in bps
-	SpreadMinBps        float64    // minimum spread (bps) to attempt maker entry
-	LimitTimeoutSec     int    // cancel-and-market fallback timeout (seconds)
+	OrderType           string  // "market" or "limit"
+	LimitPriceOffsetBps float64 // maker price offset from mid in bps
+	SpreadMinBps        float64 // minimum spread (bps) to attempt maker entry
+	LimitTimeoutSec     int     // cancel-and-market fallback timeout (seconds)
 
 	// ---------- Migrated (Bucket B) knobs ----------
 
@@ -86,22 +86,30 @@ type Config struct {
 	TPMakerOffsetBps        float64 // maker offset for fixed-TP exits
 
 	// Ramping
-	RampEnable  bool
-	RampMode    string
+	RampEnable   bool
+	RampMode     string
 	RampStartPct float64
 	RampStepPct  float64
 	RampGrowth   float64
 	RampMaxPct   float64
 
 	// Equity/reporting/runtime
-	ExitHistorySize  int
-	PersistState     bool
+	ExitHistorySize   int
+	PersistState      bool
 	MaxConcurrentLots int
 
 	// Paper/override helpers
-	PaperBaseBalance float64
-	BaseAsset        string
+	PaperBaseBalance  float64
+	BaseAsset         string
 	PaperQuoteBalance float64
+
+	// Repricer (maker-chase) guardrails
+	RepriceEnable         bool
+	RepriceIntervalMs     int
+	RepriceMinImprovTicks int
+	RepriceMinEdgeUSD     float64
+	RepriceMaxDriftBps    float64
+	RepriceMaxCount       int
 }
 
 // loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
@@ -172,8 +180,8 @@ func loadConfigFromEnv() Config {
 		TPMakerOffsetBps:       getEnvFloat("TP_MAKER_OFFSET_BPS", 0.0),
 
 		// Ramping
-		RampEnable:  getEnvBool("RAMP_ENABLE", false),
-		RampMode:    getEnv("RAMP_MODE", "linear"),
+		RampEnable:   getEnvBool("RAMP_ENABLE", false),
+		RampMode:     getEnv("RAMP_MODE", "linear"),
 		RampStartPct: getEnvFloat("RAMP_START_PCT", 0.0),
 		RampStepPct:  getEnvFloat("RAMP_STEP_PCT", 0.0),
 		RampGrowth:   getEnvFloat("RAMP_GROWTH", 1.0),
@@ -188,6 +196,14 @@ func loadConfigFromEnv() Config {
 		PaperBaseBalance:  getEnvFloat("PAPER_BASE_BALANCE", 0.0),
 		BaseAsset:         getEnv("BASE_ASSET", ""),
 		PaperQuoteBalance: getEnvFloat("PAPER_QUOTE_BALANCE", 0.0),
+
+		// Repricer (maker-chase) guardrails
+		RepriceEnable:         getEnvBool("REPRICE_ENABLE", true),
+		RepriceIntervalMs:     getEnvInt("REPRICE_INTERVAL_MS", 2000),
+		RepriceMinImprovTicks: getEnvInt("REPRICE_MIN_IMPROV_TICKS",2),
+		RepriceMinEdgeUSD:     getEnvFloat("REPRICE_MIN_EDGE_USD", 0.15),
+		RepriceMaxDriftBps:    getEnvFloat("REPRICE_MAX_DRIFT_BPS", 1.5),
+		RepriceMaxCount:       getEnvInt("REPRICE_MAX_COUNT", 2),
 	}
 
 	// Historical carry-over: if someone still sets BROKER=X, we may still
@@ -205,22 +221,22 @@ func (c *Config) UseLiveEquity() bool {
 	return getEnvBool("USE_LIVE_EQUITY", c.LiveEquity)
 }
 
-func (c *Config) SetPriceTick(){
+func (c *Config) SetPriceTick() {
 	pt := getEnvFloat("PRICE_TICK", 0.0)
 	c.PriceTick = pt
 }
 
-func (c *Config) SetBaseStep(){
-	pt :=  getEnvFloat("BASE_STEP", 0.0)
+func (c *Config) SetBaseStep() {
+	pt := getEnvFloat("BASE_STEP", 0.0)
 	c.BaseStep = pt
 }
 
-func (c *Config) SetQuoteStep(){
+func (c *Config) SetQuoteStep() {
 	pt := getEnvFloat("QUOTE_STEP", 0.0)
 	c.QuoteStep = pt
 }
 
-func (c *Config) SetMinNotional(){
+func (c *Config) SetMinNotional() {
 	pt := getEnvFloat("MIN_NOTIONAL", 0.0)
 	c.MinNotional = pt
 }
