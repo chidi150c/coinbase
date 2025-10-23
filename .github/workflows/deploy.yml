@@ -19,6 +19,7 @@ jobs:
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
+          set -euo pipefail
           install -m 700 -d ~/.ssh
           printf "%s" "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
@@ -27,9 +28,10 @@ jobs:
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
         run: |
+          set -euo pipefail
           ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
 
-      - name: Deploy (git sync + compose rollout)
+      - name: Deploy (git sync + hard rollout with prune of ALL old images)
         env:
           SSH_HOST:   ${{ secrets.SSH_HOST }}
           SSH_USER:   ${{ secrets.SSH_USER }}
@@ -38,10 +40,9 @@ jobs:
           GIT_SHA:    ${{ github.sha }}
           HUMAN_TAG:  ${{ github.ref_name }}
           GHCR_NS:    ${{ vars.GHCR_NS }}
-          GHCR_USER:  ${{ github.repository_owner }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ssh -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" bash -s -- "$DEPLOY_DIR" "$REPO_URL" "$GIT_SHA" "$HUMAN_TAG" "$GHCR_NS" "$GHCR_USER" "$GHCR_TOKEN" <<'EOF'
+          set -euo pipefail
+          ssh -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" bash -s -- "$DEPLOY_DIR" "$REPO_URL" "$GIT_SHA" "$HUMAN_TAG" "$GHCR_NS" <<'EOF'
           set -euo pipefail
 
           DEPLOY_DIR="${1:-/home/chidi/coinbase/monitoring}"
@@ -49,17 +50,11 @@ jobs:
           GIT_SHA_IN="$3"
           HUMAN_TAG_IN="$4"
           GHCR_NS_IN="${5:-}"
-          GHCR_USER_IN="${6:-}"
-          GHCR_TOKEN_IN="${7:-}"
-
-          # Ensure git is present (Ubuntu images typically have it)
-          command -v git >/dev/null 2>&1 || { echo "git not found on remote"; exit 1; }
-
           REPO_DIR="$(dirname "$DEPLOY_DIR")"
-          mkdir -p "$REPO_DIR"
 
-          # Sync repo to origin/main
+          # --- Sync repo ---
           if [ ! -d "$REPO_DIR/.git" ]; then
+            mkdir -p "$REPO_DIR"
             git clone "$REPO_URL" "$REPO_DIR"
           else
             git -C "$REPO_DIR" remote set-url origin "$REPO_URL"
@@ -69,15 +64,15 @@ jobs:
 
           cd "$DEPLOY_DIR"
 
-          # Patch docker-compose image namespace and bot tags (idempotent)
+          # --- Patch compose refs (idempotent) ---
           if [ -f docker-compose.yml ]; then
-            # Namespace -> ghcr.io/${GHCR_NS:-chidi150c}
+            # namespace -> ghcr.io/${GHCR_NS:-chidi150c}
             sed -i 's#ghcr.io/chidi150c/#ghcr.io/${GHCR_NS:-chidi150c}/#g' docker-compose.yml
-            # Tag all bot images with ${IMAGE_SHA} instead of :latest
+            # ensure coinbase-bot images use ${IMAGE_SHA} (if you still have :latest)
             sed -i 's#\(ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot\):latest#\1:${IMAGE_SHA}#g' docker-compose.yml
           fi
 
-          # Inject CI/CD identity for compose
+          # --- Inject CI identity for compose ---
           cat > .env.ci <<ENVVARS
           GIT_SHA=${GIT_SHA_IN}
           IMAGE_SHA=${GIT_SHA_IN}
@@ -85,28 +80,48 @@ jobs:
           GHCR_NS=${GHCR_NS_IN}
           ENVVARS
 
-          # Make sure docker is reachable
-          docker info >/dev/null
+          # ================= HARD ROLLOUT =================
+          # 1) Stop stack
+          docker compose --env-file .env.ci down
 
-          # Log in to GHCR on the remote (so pulls aren’t anonymous)
-          if [ -n "${GHCR_USER_IN}" ] && [ -n "${GHCR_TOKEN_IN}" ]; then
-            echo "${GHCR_TOKEN_IN}" | docker login ghcr.io -u "${GHCR_USER_IN}" --password-stdin
-          fi
+          # 2) Remove ALL old images for our repos (not just "unused")
+          NS="${GHCR_NS_IN:-chidi150c}"
+          KEEP="${GIT_SHA_IN}"
 
-          # Stop/remove any dead services before recreate (safe prune: no volumes)
-          docker system prune -f || true
-          docker image prune -a -f || true
+          remove_old_repo_keep_sha () {
+            # Keep only :$KEEP, delete every other tag (including :main, older SHAs)
+            local repo="$1"
+            docker image ls --format '{{.Repository}}:{{.Tag}}' "ghcr.io/${NS}/${repo}" \
+              | grep -v '<none>' \
+              | awk -F: -v keep="${KEEP}" -v repo="ghcr.io/${NS}/${repo}" '
+                  $0 == repo":"keep { next } { print $0 }
+                ' \
+              | xargs -r docker rmi -f || true
+          }
 
-          # Pull latest tags for everything defined in compose (no arrays)
+          remove_all_repo () {
+            # Delete every tag for a repo (used for :latest repos so compose re-pulls)
+            local repo="$1"
+            docker image ls --format '{{.Repository}}:{{.Tag}}' "ghcr.io/${NS}/${repo}" \
+              | grep -v '<none>' \
+              | xargs -r docker rmi -f || true
+          }
+
+          # SHA-pinned in compose: keep only current SHA
+          remove_old_repo_keep_sha "coinbase-bot"
+          remove_old_repo_keep_sha "coinbase-bridge-binance"
+
+          # latest in compose: remove all so a fresh pull happens
+          remove_all_repo "coinbase-bridge"
+          remove_all_repo "coinbase-bridge-hitbtc"
+
+          # 3) Global sweeps for leftovers/dangling
+          docker image prune -af || true
+          docker builder prune -af || true
+
+          # 4) Pull exact images (SHA & latest)
           docker compose --env-file .env.ci pull --ignore-pull-failures
 
-          # Force recreate all services with fresh images (no arrays)
-          docker compose --env-file .env.ci up -d --pull=always --force-recreate
-
-          # Optional sanity: show what’s running and which images are in use
-          docker compose ps
-          docker image ls --digests "ghcr.io/${GHCR_NS_IN:-chidi150c}/coinbase-bot" \
-                                   "ghcr.io/${GHCR_NS_IN:-chidi150c}/coinbase-bridge" \
-                                   "ghcr.io/${GHCR_NS_IN:-chidi150c}/coinbase-bridge-binance" \
-                                   "ghcr.io/${GHCR_NS_IN:-chidi150c}/coinbase-bridge-hitbtc" || true
+          # 5) Bring stack up fresh
+          docker compose --env-file .env.ci up -d --force-recreate
           EOF
