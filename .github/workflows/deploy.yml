@@ -19,7 +19,6 @@ jobs:
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
-          set -euo pipefail
           install -m 700 -d ~/.ssh
           printf "%s" "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
@@ -28,10 +27,9 @@ jobs:
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
         run: |
-          set -euo pipefail
           ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
 
-      - name: Deploy (git sync + hard rollout with prune of ALL old images)
+      - name: Deploy (git sync + compose rollout with pre-launch prune)
         env:
           SSH_HOST:   ${{ secrets.SSH_HOST }}
           SSH_USER:   ${{ secrets.SSH_USER }}
@@ -41,7 +39,6 @@ jobs:
           HUMAN_TAG:  ${{ github.ref_name }}
           GHCR_NS:    ${{ vars.GHCR_NS }}
         run: |
-          set -euo pipefail
           ssh -o StrictHostKeyChecking=yes "$SSH_USER@$SSH_HOST" bash -s -- "$DEPLOY_DIR" "$REPO_URL" "$GIT_SHA" "$HUMAN_TAG" "$GHCR_NS" <<'EOF'
           set -euo pipefail
 
@@ -50,9 +47,11 @@ jobs:
           GIT_SHA_IN="$3"
           HUMAN_TAG_IN="$4"
           GHCR_NS_IN="${5:-}"
+          : "${GHCR_NS_IN:=chidi150c}"
+
           REPO_DIR="$(dirname "$DEPLOY_DIR")"
 
-          # --- Sync repo ---
+          # --- 1) Sync repo ---
           if [ ! -d "$REPO_DIR/.git" ]; then
             mkdir -p "$REPO_DIR"
             git clone "$REPO_URL" "$REPO_DIR"
@@ -64,15 +63,17 @@ jobs:
 
           cd "$DEPLOY_DIR"
 
-          # --- Patch compose refs (idempotent) ---
+          # --- 2) Patch docker-compose.yml (namespace + tag pinning) ---
+          # Replace ghcr.io/chidi150c with templated namespace
           if [ -f docker-compose.yml ]; then
-            # namespace -> ghcr.io/${GHCR_NS:-chidi150c}
             sed -i 's#ghcr.io/chidi150c/#ghcr.io/${GHCR_NS:-chidi150c}/#g' docker-compose.yml
-            # ensure coinbase-bot images use ${IMAGE_SHA} (if you still have :latest)
-            sed -i 's#\(ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot\):latest#\1:${IMAGE_SHA}#g' docker-compose.yml
+            # Pin bot and binance bridge services to ${IMAGE_SHA}
+            sed -i 's#\(ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bot\):.*#\1:${IMAGE_SHA}#g' docker-compose.yml
+            sed -i 's#\(ghcr.io/${GHCR_NS:-chidi150c}/coinbase-bridge-binance\):.*#\1:${IMAGE_SHA}#g' docker-compose.yml
+            # Leave the generic bridge service on :latest as you requested
           fi
 
-          # --- Inject CI identity for compose ---
+          # --- 3) Inject CI env for compose ---
           cat > .env.ci <<ENVVARS
           GIT_SHA=${GIT_SHA_IN}
           IMAGE_SHA=${GIT_SHA_IN}
@@ -80,48 +81,41 @@ jobs:
           GHCR_NS=${GHCR_NS_IN}
           ENVVARS
 
-          # ================= HARD ROLLOUT =================
-          # 1) Stop stack
-          docker compose --env-file .env.ci down
+          # --- 4) Bring down stack BEFORE pruning images ---
+          # This ensures no image is "in use" so we can prune ALL old tags.
+          docker compose --env-file .env.ci down --remove-orphans || true
 
-          # 2) Remove ALL old images for our repos (not just "unused")
-          NS="${GHCR_NS_IN:-chidi150c}"
-          KEEP="${GIT_SHA_IN}"
+          # --- 5) PRUNE ALL OLD IMAGES (repo-scoped hard prune) BEFORE LAUNCH ---
+          # We remove ALL local images for these repos so compose will re-pull fresh tags.
+          # This is stronger than 'prune dangling' and matches your requirement.
+          REPOS=(
+            "coinbase-bot"
+            "coinbase-bridge-binance"
+            "coinbase-bridge"
+            "coinbase-bridge-hitbtc"
+          )
 
-          remove_old_repo_keep_sha () {
-            # Keep only :$KEEP, delete every other tag (including :main, older SHAs)
-            local repo="$1"
-            docker image ls --format '{{.Repository}}:{{.Tag}}' "ghcr.io/${NS}/${repo}" \
-              | grep -v '<none>' \
-              | awk -F: -v keep="${KEEP}" -v repo="ghcr.io/${NS}/${repo}" '
-                  $0 == repo":"keep { next } { print $0 }
-                ' \
-              | xargs -r docker rmi -f || true
-          }
+          for r in "${REPOS[@]}"; do
+            # Remove ALL images for each repo, regardless of tag
+            # Safe now because containers are down.
+            IDS=$(docker image ls -q "ghcr.io/${GHCR_NS_IN}/${r}" || true)
+            if [ -n "${IDS:-}" ]; then
+              echo "Removing images for ghcr.io/${GHCR_NS_IN}/${r}:"
+              echo "${IDS}" | xargs -r docker image rm -f
+            fi
+          done
 
-          remove_all_repo () {
-            # Delete every tag for a repo (used for :latest repos so compose re-pulls)
-            local repo="$1"
-            docker image ls --format '{{.Repository}}:{{.Tag}}' "ghcr.io/${NS}/${repo}" \
-              | grep -v '<none>' \
-              | xargs -r docker rmi -f || true
-          }
-
-          # SHA-pinned in compose: keep only current SHA
-          remove_old_repo_keep_sha "coinbase-bot"
-          remove_old_repo_keep_sha "coinbase-bridge-binance"
-
-          # latest in compose: remove all so a fresh pull happens
-          remove_all_repo "coinbase-bridge"
-          remove_all_repo "coinbase-bridge-hitbtc"
-
-          # 3) Global sweeps for leftovers/dangling
+          # Optional: also clear dangling layers after the hard prune
           docker image prune -af || true
-          docker builder prune -af || true
 
-          # 4) Pull exact images (SHA & latest)
-          docker compose --env-file .env.ci pull --ignore-pull-failures
+          # --- 6) Launch fresh (pull always, force recreate) ---
+          docker compose --env-file .env.ci up -d --pull=always --force-recreate
 
-          # 5) Bring stack up fresh
-          docker compose --env-file .env.ci up -d --force-recreate
+          # --- 7) Quick sanity: show what actually launched ---
+          echo
+          echo "== Running containers =="
+          docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+          echo
+          echo "== Compose images =="
+          docker compose --env-file .env.ci images
           EOF
