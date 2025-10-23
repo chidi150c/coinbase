@@ -82,7 +82,7 @@ func (d Decision) SignalToSide() OrderSide {
 }
 
 // decide computes a trading decision from recent candles and the model.
-func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit) Decision {
+func decide(c []Candle, m *AIMicroModel, mdl *ExtendedLogit, buyThreshold float64, sellThreshold float64, useMAFilter bool) Decision {
 	if len(c) < 40 {
 		return Decision{Signal: Flat, Confidence: 0, Reason: "not_enough_data", PUp: 0.0}
 	}

@@ -224,14 +224,3 @@ func loadBotEnv() {
 
 // --------- Tunable strategy thresholds (initialized in main) ---------
 
-var (
-	buyThreshold  float64
-	sellThreshold float64
-	useMAFilter   bool
-)
-
-func initThresholdsFromEnv() {
-	buyThreshold = getEnvFloat("BUY_THRESHOLD", 0.55)
-	sellThreshold = getEnvFloat("SELL_THRESHOLD", 0.45)
-	useMAFilter = getEnvBool("USE_MA_FILTER", true)
-}

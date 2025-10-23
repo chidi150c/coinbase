@@ -75,50 +75,52 @@ import (
 )
 
 // ---- Core tick ----
+// safeSend ensures we deliver a result even if the buffer is momentarily full.
+// It will drop one stale item from the channel buffer and resend the latest.
 func safeSend(ch chan OpenResult, res OpenResult) {
-    select {
-    case ch <- res:
-    default:
-        log.Printf("TRACE fallback.buffer.full: empty the buffer (drop stale) and resending") 
-        select {
-        case <-ch:
-        default:
-        }
+	select {
+	case ch <- res:
+	default:
+		log.Printf("TRACE fallback.buffer.full: empty the buffer (drop stale) and resending")
+		select {
+		case <-ch:
+		default:
+		}
 		log.Printf("TRACE fallback.buffer.emptied: emptied buffer and resending")
-        ch <- res
-    }
+		ch <- res
+	}
 }
 
-// helper (recommended)
+// helper (recommended): persist pending changes safely under lock
 func (t *Trader) repriceUpdatePending(side OrderSide, newID string, newLimitPx, newBase float64) {
-    t.mu.Lock()
-    defer t.mu.Unlock()
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
-    var p *PendingOpen
-    if side == SideBuy {
-        p = t.pendingBuy
-    } else {
-        p = t.pendingSell
-    }
-    if p == nil {
-        return
-    }
+	var p *PendingOpen
+	if side == SideBuy {
+		p = t.pendingBuy
+	} else {
+		p = t.pendingSell
+	}
+	if p == nil {
+		return
+	}
 
-    // append previous id to history (if any), cap to last 5
-    if p.OrderID != "" {
-        p.History = append(p.History, p.OrderID)
-        if len(p.History) > 5 {
-            p.History = p.History[len(p.History)-5:]
-        }
-    }
+	// append previous id to history (if any), cap to last 5
+	if p.OrderID != "" {
+		p.History = append(p.History, p.OrderID)
+		if len(p.History) > 5 {
+			p.History = p.History[len(p.History)-5:]
+		}
+	}
 
-    // transfer focus to the new live order
-    p.OrderID = newID
-    p.LimitPx = newLimitPx
-    p.BaseAtLimit = newBase
+	// transfer focus to the new live order
+	p.OrderID = newID
+	p.LimitPx = newLimitPx
+	p.BaseAtLimit = newBase
 
-    // persist immediately so state reflects the current live order
-    _ = t.saveStateFrom(t.snapshotStateLocked())
+	// persist immediately so state reflects the current live order
+	_ = t.saveStateFrom(t.snapshotStateLocked())
 }
 
 // maybeRepriceOnce tries a single reprice pass for the current pending order.
@@ -129,116 +131,115 @@ func (t *Trader) repriceUpdatePending(side OrderSide, newID string, newLimitPx, 
 //   didReprice        → true if we re-priced (placed a new order)
 // NOTE: caller should throttle by interval (e.g., time.Since(lastReprice) >= cfg.RepriceIntervalMs).
 func (t *Trader) maybeRepriceOnce(
-    pctx context.Context,
-    side OrderSide,
-    orderID string,
-    initLimitPx float64,
-    initBaseAtLimit float64,
-    lastLimitPx float64,
-    offsetBps float64,
-    pend *PendingOpen,
-    repriceCount int,
+	pctx context.Context,
+	side OrderSide,
+	orderID string,
+	initLimitPx float64,
+	initBaseAtLimit float64,
+	lastLimitPx float64,
+	offsetBps float64,
+	pend *PendingOpen,
+	repriceCount int,
 ) (string, float64, int, bool) {
 
-    // Global guards
-    if !t.cfg.RepriceEnable {
-        return orderID, lastLimitPx, repriceCount, false
-    }
-    if t.cfg.RepriceMaxCount > 0 && repriceCount >= t.cfg.RepriceMaxCount {
-        return orderID, lastLimitPx, repriceCount, false
-    }
+	// Global guards
+	if !t.cfg.RepriceEnable {
+		return orderID, lastLimitPx, repriceCount, false
+	}
+	if t.cfg.RepriceMaxCount > 0 && repriceCount >= t.cfg.RepriceMaxCount {
+		return orderID, lastLimitPx, repriceCount, false
+	}
 
-    // Fresh snap with small timeout
-    ctxPx, cancelPx := context.WithTimeout(pctx, 1*time.Second)
-    px, gErr := t.broker.GetNowPrice(ctxPx, t.cfg.ProductID)
-    cancelPx()
-    if gErr != nil || px <= 0 {
-        return orderID, lastLimitPx, repriceCount, false
-    }
+	// Fresh snap with small timeout
+	ctxPx, cancelPx := context.WithTimeout(pctx, 1*time.Second)
+	px, gErr := t.broker.GetNowPrice(ctxPx, t.cfg.ProductID)
+	cancelPx()
+	if gErr != nil || px <= 0 {
+		return orderID, lastLimitPx, repriceCount, false
+	}
 
-    // Recompute target limit with same offset
-    newLimitPx := px
-    if side == SideBuy {
-        newLimitPx = px * (1.0 - offsetBps/10000.0)
-    } else {
-        newLimitPx = px * (1.0 + offsetBps/10000.0)
-    }
+	// Recompute target limit with same offset
+	newLimitPx := px
+	if side == SideBuy {
+		newLimitPx = px * (1.0 - offsetBps/10000.0)
+	} else {
+		newLimitPx = px * (1.0 + offsetBps/10000.0)
+	}
 
-    // Snap to tick if configured
-    tick := t.cfg.PriceTick
-    if tick > 0 {
-        newLimitPx = math.Floor(newLimitPx/tick) * tick
-    }
+	// Snap to tick if configured
+	tick := t.cfg.PriceTick
+	if tick > 0 {
+		newLimitPx = math.Floor(newLimitPx/tick) * tick
+	}
 
-    // Baseline: only reprice if snapped price changed
-    shouldReprice := (tick > 0 && math.Abs(newLimitPx-lastLimitPx) >= tick) || (tick <= 0 && newLimitPx != lastLimitPx)
+	// Baseline: only reprice if snapped price changed
+	shouldReprice := (tick > 0 && math.Abs(newLimitPx-lastLimitPx) >= tick) || (tick <= 0 && newLimitPx != lastLimitPx)
 
-    // Guard: max drift from initial (bps)
-    if shouldReprice && t.cfg.RepriceMaxDriftBps > 0 {
-        driftBps := math.Abs((newLimitPx-initLimitPx)/initLimitPx) * 10000.0
-        if driftBps > t.cfg.RepriceMaxDriftBps {
-            shouldReprice = false
-        }
-    }
+	// Guard: max drift from initial (bps)
+	if shouldReprice && t.cfg.RepriceMaxDriftBps > 0 {
+		driftBps := math.Abs((newLimitPx-initLimitPx)/initLimitPx) * 10000.0
+		if driftBps > t.cfg.RepriceMaxDriftBps {
+			shouldReprice = false
+		}
+	}
 
-    // Recompute base from original quote for edge calc & placement
-    newBase := initBaseAtLimit
-    if pend != nil && pend.Quote > 0 {
-        newBase = pend.Quote / newLimitPx
-    }
-    // Snap base to step
-    if t.cfg.BaseStep > 0 {
-        newBase = math.Floor(newBase/t.cfg.BaseStep) * t.cfg.BaseStep
-    }
+	// Recompute base from original quote for edge calc & placement
+	newBase := initBaseAtLimit
+	if pend != nil && pend.Quote > 0 {
+		newBase = pend.Quote / newLimitPx
+	}
+	// Snap base to step
+	if t.cfg.BaseStep > 0 {
+		newBase = math.Floor(newBase/t.cfg.BaseStep) * t.cfg.BaseStep
+	}
 
-    // Guard: minimum improvement in ticks (directional)
-    if shouldReprice && tick > 0 && t.cfg.RepriceMinImprovTicks > 1 {
-        improveTicks := int(math.Abs(newLimitPx-lastLimitPx) / tick)
-        if side == SideBuy {
-            if !(newLimitPx < lastLimitPx && improveTicks >= t.cfg.RepriceMinImprovTicks) {
-                shouldReprice = false
-            }
-        } else {
-            if !(newLimitPx > lastLimitPx && improveTicks >= t.cfg.RepriceMinImprovTicks) {
-                shouldReprice = false
-            }
-        }
-    }
+	// Guard: minimum improvement in ticks (directional)
+	if shouldReprice && tick > 0 && t.cfg.RepriceMinImprovTicks > 1 {
+		improveTicks := int(math.Abs(newLimitPx-lastLimitPx) / tick)
+		if side == SideBuy {
+			if !(newLimitPx < lastLimitPx && improveTicks >= t.cfg.RepriceMinImprovTicks) {
+				shouldReprice = false
+			}
+		} else {
+			if !(newLimitPx > lastLimitPx && improveTicks >= t.cfg.RepriceMinImprovTicks) {
+				shouldReprice = false
+			}
+		}
+	}
 
-    // Guard: min edge USD improvement
-    if shouldReprice && t.cfg.RepriceMinEdgeUSD > 0 && newBase > 0 {
-        edgeUSD := math.Abs(newLimitPx-lastLimitPx) * newBase
-        if edgeUSD < t.cfg.RepriceMinEdgeUSD {
-            shouldReprice = false
-        }
-    }
+	// Guard: min edge USD improvement
+	if shouldReprice && t.cfg.RepriceMinEdgeUSD > 0 && newBase > 0 {
+		edgeUSD := math.Abs(newLimitPx-lastLimitPx) * newBase
+		if edgeUSD < t.cfg.RepriceMinEdgeUSD {
+			shouldReprice = false
+		}
+	}
 
-    // Ensure min-notional for the reprice candidate
-    if shouldReprice && !(newBase > 0 && newBase*newLimitPx >= t.cfg.MinNotional) {
-        shouldReprice = false
-    }
+	// Ensure min-notional for the reprice candidate
+	if shouldReprice && !(newBase > 0 && newBase*newLimitPx >= t.cfg.MinNotional) {
+		shouldReprice = false
+	}
 
-    if !shouldReprice {
-        return orderID, lastLimitPx, repriceCount, false
-    }
+	if !shouldReprice {
+		return orderID, lastLimitPx, repriceCount, false
+	}
 
-    // Cancel current and re-place at the new price
-    _ = t.broker.CancelOrder(pctx, t.cfg.ProductID, orderID)
-    newID, perr := t.broker.PlaceLimitPostOnly(pctx, t.cfg.ProductID, side, newLimitPx, newBase)
-    if perr != nil || strings.TrimSpace(newID) == "" {
-        return orderID, lastLimitPx, repriceCount, false
-    }
+	// Cancel current and re-place at the new price
+	_ = t.broker.CancelOrder(pctx, t.cfg.ProductID, orderID)
+	newID, perr := t.broker.PlaceLimitPostOnly(pctx, t.cfg.ProductID, side, newLimitPx, newBase)
+	if perr != nil || strings.TrimSpace(newID) == "" {
+		return orderID, lastLimitPx, repriceCount, false
+	}
 
-    log.Printf("TRACE postonly.reprice side=%s old_id=%s new_id=%s limit=%.8f baseReq=%.8f",
-        side, orderID, newID, newLimitPx, newBase)
+	log.Printf("TRACE postonly.reprice side=%s old_id=%s new_id=%s limit=%.8f baseReq=%.8f",
+		side, orderID, newID, newLimitPx, newBase)
 
-    // Update focus to new order + persist (also appends old ID to History)
-    t.repriceUpdatePending(side, newID, newLimitPx, newBase)
+	// Update focus to new order + persist (also appends old ID to History)
+	t.repriceUpdatePending(side, newID, newLimitPx, newBase)
 
-    // Return updated state
-    return newID, newLimitPx, repriceCount + 1, true
+	// Return updated state
+	return newID, newLimitPx, repriceCount + 1, true
 }
-
 
 // step consumes the current candle history and may place/close a position.
 // It returns a human-readable status string for logging.
@@ -272,7 +273,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 						accept = true
 					} else {
 						for _, hid := range t.pendingBuy.History {
-							if res.OrderID == hid { accept = true; break }
+							if res.OrderID == hid {
+								accept = true
+								break
+							}
 						}
 					}
 				} else {
@@ -287,9 +291,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				side := SideBuy
 				book := t.book(side)
 				priceToUse := res.Placed.Price
-				baseToUse  := res.Placed.BaseSize
+				baseToUse := res.Placed.BaseSize
 				quoteSpent := res.Placed.QuoteSpent
-				entryFee   := res.Placed.CommissionUSD
+				entryFee := res.Placed.CommissionUSD
 				if entryFee <= 0 {
 					entryFee = quoteSpent * (t.cfg.FeeRatePct / 100.0)
 				}
@@ -307,29 +311,27 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 				if t.pendingBuy != nil {
 					newLot.Reason = t.pendingBuy.Reason
-					newLot.Take   = t.pendingBuy.Take
-					if t.pendingBuy.EquityBuy {
-						book.RunnerID = len(book.Lots) - 1
-						r := book.Lots[book.RunnerID]
-						r.TrailActive = false
-						r.TrailPeak = r.OpenPrice
-						r.TrailStop = 0
-						t.applyRunnerTargets(r)
-						log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", book.RunnerID, side, r.OpenPrice, r.Take)
-					}
+					newLot.Take = t.pendingBuy.Take
 				}
-
 				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
-
+				if t.pendingBuy != nil && t.pendingBuy.EquityBuy {
+					book.RunnerID = len(book.Lots) - 1 // the newly appended lot
+					r := book.Lots[book.RunnerID]
+					r.TrailActive = false
+					r.TrailPeak = r.OpenPrice
+					r.TrailStop = 0
+					t.applyRunnerTargets(r)
+					log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", book.RunnerID, side, r.OpenPrice, r.Take)
+				}
 				// side-specific resets...
-				t.lastAddBuy   = wallNow
-				t.winLowBuy    = priceToUse
+				t.lastAddBuy = wallNow
+				t.winLowBuy = priceToUse
 				t.latchedGateBuy = 0
 				old := t.lastAddEquityBuy
 				t.lastAddEquityBuy = t.equityUSD
 				log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquityBuy)
-				
+
 				msg := fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
 					side, quoteSpent, newLot.Take, entryFee, newLot.Reason, "async postonly filled")
 				if t.cfg.Extended().UseDirectSlack {
@@ -346,7 +348,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			}
 
 			// Cancel & clear pending either way
-			if t.pendingBuyCancel != nil { t.pendingBuyCancel() }
+			if t.pendingBuyCancel != nil {
+				t.pendingBuyCancel()
+			}
 			t.pendingBuy = nil
 			t.pendingBuyCtx = nil
 			t.pendingBuyCancel = nil
@@ -369,7 +373,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 						accept = true
 					} else {
 						for _, hid := range t.pendingSell.History {
-							if res.OrderID == hid { accept = true; break }
+							if res.OrderID == hid {
+								accept = true
+								break
+							}
 						}
 					}
 				} else {
@@ -384,9 +391,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				side := SideSell
 				book := t.book(side)
 				priceToUse := res.Placed.Price
-				baseToUse  := res.Placed.BaseSize
+				baseToUse := res.Placed.BaseSize
 				quoteSpent := res.Placed.QuoteSpent
-				entryFee   := res.Placed.CommissionUSD
+				entryFee := res.Placed.CommissionUSD
 				if entryFee <= 0 {
 					entryFee = quoteSpent * (t.cfg.FeeRatePct / 100.0)
 				}
@@ -402,21 +409,21 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					LotID:        t.NextLotSeq,
 					EntryOrderID: res.OrderID,
 				}
-				if t.pendingSell != nil{
+				if t.pendingSell != nil {
 					newLot.Reason = t.pendingSell.Reason
 					newLot.Take = t.pendingSell.Take
-					if t.pendingSell.EquitySell {
-						book.RunnerID = len(book.Lots) - 1
-						r := book.Lots[book.RunnerID]
-						r.TrailActive = false
-						r.TrailPeak = r.OpenPrice
-						r.TrailStop = 0
-						t.applyRunnerTargets(r)
-						log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", book.RunnerID, side, r.OpenPrice, r.Take)
-					}
 				}
 				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
+				if t.pendingSell != nil && t.pendingSell.EquitySell {
+					book.RunnerID = len(book.Lots) - 1 // the newly appended lot
+					r := book.Lots[book.RunnerID]
+					r.TrailActive = false
+					r.TrailPeak = r.OpenPrice
+					r.TrailStop = 0
+					t.applyRunnerTargets(r)
+					log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", book.RunnerID, side, r.OpenPrice, r.Take)
+				}
 				// side-specific resets...
 				t.lastAddSell = wallNow
 				t.winHighSell = priceToUse
@@ -424,26 +431,32 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				old := t.lastAddEquitySell
 				t.lastAddEquitySell = t.equityUSD
 				log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquitySell)
-				
+
 				msg := fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
 					side, quoteSpent, newLot.Take, entryFee, newLot.Reason, "async postonly filled")
 				if t.cfg.Extended().UseDirectSlack {
 					postSlack(msg)
 				}
 				// save
-				if err := t.saveStateNoLock(); err != nil { log.Printf("[WARN] saveState (filled SELL): %v", err) }
-			}else {
+				if err := t.saveStateNoLock(); err != nil {
+					log.Printf("[WARN] saveState (filled SELL): %v", err)
+				}
+			} else {
 				// Non-fill (timeout/error) → enable one market fallback
 				t.pendingRecheckSell = true
 				log.Printf("TRACE postonly.recheck side=%s set=true reason=timeout_or_error order_id=%s", SideSell, res.OrderID)
 			}
 
 			// Cancel & clear pending either way
-			if t.pendingSellCancel != nil { t.pendingSellCancel() }
+			if t.pendingSellCancel != nil {
+				t.pendingSellCancel()
+			}
 			t.pendingSell = nil
 			t.pendingSellCtx = nil
 			t.pendingSellCancel = nil
-			if err := t.saveStateNoLock(); err != nil { log.Printf("[WARN] saveState (drain SELL): %v", err)}
+			if err := t.saveStateNoLock(); err != nil {
+				log.Printf("[WARN] saveState (drain SELL): %v", err)
+			}
 		default:
 		}
 	}
@@ -676,10 +689,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	//---ADD path continues-----
 	// --------------------------------------------------------------------------------------------------------
-	d := decide(c, t.model, t.mdlExt)
+	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
 	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v",
-		totalLots, d.Signal, d.Reason, buyThreshold, sellThreshold, t.cfg.LongOnly)
+		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
 
@@ -1392,8 +1405,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 							lastLimitPx := initLimitPx
 							lastReprice := time.Now()
 
-							// --- ENV GUARDRAILS (read once per poller) ---
-							
+							// --- Session-level aggregates and per-order delta trackers ---
+							var sessBase, sessQuote, sessFee float64
+							var lastSeenBase, lastSeenQuote, lastSeenFee float64 // per current orderID
+
 							var repriceCount int
 
 						poll:
@@ -1404,38 +1419,56 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 									break poll
 								default:
 								}
+
 								// Check current order fill state first
 								ord, gErr := t.broker.GetOrder(pctx, t.cfg.ProductID, orderID)
 								if gErr == nil && ord != nil {
-									// Take the cumulative *on this order* as reported by Binance
-									pend.AccumBase  += ord.BaseSize     // cumulative for this order
-									pend.AccumQuote += ord.QuoteSpent
-									pend.AccumFeeUSD += ord.CommissionUSD
-									vwap := 0.0
-									if pend.AccumBase > 0 { vwap = pend.AccumQuote / pend.AccumBase }
-
-									placed := &PlacedOrder{
-										Price:         vwap,
-										BaseSize:      pend.AccumBase,
-										QuoteSpent:    pend.AccumQuote,
-										CommissionUSD: pend.AccumFeeUSD ,
+									// Compute deltas relative to this specific orderID
+									dBase := ord.BaseSize - lastSeenBase
+									dQuote := ord.QuoteSpent - lastSeenQuote
+									dFee := ord.CommissionUSD - lastSeenFee
+									if dBase < 0 {
+										dBase = 0
 									}
+									if dQuote < 0 {
+										dQuote = 0
+									}
+									if dFee < 0 {
+										dFee = 0
+									}
+									// Accumulate session totals
+									sessBase += dBase
+									sessQuote += dQuote
+									sessFee += dFee
+									// Update last-seen for this order
+									lastSeenBase = ord.BaseSize
+									lastSeenQuote = ord.QuoteSpent
+									lastSeenFee = ord.CommissionUSD
 
-									// If you want to compute deltas, keep a per-order last-seen executed count.
-									// Simpler: only roll current into Accum when you are about to switch to a new orderID.
+									// Determine status-specific behavior
 									switch strings.ToUpper(strings.TrimSpace(ord.Status)) {
 									case "FILLED":
-										// fully filled → done
-							      	    log.Printf("TRACE postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f", orderID, ord.Price, ord.BaseSize, ord.QuoteSpent, ord.CommissionUSD)
-							          	mtxOrders.WithLabelValues("live", string(side)).Inc()
-							          	mtxTrades.WithLabelValues("open").Inc()
+										// fully filled → done, emit VWAP of session
+										vwap := 0.0
+										if sessBase > 0 {
+											vwap = sessQuote / sessBase
+										}
+										placed := &PlacedOrder{
+											Price:         vwap,
+											BaseSize:      sessBase,
+											QuoteSpent:    sessQuote,
+											CommissionUSD: sessFee,
+										}
+										log.Printf("TRACE postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f", orderID, ord.Price, ord.BaseSize, ord.QuoteSpent, ord.CommissionUSD)
+										mtxOrders.WithLabelValues("live", string(side)).Inc()
+										mtxTrades.WithLabelValues("open").Inc()
 										safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
-							          	return
+										return
+
 									case "PARTIALLY_FILLED":
-										// still open; keep polling (or let your reprice path run if you cancel/repost)
-										// Reprice loop (guarded by interval outside)
+										// still open; allow reprice path (throttled)
 										if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
-											orderID, lastLimitPx, repriceCount, _ = t.maybeRepriceOnce(
+											newID, newLastLimitPx, newRepriceCount, did := t.maybeRepriceOnce(
 												pctx,
 												side,
 												orderID,
@@ -1446,13 +1479,23 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 												pend,
 												repriceCount,
 											)
+											if did && newID != orderID {
+												// switched to a new order: reset per-order deltas (session aggregates stay)
+												orderID = newID
+												lastLimitPx = newLastLimitPx
+												repriceCount = newRepriceCount
+												lastSeenBase, lastSeenQuote, lastSeenFee = 0, 0, 0
+											} else {
+												lastLimitPx = newLastLimitPx
+												repriceCount = newRepriceCount
+											}
 											lastReprice = time.Now()
 										}
+
 									case "NEW", "PENDING_CANCEL":
 										// resting or in cancel transition; keep polling
-										// Reprice loop (guarded by interval outside)
 										if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
-											orderID, lastLimitPx, repriceCount, _ = t.maybeRepriceOnce(
+											newID, newLastLimitPx, newRepriceCount, did := t.maybeRepriceOnce(
 												pctx,
 												side,
 												orderID,
@@ -1463,15 +1506,32 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 												pend,
 												repriceCount,
 											)
+											if did && newID != orderID {
+												orderID = newID
+												lastLimitPx = newLastLimitPx
+												repriceCount = newRepriceCount
+												lastSeenBase, lastSeenQuote, lastSeenFee = 0, 0, 0
+											} else {
+												lastLimitPx = newLastLimitPx
+												repriceCount = newRepriceCount
+											}
 											lastReprice = time.Now()
 										}
 
 									case "CANCELED", "REJECTED", "EXPIRED":
-										// terminal without (remaining) open quantity → treat as non-fill for open logic
-										// NOTE: Depending on broker impl, ord may still carry ExecutedQty > 0 (partial before cancel)
-										if ord.BaseSize > 0 || ord.QuoteSpent > 0 {
-											// Accept partial as a fill of the executed amount; step() will append with actual size.
-											safeSend(ch, OpenResult{Filled: true, Placed: ord, OrderID: orderID})
+										// terminal without remaining open quantity → emit VWAP if any session fills, else non-fill
+										if sessBase > 0 || sessQuote > 0 {
+											vwap := 0.0
+											if sessBase > 0 {
+												vwap = sessQuote / sessBase
+											}
+											placed := &PlacedOrder{
+												Price:         vwap,
+												BaseSize:      sessBase,
+												QuoteSpent:    sessQuote,
+												CommissionUSD: sessFee,
+											}
+											safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
 										} else {
 											safeSend(ch, OpenResult{Filled: false, Placed: nil, OrderID: orderID})
 										}
@@ -1481,6 +1541,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 										// unknown status; be conservative and keep polling
 									}
 								}
+
 								// Sleep-or-cancel wait
 								select {
 								case <-pctx.Done():
@@ -1493,13 +1554,21 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 							_ = t.broker.CancelOrder(pctx, t.cfg.ProductID, orderID)
 							log.Printf("TRACE postonly.timeout order_id=%s", orderID)
 
-							if pend.AccumBase > 0 || pend.AccumQuote > 0 {
+							// On TIMEOUT: emit VWAP if any session fills, else non-fill
+							if sessBase > 0 || sessQuote > 0 {
 								vwap := 0.0
-								if pend.AccumBase > 0 { vwap = pend.AccumQuote / pend.AccumBase }
-								placed := &PlacedOrder{Price:vwap, BaseSize:pend.AccumBase, QuoteSpent:pend.AccumQuote, CommissionUSD:pend.AccumFeeUSD}
-								safeSend(ch, OpenResult{Filled:true, Placed:placed, OrderID:orderID})
+								if sessBase > 0 {
+									vwap = sessQuote / sessBase
+								}
+								placed := &PlacedOrder{
+									Price:         vwap,
+									BaseSize:      sessBase,
+									QuoteSpent:    sessQuote,
+									CommissionUSD: sessFee,
+								}
+								safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
 							} else {
-								safeSend(ch, OpenResult{Filled:false, Placed:nil, OrderID:orderID})
+								safeSend(ch, OpenResult{Filled: false, Placed: nil, OrderID: orderID})
 							}
 							// Do not clear pending here; step() drain will clear & persist synchronously
 						}(orderID, side, time.Now().Add(time.Duration(limitWait)*time.Second), limitPx, baseAtLimit, pend, ch, pctxUse)
@@ -1510,9 +1579,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 						// persist pending state
 						_ = t.saveStateNoLock()
 						t.mu.Unlock()
-
-						// Re-lock and return early: do not fall back to market here.
-						t.mu.Lock()
 						return fmt.Sprintf("OPEN-PENDING side=%s", side), nil
 					} else if err != nil {
 						log.Printf("TRACE postonly.error fallback=market err=%v", err)

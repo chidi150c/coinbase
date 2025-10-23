@@ -51,7 +51,6 @@ func main() {
 
 	// ---- Environment & Config ----
 	loadBotEnv()
-	initThresholdsFromEnv()
 	cfg := loadConfigFromEnv()
 
 	// (Phase-7 opt-in): expose model mode in metrics without changing behavior.

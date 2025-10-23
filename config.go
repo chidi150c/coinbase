@@ -6,9 +6,10 @@
 // by loadBotEnv() (see env.go), so you can tune behavior without exports.
 //
 // Typical flow (see main.go):
-//   loadBotEnv()
-//   initThresholdsFromEnv()
-//   cfg := loadConfigFromEnv()
+//
+//	loadBotEnv()
+//	initThresholdsFromEnv()
+//	cfg := loadConfigFromEnv()
 package main
 
 // NOTE: All knobs here are now read from UNPREFIXED env keys. Broker-specific
@@ -78,12 +79,12 @@ type Config struct {
 	ScalpTPMinPct      float64
 
 	// USD trailing / profit gates
-	TrailActivateUSDRunner  float64
-	TrailActivateUSDScalp   float64
-	TrailDistancePctRunner  float64
-	TrailDistancePctScalp   float64
-	ProfitGateUSD           float64
-	TPMakerOffsetBps        float64 // maker offset for fixed-TP exits
+	TrailActivateUSDRunner float64
+	TrailActivateUSDScalp  float64
+	TrailDistancePctRunner float64
+	TrailDistancePctScalp  float64
+	ProfitGateUSD          float64
+	TPMakerOffsetBps       float64 // maker offset for fixed-TP exits
 
 	// Ramping
 	RampEnable   bool
@@ -110,6 +111,9 @@ type Config struct {
 	RepriceMinEdgeUSD     float64
 	RepriceMaxDriftBps    float64
 	RepriceMaxCount       int
+	BuyThreshold          float64
+	SellThreshold         float64
+	UseMAFilter           bool
 }
 
 // loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
@@ -200,10 +204,14 @@ func loadConfigFromEnv() Config {
 		// Repricer (maker-chase) guardrails
 		RepriceEnable:         getEnvBool("REPRICE_ENABLE", true),
 		RepriceIntervalMs:     getEnvInt("REPRICE_INTERVAL_MS", 6000),
-		RepriceMinImprovTicks: getEnvInt("REPRICE_MIN_IMPROV_TICKS",1),
+		RepriceMinImprovTicks: getEnvInt("REPRICE_MIN_IMPROV_TICKS", 1),
 		RepriceMinEdgeUSD:     getEnvFloat("REPRICE_MIN_EDGE_USD", 0.15),
 		RepriceMaxDriftBps:    getEnvFloat("REPRICE_MAX_DRIFT_BPS", 1.5),
 		RepriceMaxCount:       getEnvInt("REPRICE_MAX_COUNT", 6),
+
+		BuyThreshold:  getEnvFloat("BUY_THRESHOLD", 0.55),
+		SellThreshold: getEnvFloat("SELL_THRESHOLD", 0.45),
+		UseMAFilter:   getEnvBool("USE_MA_FILTER", true),
 	}
 
 	// Historical carry-over: if someone still sets BROKER=X, we may still
