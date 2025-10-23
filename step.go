@@ -1,4 +1,3 @@
-Generate a full copy of {{
 // ---------------------------------------------------------------------------------------------
 // FILE: step.go — Synchronized trading tick (EXIT → OPEN), extracted from trader.go
 //
@@ -1720,4 +1719,3 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	t.mu.Unlock()
 	return msg, nil
 }
-}} with only the necessary minimal changes to implement {{replace pending-open poller accumulation to use per-order delta tracking with session-level aggregates (sessBase/sessQuote/sessFee), resetting on orderID changes from repricing and emitting a VWAP-based PlacedOrder on FILLED/CANCELED/EXPIRED/TIMEOUT}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{replace pending-open poller accumulation to use per-order delta tracking with session-level aggregates (sessBase/sessQuote/sessFee), resetting on orderID changes from repricing and emitting a VWAP-based PlacedOrder on FILLED/CANCELED/EXPIRED/TIMEOUT}}. Fix any compile error(s). Return the complete file, copy-paste ready, in IDE.

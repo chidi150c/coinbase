@@ -154,7 +154,7 @@ func loadConfigFromEnv() Config {
 		OrderType:           getEnv("ORDER_TYPE", "market"),
 		LimitPriceOffsetBps: getEnvFloat("LIMIT_PRICE_OFFSET_BPS", 5.0),
 		SpreadMinBps:        getEnvFloat("SPREAD_MIN_BPS", 2.0),
-		LimitTimeoutSec:     getEnvInt("LIMIT_TIMEOUT_SEC", 5),
+		LimitTimeoutSec:     getEnvInt("LIMIT_TIMEOUT_SEC", 60),
 
 		// ---------- Migrated (Bucket B) defaults ----------
 		// Pyramiding
@@ -199,11 +199,11 @@ func loadConfigFromEnv() Config {
 
 		// Repricer (maker-chase) guardrails
 		RepriceEnable:         getEnvBool("REPRICE_ENABLE", true),
-		RepriceIntervalMs:     getEnvInt("REPRICE_INTERVAL_MS", 2000),
-		RepriceMinImprovTicks: getEnvInt("REPRICE_MIN_IMPROV_TICKS",2),
+		RepriceIntervalMs:     getEnvInt("REPRICE_INTERVAL_MS", 6000),
+		RepriceMinImprovTicks: getEnvInt("REPRICE_MIN_IMPROV_TICKS",1),
 		RepriceMinEdgeUSD:     getEnvFloat("REPRICE_MIN_EDGE_USD", 0.15),
 		RepriceMaxDriftBps:    getEnvFloat("REPRICE_MAX_DRIFT_BPS", 1.5),
-		RepriceMaxCount:       getEnvInt("REPRICE_MAX_COUNT", 2),
+		RepriceMaxCount:       getEnvInt("REPRICE_MAX_COUNT", 6),
 	}
 
 	// Historical carry-over: if someone still sets BROKER=X, we may still
