@@ -579,12 +579,22 @@ type fillJSON struct {
 }
 
 type placedOrderJSON struct {
+	// Existing tolerant fields
 	ID            string     `json:"id"`
 	Price         string     `json:"price"`
 	BaseSize      string     `json:"base_size"`
 	QuoteSpent    string     `json:"quote_spent"`
 	CommissionUSD string     `json:"commission_usd"`
 	Fills         []fillJSON `json:"fills"`
+
+	// MINIMAL ADD: sidecar-compatible fields to parse
+	OrderID       string `json:"order_id"`
+	ProductID     string `json:"product_id"`
+	Status        string `json:"status"`
+	FilledSize    string `json:"filled_size"`
+	ExecutedValue string `json:"executed_value"`
+	FillFees      string `json:"fill_fees"`
+	Side          string `json:"side"`
 }
 
 // toPlacedOrder converts a tolerant JSON struct (string fields) into the strongly-typed PlacedOrder.
@@ -596,7 +606,24 @@ func toPlacedOrder(j placedOrderJSON) *PlacedOrder {
 		QuoteSpent:    parseFloat(j.QuoteSpent),
 		CommissionUSD: parseFloat(j.CommissionUSD),
 	}
-	// If the API provided only fills, sum commission best-effort if CommissionUSD is empty.
+
+	// Backfill ID from order_id if needed
+	if out.ID == "" && strings.TrimSpace(j.OrderID) != "" {
+		out.ID = j.OrderID
+	}
+
+	// Prefer sidecar fields when present
+	if out.BaseSize == 0 && strings.TrimSpace(j.FilledSize) != "" {
+		out.BaseSize = parseFloat(j.FilledSize)
+	}
+	if out.QuoteSpent == 0 && strings.TrimSpace(j.ExecutedValue) != "" {
+		out.QuoteSpent = parseFloat(j.ExecutedValue)
+	}
+	if out.CommissionUSD == 0 && strings.TrimSpace(j.FillFees) != "" {
+		out.CommissionUSD = parseFloat(j.FillFees)
+	}
+
+	// If the API provided only fills, sum commission best-effort if CommissionUSD remains empty.
 	if out.CommissionUSD == 0 && len(j.Fills) > 0 {
 		var sum float64
 		for _, f := range j.Fills {
@@ -604,5 +631,34 @@ func toPlacedOrder(j placedOrderJSON) *PlacedOrder {
 		}
 		out.CommissionUSD = sum
 	}
+
+	// Map side if provided (tolerant; relies on external OrderSide parsing elsewhere)
+	switch strings.ToUpper(strings.TrimSpace(j.Side)) {
+	case "BUY":
+		out.Side = OrderSide("BUY")
+	case "SELL":
+		out.Side = OrderSide("SELL")
+	}
+
+	// Map status from sidecar's open/done into exchange-like statuses.
+	st := strings.ToLower(strings.TrimSpace(j.Status))
+	filledAny := (out.BaseSize > 0) || (out.QuoteSpent > 0)
+	switch st {
+	case "open":
+		if filledAny {
+			out.Status = "PARTIALLY_FILLED"
+		} else {
+			out.Status = "NEW"
+		}
+	case "done":
+		if filledAny {
+			out.Status = "FILLED"
+		} else {
+			out.Status = "CANCELED"
+		}
+	default:
+		// If empty or unknown, leave as-is (zero value) and let callers enrich via fetchOrder.
+	}
+
 	return out
 }

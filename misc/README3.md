@@ -136,22 +136,33 @@ nohup bash -c 'docker compose logs -f --no-color bot         >> /opt/coinbase/lo
 mkdir -p /opt/coinbase/logs/audit
 
 # Binance
-nohup bash -c '
-  cd /home/chidi/coinbase/monitoring &&
-  exec docker compose logs -f --no-color bot_binance |
-  grep -E --line-buffered -A5 -B5 "(pyramid: .*baseline met|pyramid\.latch\.set|trail\.(activate|raise|trigger)|\[WARN\] FUNDS_EXHAUSTED|equity\.baseline\.set|lot\.take_pnl_est|runner\.assign|panic:|runtime error:|fatal error|SIGSEGV|stack trace|level=error|ERROR|FATAL|panic recovered)" \
-  >> /opt/coinbase/logs/audit/binance_audit.log 2>&1
-' >/dev/null 2>&1 &
-disown
+sudo tee /etc/systemd/system/binance-audit-tail.service >/dev/null <<'UNIT'
+[Unit]
+Description=Binance audit tailer (docker compose logs -> grep -> audit file)
+Wants=docker.service
+After=docker.service network-online.target
 
-# Coinbase
-nohup bash -c '
-  cd /home/chidi/coinbase/monitoring &&
-  exec docker compose logs -f --no-color bot |
-  grep -E --line-buffered -A5 -B5 "(pyramid: .*baseline met|pyramid\.latch\.set|trail\.(activate|raise|trigger)|\[WARN\] FUNDS_EXHAUSTED|equity\.baseline\.set|lot\.take_pnl_est|runner\.assign|panic:|runtime error:|fatal error|SIGSEGV|stack trace|level=error|ERROR|FATAL|panic recovered)" \
-  >> /opt/coinbase/logs/audit/coinbase_audit.log 2>&1
-' >/dev/null 2>&1 &
-disown
+[Service]
+Type=simple
+WorkingDirectory=/home/chidi/coinbase/monitoring
+ExecStart=/bin/bash -lc '\
+  mkdir -p /opt/coinbase/logs/audit; \
+  REGEX='\''(pyramid: .*baseline met|LATCH SET (BUY|SELL)|trail\.(activate|raise|trigger)|\[WARN\] FUNDS_EXHAUSTED|equity\.baseline\.set|runner\.assign|tp\.(post|repost|filled)|postonly\.(place|reprice|filled|timeout|error|recheck)|order\.open (request|placed|retry)|panic:|runtime error:|fatal error|SIGSEGV|stack trace|level=error|ERROR|FATAL|panic recovered)'\''; \
+  stdbuf -oL -eL docker compose logs -f --no-color --since 10s bot_binance \
+  | stdbuf -oL -eL grep -E --line-buffered -A5 -B5 "$REGEX" \
+  >> /opt/coinbase/logs/audit/binance_audit.log 2>&1'
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+sudo systemctl daemon-reload
+sudo systemctl restart binance-audit-tail.service
+
 
 # Here are handy one-liners you can stash and reuse (all work with your audit-grep):
 
@@ -200,7 +211,7 @@ audit-grep binance 'EXIT .*reason=(take_profit|stop_loss|trailing_stop)' -n
 
 # Look at a specific minute (e.g., 2025-10-10T09:45):
 
-audit-grep coinbase '2025-10-10T09:45' -n
+audit-grep binance '2025-10-23T18:19' -n
 
 # Case-insensitive scans / summaries
 
@@ -406,7 +417,7 @@ audit-grep coinbase 'EXIT .*reason=' -n
 
 # Last-N style peeks
 # Show last 50 trailing events across archives:
-audit-grep coinbase 'trail.(activate|raise|trigger)' -n | tail -50
+audit-grep binance 'trail.(activate|raise|trigger)' -n | tail -50
 
 # Last 100 equity/PNL signals:
 audit-grep coinbase 'equity.baseline.set|lot.take_pnl_est' -n | tail -100
@@ -507,4 +518,18 @@ sudo chmod 0644 /opt/coinbase/state/bot_state.newbinance.json.tmp
 # Atomic replace
 sudo mv /opt/coinbase/state/bot_state.newbinance.json.tmp \
         /opt/coinbase/state/bot_state.newbinance.json
+==================================================================================
+# confirm the unit is running and enabled on boot
+systemctl is-active binance-audit-tail.service && systemctl is-enabled binance-audit-tail.service
+
+# watch growth
+watch -n5 "stat -c 'size=%s mtime=%y' /opt/coinbase/logs/audit/binance_audit.log | sed 1q"
+
+# see how many lines were added in last 15m (compose, before filtering)
+docker compose logs --since 15m --no-color bot_binance | wc -l
+
+# see how many lines matched your filter in last 15m
+docker compose logs --since 15m --no-color bot_binance \
+| grep -E "(pyramid: .*baseline met|pyramid\.latch\.set|trail\.(activate|raise|trigger)|\[WARN\] FUNDS_EXHAUSTED|equity\.baseline\.set|lot\.take_pnl_est|runner\.assign|panic:|runtime error:|fatal error|SIGSEGV|stack trace|level=error|ERROR|FATAL|panic recovered)" \
+| wc -l
 

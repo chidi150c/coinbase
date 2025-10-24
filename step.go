@@ -691,7 +691,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver1",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-2",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
@@ -1303,6 +1303,29 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		limitWait := t.cfg.LimitTimeoutSec
 		spreadGate := t.cfg.SpreadMinBps // NOTE: no spread source via Broker; positive gate disables maker attempt
 		wantLimit := strings.ToLower(strings.TrimSpace(t.cfg.OrderType)) == "limit" && offsetBps > 0 && limitWait > 0
+
+		// ---- ONE-SHOT MARKET PREFERENCE (after a maker timeout) ----
+		// If a previous maker attempt timed out, consume a one-tick "market preference".
+		// This tick will skip maker (if an open actually happens after gates).
+		// Regardless of whether we open or HOLD, the preference is consumed now.
+		recheckNow := false
+		if side == SideBuy && t.pendingRecheckBuy { recheckNow = true }
+		if side == SideSell && t.pendingRecheckSell { recheckNow = true }
+		
+		if wantLimit && recheckNow {
+		    wantLimit = false
+		    log.Printf("TRACE postonly.skip reason=recheck_market_next_tick side=%s", side)
+		}
+		// consume the one-shot preference immediately so it never lingers
+		t.mu.Lock()
+		if recheckNow {
+		    if side == SideBuy {
+		        t.pendingRecheckBuy = false
+		    } else {
+		        t.pendingRecheckSell = false
+		    }
+		}
+		t.mu.Unlock()
 
 		// --- NEW (Phase 4): maker-first routing via Broker when ORDER_TYPE=limit (async, per-side) ---
 		if wantLimit {
