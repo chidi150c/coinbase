@@ -264,9 +264,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	if t.pendingBuyCh != nil {
 		select {
 		case res := <-t.pendingBuyCh:
+			log.Printf("TRACE postonly.drain.recv side=%s order_id=%s filled=%v placed_nil=%v", SideBuy, res.OrderID, res.Filled, res.Placed == nil)
 			// Decide whether to accept this fill
 			accept := false
 			if res.Filled && res.Placed != nil {
+				log.Printf("TRACE postonly.drain.placed side=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f", SideBuy, res.OrderID, res.Placed.Price, res.Placed.BaseSize, res.Placed.QuoteSpent, res.Placed.CommissionUSD)
 				if t.pendingBuy != nil {
 					// Accept if it matches current or any historical order id
 					if res.OrderID == t.pendingBuy.OrderID {
@@ -297,6 +299,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if entryFee <= 0 {
 					entryFee = quoteSpent * (t.cfg.FeeRatePct / 100.0)
 				}
+
+				log.Printf("TRACE postonly.drain.accept side=%s match_current=%v match_history=%v pending_nil=%v",
+				SideBuy, t.pendingBuy != nil && res.OrderID == t.pendingBuy.OrderID,
+				t.pendingBuy != nil && func() bool { for _, id := range t.pendingBuy.History { if id == res.OrderID { return true } }; return false }(),
+				t.pendingBuy == nil)
+
 				newLot := &Position{
 					OpenPrice:    priceToUse,
 					Side:         side,
@@ -364,9 +372,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	if t.pendingSellCh != nil {
 		select {
 		case res := <-t.pendingSellCh:
+			log.Printf("TRACE postonly.drain.recv side=%s order_id=%s filled=%v placed_nil=%v", SideSell, res.OrderID, res.Filled, res.Placed == nil)
 			// Decide whether to accept this fill
 			accept := false
 			if res.Filled && res.Placed != nil {
+				log.Printf("TRACE postonly.drain.placed side=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f", SideSell, res.OrderID, res.Placed.Price, res.Placed.BaseSize, res.Placed.QuoteSpent, res.Placed.CommissionUSD)
 				if t.pendingSell != nil {
 					// Accept if it matches current or any historical order id
 					if res.OrderID == t.pendingSell.OrderID {
@@ -397,6 +407,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if entryFee <= 0 {
 					entryFee = quoteSpent * (t.cfg.FeeRatePct / 100.0)
 				}
+
+				log.Printf("TRACE postonly.drain.accept side=%s match_current=%v match_history=%v pending_nil=%v",
+				SideSell, t.pendingSell != nil && res.OrderID == t.pendingSell.OrderID,
+				t.pendingSell != nil && func() bool { for _, id := range t.pendingSell.History { if id == res.OrderID { return true } }; return false }(),
+				t.pendingSell == nil)
+
 				newLot := &Position{
 					OpenPrice:    priceToUse,
 					Side:         side,
@@ -1388,6 +1404,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 								OrderID:     orderID,
 								History:     make([]string, 0, 5), // NEW
 							}
+							if side == SideBuy && t.pendingBuy != nil {
+								log.Printf("TRACE postonly.pending.set side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f dl=%s eqFlags[buy=%v sell=%v]",
+									side, t.pendingBuy.OrderID, t.pendingBuy.LimitPx, t.pendingBuy.BaseAtLimit, t.pendingBuy.Quote,
+									t.pendingBuy.Deadline.Format(time.RFC3339), t.pendingBuy.EquityBuy, t.pendingBuy.EquitySell)
+							}
 						} else {
 							t.pendingSellCtx = pctx
 							t.pendingSellCancel = cancel
@@ -1405,6 +1426,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 								EquitySell:  equityTriggerSell,
 								OrderID:     orderID,
 								History:     make([]string, 0, 5), // NEW
+							}
+							if side == SideSell && t.pendingSell != nil {
+    							log.Printf("TRACE postonly.pending.set side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f dl=%s eqFlags[buy=%v sell=%v]",
+									side, t.pendingSell.OrderID, t.pendingSell.LimitPx, t.pendingSell.BaseAtLimit, t.pendingSell.Quote,
+									t.pendingSell.Deadline.Format(time.RFC3339), t.pendingSell.EquityBuy, t.pendingSell.EquitySell)
 							}
 						}
 						// Capture immutable copy for poller
@@ -1424,6 +1450,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 						// Spawn poller (Phase 4: smart reprice loop) with environment guardrails
 						go func(initOrderID string, side OrderSide, deadline time.Time, initLimitPx, initBaseAtLimit float64, pend *PendingOpen, ch chan OpenResult, pctx context.Context) {
+							log.Printf("TRACE postonly.poll.start side=%s init_id=%s init_limit=%.8f init_base=%.8f deadline=%s offset_bps=%.3f",
+								side, initOrderID, initLimitPx, initBaseAtLimit, deadline.Format(time.RFC3339), offsetBps)
+
 							orderID := initOrderID
 							lastLimitPx := initLimitPx
 							lastReprice := time.Now()
@@ -1439,6 +1468,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 								// Check for cancellation before doing work
 								select {
 								case <-pctx.Done():
+									log.Printf("TRACE postonly.poll.cancelled side=%s last_id=%s", side, orderID)
 									break poll
 								default:
 								}
@@ -1468,6 +1498,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 									lastSeenQuote = ord.QuoteSpent
 									lastSeenFee = ord.CommissionUSD
 
+									log.Printf("TRACE postonly.poll.tick side=%s order_id=%s status=%s price=%.8f base=%.8f quote=%.2f fee=%.6f sess_agg[base=%.8f quote=%.2f fee=%.6f] reprices=%d",
+										side, orderID, strings.ToUpper(strings.TrimSpace(ord.Status)), ord.Price, ord.BaseSize, ord.QuoteSpent, ord.CommissionUSD,
+										sessBase, sessQuote, sessFee, repriceCount)
+
 									// Determine status-specific behavior
 									switch strings.ToUpper(strings.TrimSpace(ord.Status)) {
 									case "FILLED":
@@ -1482,15 +1516,21 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 											QuoteSpent:    sessQuote,
 											CommissionUSD: sessFee,
 										}
+										log.Printf("TRACE postonly.poll.done side=%s order_id=%s final=FILLED vwap=%.8f base=%.8f quote=%.2f fee=%.6f",
+    										side, orderID, func() float64 { if sessBase>0 { return sessQuote / sessBase }; return 0 }(), sessBase, sessQuote, sessFee)
 										log.Printf("TRACE postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f", orderID, ord.Price, ord.BaseSize, ord.QuoteSpent, ord.CommissionUSD)
 										mtxOrders.WithLabelValues("live", string(side)).Inc()
 										mtxTrades.WithLabelValues("open").Inc()
+										log.Printf("TRACE postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
+											side, orderID, (sessBase > 0 || sessQuote > 0), sessBase, sessQuote, sessFee)
 										safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
 										return
 
 									case "PARTIALLY_FILLED":
 										// still open; allow reprice path (throttled)
 										if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
+											log.Printf("TRACE postonly.reprice.try.partially side=%s order_id=%s last_limit=%.8f reprice_count=%d",
+    											side, orderID, lastLimitPx, repriceCount)
 											newID, newLastLimitPx, newRepriceCount, did := t.maybeRepriceOnce(
 												pctx,
 												side,
@@ -1502,13 +1542,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 												pend,
 												repriceCount,
 											)
-											if did && newID != orderID {
+											if did && newID != orderID {												
+												log.Printf("TRACE postonly.reprice.swap.partially side=%s old_id=%s new_id=%s new_limit=%.8f count=%d",
+													side, orderID, newID, newLastLimitPx, newRepriceCount)
 												// switched to a new order: reset per-order deltas (session aggregates stay)
 												orderID = newID
 												lastLimitPx = newLastLimitPx
 												repriceCount = newRepriceCount
 												lastSeenBase, lastSeenQuote, lastSeenFee = 0, 0, 0
 											} else {
+												log.Printf("TRACE postonly.reprice.skip.partially side=%s order_id=%s reason=no_guard_or_no_improve last_limit=%.8f count=%d",
+													side, orderID, lastLimitPx, repriceCount)
 												lastLimitPx = newLastLimitPx
 												repriceCount = newRepriceCount
 											}
@@ -1518,6 +1562,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 									case "NEW", "PENDING_CANCEL":
 										// resting or in cancel transition; keep polling
 										if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
+											log.Printf("TRACE postonly.reprice.try.new side=%s order_id=%s last_limit=%.8f reprice_count=%d",
+    											side, orderID, lastLimitPx, repriceCount)
 											newID, newLastLimitPx, newRepriceCount, did := t.maybeRepriceOnce(
 												pctx,
 												side,
@@ -1530,11 +1576,15 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 												repriceCount,
 											)
 											if did && newID != orderID {
+												log.Printf("TRACE postonly.reprice.swap.new side=%s old_id=%s new_id=%s new_limit=%.8f count=%d",
+													side, orderID, newID, newLastLimitPx, newRepriceCount)
 												orderID = newID
 												lastLimitPx = newLastLimitPx
 												repriceCount = newRepriceCount
 												lastSeenBase, lastSeenQuote, lastSeenFee = 0, 0, 0
 											} else {
+												log.Printf("TRACE postonly.reprice.skip.new side=%s order_id=%s reason=no_guard_or_no_improve last_limit=%.8f count=%d",
+													side, orderID, lastLimitPx, repriceCount)
 												lastLimitPx = newLastLimitPx
 												repriceCount = newRepriceCount
 											}
@@ -1542,6 +1592,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 										}
 
 									case "CANCELED", "REJECTED", "EXPIRED":
+										
 										// terminal without remaining open quantity → emit VWAP if any session fills, else non-fill
 										if sessBase > 0 || sessQuote > 0 {
 											vwap := 0.0
@@ -1554,10 +1605,19 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 												QuoteSpent:    sessQuote,
 												CommissionUSD: sessFee,
 											}
+											log.Printf("TRACE postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
+												side, orderID, (sessBase > 0 || sessQuote > 0), sessBase, sessQuote, sessFee)
 											safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
 										} else {
+											log.Printf("TRACE postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
+												side, orderID, (sessBase > 0 || sessQuote > 0), sessBase, sessQuote, sessFee)
 											safeSend(ch, OpenResult{Filled: false, Placed: nil, OrderID: orderID})
 										}
+
+										log.Printf("TRACE postonly.poll.done side=%s order_id=%s final=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f",
+											side, orderID, strings.ToUpper(strings.TrimSpace(ord.Status)),
+											func() float64 { if sessBase>0 { return sessQuote / sessBase }; return 0 }(), sessBase, sessQuote, sessFee)
+
 										return
 
 									default:
@@ -1568,6 +1628,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 								// Sleep-or-cancel wait
 								select {
 								case <-pctx.Done():
+									log.Printf("TRACE postonly.poll.cancelled side=%s last_id=%s", side, orderID)
 									break poll
 								case <-time.After(200 * time.Millisecond):
 								}
@@ -1575,6 +1636,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 							// On timeout or cancellation, cancel any resting order if still open.
 							_ = t.broker.CancelOrder(pctx, t.cfg.ProductID, orderID)
+							log.Printf("TRACE postonly.poll.timeout side=%s last_id=%s sess_base=%.8f sess_quote=%.2f sess_fee=%.6f",
+								side, orderID, sessBase, sessQuote, sessFee)
 							log.Printf("TRACE postonly.timeout order_id=%s", orderID)
 
 							// On TIMEOUT: emit VWAP if any session fills, else non-fill
@@ -1589,8 +1652,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 									QuoteSpent:    sessQuote,
 									CommissionUSD: sessFee,
 								}
+								log.Printf("TRACE postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
+    								side, orderID, (sessBase > 0 || sessQuote > 0), sessBase, sessQuote, sessFee)
 								safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
 							} else {
+								log.Printf("TRACE postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
+    								side, orderID, (sessBase > 0 || sessQuote > 0), sessBase, sessQuote, sessFee)
 								safeSend(ch, OpenResult{Filled: false, Placed: nil, OrderID: orderID})
 							}
 							// Do not clear pending here; step() drain will clear & persist synchronously
@@ -1623,12 +1690,14 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		// If maker path did not result in a fill (or was skipped), fall back to market path (baseline behavior).
 		if placed == nil {
 			if !allowMarket {
+				log.Printf("TRACE postonly.market_fallback.blocked side=%s reason=recheck_flag_not_set", side)
 				return "HOLD", nil
 			}
 			// TODO: remove TRACE
 			log.Printf("TRACE order.open request side=%s quote=%.2f baseEst=%.8f priceSnap=%.8f take=%.8f",
 				side, quote, base, price, take)
 			var err error
+			log.Printf("TRACE postonly.market_fallback.go side=%s quote=%.2f", side, quote)
 			placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
 			if err != nil {
 				// Retry once with ORDER_MIN_USD on insufficient-funds style failures.
