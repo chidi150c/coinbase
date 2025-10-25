@@ -52,7 +52,7 @@ type Position struct {
 	OpenTime  time.Time
 	// --- NEW: record entry fee for later P/L adjustment ---
 	EntryFee float64
-
+	OpenNotionalUSD float64
 	// --- NEW (runner-only trailing fields; used only when this lot is the runner) ---
 	TrailActive bool    // becomes true after TRAIL_ACTIVATE_PCT threshold (legacy flag; now also used by USD-activate)
 	TrailPeak   float64 // best favorable price since activation (peak for long; trough for short)

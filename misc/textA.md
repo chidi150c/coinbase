@@ -22,7 +22,7 @@ RISK_PER_TRADE_PCT=15.0
 ALLOW_PYRAMIDING=true
 PYRAMID_DECAY_LAMBDA=0.02
 PYRAMID_MIN_SECONDS_BETWEEN=0
-PYRAMID_MIN_ADVERSE_PCT=0.8 # lowered from 1.5 so adds can actually arm
+PYRAMID_MIN_ADVERSE_PCT=1.5
 PYRAMID_DECAY_MIN_PCT=0.4
 MAX_CONCURRENT_LOTS=8
 
@@ -35,10 +35,10 @@ SCALP_TP_MIN_PCT=0.6
 
 # === Exits (USD profit-gate + USD trailing) ===
 # Exits will not arm/trigger until per-lot NET PnL ≥ PROFIT_GATE_USD
-PROFIT_GATE_USD=0.50
+PROFIT_GATE_USD=0.25
 
 # Trailing activation thresholds (USD, per lot NET PnL)
-TRAIL_ACTIVATE_USD_RUNNER=1.00
+TRAIL_ACTIVATE_USD_RUNNER=2.00
 TRAIL_ACTIVATE_USD_SCALP=0.50
 
 # Trailing distances (percent, post-activation)
@@ -79,15 +79,9 @@ BASE_STEP=0.00000001
 # === Live equity: broker provides balances ===
 USE_LIVE_EQUITY=true
 
-# === Order entry mode ===
-ORDER_TYPE=limit
-LIMIT_PRICE_OFFSET_BPS=2 # lowered from 5 to sit closer to touch (less camping)
-SPREAD_MIN_BPS=0 # allow maker even when spread is 0; set >0 to gate maker attempts
-LIMIT_TIMEOUT_SEC=10 # lowered from 60; cancel-and-market after 10s if unfilled
-
 # --- Risk ramping (per-side; you already enabled it) ---
 RAMP_ENABLE=true
-RAMP_MODE=linear # or exp
+RAMP_MODE=linear
 RAMP_START_PCT=3.0
 RAMP_STEP_PCT=1.0
 # For exp mode:
@@ -101,12 +95,19 @@ TRAIL_ACTIVATE_PCT=1.9
 TRAIL_DISTANCE_PCT=0.4
 
 FORCE_FILTERS_REMOTE=1
+# in the container env or compose file
 LOG_LEVEL=TRACE
 
+# === Order entry / maker placement ===
+ORDER_TYPE=limit
+SPREAD_MIN_BPS=0
+LIMIT_PRICE_OFFSET_BPS=5
+LIMIT_TIMEOUT_SEC=180
+
 # =========== Reprice (maker-chase) ================
-REPRICE_ENABLE=true # ensure repricer is on
-REPRICE_INTERVAL_MS=2000 # slower cadence
-REPRICE_MIN_IMPROV_TICKS=2 # only reprice if 2+ ticks better in our favor
-REPRICE_MIN_EDGE_USD=0.15 # require meaningful improvement
-REPRICE_MAX_DRIFT_BPS=1.5 # never drift more than ~1.5 bps from initial limit
-REPRICE_MAX_COUNT=2 # after 2 tweaks, stop repricing and sit
+REPRICE_ENABLE=true
+REPRICE_INTERVAL_MS=1200
+REPRICE_MIN_IMPROV_TICKS=0
+REPRICE_MIN_EDGE_USD=0.0001      # <<< lowered so tiny orders can reprice
+REPRICE_MAX_DRIFT_BPS=3
+REPRICE_MAX_COUNT=20
