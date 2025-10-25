@@ -194,16 +194,14 @@ func (t *Trader) maybeRepriceOnce(
 	}
 
 	// Guard: minimum improvement in ticks (directional)
-	if shouldReprice && tick > 0 && t.cfg.RepriceMinImprovTicks > 1 {
+	if shouldReprice && tick > 0 {
 		improveTicks := int(math.Abs(newLimitPx-lastLimitPx) / tick)
+		need := t.cfg.RepriceMinImprovTicks
+		if need < 1 { need = 1 }
 		if side == SideBuy {
-			if !(newLimitPx < lastLimitPx && improveTicks >= t.cfg.RepriceMinImprovTicks) {
-				shouldReprice = false
-			}
+			if !(newLimitPx < lastLimitPx && improveTicks >= need) { shouldReprice = false }
 		} else {
-			if !(newLimitPx > lastLimitPx && improveTicks >= t.cfg.RepriceMinImprovTicks) {
-				shouldReprice = false
-			}
+			if !(newLimitPx > lastLimitPx && improveTicks >= need) { shouldReprice = false }
 		}
 	}
 
@@ -707,7 +705,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-3",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-4",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
@@ -717,10 +715,16 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	book := t.book(side)
 
 	// --- NEW (Phase 4): prevent duplicate opens while pending on this side (exits already ran) ---
-	if (side == SideBuy && t.pendingBuy != nil) || (side == SideSell && t.pendingSell != nil) {
+	// Extra belt-and-suspenders: if a pending exists and we haven't hit its Deadline, keep waiting.
+	if side == SideBuy && t.pendingBuy != nil && time.Now().Before(t.pendingBuy.Deadline) {
 		t.mu.Unlock()
-		return fmt.Sprintf("OPEN-PENDING side=%s", side), nil
+		return "OPEN-PENDING side=BUY", nil
 	}
+	if side == SideSell && t.pendingSell != nil && time.Now().Before(t.pendingSell.Deadline) {
+		t.mu.Unlock()
+		return "OPEN-PENDING side=SELL", nil
+	}
+
 
 	//Required spare inventory
 	var spare float64
@@ -1452,6 +1456,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 						go func(initOrderID string, side OrderSide, deadline time.Time, initLimitPx, initBaseAtLimit float64, pend *PendingOpen, ch chan OpenResult, pctx context.Context) {
 							log.Printf("TRACE postonly.poll.start side=%s init_id=%s init_limit=%.8f init_base=%.8f deadline=%s offset_bps=%.3f",
 								side, initOrderID, initLimitPx, initBaseAtLimit, deadline.Format(time.RFC3339), offsetBps)
+							defer func (){log.Printf("TRACE postonly.poll.stopped side=%s initial_id=%s", side, initOrderID)}()
+									
 
 							orderID := initOrderID
 							lastLimitPx := initLimitPx
