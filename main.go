@@ -67,8 +67,6 @@ func main() {
 	switch strings.ToLower(br) {
 	case "binance":
 		broker = NewBinanceBridge(cfg.BridgeURL)
-	case "hitbtc":
-		broker = NewHitbtcBridge(cfg.BridgeURL)
 	case "bridge":
 		broker = NewBridgeBroker(cfg.BridgeURL)
 	default:

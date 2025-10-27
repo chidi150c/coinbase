@@ -316,6 +316,11 @@ def _get_symbol_filters_normalized(sym: str) -> Dict[str, str]:
         "min_notional": min_notional, # normalized
     }
 
+# add near other globals
+last_bid: Optional[float] = None
+last_ask: Optional[float] = None
+last_bbo_ts: Optional[int] = None
+
 # ---- WS consumer ----
 async def _ws_loop():
     """
@@ -324,6 +329,8 @@ async def _ws_loop():
     Never block candle updates; always use the freshest available source.
     """
     global last_price, last_ts_ms, _first_tick_logged
+    # ensure assignments go to module-level BBO cache
+    global last_bid, last_ask, last_bbo_ts
     sym = _normalize_symbol(SYMBOL).lower()
     url = f"wss://stream.binance.com:9443/stream?streams={sym}@bookTicker/{sym}@trade"
     log.info(f"[WS] connecting url={url}")
@@ -369,10 +376,19 @@ async def _ws_loop():
                         a = data.get("a"); b = data.get("b")
                         try:
                             if a is not None and b is not None:
-                                mid = (float(a) + float(b)) / 2.0
-                                if mid > 0:
-                                    last_mid_px = mid
-                                    last_mid_ts = now_ms
+                                ba = float(b)
+                                aa = float(a)
+                                if aa > 0 and ba > 0 and aa >= ba:
+                                    # NEW: cache BBO
+                                    last_bid = ba
+                                    last_ask = aa
+                                    last_bbo_ts = now_ms
+
+                                    # keep existing mid cache
+                                    mid = (aa + ba) / 2.0
+                                    if mid > 0:
+                                        last_mid_px = mid
+                                        last_mid_ts = now_ms
                         except Exception:
                             pass
 
@@ -424,6 +440,19 @@ def price(product_id: str = Query(default=SYMBOL)):
         age_ms = max(0, _now_ms()-last_ts_ms)
         stale  = age_ms > STALE_MS
     return {"product_id": product_id, "price": float(last_price) if last_price else 0.0, "ts": last_ts_ms, "stale": stale}
+
+@app.get("/bbo")
+def bbo(product_id: str = Query(default=SYMBOL), max_stale_ms: int = Query(default=500)):
+    # product_id kept for symmetry; this bridge is single-symbol
+    if last_bid is None or last_ask is None or last_bbo_ts is None:
+        raise HTTPException(status_code=503, detail="BBO unavailable")
+    if last_ask <= last_bid:
+        raise HTTPException(status_code=503, detail="BBO invalid")
+    if max_stale_ms > 0:
+        now_ms = _now_ms()
+        if now_ms - last_bbo_ts > max_stale_ms:
+            raise HTTPException(status_code=503, detail="BBO stale")
+    return {"bid": float(last_bid), "ask": float(last_ask), "ts_ms": int(last_bbo_ts)}
 
 @app.get("/candles")
 def get_candles(

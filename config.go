@@ -131,15 +131,15 @@ func loadConfigFromEnv() Config {
 		TakeProfitPct:       getEnvFloat("TAKE_PROFIT_PCT", 0.8),
 		StopLossPct:         getEnvFloat("STOP_LOSS_PCT", 0.4),
 		OrderMinUSD:         getEnvFloat("ORDER_MIN_USD", 5.00),
-		MinNotional:         getEnvFloat("MIN_NOTIONAL", 0.0), // preferred when > 0
+		MinNotional:         getEnvFloat("MIN_NOTIONAL", 10.0), // preferred when > 0
 		LongOnly:            getEnvBool("LONG_ONLY", true),
 		RequireBaseForShort: getEnvBool("REQUIRE_BASE_FOR_SHORT", true),
 		FeeRatePct:          getEnvFloat("FEE_RATE_PCT", 0.3),
 
 		// Venue filters (can be hydrated by bridge and/or env file)
-		PriceTick: getEnvFloat("PRICE_TICK", 0.0),
-		BaseStep:  getEnvFloat("BASE_STEP", 0.0),
-		QuoteStep: getEnvFloat("QUOTE_STEP", 0.0),
+		PriceTick: getEnvFloat("PRICE_TICK", 0.01),
+		BaseStep:  getEnvFloat("BASE_STEP", 0.000001),
+		QuoteStep: getEnvFloat("QUOTE_STEP", 0.01),
 
 		Port:              getEnvInt("PORT", 8080),
 		BridgeURL:         getEnv("BRIDGE_URL", ""),
@@ -230,22 +230,22 @@ func (c *Config) UseLiveEquity() bool {
 }
 
 func (c *Config) SetPriceTick() {
-	pt := getEnvFloat("PRICE_TICK", 0.0)
+	pt := getEnvFloat("PRICE_TICK", 0.01)
 	c.PriceTick = pt
 }
 
 func (c *Config) SetBaseStep() {
-	pt := getEnvFloat("BASE_STEP", 0.0)
+	pt := getEnvFloat("BASE_STEP", 0.000001)
 	c.BaseStep = pt
 }
 
 func (c *Config) SetQuoteStep() {
-	pt := getEnvFloat("QUOTE_STEP", 0.0)
+	pt := getEnvFloat("QUOTE_STEP", 0.01)
 	c.QuoteStep = pt
 }
 
 func (c *Config) SetMinNotional() {
-	pt := getEnvFloat("MIN_NOTIONAL", 0.0)
+	pt := getEnvFloat("MIN_NOTIONAL", 10.0)
 	c.MinNotional = pt
 }
 

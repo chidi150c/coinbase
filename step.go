@@ -149,27 +149,52 @@ func (t *Trader) maybeRepriceOnce(
 	if t.cfg.RepriceMaxCount > 0 && repriceCount >= t.cfg.RepriceMaxCount {
 		return orderID, lastLimitPx, repriceCount, false
 	}
-
-	// Fresh snap with small timeout
-	ctxPx, cancelPx := context.WithTimeout(pctx, 1*time.Second)
-	px, gErr := t.broker.GetNowPrice(ctxPx, t.cfg.ProductID)
-	cancelPx()
-	if gErr != nil || px <= 0 {
-		return orderID, lastLimitPx, repriceCount, false
-	}
-
-	// Recompute target limit with same offset
-	newLimitPx := px
-	if side == SideBuy {
-		newLimitPx = px * (1.0 - offsetBps/10000.0)
+	
+	bid, ask, bErr := t.broker.GetBBO(pctx, t.cfg.ProductID)
+	useBBO := (bErr == nil && bid > 0 && ask > bid)
+	var newLimitPx float64
+	if useBBO {
+		if side == SideBuy {
+			newLimitPx = bid
+		} else {
+			newLimitPx = ask
+		}
 	} else {
-		newLimitPx = px * (1.0 + offsetBps/10000.0)
+		// existing mark±offset path
+		// Fresh snap with small timeout
+		ctxPx, cancelPx := context.WithTimeout(pctx, 1*time.Second)
+		px, gErr := t.broker.GetNowPrice(ctxPx, t.cfg.ProductID)
+		cancelPx()
+		if gErr != nil || px <= 0 { return orderID, lastLimitPx, repriceCount, false }
+		if side == SideBuy {
+			newLimitPx = px * (1.0 - offsetBps/10000.0)
+		} else {
+			newLimitPx = px * (1.0 + offsetBps/10000.0)
+		}
 	}
 
-	// Snap to tick if configured
+	// snap to tick
 	tick := t.cfg.PriceTick
 	if tick > 0 {
 		newLimitPx = math.Floor(newLimitPx/tick) * tick
+	}
+	// anti-cross nudge when using BBO
+	if useBBO && tick > 0 {
+		if side == SideBuy {
+			if newLimitPx >= ask {
+				cand := ask - tick
+				if cand <= 0 { return orderID, lastLimitPx, repriceCount, false }
+				newLimitPx = cand
+			}
+		} else {
+			if newLimitPx <= bid {
+				newLimitPx = bid + tick
+			}
+		}
+	}else if useBBO && tick <= 0 {
+		// If no tick, still ensure we don't cross the book when using BBO
+		if side == SideBuy && newLimitPx >= ask { newLimitPx = math.Nextafter(ask, 0) }   // nudge below ask
+		if side == SideSell && newLimitPx <= bid { newLimitPx = math.Nextafter(bid, +1) } // nudge above bid
 	}
 
 	// Baseline: only reprice if snapped price changed
@@ -188,30 +213,12 @@ func (t *Trader) maybeRepriceOnce(
 	if pend != nil && pend.Quote > 0 {
 		newBase = pend.Quote / newLimitPx
 	}
-	// Snap base to step
+
+	// ✱ Snap base to step BEFORE any economic/min-notional checks
 	if t.cfg.BaseStep > 0 {
 		newBase = math.Floor(newBase/t.cfg.BaseStep) * t.cfg.BaseStep
 	}
 
-	// Guard: minimum improvement in ticks (directional)
-	if shouldReprice && tick > 0 {
-		improveTicks := int(math.Abs(newLimitPx-lastLimitPx) / tick)
-		need := t.cfg.RepriceMinImprovTicks
-		if need < 1 { need = 1 }
-		if side == SideBuy {
-			if !(newLimitPx < lastLimitPx && improveTicks >= need) { shouldReprice = false }
-		} else {
-			if !(newLimitPx > lastLimitPx && improveTicks >= need) { shouldReprice = false }
-		}
-	}
-
-	// Guard: min edge USD improvement
-	if shouldReprice && t.cfg.RepriceMinEdgeUSD > 0 && newBase > 0 {
-		edgeUSD := math.Abs(newLimitPx-lastLimitPx) * newBase
-		if edgeUSD < t.cfg.RepriceMinEdgeUSD {
-			shouldReprice = false
-		}
-	}
 
 	// Ensure min-notional for the reprice candidate
 	if shouldReprice && !(newBase > 0 && newBase*newLimitPx >= t.cfg.MinNotional) {
@@ -220,6 +227,12 @@ func (t *Trader) maybeRepriceOnce(
 
 	if !shouldReprice {
 		return orderID, lastLimitPx, repriceCount, false
+	}
+
+	if useBBO {
+		log.Printf("TRACE postonly.reprice.touch side=%s bid=%.8f ask=%.8f new=%.8f last=%.8f", side, bid, ask, newLimitPx, lastLimitPx)
+	} else {
+		log.Printf("TRACE postonly.reprice.mark side=%s new=%.8f last=%.8f", side, newLimitPx, lastLimitPx)
 	}
 
 	// Cancel current and re-place at the new price
@@ -707,7 +720,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-5",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-6",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()

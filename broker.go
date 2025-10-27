@@ -82,4 +82,5 @@ type Broker interface {
 	GetOrder(ctx context.Context, product, orderID string) (*PlacedOrder, error)
 	CancelOrder(ctx context.Context, product, orderID string) error
 	GetExchangeFilters(ctx context.Context, product string) (ExFilters, error)
+	GetBBO(ctx context.Context, product string) (float64, float64, error)
 }

@@ -40,8 +40,38 @@ func NewBinanceBridge(base string) *BinanceBridge {
 
 func (b *BinanceBridge) Name() string { return "binance-bridge" }
 
-// --- Price / Product ---
+// Add near other broker methods
+func (b *BinanceBridge) GetBBO(ctx context.Context, product string) (float64, float64, error) {
+	u := fmt.Sprintf("%s/bbo?product_id=%s", b.base, url.QueryEscape(product))
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	resp, err := b.hc.Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		xb, _ := io.ReadAll(resp.Body)
+		return 0, 0, fmt.Errorf("bridge bbo %d: %s", resp.StatusCode, string(xb))
+	}
+	var payload struct {
+		Bid  float64 `json:"bid"`
+		Ask  float64 `json:"ask"`
+		TSms int64   `json:"ts_ms"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return 0, 0, err
+	}
+	if payload.Bid <= 0 || payload.Ask <= 0 || payload.Bid >= payload.Ask {
+		return 0, 0, fmt.Errorf("invalid bbo bid=%.8f ask=%.8f", payload.Bid, payload.Ask)
+	}
+	return payload.Bid, payload.Ask, nil
+}
 
+
+// --- Price / Product ---
 func (b *BinanceBridge) GetNowPrice(ctx context.Context, product string) (float64, error) {
 	u := fmt.Sprintf("%s/product/%s", b.base, url.PathEscape(product))
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
