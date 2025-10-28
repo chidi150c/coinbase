@@ -780,7 +780,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-6",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-8",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
