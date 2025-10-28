@@ -176,7 +176,11 @@ func (t *Trader) maybeRepriceOnce(
 	// snap to tick
 	tick := t.cfg.PriceTick
 	if tick > 0 {
-		newLimitPx = math.Floor(newLimitPx/tick) * tick
+		if side == SideBuy {
+			newLimitPx = math.Floor(newLimitPx/tick) * tick     // round down for buys
+		} else {
+			newLimitPx = math.Ceil(newLimitPx/tick) * tick      // round up for sells  ✅
+		}
 	}
 	// anti-cross nudge when using BBO
 	if useBBO && tick > 0 {
@@ -311,10 +315,20 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					entryFee = quoteSpent * (t.cfg.FeeRatePct / 100.0)
 				}
 
+				// Compute history match explicitly (clearer than inline func)
+				matchHistory := false
+				if t.pendingBuy != nil {
+					for _, id := range t.pendingBuy.History {
+						if id == res.OrderID { matchHistory = true; break }
+					}
+				}
+
 				log.Printf("TRACE postonly.drain.accept side=%s match_current=%v match_history=%v pending_nil=%v",
-					SideBuy, t.pendingBuy != nil && res.OrderID == t.pendingBuy.OrderID,
-					t.pendingBuy != nil && func() bool { for _, id := range t.pendingBuy.History { if id == res.OrderID { return true } }; return false }(),
-					t.pendingBuy == nil)
+					SideBuy,
+					t.pendingBuy != nil && res.OrderID == t.pendingBuy.OrderID,
+					matchHistory,
+					t.pendingBuy == nil,
+				)
 
 				newLot := &Position{
 					OpenPrice:    priceToUse,
@@ -332,6 +346,16 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if t.pendingBuy != nil {
 					newLot.Reason = t.pendingBuy.Reason
 					newLot.Take = t.pendingBuy.Take
+				}
+				idx := len(book.Lots) // the new lot’s index after append
+				if idx >= 6 {
+					if !strings.Contains(newLot.Reason, "mode=choppy") {
+						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=choppy")
+					}
+				} else if idx >= 3 && idx <= 5 {
+					if !strings.Contains(newLot.Reason, "mode=strict") {
+						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=strict")
+					}
 				}
 				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
@@ -420,10 +444,19 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					entryFee = quoteSpent * (t.cfg.FeeRatePct / 100.0)
 				}
 
+				matchHistory := false
+				if t.pendingSell != nil {
+					for _, id := range t.pendingSell.History {
+						if id == res.OrderID { matchHistory = true; break }
+					}
+				}
+
 				log.Printf("TRACE postonly.drain.accept side=%s match_current=%v match_history=%v pending_nil=%v",
-					SideSell, t.pendingSell != nil && res.OrderID == t.pendingSell.OrderID,
-					t.pendingSell != nil && func() bool { for _, id := range t.pendingSell.History { if id == res.OrderID { return true } }; return false }(),
-					t.pendingSell == nil)
+					SideSell,
+					t.pendingSell != nil && res.OrderID == t.pendingSell.OrderID,
+					matchHistory,
+					t.pendingSell == nil,
+				)
 
 				newLot := &Position{
 					OpenPrice:    priceToUse,
@@ -441,6 +474,16 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if t.pendingSell != nil {
 					newLot.Reason = t.pendingSell.Reason
 					newLot.Take = t.pendingSell.Take
+				}
+				idx := len(book.Lots) // the new lot’s index after append
+				if idx >= 6 {
+					if !strings.Contains(newLot.Reason, "mode=choppy") {
+						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=choppy")
+					}
+				} else if idx >= 3 && idx <= 5 {
+					if !strings.Contains(newLot.Reason, "mode=strict") {
+						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=strict")
+					}
 				}
 				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
@@ -546,11 +589,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 				return
 			}
-
-			// 1..4 → trailing (scalp); >4 → fixed TP
-			n := idx + 1
-			if n >= 1 && n <= 4 {
-				// ScalpTrailing: Take = fee-aware activation price for scalp USD gate (preview only)
+			// 0..2 → trailing (scalp); 3..5 → fixed TP
+			if idx >= 0 && idx <= 2 {
+				// ScalpTrailing: idx 0..2
 				lot.ExitMode = ExitModeScalpTrailing
 				lot.TrailDistancePct = t.cfg.TrailDistancePctScalp
 				lot.TrailActivateGateUSD = t.cfg.TrailActivateUSDScalp
@@ -558,6 +599,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if lot.TrailPeak == 0 {
 					lot.TrailPeak = lot.OpenPrice
 				}
+				return
 			} else {
 				// ScalpFixedTP: Take = fee-aware profit-gate price (preview);
 				// when gate passes you’ll arm FixedTPWorking and use this for post-only exits.
@@ -578,6 +620,19 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 				// compute gate
 				net, pass := computeGate(lot)
+				
+				// Override gating for FixedTP buckets:
+				// - idx 3..5 → stricter 4× gate
+				// - idx ≥ 6  → normal 1× gate (ScalpChoppyTP semantics)
+				if lot.ExitMode == ExitModeScalpFixedTP {
+					if i >= 3 && i <= 5 {
+						pass = net >= 4.0 * t.cfg.ProfitGateUSD
+						lot.TrailActivateGateUSD = 4.0 * t.cfg.ProfitGateUSD // preview consistency
+					} else if i >= 6 {
+						pass = net >= t.cfg.ProfitGateUSD
+						lot.TrailActivateGateUSD = t.cfg.ProfitGateUSD
+					}
+				}
 
 				// reset arming when gate not passed
 				if !pass {
@@ -644,6 +699,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				// --- Legacy trigger block (now governed by our gated Stop/Take) ---
 				trigger := false
 				exitReason := ""
+				if lot.ExitMode == ExitModeScalpFixedTP {
+					exitReason = "take_profit"
+				} else if lot.ExitMode == ExitModeRunnerTrailing || lot.ExitMode == ExitModeScalpTrailing {
+					exitReason = "trailing_stop"
+				}
 				if lot.Side == SideBuy && (lot.Take > 0 && price >= lot.Take) {
 					trigger = true
 				}
@@ -1375,7 +1435,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if side == SideBuy {
 					limitPx = math.Floor(limitPx/tick) * tick
 				} else {
-					limitPx = math.Floor(limitPx/tick) * tick
+					limitPx = math.Ceil(limitPx/tick) * tick
 				}
 			}
 			baseAtLimit := quote / limitPx
@@ -1820,6 +1880,16 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		Version:      1,
 		LotID:        t.NextLotSeq,
 		EntryOrderID: "", // market path has no known order id here
+	}
+	idx := len(book.Lots) // the new lot’s index after append
+	if idx >= 6 {
+		if !strings.Contains(newLot.Reason, "mode=choppy") {
+			newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=choppy")
+		}
+	} else if idx >= 3 && idx <= 5 {
+		if !strings.Contains(newLot.Reason, "mode=strict") {
+			newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=strict")
+		}
 	}
 	t.NextLotSeq++
 	book.Lots = append(book.Lots, newLot)

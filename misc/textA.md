@@ -74,7 +74,10 @@ PAPER_BASE_BALANCE=0.05
 
 # === Optional overrides (mainly for backtests / guards) ===
 BASE_ASSET=BTC
-BASE_STEP=0.00000001
+BASE_STEP=0.000001
+PRICE_TICK=0.1         # price increment (tick)
+QUOTE_STEP=0.01         # quote asset step (USDT/USD cent precision)
+MIN_NOTIONAL=10.0       # minimum notional in quote (typical Binance spot)
 
 # === Live equity: broker provides balances ===
 USE_LIVE_EQUITY=true
@@ -101,13 +104,13 @@ LOG_LEVEL=TRACE
 # === Order entry / maker placement ===
 ORDER_TYPE=limit
 SPREAD_MIN_BPS=0
-LIMIT_PRICE_OFFSET_BPS=5
-LIMIT_TIMEOUT_SEC=180
+LIMIT_PRICE_OFFSET_BPS=0.05
+LIMIT_TIMEOUT_SEC=900
 
 # =========== Reprice (maker-chase) ================
 REPRICE_ENABLE=true
-REPRICE_INTERVAL_MS=1200
+REPRICE_INTERVAL_MS=1000
 REPRICE_MIN_IMPROV_TICKS=0
-REPRICE_MIN_EDGE_USD=0.0001      # <<< lowered so tiny orders can reprice
+REPRICE_MIN_EDGE_USD=0      # <<< lowered so tiny orders can reprice
 REPRICE_MAX_DRIFT_BPS=3
-REPRICE_MAX_COUNT=20
+REPRICE_MAX_COUNT=0
