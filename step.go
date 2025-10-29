@@ -949,17 +949,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		return fmt.Sprintf("FLAT [%s]", d.Reason), nil
 	}
 
-	// === NEW: Equity over-cap guard ===
-	// Block equity-triggered opens unless we're already over the global cap.
-	if ( (equityTriggerBuy && d.Signal == Buy) || (equityTriggerSell && d.Signal == Sell) ) {
-		if (lsb + lss) <= maxConcurrentLots() {
-			t.mu.Unlock()
-			log.Printf("[DEBUG] EQUITY GATE: blocked (lots=%d <= cap=%d); HOLD", lsb+lss, maxConcurrentLots())
-			return "HOLD", nil
-		}
-	}
-
-
 	// GATE1 Respect lot cap (both sides)
 	if (lsb+lss) >= maxConcurrentLots() && !((equityTriggerBuy && d.Signal == Buy) || (equityTriggerSell && d.Signal == Sell)) {
 		t.mu.Unlock()
