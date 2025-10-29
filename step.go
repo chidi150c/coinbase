@@ -74,6 +74,38 @@ import (
 	"time"
 )
 
+// ---- Runner helpers (minimal addition to support multiple runners) ----
+func isRunner(book *SideBook, idx int) bool {
+	if book == nil || len(book.RunnerIDs) == 0 {
+		return false
+	}
+	for _, rid := range book.RunnerIDs {
+		if rid == idx {
+			return true
+		}
+	}
+	return false
+}
+
+func addRunner(book *SideBook, idx int) {
+	if book == nil || idx < 0 || idx >= len(book.Lots) {
+		return
+	}
+	for _, rid := range book.RunnerIDs {
+		if rid == idx {
+			return
+		}
+	}
+	book.RunnerIDs = append(book.RunnerIDs, idx)
+}
+
+func runnerCount(book *SideBook) int {
+	if book == nil {
+		return 0
+	}
+	return len(book.RunnerIDs)
+}
+
 // ---- Core tick ----
 // safeSend ensures we deliver a result even if the buffer is momentarily full.
 // It will drop one stale item from the channel buffer and resend the latest.
@@ -360,13 +392,14 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
 				if t.pendingBuy != nil && t.pendingBuy.EquityBuy {
-					book.RunnerID = len(book.Lots) - 1 // the newly appended lot
-					r := book.Lots[book.RunnerID]
+					newIdx := len(book.Lots) - 1 // the newly appended lot
+					addRunner(book, newIdx)
+					r := book.Lots[newIdx]
 					r.TrailActive = false
 					r.TrailPeak = r.OpenPrice
 					r.TrailStop = 0
 					t.applyRunnerTargets(r)
-					log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", book.RunnerID, side, r.OpenPrice, r.Take)
+					log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
 				}
 				// side-specific resets...
 				t.lastAddBuy = wallNow
@@ -488,13 +521,14 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
 				if t.pendingSell != nil && t.pendingSell.EquitySell {
-					book.RunnerID = len(book.Lots) - 1 // the newly appended lot
-					r := book.Lots[book.RunnerID]
+					newIdx := len(book.Lots) - 1 // the newly appended lot
+					addRunner(book, newIdx)
+					r := book.Lots[newIdx]
 					r.TrailActive = false
 					r.TrailPeak = r.OpenPrice
 					r.TrailStop = 0
 					t.applyRunnerTargets(r)
-					log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", book.RunnerID, side, r.OpenPrice, r.Take)
+					log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
 				}
 				// side-specific resets...
 				t.lastAddSell = wallNow
@@ -578,7 +612,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		setExitMode := func(book *SideBook, idx int, lot *Position) {
 			feeRatePct := t.cfg.FeeRatePct
 
-			if idx == book.RunnerID {
+			if isRunner(book, idx) {
 				// Runner: trailing; Take = fee-aware activation price for runner USD gate (preview only)
 				lot.ExitMode = ExitModeRunnerTrailing
 				lot.TrailDistancePct = t.cfg.TrailDistancePctRunner
@@ -780,7 +814,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-8",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-9",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
@@ -914,6 +948,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		t.mu.Unlock()
 		return fmt.Sprintf("FLAT [%s]", d.Reason), nil
 	}
+
+	// === NEW: Equity over-cap guard ===
+	// Block equity-triggered opens unless we're already over the global cap.
+	if ( (equityTriggerBuy && d.Signal == Buy) || (equityTriggerSell && d.Signal == Sell) ) {
+		if (lsb + lss) <= maxConcurrentLots() {
+			t.mu.Unlock()
+			log.Printf("[DEBUG] EQUITY GATE: blocked (lots=%d <= cap=%d); HOLD", lsb+lss, maxConcurrentLots())
+			return "HOLD", nil
+		}
+	}
+
 
 	// GATE1 Respect lot cap (both sides)
 	if (lsb+lss) >= maxConcurrentLots() && !((equityTriggerBuy && d.Signal == Buy) || (equityTriggerSell && d.Signal == Sell)) {
@@ -1103,6 +1148,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --- NEW: side-aware risk ramping (optional) ---
 	if t.cfg.RampEnable && !(equityTriggerSell || equityTriggerBuy) {
 		k := len(book.Lots) // number of existing lots on THIS SIDE
+		// exclude all runner(s) on this side from k
+		if rc := runnerCount(book); rc > 0 && k >= rc {
+			k = k - rc
+		}
 		switch strings.ToLower(strings.TrimSpace(t.cfg.RampMode)) {
 		case "exp":
 			start := t.cfg.RampStartPct
@@ -1320,8 +1369,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	if t.cfg.ScalpTPDecayEnable && !((equityTriggerBuy && side == SideBuy) || (equityTriggerSell && side == SideSell)) {
 		// This is a scalp add on THIS SIDE: compute k = number of existing scalps in this side
 		k := len(book.Lots)
-		if book.RunnerID >= 0 && book.RunnerID < len(book.Lots) {
-			k = len(book.Lots) - 1 // exclude the side's runner
+		// exclude all runner(s) on this side from k
+		if rc := runnerCount(book); rc > 0 && k >= rc {
+			k = len(book.Lots) - rc
 		}
 		baseTP := t.cfg.TakeProfitPct
 		tpPct := baseTP
@@ -1918,27 +1968,29 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --- CHANGED: Do NOT auto-assign runner for first/non-equity lots; instead,
 	//               promote the equity-triggered lot to runner immediately.
 	if equityTriggerSell && side == SideSell {
-		book.RunnerID = len(book.Lots) - 1 // promote the equity trade lot to runner
-		r := book.Lots[book.RunnerID]
+		newIdx := len(book.Lots) - 1 // promote the equity trade lot to runner
+		addRunner(book, newIdx)
+		r := book.Lots[newIdx]
 		// Initialize/Reset trailing fields for the new runner
 		r.TrailActive = false
 		r.TrailPeak = r.OpenPrice
 		r.TrailStop = 0
 		// Apply runner targets (stretched TP)
 		t.applyRunnerTargets(r)
-		log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", book.RunnerID, side, r.OpenPrice, r.Take)
+		log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
 	}
 	// --- NEW (minimal): promote equity-triggered BUY add to runner ---
 	if equityTriggerBuy && side == SideBuy {
-		book.RunnerID = len(book.Lots) - 1
-		r := book.Lots[book.RunnerID]
+		newIdx := len(book.Lots) - 1
+		addRunner(book, newIdx)
+		r := book.Lots[newIdx]
 		r.TrailActive = false
 		r.TrailPeak = r.OpenPrice
 		r.TrailStop = 0
 		t.applyRunnerTargets(r)
-		log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", book.RunnerID, side, r.OpenPrice, r.Take)
+		log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
 	}
-	// (If not equityTriggerSell/equityTriggerBuy, leave RunnerID unchanged so first lot is NOT the runner.)
+	// (If not equityTriggerSell/equityTriggerBuy, leave RunnerIDs unchanged so first lot is NOT the runner.)
 
 	// Rebuild legacy aggregate view for logs/compat
 	// t.refreshAggregateFromBooks()

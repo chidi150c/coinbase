@@ -81,8 +81,8 @@ type Position struct {
 
 // --- NEW: per-side book (authoritative store) ---
 type SideBook struct {
-	RunnerID int         `json:"runner_id"`
-	Lots     []*Position `json:"lots"`
+	RunnerIDs []int       `json:"runner_ids,omitempty"`  // NEW: multiple runner indices (authoritative for multi-runner mode)
+	Lots      []*Position `json:"lots"`
 }
 
 // BotState is the persistent snapshot of trader state.
@@ -233,8 +233,8 @@ func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
 		stateFile:  cfg.StateFile,
 		// runnerIdx:  -1,
 		books: map[OrderSide]*SideBook{
-			SideBuy:  {RunnerID: -1, Lots: nil},
-			SideSell: {RunnerID: -1, Lots: nil},
+			SideBuy:  {RunnerIDs: []int{}, Lots: nil},
+			SideSell: {RunnerIDs: []int{}, Lots: nil},
 		},
 		NextLotSeq:   1,
 		stateApplyCh: make(chan func(*Trader), 128),
@@ -516,7 +516,7 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 func (t *Trader) book(side OrderSide) *SideBook {
 	b := t.books[side]
 	if b == nil {
-		b = &SideBook{RunnerID: -1}
+		b = &SideBook{RunnerIDs: []int{}}
 		t.books[side] = b
 	}
 	return b
@@ -689,14 +689,30 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		return (lot.OpenPrice - priceExec) * baseFilled
 	}()
 	kind := "scalp"
-	if book.RunnerID == localIdx {
-		kind = "runner"
+	for _, rid := range book.RunnerIDs {
+		if rid == localIdx {
+			kind = "runner"
+			break
+		}
 	}
 	log.Printf("TRACE exit.classify side=%s kind=%s reason=%s open=%.8f exec=%.8f baseFilled=%.8f rawPL=%.6f entryFee=%.6f exitFee=%.6f finalPL=%.6f",
 		lot.Side, kind, exitReason, lot.OpenPrice, priceExec, baseFilled, rawPL, entryPortion, exitFee, pl)
 
 	t.dailyPnL += pl
 	t.equityUSD += pl
+
+	
+	// Track if we removed the runner and adjust book.RunnerID accordingly after removal.
+	removedWasRunner := false
+	// NEW: also consider multi-runner slice
+	if len(book.RunnerIDs) > 0 {
+		for _, rid := range book.RunnerIDs {
+			if rid == localIdx {
+				removedWasRunner = true
+				break
+			}
+		}
+	}
 
 	// Build ExitRecord (use exec price/size actually filled)
 	rec := ExitRecord{
@@ -710,7 +726,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		PNLUSD:      pl,
 		Reason:      exitReason,
 		ExitMode:    lot.ExitMode,
-		WasRunner:   (localIdx == book.RunnerID),
+		WasRunner:   removedWasRunner,
 		// NEW identifiers
 		LotID:        lot.LotID,
 		EntryOrderID: lot.EntryOrderID,
@@ -771,32 +787,28 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 
 	// --- FULL EXIT path (unchanged semantics aside from entry fee portion already applied) ---
 
-	// Track if we removed the runner and adjust book.RunnerID accordingly after removal.
-	removedWasRunner := (localIdx == book.RunnerID)
-
 	// remove lot at localIdx
 	book.Lots = append(book.Lots[:localIdx], book.Lots[localIdx+1:]...)
 
-	// shift RunnerID if needed
-	if book.RunnerID >= 0 {
-		if localIdx < book.RunnerID {
-			book.RunnerID-- // slice shifted left
-		} else if localIdx == book.RunnerID {
-			// runner removed; promote the NEWEST remaining lot (if any) to runner
-			if len(book.Lots) > 0 {
-				book.RunnerID = len(book.Lots) - 1
-				// reset trailing fields for the newly promoted runner
-				nr := book.Lots[book.RunnerID]
-				nr.TrailActive = false
-				nr.TrailPeak = nr.OpenPrice
-				nr.TrailStop = 0
-				// also re-apply runner targets (keeps existing behavior)
-				t.applyRunnerTargets(nr)
-			} else {
-				book.RunnerID = -1
+	// Update multi-runner slice: drop exited idx and shift higher ones down
+	if len(book.RunnerIDs) > 0 {
+		out := book.RunnerIDs[:0] // reuse capacity
+		for _, rid := range book.RunnerIDs {
+			if rid == localIdx {
+				// exited lot was a runner → drop it
+				continue
 			}
+			if rid > localIdx {
+				rid-- // compact indices after removal
+			}
+			out = append(out, rid)
 		}
+		// reset to a clean slice (avoid keeping stale tail)
+		book.RunnerIDs = append([]int(nil), out...)
 	}
+
+	// NOTE: Do NOT auto-promote any lot to runner.
+	// If RunnerIDs becomes empty, the side simply has no runners now.
 
 	// --- if the closed lot was the most recent add FOR THAT SIDE, re-anchor pyramiding timers/state ---
 	if wasNewest {
@@ -981,10 +993,8 @@ func (t *Trader) loadState() error {
 	if err := json.Unmarshal(bs, &st); err != nil {
 		return err
 	}
-	// Prefer configured/live equity rather than stale persisted equity when:
-	//  - running in DRY_RUN / backtest, or
-	//  - live-equity mode is enabled (we will rebase from Bridge when available).
-	// This prevents negative/old EquityUSD from leaking into runs that don't want it.
+
+	// Equity restore policy
 	if !(t.cfg.DryRun || t.cfg.UseLiveEquity()) {
 		t.equityUSD = st.EquityUSD
 	}
@@ -1001,15 +1011,29 @@ func (t *Trader) loadState() error {
 		t.lastFit = st.LastFit
 	}
 
-	// Restore per-side books
-	t.books[SideBuy] = &SideBook{RunnerID: st.BookBuy.RunnerID, Lots: st.BookBuy.Lots}
-	t.books[SideSell] = &SideBook{RunnerID: st.BookSell.RunnerID, Lots: st.BookSell.Lots}
-	// --- MIGRATION/BACKFILL for new trailing params on Position ---
+	// Restore per-side books (no migration; assume st.Book*.RunnerIDs reflects persisted state)
+	t.books[SideBuy] = &SideBook{
+		RunnerIDs: st.BookBuy.RunnerIDs,
+		Lots:      st.BookBuy.Lots,
+	}
+	t.books[SideSell] = &SideBook{
+		RunnerIDs: st.BookSell.RunnerIDs,
+		Lots:      st.BookSell.Lots,
+	}
+
+	// Backfill per-lot trailing/TP defaults based on runner vs scalp buckets
+	containsIdx := func(xs []int, i int) bool {
+		for _, v := range xs {
+			if v == i {
+				return true
+			}
+		}
+		return false
+	}
 	for _, side := range []OrderSide{SideBuy, SideSell} {
 		book := t.book(side)
 		for i, lot := range book.Lots {
-			// Determine exit class to pick defaults
-			if i == book.RunnerID {
+			if containsIdx(book.RunnerIDs, i) {
 				// Runner → trailing (runner params)
 				if lot.TrailDistancePct == 0 {
 					lot.TrailDistancePct = t.cfg.TrailDistancePctRunner
@@ -1038,11 +1062,11 @@ func (t *Trader) loadState() error {
 					if lot.ExitMode == "" {
 						lot.ExitMode = ExitModeScalpFixedTP
 					}
-					// trailing params not required for fixed-TP scalps
 				}
 			}
 		}
 	}
+
 	// Side-aware pyramiding persisted state
 	t.lastAddBuy = st.LastAddBuy
 	t.lastAddSell = st.LastAddSell
@@ -1054,17 +1078,17 @@ func (t *Trader) loadState() error {
 	t.lastAddEquityBuy = st.LastAddEquityBuy
 	t.lastExits = st.Exits
 
-	// Restore equity stages (defaults to 0 if absent)
+	// Restore equity stages
 	t.equityStageBuy = st.EquityStageBuy
 	t.equityStageSell = st.EquityStageSell
 
-	// Restore pending and recheck flags (rehydration is performed by RehydratePending)
+	// Restore pending & recheck flags
 	t.pendingBuy = st.PendingBuy
 	t.pendingSell = st.PendingSell
 	t.pendingRecheckBuy = st.PendingRecheckBuy
 	t.pendingRecheckSell = st.PendingRecheckSell
 
-	// Restore next lot sequence; if absent/zero, re-compute from existing lots (max+1), default 1.
+	// NextLotSeq (recompute if absent)
 	t.NextLotSeq = st.NextLotSeq
 	if t.NextLotSeq <= 0 {
 		maxID := 0
@@ -1081,18 +1105,20 @@ func (t *Trader) loadState() error {
 		}
 	}
 
-	// Initialize runner trailing baseline for current runners if not already set
+	// Initialize trailing baseline for any current runners (no migration; just honor existing RunnerIDs)
 	for _, side := range []OrderSide{SideBuy, SideSell} {
 		book := t.book(side)
-		if book.RunnerID >= 0 && book.RunnerID < len(book.Lots) {
-			r := book.Lots[book.RunnerID]
-			if r.TrailPeak == 0 {
-				r.TrailPeak = r.OpenPrice
+		for _, rid := range book.RunnerIDs {
+			if rid >= 0 && rid < len(book.Lots) {
+				r := book.Lots[rid]
+				if r.TrailPeak == 0 {
+					r.TrailPeak = r.OpenPrice
+				}
 			}
 		}
 	}
 
-	// --- Restart warmup for pyramiding decay/adverse tracking ---
+	// Restart warmup for pyramiding decay/adverse tracking
 	now := time.Now().UTC()
 	if len(t.book(SideBuy).Lots) > 0 && t.lastAddBuy.IsZero() {
 		t.lastAddBuy = now
@@ -1105,10 +1131,10 @@ func (t *Trader) loadState() error {
 		t.latchedGateSell = 0
 	}
 
-	// Rebuild legacy aggregate view
-	// t.refreshAggregateFromBooks()
+	// t.refreshAggregateFromBooks() // legacy aggregate (intentionally left disabled)
 	return nil
 }
+
 
 func (t *Trader) LastExits() []ExitRecord {
 	t.mu.RLock()
