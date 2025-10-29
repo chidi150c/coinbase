@@ -624,8 +624,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				return
 			}
 			// 0..2 → trailing (scalp); 3..5 → fixed TP
-			if idx >= 0 && idx <= 2 {
-				// ScalpTrailing: idx 0..2
+			if idx >= 0 && idx <= 1 {
+				// ScalpTrailing: idx 0..1
 				lot.ExitMode = ExitModeScalpTrailing
 				lot.TrailDistancePct = t.cfg.TrailDistancePctScalp
 				lot.TrailActivateGateUSD = t.cfg.TrailActivateUSDScalp
@@ -659,10 +659,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				// - idx 3..5 → stricter 4× gate
 				// - idx ≥ 6  → normal 1× gate (ScalpChoppyTP semantics)
 				if lot.ExitMode == ExitModeScalpFixedTP {
-					if i >= 3 && i <= 5 {
+					if i >= 2 && i <= 3 {
 						pass = net >= 4.0 * t.cfg.ProfitGateUSD
 						lot.TrailActivateGateUSD = 4.0 * t.cfg.ProfitGateUSD // preview consistency
-					} else if i >= 6 {
+					} else if i >= 4 {
 						pass = net >= t.cfg.ProfitGateUSD
 						lot.TrailActivateGateUSD = t.cfg.ProfitGateUSD
 					}
@@ -814,7 +814,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-9",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-10",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
