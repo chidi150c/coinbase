@@ -532,4 +532,17 @@ docker compose logs --since 15m --no-color bot_binance | wc -l
 docker compose logs --since 15m --no-color bot_binance \
 | grep -E "(pyramid: .*baseline met|pyramid\.latch\.set|trail\.(activate|raise|trigger)|\[WARN\] FUNDS_EXHAUSTED|equity\.baseline\.set|lot\.take_pnl_est|runner\.assign|panic:|runtime error:|fatal error|SIGSEGV|stack trace|level=error|ERROR|FATAL|panic recovered)" \
 | wc -l
+==================================================================
+# 1) Export the tag so compose can render the image reference
+export IMAGE_SHA=5f420825f82f1150c418ca6ac37915605a317461
+
+# (optional) Persist it in your project .env so you don’t have to export again next time:
+# echo 'IMAGE_SHA=5f420825f82f1150c418ca6ac37915605a317461' >> .env
+
+# 2) Recreate only the bot_binance service to pick up the new PROFIT_GATE_USD
+docker compose up -d --force-recreate --no-deps bot_binance
+=======================================================================
+ docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' monitoring-bot_binance-1 \
+| grep -i '^PROFIT_GATE_USD='
+
 

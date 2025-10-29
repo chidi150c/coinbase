@@ -161,6 +161,7 @@ type Trader struct {
 	cfg    Config
 	broker Broker
 	model  *AIMicroModel
+	didConsolidateStartup bool
 	pos    *Position // kept for backward compatibility with earlier logic (represents last lot in aggregate)
 	// lots      []*Position // legacy aggregate view (derived from books; do not mutate directly)
 	mu        sync.RWMutex

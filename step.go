@@ -2,74 +2,77 @@
 // FILE: step.go — Synchronized trading tick (EXIT → OPEN), extracted from trader.go
 //
 // Overview
-//   step(ctx, candles) is the single-threaded decision loop that reads the latest market
-//   snapshot, evaluates exits (profit-gate, trailing, fixed TP), then evaluates a new entry
-//   (market or maker-first limit) — in that strict order. It returns a short, human-readable
-//   status for logs/metrics and an error if any broker call fails.
+//
+//	step(ctx, candles) is the single-threaded decision loop that reads the latest market
+//	snapshot, evaluates exits (profit-gate, trailing, fixed TP), then evaluates a new entry
+//	(market or maker-first limit) — in that strict order. It returns a short, human-readable
+//	status for logs/metrics and an error if any broker call fails.
 //
 // Inputs / Outputs
-//   Input:  []Candle history (last element is the most recent mark/close).
-//           Context is used for broker/network timeouts and cancellation.
-//   Output: (msg string, err error) where msg ∈ {"EXIT …","OPEN …","HOLD","FLAT …","OPEN-PENDING …"}.
+//
+//	Input:  []Candle history (last element is the most recent mark/close).
+//	        Context is used for broker/network timeouts and cancellation.
+//	Output: (msg string, err error) where msg ∈ {"EXIT …","OPEN …","HOLD","FLAT …","OPEN-PENDING …"}.
 //
 // Concurrency & Locks
-//   • Takes t.mu at the top to read/update in-memory state, and RELEASES it around ANY I/O
+//   - Takes t.mu at the top to read/update in-memory state, and RELEASES it around ANY I/O
 //     (broker calls, price fetches, Slack). Every unlock is paired with a re-lock before
 //     mutating state again.
-//   • Close at most ONE lot per tick to keep behavior predictable.
+//   - Close at most ONE lot per tick to keep behavior predictable.
 //
 // Deterministic Flow
-//   1) Daily roll/metrics refresh
-//   2) EXIT scan per side (BUY then SELL):
-//        - Compute fee-aware net PnL and check profit gate
-//        - If gate passes:
-//            • Runner/Scalp trailing: USD-based trailing; close on stop trigger
-//            • Fixed-TP scalp: maintain maker-friendly TP preview (emulated post-only)
-//   3) OPEN evaluation (if no exit fired):
-//        - Pull balances/steps with lock released
-//        - Enforce MinNotional/OrderMinUSD and step/tick snapping symmetrically
-//        - Equity triggers may override pyramiding/ramping gates
-//        - If ORDER_TYPE=limit with offset+timeout → maker-first (async pending)
-//          else place market immediately
+//  1. Daily roll/metrics refresh
+//  2. EXIT scan per side (BUY then SELL):
+//     - Compute fee-aware net PnL and check profit gate
+//     - If gate passes:
+//     • Runner/Scalp trailing: USD-based trailing; close on stop trigger
+//     • Fixed-TP scalp: maintain maker-friendly TP preview (emulated post-only)
+//  3. OPEN evaluation (if no exit fired):
+//     - Pull balances/steps with lock released
+//     - Enforce MinNotional/OrderMinUSD and step/tick snapping symmetrically
+//     - Equity triggers may override pyramiding/ramping gates
+//     - If ORDER_TYPE=limit with offset+timeout → maker-first (async pending)
+//     else place market immediately
 //
 // Maker-First Async Opens (Post-Only)
-//   • Per-side PendingOpen is persisted and polled until filled/timeout; channels deliver the result.
-//   • On fill: append lot using actual fill price/size/fee and record EntryOrderID.
-//   • On timeout/error: set a per-side “recheck” flag permitting one market fallback later.
-//   • RehydratePending() can restore polling after restart using saved OrderID+Deadline.
+//   - Per-side PendingOpen is persisted and polled until filled/timeout; channels deliver the result.
+//   - On fill: append lot using actual fill price/size/fee and record EntryOrderID.
+//   - On timeout/error: set a per-side “recheck” flag permitting one market fallback later.
+//   - RehydratePending() can restore polling after restart using saved OrderID+Deadline.
 //
 // Repricing Guardrails (async maker path)
-//   • Optional repricing loop honors cfg: RepriceEnable, RepriceIntervalMs, RepriceMaxCount,
+//   - Optional repricing loop honors cfg: RepriceEnable, RepriceIntervalMs, RepriceMaxCount,
 //     RepriceMaxDriftBps, RepriceMinImprovTicks, RepriceMinEdgeUSD, PriceTick, BaseStep, MinNotional.
 //
 // Pyramiding & Equity Triggers
-//   • Pyramiding adds are side-aware and gated by spacing (seconds) and adverse-move thresholds,
+//   - Pyramiding adds are side-aware and gated by spacing (seconds) and adverse-move thresholds,
 //     with optional exponential decay & latching. Equity triggers can stage sizes (25/50/75/100%)
 //     and may auto-designate the new lot as the side’s runner.
 //
 // Fees, Notional & Sizing
-//   • Entry/exit PnL is fee-aware. Prefer broker-reported commission; fallback to FeeRatePct.
-//   • All orders satisfy exchange min-notional and step/tick rules before submission.
+//   - Entry/exit PnL is fee-aware. Prefer broker-reported commission; fallback to FeeRatePct.
+//   - All orders satisfy exchange min-notional and step/tick rules before submission.
 //
 // Persistence & IDs
-//   • State mutations (equity, books, exits, pending) are persisted opportunistically.
-//   • Lots carry LotID and EntryOrderID; NextLotSeq is incremented on each append.
+//   - State mutations (equity, books, exits, pending) are persisted opportunistically.
+//   - Lots carry LotID and EntryOrderID; NextLotSeq is incremented on each append.
 //
 // Dry-Run Behavior
-//   • Simulates fees and adjusts equity locally; no broker calls.
+//   - Simulates fees and adjusts equity locally; no broker calls.
 //
 // Logging & Metrics
-//   • TRACE/DEBUG breadcrumbs at key gates (spacing, latching, trailing, post-only lifecycle).
+//   - TRACE/DEBUG breadcrumbs at key gates (spacing, latching, trailing, post-only lifecycle).
 //     Prometheus-style counters/gauges are updated for opens/exits.
+//
 // ---------------------------------------------------------------------------------------------
 package main
-
 
 import (
 	"context"
 	"fmt"
 	"log"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -391,6 +394,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
+				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
 				if t.pendingBuy != nil && t.pendingBuy.EquityBuy {
 					newIdx := len(book.Lots) - 1 // the newly appended lot
 					addRunner(book, newIdx)
@@ -520,6 +524,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
+				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
 				if t.pendingSell != nil && t.pendingSell.EquitySell {
 					newIdx := len(book.Lots) - 1 // the newly appended lot
 					addRunner(book, newIdx)
@@ -583,6 +588,19 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	minNotional := t.cfg.MinNotional
 	if minNotional <= 0 {
 		minNotional = t.cfg.OrderMinUSD
+	}
+
+	// One-time dust consolidation right after startup (uses current price snapshot)
+	if !t.didConsolidateStartup {
+		// We already hold t.mu here
+		t.consolidateDust(t.book(SideBuy),  price, minNotional)
+		t.consolidateDust(t.book(SideSell), price, minNotional)
+
+		if err := t.saveStateNoLock(); err != nil {
+			log.Printf("[WARN] saveState (startup consolidate): %v", err)
+		}
+		t.didConsolidateStartup = true
+		log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
 	}
 
 	// --------------------------------------------------------------------------------------------------------
@@ -744,6 +762,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if lot.Side == SideSell && (lot.Take > 0 && price <= lot.Take) {
 					trigger = true
 				}
+				// ⬇️ ADD THIS dust guard for Fixed-TP before calling closeLot:
+				if trigger && lot.ExitMode == ExitModeScalpFixedTP {
+					notional := lot.SizeBase * price
+					if notional < minNotional {
+						// skip attempting a broker close; leave it armed or quiet it if you prefer
+						// (optional) quiet the spam:
+						lot.FixedTPWorking = false; lot.Take = 0
+						i++
+						continue
+					}
+				}
 				if trigger {
 					msg, err := t.closeLot(ctx, c, side, i, exitReason)
 					if err != nil {
@@ -814,7 +843,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-10",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-11",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
@@ -1932,6 +1961,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 	t.NextLotSeq++
 	book.Lots = append(book.Lots, newLot)
+	t.consolidateDust(book, priceToUse, minNotional)
 	// Use wall clock for lastAdd to drive spacing/decay even if candle time is zero.
 	if side == SideBuy {
 		t.lastAddBuy = wallNow
@@ -2003,4 +2033,107 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 	t.mu.Unlock()
 	return msg, nil
+}
+
+// consolidateDust collapses tiny (notional < minNotional) lots on a side, without changing exposure.
+// 1) If the newest lot is dust, merge it backward into the previous lot (repeat as needed).
+// 2) Merge any older dust lots forward into the newest lot.
+// RunnerIDs are kept authoritative: if a merged-from lot was a runner, the merged-into index remains (or becomes) a runner.
+// NOTE: px should be the best current mark/close (same used for notional checks).
+func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64) {
+	if len(book.Lots) < 2 {
+		return
+	}
+
+	ensureRunner := func(idx int) {
+		// add idx to RunnerIDs if not present
+		for _, r := range book.RunnerIDs {
+			if r == idx { return }
+		}
+		book.RunnerIDs = append(book.RunnerIDs, idx)
+	}
+
+	// shift RunnerIDs after removing lot at removedIdx
+	shiftAfterRemoval := func(removedIdx int) {
+		if len(book.RunnerIDs) == 0 { return }
+		out := book.RunnerIDs[:0]
+		for _, r := range book.RunnerIDs {
+			if r == removedIdx {
+				// dropped lot: skip
+				continue
+			}
+			if r > removedIdx {
+				r--
+			}
+			out = append(out, r)
+		}
+		book.RunnerIDs = append([]int(nil), out...)
+	}
+
+	// merge fromIdx -> toIdx (toIdx absorbs)
+	mergeInto := func(fromIdx, toIdx int) {
+		a := book.Lots[toIdx] // survivor
+		b := book.Lots[fromIdx]
+
+		// If either is runner, survivor must be runner
+		wereRunner := false
+		for _, r := range book.RunnerIDs {
+			if r == fromIdx || r == toIdx {
+				wereRunner = true
+				break
+			}
+		}
+
+		// VWAP price on size
+		totalBase := a.SizeBase + b.SizeBase
+		if totalBase > 0 {
+			totalQuote := a.OpenPrice*a.SizeBase + b.OpenPrice*b.SizeBase
+			a.OpenPrice = totalQuote / totalBase
+		}
+		a.SizeBase += b.SizeBase
+		a.EntryFee += b.EntryFee
+		// keep a.Take as-is; exit logic will recompute previews anyway
+		// (Optional) concatenate reasons
+    	a.Reason = strings.TrimSpace(a.Reason + " merge:" + strconv.Itoa(b.LotID))
+
+		// Remove fromIdx
+		book.Lots = append(book.Lots[:fromIdx], book.Lots[fromIdx+1:]...)
+		shiftAfterRemoval(fromIdx)
+
+		// Re-assert runner on survivor if either constituent was runner
+		if wereRunner {
+			ensureRunner(toIdx)
+		}
+	}
+
+	// 1) If newest is dust, merge it backward repeatedly
+	for len(book.Lots) >= 2 {
+		newestIdx := len(book.Lots) - 1
+		newest := book.Lots[newestIdx]
+		if newest.SizeBase*px >= minNotional {
+			break
+		}
+		// Merge newest into previous (newestIdx-1 survives)
+		mergeInto(newestIdx, newestIdx-1)
+	}
+
+	// If only one lot remains after merges, done.
+	if len(book.Lots) < 2 {
+		return
+	}
+
+	// 2) Merge any older dust forward into newest
+	newestIdx := len(book.Lots) - 1
+	for i := 0; i < newestIdx; {
+		lot := book.Lots[i]
+		if lot.SizeBase*px < minNotional {
+			// Merge i into newestIdx (newest survives)
+			mergeInto(i, newestIdx-1) // careful: newestIdx will shift if i < newestIdx
+			// After removal at i, the newest is now at index (len-1) again; recompute:
+			newestIdx = len(book.Lots) - 1
+			// Do not increment i; slice shifted left
+			continue
+		}
+		i++
+	}
 }
