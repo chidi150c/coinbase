@@ -383,11 +383,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					newLot.Take = t.pendingBuy.Take
 				}
 				idx := len(book.Lots) // the new lot’s index after append
-				if idx >= 6 {
+				if idx >= 2 {
 					if !strings.Contains(newLot.Reason, "mode=choppy") {
 						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=choppy")
 					}
-				} else if idx >= 3 && idx <= 5 {
+				} else if idx >= 1 && idx < 2 {
 					if !strings.Contains(newLot.Reason, "mode=strict") {
 						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=strict")
 					}
@@ -513,11 +513,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					newLot.Take = t.pendingSell.Take
 				}
 				idx := len(book.Lots) // the new lot’s index after append
-				if idx >= 6 {
+				if idx >= 2 {
 					if !strings.Contains(newLot.Reason, "mode=choppy") {
 						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=choppy")
 					}
-				} else if idx >= 3 && idx <= 5 {
+				} else if idx >= 1 && idx < 2 {
 					if !strings.Contains(newLot.Reason, "mode=strict") {
 						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=strict")
 					}
@@ -590,18 +590,18 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		minNotional = t.cfg.OrderMinUSD
 	}
 
-	// One-time dust consolidation right after startup (uses current price snapshot)
-	if !t.didConsolidateStartup {
-		// We already hold t.mu here
-		t.consolidateDust(t.book(SideBuy),  price, minNotional)
-		t.consolidateDust(t.book(SideSell), price, minNotional)
+	// // One-time dust consolidation right after startup (uses current price snapshot)
+	// if !t.didConsolidateStartup {
+	// 	// We already hold t.mu here
+	// 	t.consolidateDust(t.book(SideBuy),  price, minNotional)
+	// 	t.consolidateDust(t.book(SideSell), price, minNotional)
 
-		if err := t.saveStateNoLock(); err != nil {
-			log.Printf("[WARN] saveState (startup consolidate): %v", err)
-		}
-		t.didConsolidateStartup = true
-		log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
-	}
+	// 	if err := t.saveStateNoLock(); err != nil {
+	// 		log.Printf("[WARN] saveState (startup consolidate): %v", err)
+	// 	}
+	// 	t.didConsolidateStartup = true
+	// 	log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
+	// }
 
 	// --------------------------------------------------------------------------------------------------------
 	// --- EXIT path: evaluate profit gate and trailing/TP logic per lot (side-aware) and close at most one.
@@ -641,9 +641,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 				return
 			}
-			// 0..2 → trailing (scalp); 3..5 → fixed TP
-			if idx >= 0 && idx <= 1 {
-				// ScalpTrailing: idx 0..1
+			// 0 → trailing (scalp); 1.. → fixed TP
+			if idx == 0 {
 				lot.ExitMode = ExitModeScalpTrailing
 				lot.TrailDistancePct = t.cfg.TrailDistancePctScalp
 				lot.TrailActivateGateUSD = t.cfg.TrailActivateUSDScalp
@@ -674,13 +673,13 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				net, pass := computeGate(lot)
 				
 				// Override gating for FixedTP buckets:
-				// - idx 3..5 → stricter 4× gate
-				// - idx ≥ 6  → normal 1× gate (ScalpChoppyTP semantics)
+				// - idx == 1 → stricter 25× gate (gate = 0.02 now)
+				// - idx ≥ 2  → normal 1× gate (ScalpChoppyTP semantics)
 				if lot.ExitMode == ExitModeScalpFixedTP {
-					if i >= 2 && i <= 3 {
-						pass = net >= 4.0 * t.cfg.ProfitGateUSD
-						lot.TrailActivateGateUSD = 4.0 * t.cfg.ProfitGateUSD // preview consistency
-					} else if i >= 4 {
+					if i == 1 {
+						pass = net >= 25.0 * t.cfg.ProfitGateUSD
+						lot.TrailActivateGateUSD = 25.0 * t.cfg.ProfitGateUSD // preview consistency
+					} else if i >= 2 {
 						pass = net >= t.cfg.ProfitGateUSD
 						lot.TrailActivateGateUSD = t.cfg.ProfitGateUSD
 					}
@@ -1491,7 +1490,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		// --- NEW (Phase 4): maker-first routing via Broker when ORDER_TYPE=limit (async, per-side) ---
 		if wantLimit {
 			// Compute limit price away from last snapshot; compute base from limit price (keeps notional under control).
-			limitPx := price
+			var limitPx float64
 			if side == SideBuy {
 				limitPx = price * (1.0 - offsetBps/10000.0)
 			} else {
@@ -1950,11 +1949,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		EntryOrderID: "", // market path has no known order id here
 	}
 	idx := len(book.Lots) // the new lot’s index after append
-	if idx >= 6 {
+	if idx >= 2 {
 		if !strings.Contains(newLot.Reason, "mode=choppy") {
 			newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=choppy")
 		}
-	} else if idx >= 3 && idx <= 5 {
+	} else if idx >= 1 && idx < 2 {
 		if !strings.Contains(newLot.Reason, "mode=strict") {
 			newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=strict")
 		}
@@ -2115,25 +2114,5 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 		}
 		// Merge newest into previous (newestIdx-1 survives)
 		mergeInto(newestIdx, newestIdx-1)
-	}
-
-	// If only one lot remains after merges, done.
-	if len(book.Lots) < 2 {
-		return
-	}
-
-	// 2) Merge any older dust forward into newest
-	newestIdx := len(book.Lots) - 1
-	for i := 0; i < newestIdx; {
-		lot := book.Lots[i]
-		if lot.SizeBase*px < minNotional {
-			// Merge i into newestIdx (newest survives)
-			mergeInto(i, newestIdx-1) // careful: newestIdx will shift if i < newestIdx
-			// After removal at i, the newest is now at index (len-1) again; recompute:
-			newestIdx = len(book.Lots) - 1
-			// Do not increment i; slice shifted left
-			continue
-		}
-		i++
 	}
 }
