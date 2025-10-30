@@ -375,7 +375,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					Reason:       "async postonly filled",
 					Take:         0, // or carry from pending if available
 					Version:      1,
-					LotID:        t.NextLotSeq,
+					LotID:        len(book.Lots),
 					EntryOrderID: res.OrderID,
 				}
 				if t.pendingBuy != nil {
@@ -392,7 +392,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=strict")
 					}
 				}
-				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
 				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
 				if t.pendingBuy != nil && t.pendingBuy.EquityBuy {
@@ -505,7 +504,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					Reason:       "async postonly filled",
 					Take:         0, // or carry from pending if available
 					Version:      1,
-					LotID:        t.NextLotSeq,
+					LotID:        len(book.Lots),
 					EntryOrderID: res.OrderID,
 				}
 				if t.pendingSell != nil {
@@ -522,7 +521,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=strict")
 					}
 				}
-				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
 				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
 				if t.pendingSell != nil && t.pendingSell.EquitySell {
@@ -888,7 +886,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-14",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-15",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
@@ -1991,7 +1989,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		Reason:       gatesReason, // side-biased; no winLow
 		Take:         take,
 		Version:      1,
-		LotID:        t.NextLotSeq,
+		LotID:        len(book.Lots),
 		EntryOrderID: "", // market path has no known order id here
 	}
 	idx := len(book.Lots) // the new lot’s index after append
@@ -2004,7 +2002,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=strict")
 		}
 	}
-	t.NextLotSeq++
 	book.Lots = append(book.Lots, newLot)
 	t.consolidateDust(book, priceToUse, minNotional)
 	// Use wall clock for lastAdd to drive spacing/decay even if candle time is zero.

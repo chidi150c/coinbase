@@ -217,9 +217,6 @@ type Trader struct {
 	pendingRecheckBuy  bool
 	pendingRecheckSell bool
 
-	// --- NEW: next lot sequence counter for stable LotIDs ---
-	NextLotSeq int
-
 	// --- NEW: centralized state manager channel ---
 	stateApplyCh chan func(*Trader)
 }
@@ -237,7 +234,6 @@ func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
 			SideBuy:  {RunnerIDs: []int{}, Lots: nil},
 			SideSell: {RunnerIDs: []int{}, Lots: nil},
 		},
-		NextLotSeq:   1,
 		stateApplyCh: make(chan func(*Trader), 128),
 	}
 
@@ -727,7 +723,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		EntryFeeUSD: entryPortion, // Phase 3: record proportional entry fee
 		ExitFeeUSD:  exitFee,
 		PNLUSD:      pl,
-		Reason:      exitReason,
+		Reason:      exitReason + lot.Reason,
 		ExitMode:    lot.ExitMode,
 		WasRunner:   removedWasRunner,
 		// NEW identifiers
@@ -962,9 +958,6 @@ func (t *Trader) snapshotStateLocked() BotState {
 		PendingSell:        t.pendingSell,
 		PendingRecheckBuy:  t.pendingRecheckBuy,
 		PendingRecheckSell: t.pendingRecheckSell,
-
-		// NEW: persist next lot sequence
-		NextLotSeq: t.NextLotSeq,
 	}
 }
 
@@ -1090,23 +1083,6 @@ func (t *Trader) loadState() error {
 	t.pendingSell = st.PendingSell
 	t.pendingRecheckBuy = st.PendingRecheckBuy
 	t.pendingRecheckSell = st.PendingRecheckSell
-
-	// NextLotSeq (recompute if absent)
-	t.NextLotSeq = st.NextLotSeq
-	if t.NextLotSeq <= 0 {
-		maxID := 0
-		for _, side := range []OrderSide{SideBuy, SideSell} {
-			for _, lot := range t.book(side).Lots {
-				if lot != nil && lot.LotID > maxID {
-					maxID = lot.LotID
-				}
-			}
-		}
-		t.NextLotSeq = maxID + 1
-		if t.NextLotSeq <= 0 {
-			t.NextLotSeq = 1
-		}
-	}
 
 	// Initialize trailing baseline for any current runners (no migration; just honor existing RunnerIDs)
 	for _, side := range []OrderSide{SideBuy, SideSell} {
