@@ -762,13 +762,13 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 							i++
 							continue
 						}
-                        // RELEASE LOCK before broker I/O:
-                        t.mu.Unlock()
-                        msg, err := t.closeLot(ctx, c, side, i, "trailing_stop")
-                        if err != nil {
-                            return "", true, err
-                        }
-                        return msg, true, nil
+						msg, err := t.closeLot(ctx, c, side, i, "trailing_stop")
+						if err != nil {
+							t.mu.Unlock()
+							return "", true, err
+						}
+						t.mu.Unlock()
+						return msg, true, nil
 					}
 
 				case ExitModeScalpFixedTP:
@@ -816,18 +816,18 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 						continue
 					}
 				}
-                if trigger {
-                    // RELEASE LOCK before broker I/O:
-                    t.mu.Unlock()
-                    msg, err := t.closeLot(ctx, c, side, i, exitReason)
-                    if err != nil {
-                        return "", true, err
-                    }
-                    if lot.ExitMode == ExitModeScalpFixedTP {
-                        log.Printf("TRACE tp.filled side=%s idx=%d mark=%.8f take=%.8f", lot.Side, i, price, lot.Take)
-                    }
-                    return msg, true, nil
-                }
+				if trigger {
+					msg, err := t.closeLot(ctx, c, side, i, exitReason)
+					if err != nil {
+						t.mu.Unlock()
+						return "", true, err
+					}
+					if lot.ExitMode == ExitModeScalpFixedTP {
+						log.Printf("TRACE tp.filled side=%s idx=%d mark=%.8f take=%.8f", lot.Side, i, price, lot.Take)
+					}
+					t.mu.Unlock()
+					return msg, true, nil
+				}
 
 				// nearest summary (unchanged)
 				if lot.Side == SideBuy {
@@ -854,7 +854,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			return msg, err
 		}
 		// single-pass enriched summary (collected in-loop; no extra scans)
-		 log.Printf("[DEBUG] Nearest Takes | BUY=%.2f (%s, net=%.2f, idx=%d) | SELL=%.2f (%s, net=%.2f, idx=%d) | lots buy=%d sell=%d",
+		 log.Printf("[DEBUG] Nearest Takes | CLOSE-BUY=%.2f (%s, net=%.2f, idx=%d) | CLOSE-SELL=%.2f (%s, net=%.2f, idx=%d) | Buy-Lots=%d Sell-Lots=%d",
 		   nearestTakeBuy, buyModeLabel, buyNet, buyNearestIdx,
 		   nearestTakeSell, sellModeLabel, sellNet, sellNearestIdx, lsb, lss)
 	}
@@ -890,7 +890,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-12",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-13",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
