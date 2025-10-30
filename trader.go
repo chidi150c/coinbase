@@ -285,6 +285,7 @@ type ExitRecord struct {
 	OpenPrice   float64   `json:"open_price"`
 	ClosePrice  float64   `json:"close_price"`
 	SizeBase    float64   `json:"size_base"`
+	OpenNotionalUSD    float64   `json:"open_notional_usd"`
 	EntryFeeUSD float64   `json:"entry_fee_usd"`
 	ExitFeeUSD  float64   `json:"exit_fee_usd"`
 	PNLUSD      float64   `json:"pnl_usd"`
@@ -722,6 +723,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		OpenPrice:   lot.OpenPrice,
 		ClosePrice:  priceExec,
 		SizeBase:    baseFilled,
+		OpenNotionalUSD: lot.OpenNotionalUSD,
 		EntryFeeUSD: entryPortion, // Phase 3: record proportional entry fee
 		ExitFeeUSD:  exitFee,
 		PNLUSD:      pl,

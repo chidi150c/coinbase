@@ -762,12 +762,13 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 							i++
 							continue
 						}
+						t.mu.Unlock()
 						msg, err := t.closeLot(ctx, c, side, i, "trailing_stop")
+						t.mu.Lock()
+						defer t.mu.Unlock()
 						if err != nil {
-							t.mu.Unlock()
 							return "", true, err
 						}
-						t.mu.Unlock()
 						return msg, true, nil
 					}
 
@@ -817,15 +818,16 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					}
 				}
 				if trigger {
+					t.mu.Unlock()
 					msg, err := t.closeLot(ctx, c, side, i, exitReason)
+					t.mu.Lock()
+					defer t.mu.Unlock()
 					if err != nil {
-						t.mu.Unlock()
 						return "", true, err
 					}
 					if lot.ExitMode == ExitModeScalpFixedTP {
 						log.Printf("TRACE tp.filled side=%s idx=%d mark=%.8f take=%.8f", lot.Side, i, price, lot.Take)
 					}
-					t.mu.Unlock()
 					return msg, true, nil
 				}
 
@@ -890,7 +892,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-13",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-14",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
