@@ -762,9 +762,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 							i++
 							continue
 						}
-						t.mu.Unlock()
 						msg, err := t.closeLot(ctx, c, side, i, "trailing_stop")
-						t.mu.Lock()
 						defer t.mu.Unlock()
 						if err != nil {
 							return "", true, err
@@ -818,9 +816,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					}
 				}
 				if trigger {
-					t.mu.Unlock()
 					msg, err := t.closeLot(ctx, c, side, i, exitReason)
-					t.mu.Lock()
 					defer t.mu.Unlock()
 					if err != nil {
 						return "", true, err
