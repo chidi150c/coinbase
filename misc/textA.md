@@ -16,7 +16,7 @@ DRY_RUN=false
 MAX_DAILY_LOSS_PCT=2.0
 USD_EQUITY=250.0
 MAX_HISTORY_CANDLES=6000
-RISK_PER_TRADE_PCT=15.0
+RISK_PER_TRADE_PCT=20.0
 
 # === Position controls ===
 ALLOW_PYRAMIDING=true
@@ -24,7 +24,7 @@ PYRAMID_DECAY_LAMBDA=0.02
 PYRAMID_MIN_SECONDS_BETWEEN=0
 PYRAMID_MIN_ADVERSE_PCT=1.5
 PYRAMID_DECAY_MIN_PCT=0.4
-MAX_CONCURRENT_LOTS=8
+MAX_CONCURRENT_LOTS=6
 
 # --- Optional: per-add TP decay for scalp lots (legacy; kept for logs/estimates) ---
 SCALP_TP_DECAY_ENABLE=true
@@ -35,7 +35,7 @@ SCALP_TP_MIN_PCT=0.6
 
 # === Exits (USD profit-gate + USD trailing) ===
 # Exits will not arm/trigger until per-lot NET PnL ≥ PROFIT_GATE_USD
-PROFIT_GATE_USD=0.25
+PROFIT_GATE_USD=0.02
 
 # Trailing activation thresholds (USD, per lot NET PnL)
 TRAIL_ACTIVATE_USD_RUNNER=2.00
@@ -104,7 +104,7 @@ LOG_LEVEL=TRACE
 # === Order entry / maker placement ===
 ORDER_TYPE=limit
 SPREAD_MIN_BPS=0
-LIMIT_PRICE_OFFSET_BPS=0.05
+LIMIT_PRICE_OFFSET_BPS=0.01
 LIMIT_TIMEOUT_SEC=900
 
 # =========== Reprice (maker-chase) ================
@@ -112,5 +112,5 @@ REPRICE_ENABLE=true
 REPRICE_INTERVAL_MS=1000
 REPRICE_MIN_IMPROV_TICKS=0
 REPRICE_MIN_EDGE_USD=0      # <<< lowered so tiny orders can reprice
-REPRICE_MAX_DRIFT_BPS=3
+REPRICE_MAX_DRIFT_BPS=1.0
 REPRICE_MAX_COUNT=0

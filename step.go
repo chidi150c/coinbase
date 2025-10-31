@@ -886,7 +886,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-15",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-16",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
@@ -1703,13 +1703,14 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 										QuoteSpent:    sessQuote,
 										CommissionUSD: sessFee,
 									}
-									log.Printf("TRACE postonly.poll.done side=%s order_id=%s final=FILLED vwap=%.8f base=%.8f quote=%.2f fee=%.6f",
-										side, orderID, func() float64 { if sessBase>0 { return sessQuote / sessBase }; return 0 }(), sessBase, sessQuote, sessFee)
 									log.Printf("TRACE postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f", orderID, ord.Price, ord.BaseSize, ord.QuoteSpent, ord.CommissionUSD)
 									mtxOrders.WithLabelValues("live", string(side)).Inc()
 									mtxTrades.WithLabelValues("open").Inc()
 									log.Printf("TRACE postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
 										side, orderID, (sessBase > 0 || sessQuote > 0), sessBase, sessQuote, sessFee)
+									log.Printf("[KPI] maker.open.filled side=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f order_id=%s",
+										side, placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD, orderID)
+
 									safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
 									return
 
@@ -1792,6 +1793,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 											QuoteSpent:    sessQuote,
 											CommissionUSD: sessFee,
 										}
+										log.Printf("[KPI] maker.open.filled side=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f order_id=%s status=%s",
+											side,
+											func() float64 { if sessBase>0 { return sessQuote/sessBase }; return 0 }(),
+											sessBase, sessQuote, sessFee, orderID, strings.ToUpper(strings.TrimSpace(ord.Status)))
+
 										log.Printf("TRACE postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
 											side, orderID, (sessBase > 0 || sessQuote > 0), sessBase, sessQuote, sessFee)
 										safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
@@ -1879,12 +1885,14 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				log.Printf("TRACE postonly.market_fallback.blocked side=%s reason=recheck_flag_not_set", side)
 				return "HOLD", nil
 			}
+			var err error
+			placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
 			// TODO: remove TRACE
 			log.Printf("TRACE order.open request side=%s quote=%.2f baseEst=%.8f priceSnap=%.8f take=%.8f",
 				side, quote, base, price, take)
-			var err error
 			log.Printf("TRACE postonly.market_fallback.go side=%s quote=%.2f", side, quote)
-			placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
+			log.Printf("[KPI] taker.open side=%s quote=%.2f reason=market_fallback", side, quote)
+
 			if err != nil {
 				// Retry once with ORDER_MIN_USD on insufficient-funds style failures.
 				e := strings.ToLower(err.Error())
@@ -2073,6 +2081,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		log.Printf("[WARN] saveState: %v", err)
 		log.Printf("TRACE state.save error=%v", err)
 	}
+	log.Printf("[KPI] summary equity=%.2f daily_pnl=%.2f lots_buy=%d lots_sell=%d product=%s",
+    t.equityUSD, t.dailyPnL, len(t.book(SideBuy).Lots), len(t.book(SideSell).Lots), t.cfg.ProductID)
 	t.mu.Unlock()
 	return msg, nil
 }

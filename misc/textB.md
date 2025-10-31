@@ -16,7 +16,7 @@ DRY_RUN=false
 MAX_DAILY_LOSS_PCT=2.0
 USD_EQUITY=250.0
 MAX_HISTORY_CANDLES=6000
-RISK_PER_TRADE_PCT=15.0
+RISK_PER_TRADE_PCT=10.0
 
 # === Position controls ===
 ALLOW_PYRAMIDING=true
@@ -24,7 +24,7 @@ PYRAMID_DECAY_LAMBDA=0.02
 PYRAMID_MIN_SECONDS_BETWEEN=0
 PYRAMID_MIN_ADVERSE_PCT=1.5
 PYRAMID_DECAY_MIN_PCT=0.4
-MAX_CONCURRENT_LOTS=8
+MAX_CONCURRENT_LOTS=6
 
 # --- Optional: per-add TP decay for scalp lots (legacy; kept for logs/estimates) ---
 SCALP_TP_DECAY_ENABLE=true
@@ -35,7 +35,7 @@ SCALP_TP_MIN_PCT=0.6
 
 # === Exits (USD profit-gate + USD trailing) ===
 # Exits will not arm/trigger until per-lot NET PnL ≥ PROFIT_GATE_USD
-PROFIT_GATE_USD=0.25
+PROFIT_GATE_USD=0.02
 
 # Trailing activation thresholds (USD, per lot NET PnL)
 TRAIL_ACTIVATE_USD_RUNNER=2.00
@@ -74,7 +74,10 @@ PAPER_BASE_BALANCE=0.05
 
 # === Optional overrides (mainly for backtests / guards) ===
 BASE_ASSET=BTC
-BASE_STEP=0.00000001
+BASE_STEP=0.000001
+PRICE_TICK=0.1         # price increment (tick)
+QUOTE_STEP=0.01         # quote asset step (USDT/USD cent precision)
+MIN_NOTIONAL=10.0       # minimum notional in quote (typical Binance spot)
 
 # === Live equity: broker provides balances ===
 USE_LIVE_EQUITY=true
@@ -82,8 +85,9 @@ USE_LIVE_EQUITY=true
 # --- Risk ramping (per-side; you already enabled it) ---
 RAMP_ENABLE=true
 RAMP_MODE=linear
-RAMP_START_PCT=3.0
+RAMP_START_PCT=10.0
 RAMP_STEP_PCT=1.0
+RAMP_MAX_PCT=20.0
 # For exp mode:
 # RAMP_GROWTH=1.25
 # RAMP_MAX_PCT=6.0
@@ -101,45 +105,13 @@ LOG_LEVEL=TRACE
 # === Order entry / maker placement ===
 ORDER_TYPE=limit
 SPREAD_MIN_BPS=0
-LIMIT_PRICE_OFFSET_BPS=5
-LIMIT_TIMEOUT_SEC=180
+LIMIT_PRICE_OFFSET_BPS=0.3
+LIMIT_TIMEOUT_SEC=900
 
 # =========== Reprice (maker-chase) ================
 REPRICE_ENABLE=true
-REPRICE_INTERVAL_MS=1200
+REPRICE_INTERVAL_MS=1000
 REPRICE_MIN_IMPROV_TICKS=0
-REPRICE_MIN_EDGE_USD=0.0001      # <<< lowered so tiny orders can reprice
+REPRICE_MIN_EDGE_USD=0      # <<< lowered so tiny orders can reprice
 REPRICE_MAX_DRIFT_BPS=3
-REPRICE_MAX_COUNT=20
-
-
-
-	priceToUse := c[len(c)-1].Close
-	baseRequested := ( (t.cfg.RiskPerTradePct / 100.0) * t.equityUSD ) / priceToUse // only for partial-fill warn context
-	if placed == nil {
-		// baseRequested recomputed earlier; retain logs only
-	}
-	baseToUse := (func() float64 {
-		if placed != nil && placed.BaseSize > 0 {
-			return placed.BaseSize
-		}
-		// fallback: recompute from last computed quote/price path
-		// NOTE: base was computed before unlock; here we don't have it, but this is only used for struct fields.
-		// We will set notional from actualQuote below, so baseToUse isn't critical here.
-		return 0
-	})()
-	actualQuote := (func() float64 {
-		if placed != nil && placed.QuoteSpent > 0 {
-			return placed.QuoteSpent
-		}
-		// For DryRun, 'quote' is the intent size; we want to persist USD notional anyway.
-		// Since we're in a minimal-change pass, use entryFee's base metric to avoid recompute; but we kept 'quote' earlier.
-		// We cannot access 'quote' here post-unlock safely; so if Placed is nil (paper),
-		// we derive from entryFee and feeRate (entryFee = quote * feeRatePct/100).
-		if feeRate > 0 {
-			return entryFee * 100.0 / feeRate
-		}
-		return 0
-	})()
-
-
+REPRICE_MAX_COUNT=0
