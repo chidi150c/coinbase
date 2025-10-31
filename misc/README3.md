@@ -544,5 +544,10 @@ docker compose up -d --force-recreate --no-deps bot_binance
 =======================================================================
  docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' monitoring-bot_binance-1 \
 | grep -i '^PROFIT_GATE_USD='
+===================================================================================
+ why-trade oid 51006913165 -w 400 | egrep 'postonly\.poll\.done|postonly\.poll\.timeout|postonly\.drain\.recv|postonly\.drain\.accept'
 
+=======================================================================
 
+why-trade oid 51006913165 | egrep 'postonly\.(place|pending\.set|poll\.(start|tick|done|emit|stopped)|filled|drain\.(recv|placed|accept))' \
+> /opt/coinbase/logs/audit/oid_51006913165_proof.txt

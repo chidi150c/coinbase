@@ -122,9 +122,6 @@ type BotState struct {
 	PendingSell        *PendingOpen
 	PendingRecheckBuy  bool
 	PendingRecheckSell bool
-
-	// --- NEW: persist next lot sequence for stable LotIDs ---
-	NextLotSeq int
 }
 
 // --- NEW (Phase 1): pending async maker-first open support ---
@@ -723,7 +720,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		EntryFeeUSD: entryPortion, // Phase 3: record proportional entry fee
 		ExitFeeUSD:  exitFee,
 		PNLUSD:      pl,
-		Reason:      exitReason + lot.Reason,
+		Reason:      exitReason + " | " + lot.Reason,
 		ExitMode:    lot.ExitMode,
 		WasRunner:   removedWasRunner,
 		// NEW identifiers
