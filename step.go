@@ -628,7 +628,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		}
 
 		// Update nearest TAKE for a side using already computed fields in-loop
-		updateNearest := func(book *SideBook, side OrderSide, idx int, lot *Position, net float64) {
+		updateNearest := func(book *SideBook, side OrderSide, idx int, lot *Position, net float64, price float64) {
 			cand := lot.Take
 			if cand <= 0 {
 				// lightweight preview if not armed: use lot’s gate (already set by setExitMode)
@@ -638,6 +638,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 			}
 			if cand <= 0 { return }
+
+			// NEW: directional validity check (no other logic touched)
+			if side == SideBuy && cand < price { return } // BUY exits must be >= price
+			if side == SideSell && cand > price { return } // SELL exits must be <= price
+
 			if side == SideBuy {
 				if nearestTakeBuy == 0 || cand < nearestTakeBuy {
 					nearestTakeBuy = cand; buyNearestIdx = idx; buyModeLabel = modeLabel(lot.ExitMode); buyNet = net
@@ -712,7 +717,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				net, pass := computeGate(lot)
 
 				// gather nearest TAKE/mode/net while we're already here (no extra loops later)
-				updateNearest(book, side, i, lot, net)
+				updateNearest(book, side, i, lot, net, price)
 				
 				// Override gating for FixedTP buckets:
 				// - idx == 1 → stricter 25× gate (gate = 0.02 now)

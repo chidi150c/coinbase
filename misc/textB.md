@@ -16,7 +16,7 @@ DRY_RUN=false
 MAX_DAILY_LOSS_PCT=2.0
 USD_EQUITY=250.0
 MAX_HISTORY_CANDLES=6000
-RISK_PER_TRADE_PCT=10.0
+RISK_PER_TRADE_PCT=8.0
 
 # === Position controls ===
 ALLOW_PYRAMIDING=true
@@ -85,9 +85,9 @@ USE_LIVE_EQUITY=true
 # --- Risk ramping (per-side; you already enabled it) ---
 RAMP_ENABLE=true
 RAMP_MODE=linear
-RAMP_START_PCT=10.0
+RAMP_START_PCT=8.0
 RAMP_STEP_PCT=1.0
-RAMP_MAX_PCT=20.0
+RAMP_MAX_PCT=12.0
 # For exp mode:
 # RAMP_GROWTH=1.25
 # RAMP_MAX_PCT=6.0
@@ -105,7 +105,7 @@ LOG_LEVEL=TRACE
 # === Order entry / maker placement ===
 ORDER_TYPE=limit
 SPREAD_MIN_BPS=0
-LIMIT_PRICE_OFFSET_BPS=0.3
+LIMIT_PRICE_OFFSET_BPS=0.01
 LIMIT_TIMEOUT_SEC=900
 
 # =========== Reprice (maker-chase) ================
@@ -113,5 +113,5 @@ REPRICE_ENABLE=true
 REPRICE_INTERVAL_MS=1000
 REPRICE_MIN_IMPROV_TICKS=0
 REPRICE_MIN_EDGE_USD=0      # <<< lowered so tiny orders can reprice
-REPRICE_MAX_DRIFT_BPS=3
+REPRICE_MAX_DRIFT_BPS=1.0
 REPRICE_MAX_COUNT=0
