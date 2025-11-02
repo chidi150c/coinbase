@@ -342,30 +342,6 @@ func (t *Trader) apply(fn func(*Trader)) {
 	}
 }
 
-// mirrorEffectiveGate returns the dynamic (ramped) mirror gate based on nearest lot index.
-func (t *Trader) mirrorEffectiveGate(side OrderSide) float64 {
-    base  := t.cfg.MirrorGateUSD
-    slope := t.cfg.MirrorGateSlopeUSD
-    start := t.cfg.MirrorGateStartIdx
-    cap   := t.cfg.MirrorGateMaxUSD
-
-    var idx int
-    if side == SideBuy {
-        idx = t.nearestIdxBuy
-    } else {
-        idx = t.nearestIdxSell
-    }
-    steps := idx - start
-    if steps < 0 {
-       steps = 0
-    }
-    gate := base + float64(steps)*slope
-    if cap > 0 && gate > cap {
-        gate = cap
-    }
-    return gate
-}
-
 // NEW (minimal): allow live loop to inject/refresh the optional extended model.
 func (t *Trader) SetExtendedModel(m *ExtendedLogit) {
 	t.mu.Lock()
@@ -548,6 +524,29 @@ func (t *Trader) book(side OrderSide) *SideBook {
 	return b
 }
 
+// mirrorEffectiveGate returns the dynamic (ramped) mirror gate based on nearest lot index.
+func (t *Trader) mirrorEffectiveGate(side OrderSide) float64 {
+    base  := t.cfg.MirrorGateUSD
+    slope := t.cfg.MirrorGateSlopeUSD
+    start := t.cfg.MirrorGateStartIdx
+    cap   := t.cfg.MirrorGateMaxUSD
+
+    var idx int
+    if side == SideBuy {
+        idx = t.nearestIdxBuy
+    } else {
+        idx = t.nearestIdxSell
+    }
+    steps := idx - start
+    if steps < 0 {
+       steps = 0
+    }
+    gate := base + float64(steps)*slope
+    if cap > 0 && gate > cap {
+        gate = cap
+    }
+    return gate
+}
 // --- NEW: side-aware lot closing (no global index) ---
 func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, localIdx int, exitReason string) (string, error) {
 	book := t.book(side)

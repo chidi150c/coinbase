@@ -222,8 +222,8 @@ func loadConfigFromEnv() Config {
 	}
 	// sensible defaults if unset
 	if cfg.MirrorGateUSD == 0 { cfg.MirrorGateUSD = 0.020 }
-	if cfg.MirrorGateSlopeUSD == 0 { cfg.MirrorGateSlopeUSD = 0.003 }
-	if cfg.MirrorGateStartIdx == 0 { cfg.MirrorGateStartIdx = 2 }
+	if cfg.MirrorGateSlopeUSD == 0 { cfg.MirrorGateSlopeUSD = 0.005 }
+	if cfg.MirrorGateStartIdx == 0 { cfg.MirrorGateStartIdx = 1 }
 	if cfg.MirrorGateMaxUSD == 0 { cfg.MirrorGateMaxUSD = 0.050 }
 
 	// Historical carry-over: if someone still sets BROKER=X, we may still

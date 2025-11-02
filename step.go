@@ -1066,22 +1066,22 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	if t.cfg.MirrorEnabled {
 		dynamicGate = t.mirrorEffectiveGate(side) // ramped by nearest idx
 		if side == SideBuy {
-			if t.nearestIdxBuy >= 2 && t.nearestNetSell >= dynamicGate {
+			if t.nearestNetSell >= dynamicGate {
 				mirrorProfitOverride = true
 			}
 		} else {
-			if t.nearestIdxSell >= 2 && t.nearestNetBuy >= dynamicGate {
+			if t.nearestNetBuy >= dynamicGate {
 				mirrorProfitOverride = true
 			}
 		}
 	} else {
 		// fallback to legacy fixed gate if MirrorEnabled=false
 		if side == SideBuy {
-			if t.nearestIdxBuy >= 2 && t.nearestNetSell >= t.cfg.ProfitGateUSD {
+			if t.nearestNetSell >= t.cfg.ProfitGateUSD {
 				mirrorProfitOverride = true
 			}
 		} else {
-			if t.nearestIdxSell >= 2 && t.nearestNetBuy >= t.cfg.ProfitGateUSD {
+			if t.nearestNetBuy >= t.cfg.ProfitGateUSD {
 				mirrorProfitOverride = true
 			}
 		}
