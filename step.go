@@ -858,6 +858,16 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		 log.Printf("[DEBUG] Nearest Takes | CLOSE-BUY=%.2f (%s, net=%.2f, idx=%d) | CLOSE-SELL=%.2f (%s, net=%.2f, idx=%d) | Buy-Lots=%d Sell-Lots=%d",
 		   nearestTakeBuy, buyModeLabel, buyNet, buyNearestIdx,
 		   nearestTakeSell, sellModeLabel, sellNet, sellNearestIdx, lsb, lss)
+
+		// Persist snapshots for Gate2 use (under lock; we are holding t.mu in step())
+		t.nearestTakeBuy = nearestTakeBuy
+		t.nearestNetBuy  = buyNet
+		t.nearestIdxBuy  = buyNearestIdx
+
+		t.nearestTakeSell = nearestTakeSell
+		t.nearestNetSell  = sellNet
+		t.nearestIdxSell  = sellNearestIdx
+		
 	}
 
 	feeMult := 1.0 + (t.cfg.FeeRatePct / 100.0)
@@ -891,7 +901,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-16",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-17",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
@@ -1047,161 +1057,194 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		reasonElapsedHr float64
 	)
 
-	// GATE2 Gating for pyramiding adds — spacing + adverse move (with optional time-decay), side-aware.
-	if isAdd && !skipPyramidGates {
-		// Choose side-aware anchor set
-		var lastAddSide time.Time
-		if side == SideBuy {
-			lastAddSide = t.lastAddBuy
-		} else {
-			lastAddSide = t.lastAddSell
+	// --- MIRROR-PROFIT GATE (choppy scalp override):
+	// If the opposite side's nearest net ≥ ProfitGateUSD and this side is in choppy tier (idx≥2),
+	// bypass Gate2 (spacing + adverse) for THIS SIDE ONLY.
+	// Toggle: cfg.MirrorProfitGateEnabled
+	mirrorProfitOverride := false
+	if side == SideBuy {
+		if t.nearestIdxBuy >= 2 && t.nearestNetSell >= t.cfg.ProfitGateUSD {
+			mirrorProfitOverride = true
 		}
-
-		// 1) Spacing
-		psb := t.cfg.PyramidMinSecondsBetween
-		// TODO: remove TRACE
-		log.Printf("TRACE pyramid.spacing since_last=%.1fs need>=%ds", time.Since(lastAddSide).Seconds(), psb)
-		if time.Since(lastAddSide) < time.Duration(psb)*time.Second {
-			t.mu.Unlock()
-			hrs := time.Since(lastAddSide).Hours()
-			log.Printf("[DEBUG] GATE2 pyramid: blocked by spacing; since_last=%vHours need>=%ds", fmt.Sprintf("%.1f", hrs), psb)
-			return "HOLD", nil
+	} else {
+		if t.nearestIdxSell >= 2 && t.nearestNetBuy >= t.cfg.ProfitGateUSD {
+			mirrorProfitOverride = true
 		}
+	}
 
-		// 2) Adverse move gate with optional time-based exponential decay.
-		basePct := t.cfg.PyramidMinAdversePct
-		effPct := basePct
-		lambda := t.cfg.PyramidDecayLambda
-		floor := t.cfg.PyramidDecayMinPct
-		elapsedMin := 0.0
-		if lambda > 0 {
-			if !lastAddSide.IsZero() {
-				elapsedMin = time.Since(lastAddSide).Minutes()
-			} else {
-				elapsedMin = 0.0
-			}
-			decayed := basePct * math.Exp(-lambda*elapsedMin)
-			if decayed < floor {
-				decayed = floor
-			}
-			effPct = decayed
-		}
-
-		// Capture for reason string
-		reasonBasePct = basePct
-		reasonEffPct = effPct
-		reasonElapsedHr = elapsedMin / 60.0
-
-		// Time (in minutes) to hit the floor once (t_floor_min)
-		tFloorMin := 0.0
-		if lambda > 0 && basePct > floor {
-			tFloorMin = math.Log(basePct/floor) / lambda
-		}
-
-		// TODO: remove TRACE
-		log.Printf("TRACE pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
-			side, elapsedMin, basePct, effPct, lambda, floor, tFloorMin)
-
-		// Use side-aware latest entry for adverse gate anchoring
-		last := t.latestEntryBySide(side)
-
-		if last > 0 {
+	if mirrorProfitOverride {
+		log.Printf("[DEBUG] GATE2 override (choppy scalp): side=%s net=%.4f ≥ gate=%.4f idx=%d",
+			side,
+			func() float64 {
+				if side == SideBuy { return t.nearestNetSell }
+				return t.nearestNetBuy
+			}(),
+			t.cfg.ProfitGateUSD,
+			func() int {
+				if side == SideBuy { return t.nearestIdxBuy }
+				return t.nearestIdxSell
+			}(),
+		)
+		// Bypass spacing & adverse; continue with sizing/entry path
+	} else {
+		// (existing Gate2 logic: spacing + adverse move + latch etc.)
+			// GATE2 Gating for pyramiding adds — spacing + adverse move (with optional time-decay), side-aware.
+		if isAdd && !skipPyramidGates {
+			// Choose side-aware anchor set
+			var lastAddSide time.Time
 			if side == SideBuy {
-				// BUY adverse tracker (side-aware)
-				if elapsedMin >= tFloorMin {
-					if t.winLowBuy == 0 || price < t.winLowBuy {
-						t.winLowBuy = price
-					}
+				lastAddSide = t.lastAddBuy
+			} else {
+				lastAddSide = t.lastAddSell
+			}
+
+			// 1) Spacing
+			psb := t.cfg.PyramidMinSecondsBetween
+			// TODO: remove TRACE
+			log.Printf("TRACE pyramid.spacing since_last=%.1fs need>=%ds", time.Since(lastAddSide).Seconds(), psb)
+			if time.Since(lastAddSide) < time.Duration(psb)*time.Second {
+				t.mu.Unlock()
+				hrs := time.Since(lastAddSide).Hours()
+				log.Printf("[DEBUG] GATE2 pyramid: blocked by spacing; since_last=%vHours need>=%ds", fmt.Sprintf("%.1f", hrs), psb)
+				return "HOLD", nil
+			}
+
+			// 2) Adverse move gate with optional time-based exponential decay.
+			basePct := t.cfg.PyramidMinAdversePct
+			effPct := basePct
+			lambda := t.cfg.PyramidDecayLambda
+			floor := t.cfg.PyramidDecayMinPct
+			elapsedMin := 0.0
+			if lambda > 0 {
+				if !lastAddSide.IsZero() {
+					elapsedMin = time.Since(lastAddSide).Minutes()
 				} else {
-					t.winLowBuy = 0
+					elapsedMin = 0.0
 				}
-				// latch at 2*t_floor_min
-				if t.latchedGateBuy == 0 && elapsedMin >= 2.0*tFloorMin && t.winLowBuy > 0 {
-					t.latchedGateBuy = t.winLowBuy
-					// --- breadcrumb ---
-					log.Printf("[DEBUG] LATCH SET BUY: latchedGate=%.2f winLow=%.2f elapsedMin=%.1f tFloorMin=%.2f",
-						t.latchedGateBuy, t.winLowBuy, elapsedMin, tFloorMin)
+				decayed := basePct * math.Exp(-lambda*elapsedMin)
+				if decayed < floor {
+					decayed = floor
 				}
-				// baseline gate: last * (1.0 - effPct); latched replaces baseline
-				gatePrice := last * (1.0 - effPct/100.0)
-				if t.latchedGateBuy > 0 {
-					gatePrice = t.latchedGateBuy
-				}
-				// clamp to min(winLowBuy, last BUY open)
-				clampP := last
-				if t.winLowBuy > 0 && t.winLowBuy < clampP {
-					clampP = t.winLowBuy
-				}
-				if gatePrice > clampP {
-					gatePrice = clampP
-				}
+				effPct = decayed
+			}
 
-				// mirror for reason/log fields
-				reasonGatePrice = gatePrice
-				reasonLatched = t.latchedGateBuy
+			// Capture for reason string
+			reasonBasePct = basePct
+			reasonEffPct = effPct
+			reasonElapsedHr = elapsedMin / 60.0
 
-				// --- breadcrumb when baseline condition met ---
-				if price <= gatePrice {
-					log.Printf("[DEBUG] pyramid: BUY baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
-						price, gatePrice, last, effPct, elapsedMin)
-				}
+			// Time (in minutes) to hit the floor once (t_floor_min)
+			tFloorMin := 0.0
+			if lambda > 0 && basePct > floor {
+				tFloorMin = math.Log(basePct/floor) / lambda
+			}
 
-				if !(price <= gatePrice) {
-					t.mu.Unlock()
-					log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
-						price, gatePrice, t.winLowBuy, effPct, basePct, reasonElapsedHr)
-					log.Printf("TRACE pyramid.block.buy price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateBuy)
-					return "HOLD", nil
-				}
-			} else { // SELL
-				// SELL adverse tracker (side-aware)
-				if elapsedMin >= tFloorMin {
-					if t.winHighSell == 0 || price > t.winHighSell {
-						t.winHighSell = price
+			// TODO: remove TRACE
+			log.Printf("TRACE pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
+				side, elapsedMin, basePct, effPct, lambda, floor, tFloorMin)
+
+			// Use side-aware latest entry for adverse gate anchoring
+			last := t.latestEntryBySide(side)
+
+			if last > 0 {
+				if side == SideBuy {
+					// BUY adverse tracker (side-aware)
+					if elapsedMin >= tFloorMin {
+						if t.winLowBuy == 0 || price < t.winLowBuy {
+							t.winLowBuy = price
+						}
+					} else {
+						t.winLowBuy = 0
 					}
-				} else {
-					t.winHighSell = 0
-				}
-				if t.latchedGateSell == 0 && elapsedMin >= 2.0*tFloorMin && t.winHighSell > 0 {
-					t.latchedGateSell = t.winHighSell
-					// --- breadcrumb ---
-					log.Printf("[DEBUG] LATCH SET SELL: latchedGate=%.2f winHigh=%.2f elapsedMin=%.1f tFloorMin=%.2f",
-						t.latchedGateSell, t.winHighSell, elapsedMin, tFloorMin)
-				}
-				// baseline gate: last * (1.0 + effPct); latched replaces baseline
-				gatePrice := last * (1.0 + effPct/100.0)
-				if t.latchedGateSell > 0 {
-					gatePrice = t.latchedGateSell
-				}
-				// clamp to max(winHighSell, last SELL open)
-				clampP := last
-				if t.winHighSell > 0 && t.winHighSell > clampP {
-					clampP = t.winHighSell
-				}
-				if gatePrice < clampP {
-					gatePrice = clampP
-				}
+					// latch at 2*t_floor_min
+					if t.latchedGateBuy == 0 && elapsedMin >= 2.0*tFloorMin && t.winLowBuy > 0 {
+						t.latchedGateBuy = t.winLowBuy
+						// --- breadcrumb ---
+						log.Printf("[DEBUG] LATCH SET BUY: latchedGate=%.2f winLow=%.2f elapsedMin=%.1f tFloorMin=%.2f",
+							t.latchedGateBuy, t.winLowBuy, elapsedMin, tFloorMin)
+					}
+					// baseline gate: last * (1.0 - effPct); latched replaces baseline
+					gatePrice := last * (1.0 - effPct/100.0)
+					if t.latchedGateBuy > 0 {
+						gatePrice = t.latchedGateBuy
+					}
+					// clamp to min(winLowBuy, last BUY open)
+					clampP := last
+					if t.winLowBuy > 0 && t.winLowBuy < clampP {
+						clampP = t.winLowBuy
+					}
+					if gatePrice > clampP {
+						gatePrice = clampP
+					}
 
-				// mirror for legacy reason/log fields
-				reasonGatePrice = gatePrice
-				reasonLatched = t.latchedGateSell
+					// mirror for reason/log fields
+					reasonGatePrice = gatePrice
+					reasonLatched = t.latchedGateBuy
 
-				// --- breadcrumb when baseline condition met ---
-				if price >= gatePrice {
-					log.Printf("[DEBUG] pyramid: SELL baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
-						price, gatePrice, last, effPct, elapsedMin)
-				}
+					// --- breadcrumb when baseline condition met ---
+					if price <= gatePrice {
+						log.Printf("[DEBUG] pyramid: BUY baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
+							price, gatePrice, last, effPct, elapsedMin)
+					}
 
-				if !(price >= gatePrice) {
-					t.mu.Unlock()
-					log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
-						price, gatePrice, t.winHighSell, effPct, basePct, reasonElapsedHr)
-					log.Printf("TRACE pyramid.block.sell price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateSell)
-					return "HOLD", nil
+					if !(price <= gatePrice) {
+						t.mu.Unlock()
+						log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
+							price, gatePrice, t.winLowBuy, effPct, basePct, reasonElapsedHr)
+						log.Printf("TRACE pyramid.block.buy price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateBuy)
+						return "HOLD", nil
+					}
+				} else { // SELL
+					// SELL adverse tracker (side-aware)
+					if elapsedMin >= tFloorMin {
+						if t.winHighSell == 0 || price > t.winHighSell {
+							t.winHighSell = price
+						}
+					} else {
+						t.winHighSell = 0
+					}
+					if t.latchedGateSell == 0 && elapsedMin >= 2.0*tFloorMin && t.winHighSell > 0 {
+						t.latchedGateSell = t.winHighSell
+						// --- breadcrumb ---
+						log.Printf("[DEBUG] LATCH SET SELL: latchedGate=%.2f winHigh=%.2f elapsedMin=%.1f tFloorMin=%.2f",
+							t.latchedGateSell, t.winHighSell, elapsedMin, tFloorMin)
+					}
+					// baseline gate: last * (1.0 + effPct); latched replaces baseline
+					gatePrice := last * (1.0 + effPct/100.0)
+					if t.latchedGateSell > 0 {
+						gatePrice = t.latchedGateSell
+					}
+					// clamp to max(winHighSell, last SELL open)
+					clampP := last
+					if t.winHighSell > 0 && t.winHighSell > clampP {
+						clampP = t.winHighSell
+					}
+					if gatePrice < clampP {
+						gatePrice = clampP
+					}
+
+					// mirror for legacy reason/log fields
+					reasonGatePrice = gatePrice
+					reasonLatched = t.latchedGateSell
+
+					// --- breadcrumb when baseline condition met ---
+					if price >= gatePrice {
+						log.Printf("[DEBUG] pyramid: SELL baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
+							price, gatePrice, last, effPct, elapsedMin)
+					}
+
+					if !(price >= gatePrice) {
+						t.mu.Unlock()
+						log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
+							price, gatePrice, t.winHighSell, effPct, basePct, reasonElapsedHr)
+						log.Printf("TRACE pyramid.block.sell price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateSell)
+						return "HOLD", nil
+					}
 				}
 			}
 		}
 	}
+
 
 	// Sizing (risk % of current equity, with optional volatility adjust already supported).
 	riskPct := t.cfg.RiskPerTradePct
@@ -2149,6 +2192,7 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 		}
 		a.SizeBase += b.SizeBase
 		a.EntryFee += b.EntryFee
+		a.OpenNotionalUSD = a.SizeBase * a.OpenPrice
 		// keep a.Take as-is; exit logic will recompute previews anyway
 		// (Optional) concatenate reasons
     	a.Reason = strings.TrimSpace(a.Reason + " merge:" + strconv.Itoa(b.LotID))

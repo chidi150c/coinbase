@@ -216,6 +216,13 @@ type Trader struct {
 
 	// --- NEW: centralized state manager channel ---
 	stateApplyCh chan func(*Trader)
+	// Persist snapshots for Gate2 use (under lock; we are holding t.mu in step())
+	nearestTakeBuy float64
+	nearestNetBuy  float64
+	nearestIdxBuy  int
+	nearestTakeSell float64
+	nearestNetSell  float64
+	nearestIdxSell  int
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -576,7 +583,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 							closeSide, placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD, exitOrderID, exitReason)
 						log.Printf("TRACE postonly.exit.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
 							oid, placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
-							
+
 						mtxOrders.WithLabelValues("live", string(closeSide)).Inc()
 						break
 					}
@@ -774,6 +781,8 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		if lot.EntryFee < 0 {
 			lot.EntryFee = 0 // safety clamp
 		}
+
+		lot.OpenNotionalUSD = lot.SizeBase * lot.OpenPrice
 
 		// Do NOT remove the lot; do NOT shift RunnerID; do NOT re-anchor timers/stages
 		msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
