@@ -1062,28 +1062,14 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// bypass Gate2 (spacing + adverse) for THIS SIDE ONLY.
 	// Toggle: cfg.MirrorProfitGateEnabled
 	mirrorProfitOverride := false
-	var dynamicGate float64
-	if t.cfg.MirrorEnabled {
-		dynamicGate = t.mirrorEffectiveGate(side) // ramped by nearest idx
-		if side == SideBuy {
-			if t.nearestNetSell >= dynamicGate {
-				mirrorProfitOverride = true
-			}
-		} else {
-			if t.nearestNetBuy >= dynamicGate {
-				mirrorProfitOverride = true
-			}
+	dynamicGate := t.mirrorEffectiveGate(side) // ramped by nearest idx
+	if side == SideBuy {
+		if t.nearestIdxBuy >= 1 && t.nearestNetSell >= dynamicGate {
+			mirrorProfitOverride = true
 		}
 	} else {
-		// fallback to legacy fixed gate if MirrorEnabled=false
-		if side == SideBuy {
-			if t.nearestNetSell >= t.cfg.ProfitGateUSD {
-				mirrorProfitOverride = true
-			}
-		} else {
-			if t.nearestNetBuy >= t.cfg.ProfitGateUSD {
-				mirrorProfitOverride = true
-			}
+		if t.nearestIdxSell >= 1 && t.nearestNetBuy >= dynamicGate {
+			mirrorProfitOverride = true
 		}
 	}
 
