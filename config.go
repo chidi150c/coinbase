@@ -114,6 +114,13 @@ type Config struct {
 	BuyThreshold          float64
 	SellThreshold         float64
 	UseMAFilter           bool
+	
+    // Mirror (Gate2 bypass) ramping
+    MirrorEnabled           bool    // turn on/off
+    MirrorGateUSD           float64 // base gate, e.g., 0.020
+    MirrorGateSlopeUSD      float64 // per-index increment, e.g., 0.003
+    MirrorGateStartIdx      int     // start ramping at this nearest idx, e.g., 2
+    MirrorGateMaxUSD        float64 // cap the gate, e.g., 0.050
 }
 
 // loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
@@ -213,6 +220,11 @@ func loadConfigFromEnv() Config {
 		SellThreshold: getEnvFloat("SELL_THRESHOLD", 0.45),
 		UseMAFilter:   getEnvBool("USE_MA_FILTER", true),
 	}
+	// sensible defaults if unset
+	if cfg.MirrorGateUSD == 0 { cfg.MirrorGateUSD = 0.020 }
+	if cfg.MirrorGateSlopeUSD == 0 { cfg.MirrorGateSlopeUSD = 0.003 }
+	if cfg.MirrorGateStartIdx == 0 { cfg.MirrorGateStartIdx = 2 }
+	if cfg.MirrorGateMaxUSD == 0 { cfg.MirrorGateMaxUSD = 0.050 }
 
 	// Historical carry-over: if someone still sets BROKER=X, we may still
 	// want to validate it's present, but we no longer use it to select knobs.

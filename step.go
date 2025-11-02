@@ -1062,24 +1062,39 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// bypass Gate2 (spacing + adverse) for THIS SIDE ONLY.
 	// Toggle: cfg.MirrorProfitGateEnabled
 	mirrorProfitOverride := false
-	if side == SideBuy {
-		if t.nearestIdxBuy >= 2 && t.nearestNetSell >= t.cfg.ProfitGateUSD {
-			mirrorProfitOverride = true
+	var dynamicGate float64
+	if t.cfg.MirrorEnabled {
+		dynamicGate = t.mirrorEffectiveGate(side) // ramped by nearest idx
+		if side == SideBuy {
+			if t.nearestIdxBuy >= 2 && t.nearestNetSell >= dynamicGate {
+				mirrorProfitOverride = true
+			}
+		} else {
+			if t.nearestIdxSell >= 2 && t.nearestNetBuy >= dynamicGate {
+				mirrorProfitOverride = true
+			}
 		}
 	} else {
-		if t.nearestIdxSell >= 2 && t.nearestNetBuy >= t.cfg.ProfitGateUSD {
-			mirrorProfitOverride = true
+		// fallback to legacy fixed gate if MirrorEnabled=false
+		if side == SideBuy {
+			if t.nearestIdxBuy >= 2 && t.nearestNetSell >= t.cfg.ProfitGateUSD {
+				mirrorProfitOverride = true
+			}
+		} else {
+			if t.nearestIdxSell >= 2 && t.nearestNetBuy >= t.cfg.ProfitGateUSD {
+				mirrorProfitOverride = true
+			}
 		}
 	}
 
 	if mirrorProfitOverride {
-		log.Printf("[DEBUG] GATE2 override (choppy scalp): side=%s net=%.4f ≥ gate=%.4f idx=%d",
+		log.Printf("[DEBUG] GATE2 override (mirror-profit choppy): side=%s net=%.4f ≥ gate=%.4f idx=%d",
 			side,
 			func() float64 {
 				if side == SideBuy { return t.nearestNetSell }
 				return t.nearestNetBuy
 			}(),
-			t.cfg.ProfitGateUSD,
+			dynamicGate,
 			func() int {
 				if side == SideBuy { return t.nearestIdxBuy }
 				return t.nearestIdxSell
