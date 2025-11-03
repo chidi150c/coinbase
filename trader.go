@@ -367,15 +367,6 @@ func (t *Trader) updateDaily(date time.Time) {
 	}
 }
 
-// Cap concurrent lots (env-tunable). Default is effectively "no cap".
-func maxConcurrentLots() int {
-	n := getEnvInt("MAX_CONCURRENT_LOTS", 1_000_000)
-	if n < 1 {
-		n = 1_000_000 // safety: never block adds due to bad input
-	}
-	return n
-}
-
 func clamp(x, lo, hi float64) float64 {
 	if hi > 0 && x > hi {
 		return hi

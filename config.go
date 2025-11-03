@@ -201,7 +201,7 @@ func loadConfigFromEnv() Config {
 		// Equity/reporting/runtime
 		ExitHistorySize:   getEnvInt("EXIT_HISTORY_SIZE", 8),
 		PersistState:      getEnvBool("PERSIST_STATE", true),
-		MaxConcurrentLots: getEnvInt("MAX_CONCURRENT_LOTS", 1_000_000),
+		MaxConcurrentLots: getEnvInt("MAX_CONCURRENT_LOTS", 8),
 
 		// Paper/override helpers
 		PaperBaseBalance:  getEnvFloat("PAPER_BASE_BALANCE", 0.0),
@@ -210,11 +210,11 @@ func loadConfigFromEnv() Config {
 
 		// Repricer (maker-chase) guardrails
 		RepriceEnable:         getEnvBool("REPRICE_ENABLE", true),
-		RepriceIntervalMs:     getEnvInt("REPRICE_INTERVAL_MS", 6000),
-		RepriceMinImprovTicks: getEnvInt("REPRICE_MIN_IMPROV_TICKS", 1),
-		RepriceMinEdgeUSD:     getEnvFloat("REPRICE_MIN_EDGE_USD", 0.15),
+		RepriceIntervalMs:     getEnvInt("REPRICE_INTERVAL_MS", 1000),
+		RepriceMinImprovTicks: getEnvInt("REPRICE_MIN_IMPROV_TICKS", 0),
+		RepriceMinEdgeUSD:     getEnvFloat("REPRICE_MIN_EDGE_USD", 0.0),
 		RepriceMaxDriftBps:    getEnvFloat("REPRICE_MAX_DRIFT_BPS", 1.5),
-		RepriceMaxCount:       getEnvInt("REPRICE_MAX_COUNT", 6),
+		RepriceMaxCount:       getEnvInt("REPRICE_MAX_COUNT", 0),
 
 		BuyThreshold:  getEnvFloat("BUY_THRESHOLD", 0.55),
 		SellThreshold: getEnvFloat("SELL_THRESHOLD", 0.45),
@@ -225,6 +225,10 @@ func loadConfigFromEnv() Config {
 	if cfg.MirrorGateSlopeUSD == 0 { cfg.MirrorGateSlopeUSD = 0.25 * cfg.MirrorGateUSD }
 	if cfg.MirrorGateStartIdx == 0 { cfg.MirrorGateStartIdx = 1 }
 	if cfg.MirrorGateMaxUSD == 0 { cfg.MirrorGateMaxUSD = cfg.ProfitGateUSD + cfg.MirrorGateSlopeUSD * 8 }
+
+	//dependency
+	if cfg.TrailActivateUSDRunner == 0 { cfg.TrailActivateUSDRunner = 25.0 * cfg.ProfitGateUSD }                               
+	if cfg.TrailActivateUSDScalp == 0 { cfg.TrailActivateUSDScalp = 12.5 * cfg.ProfitGateUSD }
 
 	// Historical carry-over: if someone still sets BROKER=X, we may still
 	// want to validate it's present, but we no longer use it to select knobs.

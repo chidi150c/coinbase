@@ -16,7 +16,7 @@ DRY_RUN=false
 MAX_DAILY_LOSS_PCT=2.0
 USD_EQUITY=250.0
 MAX_HISTORY_CANDLES=6000
-RISK_PER_TRADE_PCT=20.0
+RISK_PER_TRADE_PCT=8.0
 
 # === Position controls ===
 ALLOW_PYRAMIDING=true
@@ -24,7 +24,7 @@ PYRAMID_DECAY_LAMBDA=0.02
 PYRAMID_MIN_SECONDS_BETWEEN=0
 PYRAMID_MIN_ADVERSE_PCT=1.5
 PYRAMID_DECAY_MIN_PCT=0.4
-MAX_CONCURRENT_LOTS=6
+MAX_CONCURRENT_LOTS=8
 
 # --- Optional: per-add TP decay for scalp lots (legacy; kept for logs/estimates) ---
 SCALP_TP_DECAY_ENABLE=true
@@ -35,11 +35,11 @@ SCALP_TP_MIN_PCT=0.6
 
 # === Exits (USD profit-gate + USD trailing) ===
 # Exits will not arm/trigger until per-lot NET PnL ≥ PROFIT_GATE_USD
-PROFIT_GATE_USD=0.02
+PROFIT_GATE_USD=0.1
 
 # Trailing activation thresholds (USD, per lot NET PnL)
-TRAIL_ACTIVATE_USD_RUNNER=2.00
-TRAIL_ACTIVATE_USD_SCALP=0.50
+TRAIL_ACTIVATE_USD_RUNNER=0
+TRAIL_ACTIVATE_USD_SCALP=0
 
 # Trailing distances (percent, post-activation)
 TRAIL_DISTANCE_PCT_RUNNER=0.40
@@ -85,8 +85,9 @@ USE_LIVE_EQUITY=true
 # --- Risk ramping (per-side; you already enabled it) ---
 RAMP_ENABLE=true
 RAMP_MODE=linear
-RAMP_START_PCT=3.0
+RAMP_START_PCT=8.0
 RAMP_STEP_PCT=1.0
+RAMP_MAX_PCT=12.0
 # For exp mode:
 # RAMP_GROWTH=1.25
 # RAMP_MAX_PCT=6.0

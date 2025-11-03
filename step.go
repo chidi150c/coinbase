@@ -724,8 +724,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				// - idx ≥ 2  → normal 1× gate (ScalpChoppyTP semantics)
 				if lot.ExitMode == ExitModeScalpFixedTP {
 					if i == 1 {
-						pass = net >= 25.0 * t.cfg.ProfitGateUSD
-						lot.TrailActivateGateUSD = 25.0 * t.cfg.ProfitGateUSD // preview consistency
+						pass = net >= t.cfg.TrailActivateUSDScalp
+						lot.TrailActivateGateUSD = t.cfg.TrailActivateUSDScalp // preview consistency
 					} else if i >= 2 {
 						pass = net >= t.cfg.ProfitGateUSD
 						lot.TrailActivateGateUSD = t.cfg.ProfitGateUSD
@@ -901,7 +901,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-18",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-19",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
@@ -1037,9 +1037,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	// GATE1 Respect lot cap (both sides)
-	if (lsb+lss) >= maxConcurrentLots() && !((equityTriggerBuy && d.Signal == Buy) || (equityTriggerSell && d.Signal == Sell)) {
+	if (lsb+lss) >= t.cfg.MaxConcurrentLots && !((equityTriggerBuy && d.Signal == Buy) || (equityTriggerSell && d.Signal == Sell)) {
 		t.mu.Unlock()
-		log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", maxConcurrentLots())
+		log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", t.cfg.MaxConcurrentLots)
 		return "HOLD", nil
 	}
 
