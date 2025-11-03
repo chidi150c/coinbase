@@ -1062,35 +1062,34 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// bypass Gate2 (spacing + adverse) for THIS SIDE ONLY.
 	// Toggle: cfg.MirrorProfitGateEnabled
 	mirrorProfitOverride := false
-	dynamicGate := t.mirrorEffectiveGate(side) // ramped by nearest idx
-	if side == SideBuy {
-		if t.nearestIdxBuy >= 1 && t.nearestNetSell >= dynamicGate {
-			mirrorProfitOverride = true
+	// GATE2 Gating for pyramiding adds — spacing + adverse move (with optional time-decay), side-aware.
+	if isAdd && !skipPyramidGates {
+		dynamicGate := t.mirrorEffectiveGate(side) // ramped by nearest idx
+		if side == SideBuy {
+			if t.nearestIdxBuy >= 1 && t.nearestNetSell >= dynamicGate {
+				mirrorProfitOverride = true
+			}
+		} else {
+			if t.nearestIdxSell >= 1 && t.nearestNetBuy >= dynamicGate {
+				mirrorProfitOverride = true
+			}
 		}
-	} else {
-		if t.nearestIdxSell >= 1 && t.nearestNetBuy >= dynamicGate {
-			mirrorProfitOverride = true
-		}
-	}
 
-	if mirrorProfitOverride {
-		log.Printf("[DEBUG] GATE2 override (mirror-profit choppy): side=%s net=%.4f ≥ gate=%.4f idx=%d",
-			side,
-			func() float64 {
-				if side == SideBuy { return t.nearestNetSell }
-				return t.nearestNetBuy
-			}(),
-			dynamicGate,
-			func() int {
-				if side == SideBuy { return t.nearestIdxBuy }
-				return t.nearestIdxSell
-			}(),
-		)
-		// Bypass spacing & adverse; continue with sizing/entry path
-	} else {
-		// (existing Gate2 logic: spacing + adverse move + latch etc.)
-			// GATE2 Gating for pyramiding adds — spacing + adverse move (with optional time-decay), side-aware.
-		if isAdd && !skipPyramidGates {
+		if mirrorProfitOverride {
+			log.Printf("[DEBUG] GATE2 override (mirror-profit choppy): side=%s net=%.4f ≥ gate=%.4f idx=%d",
+				side,
+				func() float64 {
+					if side == SideBuy { return t.nearestNetSell }
+					return t.nearestNetBuy
+				}(),
+				dynamicGate,
+				func() int {
+					if side == SideBuy { return t.nearestIdxBuy }
+					return t.nearestIdxSell
+				}(),
+			)
+			// Bypass spacing & adverse; continue with sizing/entry path
+		} else {
 			// Choose side-aware anchor set
 			var lastAddSide time.Time
 			if side == SideBuy {
@@ -1243,9 +1242,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					}
 				}
 			}
+		
 		}
-	}
 
+	}
 
 	// Sizing (risk % of current equity, with optional volatility adjust already supported).
 	riskPct := t.cfg.RiskPerTradePct
@@ -1535,15 +1535,15 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquityBuy=%.2f pct_diff_buy=%.6f equitySpareQuote=%.2f", t.equityUSD, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, equitySpareQuote)
 	} else if side == SideBuy {
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|PriceDownGoingUp=%v|LowBottom=%v",
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|PriceDownGoingUp=%v|LowBottom=%v|mirror=%v",
 			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr,
-			d.PriceDownGoingUp, d.LowBottom,
+			d.PriceDownGoingUp, d.LowBottom, mirrorProfitOverride,
 		)
 	} else { // SideSell
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|HighPeak=%v|PriceUpGoingDown=%v",
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|HighPeak=%v|PriceUpGoingDown=%v|mirror=%v",
 			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr,
-			d.HighPeak, d.PriceUpGoingDown,
+			d.HighPeak, d.PriceUpGoingDown, mirrorProfitOverride,
 		)
 	}
 
