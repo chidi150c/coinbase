@@ -123,8 +123,8 @@ type BotState struct {
 	PendingSell        *PendingOpen
 	PendingRecheckBuy  bool
 	PendingRecheckSell bool
-	refundBuyUSD  float64
-	refundSellUSD float64
+	RefundBuyUSD  float64
+	RefundSellUSD float64
 }
 
 // --- NEW (Phase 1): pending async maker-first open support ---
@@ -144,7 +144,7 @@ type PendingOpen struct {
 	// --- NEW: persisted working order id to allow rehydration ---
 	OrderID string
 	    // NEW: keep last few order IDs so we accept late fills after a cancel/reprice.
-    History []string `json:"History,omitempty"` // capped (e.g., last 5)
+    History []string `json:"history,omitempty"` // capped (e.g., last 5)
     // NEW: accumulate fills across reprices
     AccumBase   float64 // sum of executed base over all prior order IDs
     AccumQuote  float64 // sum of executed quote
@@ -253,8 +253,8 @@ func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
 	go func() {
 		for fn := range t.stateApplyCh {
 			t.mu.Lock()
-			defer t.unlockSafe()
 			fn(t)
+			t.mu.Unlock()
 		}
 	}()
 
@@ -993,6 +993,8 @@ func (t *Trader) snapshotStateLocked() BotState {
 		PendingSell:        t.pendingSell,
 		PendingRecheckBuy:  t.pendingRecheckBuy,
 		PendingRecheckSell: t.pendingRecheckSell,
+        RefundBuyUSD:  t.refundBuyUSD,
+        RefundSellUSD: t.refundSellUSD,
 	}
 }
 
@@ -1118,6 +1120,9 @@ func (t *Trader) loadState() error {
 	t.pendingSell = st.PendingSell
 	t.pendingRecheckBuy = st.PendingRecheckBuy
 	t.pendingRecheckSell = st.PendingRecheckSell
+	
+    t.refundBuyUSD = st.RefundBuyUSD
+    t.refundSellUSD = st.RefundSellUSD
 
 	// Initialize trailing baseline for any current runners (no migration; just honor existing RunnerIDs)
 	for _, side := range []OrderSide{SideBuy, SideSell} {
