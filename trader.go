@@ -73,6 +73,7 @@ type Position struct {
 
 	// --- NEW: track maker-first TP exit order id (post-only limit attempt) ---
 	FixedTPOrderID string `json:"-"`
+	RefundPortionUSD float64 `json:"refund_portion_usd"` 
 
 	// --- NEW: stable lot identifier & entry order id (persisted) ---
 	LotID        int    `json:"lot_id,omitempty"`
@@ -122,6 +123,8 @@ type BotState struct {
 	PendingSell        *PendingOpen
 	PendingRecheckBuy  bool
 	PendingRecheckSell bool
+	refundBuyUSD  float64
+	refundSellUSD float64
 }
 
 // --- NEW (Phase 1): pending async maker-first open support ---
@@ -132,6 +135,7 @@ type PendingOpen struct {
 	Quote        float64
 	Take         float64
 	Reason       string
+	RefundPortionUSD float64 `json:"refund_portion_usd"` 
 	ProductID    string
 	CreatedAt    time.Time
 	Deadline     time.Time
@@ -223,6 +227,10 @@ type Trader struct {
 	nearestTakeSell float64
 	nearestNetSell  float64
 	nearestIdxSell  int
+
+	refundBuyUSD  float64
+	refundSellUSD float64
+
 }
 
 func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
@@ -887,7 +895,6 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	_ = removedWasRunner // kept to emphasize runner path; no extra logs.
 	return msg, nil
 }
-
 // activationPrice returns the mark price that achieves a given NET USD gain (usdGate)
 // after subtracting the already-paid entry fee and estimating exit fee at feeRatePct.
 func activationPrice(lot *Position, usdGate float64, feeRatePct float64) float64 {

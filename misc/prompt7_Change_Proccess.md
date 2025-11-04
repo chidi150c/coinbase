@@ -1,5 +1,4 @@
-Generate a full copy of {{
-// ---------------------------------------------------------------------------------------------
+Generate a full copy of {{// ---------------------------------------------------------------------------------------------
 // FILE: step.go — Synchronized trading tick (EXIT → OPEN), extracted from trader.go
 //
 // Overview
@@ -366,6 +365,30 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					t.pendingBuy == nil,
 				)
 
+				if t.pendingBuy != nil {
+					if t.pendingBuy.RefundPortionUSD > 0 {
+						refundBase := t.pendingBuy.RefundPortionUSD / priceToUse
+						if refundBase > baseToUse {
+							refundBase = baseToUse
+						}
+						keptBase := baseToUse - refundBase
+						if keptBase < 0 {
+							keptBase = 0
+						}
+						keptQuote := quoteSpent
+						if baseToUse > 0 {
+							keptQuote = quoteSpent * (keptBase / baseToUse)
+						}
+						keptFee := entryFee
+						if baseToUse > 0 {
+							keptFee = entryFee * (keptBase / baseToUse)
+						}
+						baseToUse = keptBase
+						quoteSpent = keptQuote
+						entryFee = keptFee
+					}
+				}
+
 				newLot := &Position{
 					OpenPrice:    priceToUse,
 					Side:         side,
@@ -376,11 +399,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					Reason:       "async postonly filled",
 					Take:         0, // or carry from pending if available
 					Version:      1,
-					LotID:        t.NextLotSeq,
+					LotID:        len(book.Lots),
 					EntryOrderID: res.OrderID,
 				}
 				if t.pendingBuy != nil {
 					newLot.Reason = t.pendingBuy.Reason
+					newLot.RefundPortionUSD = t.pendingBuy.RefundPortionUSD
 					newLot.Take = t.pendingBuy.Take
 				}
 				idx := len(book.Lots) // the new lot’s index after append
@@ -393,7 +417,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=strict")
 					}
 				}
-				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
 				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
 				if t.pendingBuy != nil && t.pendingBuy.EquityBuy {
@@ -495,7 +518,29 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					matchHistory,
 					t.pendingSell == nil,
 				)
-
+				if t.pendingSell != nil {
+					if t.pendingSell.RefundPortionUSD > 0 {
+						refundBase := t.pendingSell.RefundPortionUSD / priceToUse
+						if refundBase > baseToUse {
+							refundBase = baseToUse
+						}
+						keptBase := baseToUse - refundBase
+						if keptBase < 0 {
+							keptBase = 0
+						}
+						keptQuote := quoteSpent
+						if baseToUse > 0 {
+							keptQuote = quoteSpent * (keptBase / baseToUse)
+						}
+						keptFee := entryFee
+						if baseToUse > 0 {
+							keptFee = entryFee * (keptBase / baseToUse)
+						}
+						baseToUse = keptBase
+						quoteSpent = keptQuote
+						entryFee = keptFee
+					}
+				}
 				newLot := &Position{
 					OpenPrice:    priceToUse,
 					Side:         side,
@@ -506,13 +551,15 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					Reason:       "async postonly filled",
 					Take:         0, // or carry from pending if available
 					Version:      1,
-					LotID:        t.NextLotSeq,
+					LotID:        len(book.Lots),
 					EntryOrderID: res.OrderID,
 				}
 				if t.pendingSell != nil {
 					newLot.Reason = t.pendingSell.Reason
 					newLot.Take = t.pendingSell.Take
+					newLot.RefundPortionUSD = t.pendingSell.RefundPortionUSD
 				}
+				                      
 				idx := len(book.Lots) // the new lot’s index after append
 				if idx >= 2 {
 					if !strings.Contains(newLot.Reason, "mode=choppy") {
@@ -523,7 +570,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=strict")
 					}
 				}
-				t.NextLotSeq++
 				book.Lots = append(book.Lots, newLot)
 				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
 				if t.pendingSell != nil && t.pendingSell.EquitySell {
@@ -611,6 +657,51 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 		nearestTakeBuy := 0.0
 		nearestTakeSell := 0.0
+		buyNearestIdx, sellNearestIdx := -1, -1
+		buyModeLabel,  sellModeLabel  := "n/a", "n/a"
+		buyNet,        sellNet        := 0.0,  0.0
+		feeRatePct := t.cfg.FeeRatePct
+
+		// Label exit mode
+		modeLabel := func(m ExitMode) string {
+			switch m {
+			case ExitModeRunnerTrailing:
+				return "RunnerTrailing"
+			case ExitModeScalpTrailing:
+				return "ScalpTrailing"
+			case ExitModeScalpFixedTP:
+				return "ScalpFixedTP"
+			default:
+				return "Unknown"
+			}
+		}
+
+		// Update nearest TAKE for a side using already computed fields in-loop
+		updateNearest := func(book *SideBook, side OrderSide, idx int, lot *Position, net float64, price float64) {
+			cand := lot.Take
+			if cand <= 0 {
+				// lightweight preview if not armed: use lot’s gate (already set by setExitMode)
+				gate := lot.TrailActivateGateUSD
+				if gate > 0 {
+					cand = activationPrice(lot, gate, feeRatePct)
+				}
+			}
+			if cand <= 0 { return }
+
+			// NEW: directional validity check (no other logic touched)
+			if side == SideBuy && cand < price { return } // BUY exits must be >= price
+			if side == SideSell && cand > price { return } // SELL exits must be <= price
+
+			if side == SideBuy {
+				if nearestTakeBuy == 0 || cand < nearestTakeBuy {
+					nearestTakeBuy = cand; buyNearestIdx = idx; buyModeLabel = modeLabel(lot.ExitMode); buyNet = net
+				}
+			} else {
+				if nearestTakeSell == 0 || cand > nearestTakeSell {
+					nearestTakeSell = cand; sellNearestIdx = idx; sellModeLabel = modeLabel(lot.ExitMode); sellNet = net
+				}
+			}
+		}
 
 		// Helper: compute net PnL and gate state for one lot, update EstExitFeeUSD/UnrealizedPnLUSD
 		computeGate := func(lot *Position) (netPnL float64, gate bool) {
@@ -671,15 +762,19 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				setExitMode(book, i, lot)
 
 				// compute gate
+				
 				net, pass := computeGate(lot)
+
+				// gather nearest TAKE/mode/net while we're already here (no extra loops later)
+				updateNearest(book, side, i, lot, net, price)
 				
 				// Override gating for FixedTP buckets:
 				// - idx == 1 → stricter 25× gate (gate = 0.02 now)
 				// - idx ≥ 2  → normal 1× gate (ScalpChoppyTP semantics)
 				if lot.ExitMode == ExitModeScalpFixedTP {
 					if i == 1 {
-						pass = net >= 25.0 * t.cfg.ProfitGateUSD
-						lot.TrailActivateGateUSD = 25.0 * t.cfg.ProfitGateUSD // preview consistency
+						pass = net >= t.cfg.TrailActivateUSDScalp
+						lot.TrailActivateGateUSD = t.cfg.TrailActivateUSDScalp // preview consistency
 					} else if i >= 2 {
 						pass = net >= t.cfg.ProfitGateUSD
 						lot.TrailActivateGateUSD = t.cfg.ProfitGateUSD
@@ -720,11 +815,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 							continue
 						}
 						msg, err := t.closeLot(ctx, c, side, i, "trailing_stop")
+						defer t.mu.Unlock()
 						if err != nil {
-							t.mu.Unlock()
 							return "", true, err
 						}
-						t.mu.Unlock()
 						return msg, true, nil
 					}
 
@@ -775,14 +869,13 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 				if trigger {
 					msg, err := t.closeLot(ctx, c, side, i, exitReason)
+					defer t.mu.Unlock()
 					if err != nil {
-						t.mu.Unlock()
 						return "", true, err
 					}
 					if lot.ExitMode == ExitModeScalpFixedTP {
 						log.Printf("TRACE tp.filled side=%s idx=%d mark=%.8f take=%.8f", lot.Side, i, price, lot.Take)
 					}
-					t.mu.Unlock()
 					return msg, true, nil
 				}
 
@@ -790,10 +883,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if lot.Side == SideBuy {
 					if lot.Take > 0 && (nearestTakeBuy == 0 || lot.Take < nearestTakeBuy) {
 						nearestTakeBuy = lot.Take
+						buyNearestIdx, buyModeLabel, buyNet = i, modeLabel(lot.ExitMode), net
 					}
 				} else {
 					if lot.Take > 0 && (nearestTakeSell == 0 || lot.Take > nearestTakeSell) {
 						nearestTakeSell = lot.Take
+						sellNearestIdx, sellModeLabel, sellNet = i, modeLabel(lot.ExitMode), net
 					}
 				}
 				i++
@@ -808,8 +903,20 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		if msg, done, err := scanSide(SideSell); done || err != nil {
 			return msg, err
 		}
+		// single-pass enriched summary (collected in-loop; no extra scans)
+		 log.Printf("[DEBUG] Nearest Takes | CLOSE-BUY=%.2f (%s, net=%.2f, idx=%d) | CLOSE-SELL=%.2f (%s, net=%.2f, idx=%d) | Buy-Lots=%d Sell-Lots=%d",
+		   nearestTakeBuy, buyModeLabel, buyNet, buyNearestIdx,
+		   nearestTakeSell, sellModeLabel, sellNet, sellNearestIdx, lsb, lss)
 
-		log.Printf("[DEBUG] Nearest Take (to close a buy lot)=%.2f, (to close a sell lot)=%.2f, across %d BuyLots, and %d SellLots", nearestTakeBuy, nearestTakeSell, lsb, lss)
+		// Persist snapshots for Gate2 use (under lock; we are holding t.mu in step())
+		t.nearestTakeBuy = nearestTakeBuy
+		t.nearestNetBuy  = buyNet
+		t.nearestIdxBuy  = buyNearestIdx
+
+		t.nearestTakeSell = nearestTakeSell
+		t.nearestNetSell  = sellNet
+		t.nearestIdxSell  = sellNearestIdx
+		
 	}
 
 	feeMult := 1.0 + (t.cfg.FeeRatePct / 100.0)
@@ -843,7 +950,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-11",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-19",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
@@ -979,9 +1086,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	// GATE1 Respect lot cap (both sides)
-	if (lsb+lss) >= maxConcurrentLots() && !((equityTriggerBuy && d.Signal == Buy) || (equityTriggerSell && d.Signal == Sell)) {
+	if (lsb+lss) >= t.cfg.MaxConcurrentLots && !((equityTriggerBuy && d.Signal == Buy) || (equityTriggerSell && d.Signal == Sell)) {
 		t.mu.Unlock()
-		log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", maxConcurrentLots())
+		log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", t.cfg.MaxConcurrentLots)
 		return "HOLD", nil
 	}
 
@@ -999,160 +1106,194 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		reasonElapsedHr float64
 	)
 
+	// --- MIRROR-PROFIT GATE (choppy scalp override):
+	// If the opposite side's nearest net ≥ ProfitGateUSD and this side is in choppy tier (idx≥2),
+	// bypass Gate2 (spacing + adverse) for THIS SIDE ONLY.
+	// Toggle: cfg.MirrorProfitGateEnabled
+	mirrorProfitOverride := false
 	// GATE2 Gating for pyramiding adds — spacing + adverse move (with optional time-decay), side-aware.
 	if isAdd && !skipPyramidGates {
-		// Choose side-aware anchor set
-		var lastAddSide time.Time
+		dynamicGate := t.mirrorEffectiveGate(side) // ramped by nearest idx
 		if side == SideBuy {
-			lastAddSide = t.lastAddBuy
+			if t.nearestIdxBuy >= 1 && t.nearestNetSell >= dynamicGate {
+				mirrorProfitOverride = true
+			}
 		} else {
-			lastAddSide = t.lastAddSell
-		}
-
-		// 1) Spacing
-		psb := t.cfg.PyramidMinSecondsBetween
-		// TODO: remove TRACE
-		log.Printf("TRACE pyramid.spacing since_last=%.1fs need>=%ds", time.Since(lastAddSide).Seconds(), psb)
-		if time.Since(lastAddSide) < time.Duration(psb)*time.Second {
-			t.mu.Unlock()
-			hrs := time.Since(lastAddSide).Hours()
-			log.Printf("[DEBUG] GATE2 pyramid: blocked by spacing; since_last=%vHours need>=%ds", fmt.Sprintf("%.1f", hrs), psb)
-			return "HOLD", nil
-		}
-
-		// 2) Adverse move gate with optional time-based exponential decay.
-		basePct := t.cfg.PyramidMinAdversePct
-		effPct := basePct
-		lambda := t.cfg.PyramidDecayLambda
-		floor := t.cfg.PyramidDecayMinPct
-		elapsedMin := 0.0
-		if lambda > 0 {
-			if !lastAddSide.IsZero() {
-				elapsedMin = time.Since(lastAddSide).Minutes()
-			} else {
-				elapsedMin = 0.0
+			if t.nearestIdxSell >= 1 && t.nearestNetBuy >= dynamicGate {
+				mirrorProfitOverride = true
 			}
-			decayed := basePct * math.Exp(-lambda*elapsedMin)
-			if decayed < floor {
-				decayed = floor
-			}
-			effPct = decayed
 		}
 
-		// Capture for reason string
-		reasonBasePct = basePct
-		reasonEffPct = effPct
-		reasonElapsedHr = elapsedMin / 60.0
-
-		// Time (in minutes) to hit the floor once (t_floor_min)
-		tFloorMin := 0.0
-		if lambda > 0 && basePct > floor {
-			tFloorMin = math.Log(basePct/floor) / lambda
-		}
-
-		// TODO: remove TRACE
-		log.Printf("TRACE pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
-			side, elapsedMin, basePct, effPct, lambda, floor, tFloorMin)
-
-		// Use side-aware latest entry for adverse gate anchoring
-		last := t.latestEntryBySide(side)
-
-		if last > 0 {
+		if mirrorProfitOverride {
+			log.Printf("[DEBUG] GATE2 override (mirror-profit choppy): side=%s net=%.4f ≥ gate=%.4f idx=%d",
+				side,
+				func() float64 {
+					if side == SideBuy { return t.nearestNetSell }
+					return t.nearestNetBuy
+				}(),
+				dynamicGate,
+				func() int {
+					if side == SideBuy { return t.nearestIdxBuy }
+					return t.nearestIdxSell
+				}(),
+			)
+			// Bypass spacing & adverse; continue with sizing/entry path
+		} else {
+			// Choose side-aware anchor set
+			var lastAddSide time.Time
 			if side == SideBuy {
-				// BUY adverse tracker (side-aware)
-				if elapsedMin >= tFloorMin {
-					if t.winLowBuy == 0 || price < t.winLowBuy {
-						t.winLowBuy = price
-					}
+				lastAddSide = t.lastAddBuy
+			} else {
+				lastAddSide = t.lastAddSell
+			}
+
+			// 1) Spacing
+			psb := t.cfg.PyramidMinSecondsBetween
+			// TODO: remove TRACE
+			log.Printf("TRACE pyramid.spacing since_last=%.1fs need>=%ds", time.Since(lastAddSide).Seconds(), psb)
+			if time.Since(lastAddSide) < time.Duration(psb)*time.Second {
+				t.mu.Unlock()
+				hrs := time.Since(lastAddSide).Hours()
+				log.Printf("[DEBUG] GATE2 pyramid: blocked by spacing; since_last=%vHours need>=%ds", fmt.Sprintf("%.1f", hrs), psb)
+				return "HOLD", nil
+			}
+
+			// 2) Adverse move gate with optional time-based exponential decay.
+			basePct := t.cfg.PyramidMinAdversePct
+			effPct := basePct
+			lambda := t.cfg.PyramidDecayLambda
+			floor := t.cfg.PyramidDecayMinPct
+			elapsedMin := 0.0
+			if lambda > 0 {
+				if !lastAddSide.IsZero() {
+					elapsedMin = time.Since(lastAddSide).Minutes()
 				} else {
-					t.winLowBuy = 0
+					elapsedMin = 0.0
 				}
-				// latch at 2*t_floor_min
-				if t.latchedGateBuy == 0 && elapsedMin >= 2.0*tFloorMin && t.winLowBuy > 0 {
-					t.latchedGateBuy = t.winLowBuy
-					// --- breadcrumb ---
-					log.Printf("[DEBUG] LATCH SET BUY: latchedGate=%.2f winLow=%.2f elapsedMin=%.1f tFloorMin=%.2f",
-						t.latchedGateBuy, t.winLowBuy, elapsedMin, tFloorMin)
+				decayed := basePct * math.Exp(-lambda*elapsedMin)
+				if decayed < floor {
+					decayed = floor
 				}
-				// baseline gate: last * (1.0 - effPct); latched replaces baseline
-				gatePrice := last * (1.0 - effPct/100.0)
-				if t.latchedGateBuy > 0 {
-					gatePrice = t.latchedGateBuy
-				}
-				// clamp to min(winLowBuy, last BUY open)
-				clampP := last
-				if t.winLowBuy > 0 && t.winLowBuy < clampP {
-					clampP = t.winLowBuy
-				}
-				if gatePrice > clampP {
-					gatePrice = clampP
-				}
+				effPct = decayed
+			}
 
-				// mirror for reason/log fields
-				reasonGatePrice = gatePrice
-				reasonLatched = t.latchedGateBuy
+			// Capture for reason string
+			reasonBasePct = basePct
+			reasonEffPct = effPct
+			reasonElapsedHr = elapsedMin / 60.0
 
-				// --- breadcrumb when baseline condition met ---
-				if price <= gatePrice {
-					log.Printf("[DEBUG] pyramid: BUY baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
-						price, gatePrice, last, effPct, elapsedMin)
-				}
+			// Time (in minutes) to hit the floor once (t_floor_min)
+			tFloorMin := 0.0
+			if lambda > 0 && basePct > floor {
+				tFloorMin = math.Log(basePct/floor) / lambda
+			}
 
-				if !(price <= gatePrice) {
-					t.mu.Unlock()
-					log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
-						price, gatePrice, t.winLowBuy, effPct, basePct, reasonElapsedHr)
-					log.Printf("TRACE pyramid.block.buy price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateBuy)
-					return "HOLD", nil
-				}
-			} else { // SELL
-				// SELL adverse tracker (side-aware)
-				if elapsedMin >= tFloorMin {
-					if t.winHighSell == 0 || price > t.winHighSell {
-						t.winHighSell = price
+			// TODO: remove TRACE
+			log.Printf("TRACE pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
+				side, elapsedMin, basePct, effPct, lambda, floor, tFloorMin)
+
+			// Use side-aware latest entry for adverse gate anchoring
+			last := t.latestEntryBySide(side)
+
+			if last > 0 {
+				if side == SideBuy {
+					// BUY adverse tracker (side-aware)
+					if elapsedMin >= tFloorMin {
+						if t.winLowBuy == 0 || price < t.winLowBuy {
+							t.winLowBuy = price
+						}
+					} else {
+						t.winLowBuy = 0
 					}
-				} else {
-					t.winHighSell = 0
-				}
-				if t.latchedGateSell == 0 && elapsedMin >= 2.0*tFloorMin && t.winHighSell > 0 {
-					t.latchedGateSell = t.winHighSell
-					// --- breadcrumb ---
-					log.Printf("[DEBUG] LATCH SET SELL: latchedGate=%.2f winHigh=%.2f elapsedMin=%.1f tFloorMin=%.2f",
-						t.latchedGateSell, t.winHighSell, elapsedMin, tFloorMin)
-				}
-				// baseline gate: last * (1.0 + effPct); latched replaces baseline
-				gatePrice := last * (1.0 + effPct/100.0)
-				if t.latchedGateSell > 0 {
-					gatePrice = t.latchedGateSell
-				}
-				// clamp to max(winHighSell, last SELL open)
-				clampP := last
-				if t.winHighSell > 0 && t.winHighSell > clampP {
-					clampP = t.winHighSell
-				}
-				if gatePrice < clampP {
-					gatePrice = clampP
-				}
+					// latch at 2*t_floor_min
+					if t.latchedGateBuy == 0 && elapsedMin >= 2.0*tFloorMin && t.winLowBuy > 0 {
+						t.latchedGateBuy = t.winLowBuy
+						// --- breadcrumb ---
+						log.Printf("[DEBUG] LATCH SET BUY: latchedGate=%.2f winLow=%.2f elapsedMin=%.1f tFloorMin=%.2f",
+							t.latchedGateBuy, t.winLowBuy, elapsedMin, tFloorMin)
+					}
+					// baseline gate: last * (1.0 - effPct); latched replaces baseline
+					gatePrice := last * (1.0 - effPct/100.0)
+					if t.latchedGateBuy > 0 {
+						gatePrice = t.latchedGateBuy
+					}
+					// clamp to min(winLowBuy, last BUY open)
+					clampP := last
+					if t.winLowBuy > 0 && t.winLowBuy < clampP {
+						clampP = t.winLowBuy
+					}
+					if gatePrice > clampP {
+						gatePrice = clampP
+					}
 
-				// mirror for legacy reason/log fields
-				reasonGatePrice = gatePrice
-				reasonLatched = t.latchedGateSell
+					// mirror for reason/log fields
+					reasonGatePrice = gatePrice
+					reasonLatched = t.latchedGateBuy
 
-				// --- breadcrumb when baseline condition met ---
-				if price >= gatePrice {
-					log.Printf("[DEBUG] pyramid: SELL baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
-						price, gatePrice, last, effPct, elapsedMin)
-				}
+					// --- breadcrumb when baseline condition met ---
+					if price <= gatePrice {
+						log.Printf("[DEBUG] pyramid: BUY baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
+							price, gatePrice, last, effPct, elapsedMin)
+					}
 
-				if !(price >= gatePrice) {
-					t.mu.Unlock()
-					log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
-						price, gatePrice, t.winHighSell, effPct, basePct, reasonElapsedHr)
-					log.Printf("TRACE pyramid.block.sell price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateSell)
-					return "HOLD", nil
+					if !(price <= gatePrice) {
+						t.mu.Unlock()
+						log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
+							price, gatePrice, t.winLowBuy, effPct, basePct, reasonElapsedHr)
+						log.Printf("TRACE pyramid.block.buy price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateBuy)
+						return "HOLD", nil
+					}
+				} else { // SELL
+					// SELL adverse tracker (side-aware)
+					if elapsedMin >= tFloorMin {
+						if t.winHighSell == 0 || price > t.winHighSell {
+							t.winHighSell = price
+						}
+					} else {
+						t.winHighSell = 0
+					}
+					if t.latchedGateSell == 0 && elapsedMin >= 2.0*tFloorMin && t.winHighSell > 0 {
+						t.latchedGateSell = t.winHighSell
+						// --- breadcrumb ---
+						log.Printf("[DEBUG] LATCH SET SELL: latchedGate=%.2f winHigh=%.2f elapsedMin=%.1f tFloorMin=%.2f",
+							t.latchedGateSell, t.winHighSell, elapsedMin, tFloorMin)
+					}
+					// baseline gate: last * (1.0 + effPct); latched replaces baseline
+					gatePrice := last * (1.0 + effPct/100.0)
+					if t.latchedGateSell > 0 {
+						gatePrice = t.latchedGateSell
+					}
+					// clamp to max(winHighSell, last SELL open)
+					clampP := last
+					if t.winHighSell > 0 && t.winHighSell > clampP {
+						clampP = t.winHighSell
+					}
+					if gatePrice < clampP {
+						gatePrice = clampP
+					}
+
+					// mirror for legacy reason/log fields
+					reasonGatePrice = gatePrice
+					reasonLatched = t.latchedGateSell
+
+					// --- breadcrumb when baseline condition met ---
+					if price >= gatePrice {
+						log.Printf("[DEBUG] pyramid: SELL baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
+							price, gatePrice, last, effPct, elapsedMin)
+					}
+
+					if !(price >= gatePrice) {
+						t.mu.Unlock()
+						log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
+							price, gatePrice, t.winHighSell, effPct, basePct, reasonElapsedHr)
+						log.Printf("TRACE pyramid.block.sell price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateSell)
+						return "HOLD", nil
+					}
 				}
 			}
+		
 		}
+
 	}
 
 	// Sizing (risk % of current equity, with optional volatility adjust already supported).
@@ -1288,10 +1429,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			// --- breadcrumb ---
 			log.Printf("[WARN] FUNDS_EXHAUSTED BUY need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 				neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
-			t.mu.Unlock()
 			log.Printf("[DEBUG] GATE BUY: need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 				neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
 			log.Printf("TRACE buy.gate.block need=%.2f spare=%.2f", neededQuote, spare)
+			
+			short := neededQuote - spare
+			if short > 0 && short > t.refundBuyUSD{
+				// remember that a BUY was blocked by this amount
+				t.refundBuyUSD = short
+			}
+
+			t.mu.Unlock()
 			return "HOLD", nil
 		}
 
@@ -1306,10 +1454,16 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				// --- breadcrumb ---
 				log.Printf("[WARN] FUNDS_EXHAUSTED BUY need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 					neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
-				t.mu.Unlock()
 				log.Printf("[DEBUG] GATE BUY: need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 					neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
 				log.Printf("TRACE buy.gate.block minNotional need=%.2f spare=%.2f", neededQuote, spare)
+				
+				short := neededQuote - spare
+				if short > 0 && short > t.refundBuyUSD{
+					// remember that a BUY was blocked by this amount
+					t.refundBuyUSD = short
+				}
+				t.mu.Unlock()
 				return "HOLD", nil
 			}
 		}
@@ -1340,14 +1494,23 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		if spare < 0 {
 			spare = 0
 		}
+		
 		if spare+spareEps < neededBase {
 			// --- breadcrumb ---
 			log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
 				neededBase, spare, availBase, reservedLongBase, baseStep)
-			t.mu.Unlock()
 			log.Printf("[DEBUG] GATE SELL: need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
 				neededBase, spare, availBase, reservedLongBase, baseStep)
 			log.Printf("TRACE sell.gate.block need=%.8f spare=%.8f", neededBase, spare)
+
+			// convert the short to USD at current price so we can reuse later on BUY
+			shortBase := neededBase - spare
+			shortUSD := shortBase * price
+			if shortUSD > 0 && shortUSD > t.refundSellUSD {
+				t.refundSellUSD = shortUSD
+			}
+
+			t.mu.Unlock()
 			return "HOLD", nil
 		}
 
@@ -1371,10 +1534,18 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				// --- breadcrumb ---
 				log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
 					base, spare, availBase, reservedLongBase, baseStep)
-				t.mu.Unlock()
 				log.Printf("[DEBUG] GATE SELL: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
 					base, spare, availBase, reservedLongBase, baseStep)
 				log.Printf("TRACE sell.gate.block minNotional need=%.8f spare=%.8f", base, spare)
+				
+				// convert the short to USD at current price so we can reuse later on BUY
+				shortBase := neededBase - spare
+				shortUSD := shortBase * price
+				if shortUSD > 0 && shortUSD > t.refundSellUSD {
+					t.refundSellUSD = shortUSD
+				}
+
+				t.mu.Unlock()
 				return "HOLD", nil
 			}
 		}
@@ -1443,16 +1614,55 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquityBuy=%.2f pct_diff_buy=%.6f equitySpareQuote=%.2f", t.equityUSD, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, equitySpareQuote)
 	} else if side == SideBuy {
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|PriceDownGoingUp=%v|LowBottom=%v",
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|PriceDownGoingUp=%v|LowBottom=%v|mirror=%v",
 			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr,
-			d.PriceDownGoingUp, d.LowBottom,
+			d.PriceDownGoingUp, d.LowBottom, mirrorProfitOverride,
 		)
 	} else { // SideSell
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|HighPeak=%v|PriceUpGoingDown=%v",
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|HighPeak=%v|PriceUpGoingDown=%v|mirror=%v",
 			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr,
-			d.HighPeak, d.PriceUpGoingDown,
+			d.HighPeak, d.PriceUpGoingDown, mirrorProfitOverride,
 		)
+	}
+	refundFromOpposite := 0.0
+	if t.refundBuyUSD > 0 && side == SideSell{
+		// turn refund USD into extra base at current price
+		extraBase := t.refundBuyUSD / price
+
+		// snap to step if we know it
+		if baseStep > 0 {
+			extraBase = math.Floor(extraBase/baseStep) * baseStep
+		}
+
+		if extraBase > 0 {
+			// check spare again: we can only add it if we still fit
+			if spare >= base+extraBase {
+				base  += extraBase
+				quote  = base * price
+				refundFromOpposite = t.refundBuyUSD
+				t.refundBuyUSD = 0
+				// optional: tag reason
+				gatesReason = strings.TrimSpace(gatesReason + " refund_repay=buy")
+			}
+		}
+	}
+
+	if t.refundSellUSD > 0 && side == SideBuy{
+		extraQuote := t.refundSellUSD
+		// snap to quoteStep
+		if quoteStep > 0 {
+			extraQuote = math.Floor(extraQuote/quoteStep) * quoteStep
+		}
+		if extraQuote > 0 {
+			if spare >= quote+extraQuote {
+				quote += extraQuote
+				base   = quote / price
+				refundFromOpposite = t.refundSellUSD
+				t.refundSellUSD = 0
+				gatesReason = strings.TrimSpace(gatesReason + " refund_repay=sell")
+			}
+		}
 	}
 
 	//-----------------------------------------------------------------------------------------------------------
@@ -1538,6 +1748,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 							Quote:       quote,
 							Take:        take,
 							Reason:      gatesReason, // set later below
+							RefundPortionUSD: refundFromOpposite,
 							ProductID:   t.cfg.ProductID,
 							CreatedAt:   time.Now().UTC(),
 							Deadline:    time.Now().Add(time.Duration(limitWait) * time.Second),
@@ -1561,6 +1772,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 							Quote:       quote,
 							Take:        take,
 							Reason:      gatesReason, // set later below
+							RefundPortionUSD: refundFromOpposite,
 							ProductID:   t.cfg.ProductID,
 							CreatedAt:   time.Now().UTC(),
 							Deadline:    time.Now().Add(time.Duration(limitWait) * time.Second),
@@ -1660,13 +1872,14 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 										QuoteSpent:    sessQuote,
 										CommissionUSD: sessFee,
 									}
-									log.Printf("TRACE postonly.poll.done side=%s order_id=%s final=FILLED vwap=%.8f base=%.8f quote=%.2f fee=%.6f",
-										side, orderID, func() float64 { if sessBase>0 { return sessQuote / sessBase }; return 0 }(), sessBase, sessQuote, sessFee)
 									log.Printf("TRACE postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f", orderID, ord.Price, ord.BaseSize, ord.QuoteSpent, ord.CommissionUSD)
 									mtxOrders.WithLabelValues("live", string(side)).Inc()
 									mtxTrades.WithLabelValues("open").Inc()
 									log.Printf("TRACE postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
 										side, orderID, (sessBase > 0 || sessQuote > 0), sessBase, sessQuote, sessFee)
+									log.Printf("[KPI] maker.open.filled side=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f order_id=%s",
+										side, placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD, orderID)
+
 									safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
 									return
 
@@ -1749,6 +1962,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 											QuoteSpent:    sessQuote,
 											CommissionUSD: sessFee,
 										}
+										log.Printf("[KPI] maker.open.filled side=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f order_id=%s status=%s",
+											side,
+											func() float64 { if sessBase>0 { return sessQuote/sessBase }; return 0 }(),
+											sessBase, sessQuote, sessFee, orderID, strings.ToUpper(strings.TrimSpace(ord.Status)))
+
 										log.Printf("TRACE postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
 											side, orderID, (sessBase > 0 || sessQuote > 0), sessBase, sessQuote, sessFee)
 										safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
@@ -1836,12 +2054,14 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				log.Printf("TRACE postonly.market_fallback.blocked side=%s reason=recheck_flag_not_set", side)
 				return "HOLD", nil
 			}
+			var err error
+			placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
 			// TODO: remove TRACE
 			log.Printf("TRACE order.open request side=%s quote=%.2f baseEst=%.8f priceSnap=%.8f take=%.8f",
 				side, quote, base, price, take)
-			var err error
 			log.Printf("TRACE postonly.market_fallback.go side=%s quote=%.2f", side, quote)
-			placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
+			log.Printf("[KPI] taker.open side=%s quote=%.2f reason=market_fallback", side, quote)
+
 			if err != nil {
 				// Retry once with ORDER_MIN_USD on insufficient-funds style failures.
 				e := strings.ToLower(err.Error())
@@ -1936,6 +2156,28 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		t.equityUSD -= delta
 	}
 
+	if refundFromOpposite > 0 {
+		refundBase := refundFromOpposite / priceToUse
+		if refundBase > baseToUse {
+			refundBase = baseToUse
+		}
+		keptBase := baseToUse - refundBase
+		if keptBase < 0 {
+			keptBase = 0
+		}
+		keptQuote := actualQuote
+		if baseToUse > 0 {
+			keptQuote = actualQuote * (keptBase / baseToUse)
+		}
+		keptFee := entryFee
+		if baseToUse > 0 {
+			keptFee = entryFee * (keptBase / baseToUse)
+		}
+		baseToUse = keptBase
+		actualQuote = keptQuote
+		entryFee = keptFee
+	}
+
 	newLot := &Position{
 		OpenPrice:    priceToUse,
 		Side:         side,
@@ -1946,8 +2188,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		Reason:       gatesReason, // side-biased; no winLow
 		Take:         take,
 		Version:      1,
-		LotID:        t.NextLotSeq,
+		LotID:        len(book.Lots),
 		EntryOrderID: "", // market path has no known order id here
+		RefundPortionUSD: refundFromOpposite,
 	}
 	idx := len(book.Lots) // the new lot’s index after append
 	if idx >= 2 {
@@ -1959,7 +2202,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=strict")
 		}
 	}
-	t.NextLotSeq++
 	book.Lots = append(book.Lots, newLot)
 	t.consolidateDust(book, priceToUse, minNotional)
 	// Use wall clock for lastAdd to drive spacing/decay even if candle time is zero.
@@ -2031,6 +2273,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		log.Printf("[WARN] saveState: %v", err)
 		log.Printf("TRACE state.save error=%v", err)
 	}
+	log.Printf("[KPI] summary equity=%.2f daily_pnl=%.2f lots_buy=%d lots_sell=%d product=%s",
+    t.equityUSD, t.dailyPnL, len(t.book(SideBuy).Lots), len(t.book(SideSell).Lots), t.cfg.ProductID)
 	t.mu.Unlock()
 	return msg, nil
 }
@@ -2092,6 +2336,7 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 		}
 		a.SizeBase += b.SizeBase
 		a.EntryFee += b.EntryFee
+		a.OpenNotionalUSD = a.SizeBase * a.OpenPrice
 		// keep a.Take as-is; exit logic will recompute previews anyway
 		// (Optional) concatenate reasons
     	a.Reason = strings.TrimSpace(a.Reason + " merge:" + strconv.Itoa(b.LotID))
@@ -2117,4 +2362,4 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 		mergeInto(newestIdx, newestIdx-1)
 	}
 }
-}} with only the necessary minimal changes to implement {{release t.mu before invoking closeLot in step.go exit triggers by unlocking prior to the call (and removing the post-call unlock) to avoid holding the trader mutex during broker I/O}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{release t.mu before invoking closeLot in step.go exit triggers by unlocking prior to the call (and removing the post-call unlock) to avoid holding the trader mutex during broker I/O}}. Fix any compile error(s). Return the complete file, copy-paste ready, in IDE.
+}} with only the necessary minimal changes to implement {{update pending BUY and SELL reservation calculations to exclude RefundPortionUSD from the reserved quote/base amounts}}. Do not alter any function names, struct names, metric names, environment keys, log strings, or the return value of identity functions (e.g., Name()). Keep all public behavior, identifiers, and monitoring outputs identical to the current baseline. Only apply the minimal edits required to implement {{update pending BUY and SELL reservation calculations to exclude RefundPortionUSD from the reserved quote/base amounts}}. Fix any compile error(s). Return the complete file, copy-paste ready, in IDE.

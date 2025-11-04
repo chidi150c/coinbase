@@ -365,6 +365,30 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					t.pendingBuy == nil,
 				)
 
+				if t.pendingBuy != nil {
+					if t.pendingBuy.RefundPortionUSD > 0 {
+						refundBase := t.pendingBuy.RefundPortionUSD / priceToUse
+						if refundBase > baseToUse {
+							refundBase = baseToUse
+						}
+						keptBase := baseToUse - refundBase
+						if keptBase < 0 {
+							keptBase = 0
+						}
+						keptQuote := quoteSpent
+						if baseToUse > 0 {
+							keptQuote = quoteSpent * (keptBase / baseToUse)
+						}
+						keptFee := entryFee
+						if baseToUse > 0 {
+							keptFee = entryFee * (keptBase / baseToUse)
+						}
+						baseToUse = keptBase
+						quoteSpent = keptQuote
+						entryFee = keptFee
+					}
+				}
+
 				newLot := &Position{
 					OpenPrice:    priceToUse,
 					Side:         side,
@@ -380,6 +404,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 				if t.pendingBuy != nil {
 					newLot.Reason = t.pendingBuy.Reason
+					newLot.RefundPortionUSD = t.pendingBuy.RefundPortionUSD
 					newLot.Take = t.pendingBuy.Take
 				}
 				idx := len(book.Lots) // the new lot’s index after append
@@ -493,7 +518,29 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					matchHistory,
 					t.pendingSell == nil,
 				)
-
+				if t.pendingSell != nil {
+					if t.pendingSell.RefundPortionUSD > 0 {
+						refundBase := t.pendingSell.RefundPortionUSD / priceToUse
+						if refundBase > baseToUse {
+							refundBase = baseToUse
+						}
+						keptBase := baseToUse - refundBase
+						if keptBase < 0 {
+							keptBase = 0
+						}
+						keptQuote := quoteSpent
+						if baseToUse > 0 {
+							keptQuote = quoteSpent * (keptBase / baseToUse)
+						}
+						keptFee := entryFee
+						if baseToUse > 0 {
+							keptFee = entryFee * (keptBase / baseToUse)
+						}
+						baseToUse = keptBase
+						quoteSpent = keptQuote
+						entryFee = keptFee
+					}
+				}
 				newLot := &Position{
 					OpenPrice:    priceToUse,
 					Side:         side,
@@ -510,7 +557,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				if t.pendingSell != nil {
 					newLot.Reason = t.pendingSell.Reason
 					newLot.Take = t.pendingSell.Take
+					newLot.RefundPortionUSD = t.pendingSell.RefundPortionUSD
 				}
+				                      
 				idx := len(book.Lots) // the new lot’s index after append
 				if idx >= 2 {
 					if !strings.Contains(newLot.Reason, "mode=choppy") {
@@ -1380,10 +1429,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			// --- breadcrumb ---
 			log.Printf("[WARN] FUNDS_EXHAUSTED BUY need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 				neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
-			t.mu.Unlock()
 			log.Printf("[DEBUG] GATE BUY: need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 				neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
 			log.Printf("TRACE buy.gate.block need=%.2f spare=%.2f", neededQuote, spare)
+			
+			short := neededQuote - spare
+			if short > 0 && short > t.refundBuyUSD{
+				// remember that a BUY was blocked by this amount
+				t.refundBuyUSD = short
+			}
+
+			t.mu.Unlock()
 			return "HOLD", nil
 		}
 
@@ -1398,10 +1454,16 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				// --- breadcrumb ---
 				log.Printf("[WARN] FUNDS_EXHAUSTED BUY need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 					neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
-				t.mu.Unlock()
 				log.Printf("[DEBUG] GATE BUY: need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 					neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
 				log.Printf("TRACE buy.gate.block minNotional need=%.2f spare=%.2f", neededQuote, spare)
+				
+				short := neededQuote - spare
+				if short > 0 && short > t.refundBuyUSD{
+					// remember that a BUY was blocked by this amount
+					t.refundBuyUSD = short
+				}
+				t.mu.Unlock()
 				return "HOLD", nil
 			}
 		}
@@ -1432,14 +1494,23 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		if spare < 0 {
 			spare = 0
 		}
+		
 		if spare+spareEps < neededBase {
 			// --- breadcrumb ---
 			log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
 				neededBase, spare, availBase, reservedLongBase, baseStep)
-			t.mu.Unlock()
 			log.Printf("[DEBUG] GATE SELL: need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
 				neededBase, spare, availBase, reservedLongBase, baseStep)
 			log.Printf("TRACE sell.gate.block need=%.8f spare=%.8f", neededBase, spare)
+
+			// convert the short to USD at current price so we can reuse later on BUY
+			shortBase := neededBase - spare
+			shortUSD := shortBase * price
+			if shortUSD > 0 && shortUSD > t.refundSellUSD {
+				t.refundSellUSD = shortUSD
+			}
+
+			t.mu.Unlock()
 			return "HOLD", nil
 		}
 
@@ -1463,10 +1534,18 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				// --- breadcrumb ---
 				log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
 					base, spare, availBase, reservedLongBase, baseStep)
-				t.mu.Unlock()
 				log.Printf("[DEBUG] GATE SELL: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
 					base, spare, availBase, reservedLongBase, baseStep)
 				log.Printf("TRACE sell.gate.block minNotional need=%.8f spare=%.8f", base, spare)
+				
+				// convert the short to USD at current price so we can reuse later on BUY
+				shortBase := neededBase - spare
+				shortUSD := shortBase * price
+				if shortUSD > 0 && shortUSD > t.refundSellUSD {
+					t.refundSellUSD = shortUSD
+				}
+
+				t.mu.Unlock()
 				return "HOLD", nil
 			}
 		}
@@ -1545,6 +1624,45 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr,
 			d.HighPeak, d.PriceUpGoingDown, mirrorProfitOverride,
 		)
+	}
+	refundFromOpposite := 0.0
+	if t.refundBuyUSD > 0 && side == SideSell{
+		// turn refund USD into extra base at current price
+		extraBase := t.refundBuyUSD / price
+
+		// snap to step if we know it
+		if baseStep > 0 {
+			extraBase = math.Floor(extraBase/baseStep) * baseStep
+		}
+
+		if extraBase > 0 {
+			// check spare again: we can only add it if we still fit
+			if spare >= base+extraBase {
+				base  += extraBase
+				quote  = base * price
+				refundFromOpposite = t.refundBuyUSD
+				t.refundBuyUSD = 0
+				// optional: tag reason
+				gatesReason = strings.TrimSpace(gatesReason + " refund_repay=buy")
+			}
+		}
+	}
+
+	if t.refundSellUSD > 0 && side == SideBuy{
+		extraQuote := t.refundSellUSD
+		// snap to quoteStep
+		if quoteStep > 0 {
+			extraQuote = math.Floor(extraQuote/quoteStep) * quoteStep
+		}
+		if extraQuote > 0 {
+			if spare >= quote+extraQuote {
+				quote += extraQuote
+				base   = quote / price
+				refundFromOpposite = t.refundSellUSD
+				t.refundSellUSD = 0
+				gatesReason = strings.TrimSpace(gatesReason + " refund_repay=sell")
+			}
+		}
 	}
 
 	//-----------------------------------------------------------------------------------------------------------
@@ -1630,6 +1748,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 							Quote:       quote,
 							Take:        take,
 							Reason:      gatesReason, // set later below
+							RefundPortionUSD: refundFromOpposite,
 							ProductID:   t.cfg.ProductID,
 							CreatedAt:   time.Now().UTC(),
 							Deadline:    time.Now().Add(time.Duration(limitWait) * time.Second),
@@ -1653,6 +1772,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 							Quote:       quote,
 							Take:        take,
 							Reason:      gatesReason, // set later below
+							RefundPortionUSD: refundFromOpposite,
 							ProductID:   t.cfg.ProductID,
 							CreatedAt:   time.Now().UTC(),
 							Deadline:    time.Now().Add(time.Duration(limitWait) * time.Second),
@@ -2036,6 +2156,28 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		t.equityUSD -= delta
 	}
 
+	if refundFromOpposite > 0 {
+		refundBase := refundFromOpposite / priceToUse
+		if refundBase > baseToUse {
+			refundBase = baseToUse
+		}
+		keptBase := baseToUse - refundBase
+		if keptBase < 0 {
+			keptBase = 0
+		}
+		keptQuote := actualQuote
+		if baseToUse > 0 {
+			keptQuote = actualQuote * (keptBase / baseToUse)
+		}
+		keptFee := entryFee
+		if baseToUse > 0 {
+			keptFee = entryFee * (keptBase / baseToUse)
+		}
+		baseToUse = keptBase
+		actualQuote = keptQuote
+		entryFee = keptFee
+	}
+
 	newLot := &Position{
 		OpenPrice:    priceToUse,
 		Side:         side,
@@ -2048,6 +2190,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		Version:      1,
 		LotID:        len(book.Lots),
 		EntryOrderID: "", // market path has no known order id here
+		RefundPortionUSD: refundFromOpposite,
 	}
 	idx := len(book.Lots) // the new lot’s index after append
 	if idx >= 2 {
