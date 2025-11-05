@@ -1128,11 +1128,11 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	if isAdd && !skipPyramidGates {
 		dynamicGate := t.mirrorEffectiveGate(side) // ramped by nearest idx
 		if side == SideBuy {
-			if t.nearestIdxBuy >= 1 && t.nearestNetSell >= dynamicGate {
+			if t.nearestNetSell >= dynamicGate {
 				mirrorProfitOverride = true
 			}
 		} else {
-			if t.nearestIdxSell >= 1 && t.nearestNetBuy >= dynamicGate {
+			if t.nearestNetBuy >= dynamicGate {
 				mirrorProfitOverride = true
 			}
 		}
