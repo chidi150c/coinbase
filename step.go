@@ -419,6 +419,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 				book.Lots = append(book.Lots, newLot)
 				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
+				t.didConsolidateStartup = false
 				if t.pendingBuy != nil && t.pendingBuy.EquityBuy {
 					newIdx := len(book.Lots) - 1 // the newly appended lot
 					addRunner(book, newIdx)
@@ -572,6 +573,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 				book.Lots = append(book.Lots, newLot)
 				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
+				t.didConsolidateStartup = false
 				if t.pendingSell != nil && t.pendingSell.EquitySell {
 					newIdx := len(book.Lots) - 1 // the newly appended lot
 					addRunner(book, newIdx)
@@ -638,17 +640,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	// // One-time dust consolidation right after startup (uses current price snapshot)
-	if !t.didConsolidateStartup {
-		// We already hold t.mu here
-		t.consolidateDust(t.book(SideBuy),  price, minNotional)
-		t.consolidateDust(t.book(SideSell), price, minNotional)
+	// if !t.didConsolidateStartup {
+	// 	// We already hold t.mu here
+	// 	t.consolidateDust(t.book(SideBuy),  price, minNotional)
+	// 	t.consolidateDust(t.book(SideSell), price, minNotional)
 
-		if err := t.saveStateNoLock(); err != nil {
-			log.Printf("[WARN] saveState (startup consolidate): %v", err)
-		}
-		t.didConsolidateStartup = true
-		log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
-	}
+	// 	if err := t.saveStateNoLock(); err != nil {
+	// 		log.Printf("[WARN] saveState (startup consolidate): %v", err)
+	// 	}
+	// 	t.didConsolidateStartup = true
+	// 	log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
+	// }
 
 	// --------------------------------------------------------------------------------------------------------
 	// --- EXIT path: evaluate profit gate and trailing/TP logic per lot (side-aware) and close at most one.
@@ -1087,11 +1089,22 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// GATE1 Respect lot cap (both sides)
 	if (lsb+lss) >= t.cfg.MaxConcurrentLots && !((equityTriggerBuy && d.Signal == Buy) || (equityTriggerSell && d.Signal == Sell)) {
+		// // One-time dust consolidation right after startup (uses current price snapshot)
+		if !t.didConsolidateStartup {
+			// We already hold t.mu here
+			t.consolidateDust(t.book(SideBuy),  price, minNotional)
+			t.consolidateDust(t.book(SideSell), price, minNotional)
+
+			if err := t.saveStateNoLock(); err != nil {
+				log.Printf("[WARN] saveState (startup consolidate): %v", err)
+			}
+			t.didConsolidateStartup = true
+			log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
+		}
 		t.mu.Unlock()
 		log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", t.cfg.MaxConcurrentLots)
 		return "HOLD", nil
 	}
-
 	// Determine if we are opening equity triggered trade or attempting a pyramid add (side-aware).
 	isAdd := len(book.Lots) > 0 && t.cfg.AllowPyramiding && (d.Signal == Buy || d.Signal == Sell)
 	// --- NEW: skip pyramiding gates for equity-triggered paths (minimal) ---
@@ -2204,6 +2217,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 	book.Lots = append(book.Lots, newLot)
 	t.consolidateDust(book, priceToUse, minNotional)
+	t.didConsolidateStartup = false
 	// Use wall clock for lastAdd to drive spacing/decay even if candle time is zero.
 	if side == SideBuy {
 		t.lastAddBuy = wallNow
