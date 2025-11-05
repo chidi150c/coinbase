@@ -638,17 +638,17 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 
 	// // One-time dust consolidation right after startup (uses current price snapshot)
-	// if !t.didConsolidateStartup {
-	// 	// We already hold t.mu here
-	// 	t.consolidateDust(t.book(SideBuy),  price, minNotional)
-	// 	t.consolidateDust(t.book(SideSell), price, minNotional)
+	if !t.didConsolidateStartup {
+		// We already hold t.mu here
+		t.consolidateDust(t.book(SideBuy),  price, minNotional)
+		t.consolidateDust(t.book(SideSell), price, minNotional)
 
-	// 	if err := t.saveStateNoLock(); err != nil {
-	// 		log.Printf("[WARN] saveState (startup consolidate): %v", err)
-	// 	}
-	// 	t.didConsolidateStartup = true
-	// 	log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
-	// }
+		if err := t.saveStateNoLock(); err != nil {
+			log.Printf("[WARN] saveState (startup consolidate): %v", err)
+		}
+		t.didConsolidateStartup = true
+		log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
+	}
 
 	// --------------------------------------------------------------------------------------------------------
 	// --- EXIT path: evaluate profit gate and trailing/TP logic per lot (side-aware) and close at most one.
@@ -1643,7 +1643,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				refundFromOpposite = t.refundBuyUSD
 				t.refundBuyUSD = 0
 				// optional: tag reason
-				gatesReason = strings.TrimSpace(gatesReason + " refund_repay=buy")
+				gatesReason = strings.TrimSpace(gatesReason + "|refund=buy")
 			}
 		}
 	}
@@ -1660,7 +1660,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				base   = quote / price
 				refundFromOpposite = t.refundSellUSD
 				t.refundSellUSD = 0
-				gatesReason = strings.TrimSpace(gatesReason + " refund_repay=sell")
+				gatesReason = strings.TrimSpace(gatesReason + "|refund=sell")
 			}
 		}
 	}
@@ -2279,31 +2279,58 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	return msg, nil
 }
 
-// consolidateDust collapses tiny (notional < minNotional) lots on a side, without changing exposure.
-// 1) If the newest lot is dust, merge it backward into the previous lot (repeat as needed).
-// 2) Merge any older dust lots forward into the newest lot.
-// RunnerIDs are kept authoritative: if a merged-from lot was a runner, the merged-into index remains (or becomes) a runner.
-// NOTE: px should be the best current mark/close (same used for notional checks).
+// consolidateDust collapses tiny (notional < minNotional) lots on a side.
+// Behavior:
+// - If there is exactly 1 lot and it's below minNotional → pad it up to minNotional.
+// - If there are 2+ lots →
+//   1) collapse tail dust backward,
+//   2) sweep older dust forward into newest,
+//   3) if at the end there's 1 dust left → pad it.
+// RunnerIDs are kept authoritative.
 func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64) {
-	if len(book.Lots) < 2 {
+	// helper to pad a single lot to minNotional (synthetic size increase!)
+	padSingleLot := func(lot *Position) {
+		if lot == nil || px <= 0 {
+			return
+		}
+		curNotional := lot.SizeBase * px
+		if curNotional < minNotional {
+			requiredBase := minNotional / px
+			lot.SizeBase = requiredBase
+			// keep original entry price; recompute USD notional off entry
+			lot.OpenNotionalUSD = lot.SizeBase * lot.OpenPrice
+			lot.Reason = strings.TrimSpace(lot.Reason + " padded-to-min")
+		}
+	}
+
+	// 0 lots: nothing to do
+	if len(book.Lots) == 0 {
+		return
+	}
+
+	// 1 lot at start: pad and stop
+	if len(book.Lots) == 1 {
+		padSingleLot(book.Lots[0])
 		return
 	}
 
 	ensureRunner := func(idx int) {
-		// add idx to RunnerIDs if not present
 		for _, r := range book.RunnerIDs {
-			if r == idx { return }
+			if r == idx {
+				return
+			}
 		}
 		book.RunnerIDs = append(book.RunnerIDs, idx)
 	}
 
 	// shift RunnerIDs after removing lot at removedIdx
 	shiftAfterRemoval := func(removedIdx int) {
-		if len(book.RunnerIDs) == 0 { return }
+		if len(book.RunnerIDs) == 0 {
+			return
+		}
 		out := book.RunnerIDs[:0]
 		for _, r := range book.RunnerIDs {
 			if r == removedIdx {
-				// dropped lot: skip
 				continue
 			}
 			if r > removedIdx {
@@ -2316,10 +2343,10 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 
 	// merge fromIdx -> toIdx (toIdx absorbs)
 	mergeInto := func(fromIdx, toIdx int) {
-		a := book.Lots[toIdx] // survivor
+		a := book.Lots[toIdx] // survivor (*Position)
 		b := book.Lots[fromIdx]
 
-		// If either is runner, survivor must be runner
+		// see if any was runner
 		wereRunner := false
 		for _, r := range book.RunnerIDs {
 			if r == fromIdx || r == toIdx {
@@ -2328,7 +2355,7 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 			}
 		}
 
-		// VWAP price on size
+		// VWAP the two
 		totalBase := a.SizeBase + b.SizeBase
 		if totalBase > 0 {
 			totalQuote := a.OpenPrice*a.SizeBase + b.OpenPrice*b.SizeBase
@@ -2337,28 +2364,58 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 		a.SizeBase += b.SizeBase
 		a.EntryFee += b.EntryFee
 		a.OpenNotionalUSD = a.SizeBase * a.OpenPrice
-		// keep a.Take as-is; exit logic will recompute previews anyway
-		// (Optional) concatenate reasons
-    	a.Reason = strings.TrimSpace(a.Reason + " merge:" + strconv.Itoa(b.LotID))
 
-		// Remove fromIdx
+		// tag reason
+		a.Reason = strings.TrimSpace(a.Reason + " merge:" + strconv.Itoa(b.LotID))
+
+		// drop fromIdx
 		book.Lots = append(book.Lots[:fromIdx], book.Lots[fromIdx+1:]...)
 		shiftAfterRemoval(fromIdx)
 
-		// Re-assert runner on survivor if either constituent was runner
+		// re-assert runner
 		if wereRunner {
 			ensureRunner(toIdx)
 		}
 	}
 
-	// 1) If newest is dust, merge it backward repeatedly
-	for len(book.Lots) >= 2 {
-		newestIdx := len(book.Lots) - 1
-		newest := book.Lots[newestIdx]
-		if newest.SizeBase*px >= minNotional {
+	// helper: notional at idx using current px
+	notionalAt := func(idx int) float64 {
+		if idx < 0 || idx >= len(book.Lots) {
+			return 0
+		}
+		return book.Lots[idx].SizeBase * px
+	}
+
+	// 1) collapse tail dust backward
+	for len(book.Lots) > 1 {
+		lastIdx := len(book.Lots) - 1
+		if notionalAt(lastIdx) >= minNotional {
 			break
 		}
-		// Merge newest into previous (newestIdx-1 survives)
-		mergeInto(newestIdx, newestIdx-1)
+		mergeInto(lastIdx, lastIdx-1)
+	}
+
+	// if we now have only 1 lot, pad it (if dust) and stop
+	if len(book.Lots) == 1 {
+		padSingleLot(book.Lots[0])
+		return
+	}
+
+	// 2) sweep older dust forward into newest
+	newestIdx := len(book.Lots) - 1
+	i := 0
+	for i < newestIdx {
+		if notionalAt(i) < minNotional {
+			mergeInto(i, newestIdx)
+			newestIdx = len(book.Lots) - 1
+			continue
+		}
+		i++
+	}
+
+	// final safety: if after all merges we are left with 1 lot and it's dust, pad it
+	if len(book.Lots) == 1 {
+		padSingleLot(book.Lots[0])
 	}
 }
+

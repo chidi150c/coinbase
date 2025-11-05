@@ -300,6 +300,7 @@ type ExitRecord struct {
 	Reason      string    `json:"reason"`
 	ExitMode    ExitMode  `json:"exit_mode,omitempty"`
 	WasRunner   bool      `json:"was_runner"`
+	RefundPortionUSD float64 `json:"refund_portion_usd"` 
 	// --- NEW: identifiers for traceability ---
 	LotID        int    `json:"lot_id,omitempty"`
 	EntryOrderID string `json:"entry_order_id,omitempty"`
@@ -760,6 +761,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		Reason:      exitReason + " | " + lot.Reason,
 		ExitMode:    lot.ExitMode,
 		WasRunner:   removedWasRunner,
+		RefundPortionUSD: lot.RefundPortionUSD,
 		// NEW identifiers
 		LotID:        lot.LotID,
 		EntryOrderID: lot.EntryOrderID,
