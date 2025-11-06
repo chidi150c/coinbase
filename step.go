@@ -698,10 +698,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			}
 			if cand <= 0 { return }
 
-			// NEW: directional validity check (no other logic touched)
-			if side == SideBuy && cand < price { return } // BUY exits must be >= price
-			if side == SideSell && cand > price { return } // SELL exits must be <= price
-
 			if side == SideBuy {
 				if nearestTakeBuy == 0 || cand < nearestTakeBuy {
 					nearestTakeBuy = cand; buyNearestIdx = idx; buyModeLabel = modeLabel(lot.ExitMode); buyNet = net
@@ -960,7 +956,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-25",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-26",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
