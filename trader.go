@@ -125,6 +125,8 @@ type BotState struct {
 	PendingRecheckSell bool
 	RefundBuyUSD  float64
 	RefundSellUSD float64
+	SpareBuyUSD  float64
+	SpareSellUSD float64
 }
 
 // --- NEW (Phase 1): pending async maker-first open support ---
@@ -230,6 +232,8 @@ type Trader struct {
 
 	refundBuyUSD  float64
 	refundSellUSD float64
+	SpareBuyUSD  float64
+	SpareSellUSD float64
 
 }
 
@@ -997,6 +1001,8 @@ func (t *Trader) snapshotStateLocked() BotState {
 		PendingRecheckSell: t.pendingRecheckSell,
         RefundBuyUSD:  t.refundBuyUSD,
         RefundSellUSD: t.refundSellUSD,
+		SpareBuyUSD: t.SpareBuyUSD,
+		SpareSellUSD: t.SpareSellUSD,
 	}
 }
 
@@ -1125,6 +1131,8 @@ func (t *Trader) loadState() error {
 	
     t.refundBuyUSD = st.RefundBuyUSD
     t.refundSellUSD = st.RefundSellUSD
+	t.SpareBuyUSD = st.SpareBuyUSD
+	t.SpareSellUSD = st.SpareSellUSD
 
 	// Initialize trailing baseline for any current runners (no migration; just honor existing RunnerIDs)
 	for _, side := range []OrderSide{SideBuy, SideSell} {

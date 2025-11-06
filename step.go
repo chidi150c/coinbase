@@ -420,6 +420,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				book.Lots = append(book.Lots, newLot)
 				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
 				t.didConsolidateStartup = false
+				t.SpareBuyUSD -= quoteSpent
+				if t.SpareBuyUSD < 0 {
+					t.SpareBuyUSD = 0
+				}
 				if t.pendingBuy != nil && t.pendingBuy.EquityBuy {
 					newIdx := len(book.Lots) - 1 // the newly appended lot
 					addRunner(book, newIdx)
@@ -574,6 +578,10 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				book.Lots = append(book.Lots, newLot)
 				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
 				t.didConsolidateStartup = false
+				t.SpareSellUSD -= quoteSpent
+				if t.SpareSellUSD < 0 {
+					t.SpareSellUSD = 0
+				}
 				if t.pendingSell != nil && t.pendingSell.EquitySell {
 					newIdx := len(book.Lots) - 1 // the newly appended lot
 					addRunner(book, newIdx)
@@ -952,7 +960,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-24",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-25",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
@@ -1677,7 +1685,20 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			}
 		}
 	}
-
+	if side == SideBuy{
+		buySpareUSD := spare
+		if buySpareUSD < 0 {
+			buySpareUSD = 0
+		}
+		t.SpareBuyUSD = buySpareUSD
+	}
+	if side == SideSell{
+		sellSpareUSD := spare * price
+		if sellSpareUSD < 0 {
+			sellSpareUSD = 0
+		}
+		t.SpareSellUSD = sellSpareUSD
+	}
 	//-----------------------------------------------------------------------------------------------------------
 	//------------------ Place live order without holding the lock.=====================
 	//-------------------------------------------------------------------------------------------------------------------
@@ -2223,10 +2244,18 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		t.lastAddBuy = wallNow
 		t.winLowBuy = priceToUse
 		t.latchedGateBuy = 0
+		t.SpareBuyUSD -= actualQuote
+		if t.SpareBuyUSD < 0 {
+			t.SpareBuyUSD = 0
+		}
 	} else {
 		t.lastAddSell = wallNow
 		t.winHighSell = priceToUse
 		t.latchedGateSell = 0
+		t.SpareSellUSD -= actualQuote
+		if t.SpareSellUSD < 0 {
+			t.SpareSellUSD = 0
+		}
 	}
 	// --- NEW: capture equity snapshots at add (side-specific) ---
 	if side == SideSell {
