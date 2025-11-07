@@ -956,7 +956,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-26",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-27",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
@@ -1439,59 +1439,82 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				neededQuote = n
 			}
 		}
+
 		if spare < 0 {
 			spare = 0
 		}
-		if spare+spareEps < neededQuote {
-			// --- breadcrumb ---
-			log.Printf("[WARN] FUNDS_EXHAUSTED BUY need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
-				neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
-			log.Printf("[DEBUG] GATE BUY: need=%.2f quote, spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
-				neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
-			log.Printf("TRACE buy.gate.block need=%.2f spare=%.2f", neededQuote, spare)
-			
-			short := neededQuote - spare
-			if short > 0 && short > t.refundBuyUSD{
-				// remember that a BUY was blocked by this amount
-				t.refundBuyUSD = short
+
+		// Fast path: we have enough spare to fund the snapped neededQuote
+		if spare+spareEps >= neededQuote {
+			// Enforce exchange minimum notional after snapping, then snap UP to step to keep >= min; re-check spare.
+			if neededQuote < minNotional {
+				neededQuote = minNotional
+				if quoteStep > 0 {
+					steps := math.Ceil(neededQuote / quoteStep)
+					neededQuote = steps * quoteStep
+				}
+				// after bump to minNotional we must still have spare
+				if spare+spareEps < neededQuote {
+					log.Printf("[WARN] FUNDS_EXHAUSTED BUY need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
+						neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
+					log.Printf("[DEBUG] GATE BUY: need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
+						neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
+					log.Printf("TRACE buy.gate.block minNotional need=%.2f spare=%.2f", neededQuote, spare)
+
+					short := neededQuote - spare
+					if short > 0 {
+						// remember that a BUY was blocked by this amount
+						t.refundBuyUSD = short
+					}
+					t.mu.Unlock()
+					return "HOLD", nil
+				}
 			}
 
-			t.mu.Unlock()
-			return "HOLD", nil
-		}
+			// Use the final neededQuote; recompute base.
+			quote = neededQuote
+			base = quote / price
 
-		// Enforce exchange minimum notional after snapping, then snap UP to step to keep >= min; re-check spare.
-		if neededQuote < minNotional {
-			neededQuote = minNotional
+			log.Printf("TRACE buy.gate.post needQuote=%.2f spare=%.2f base=%.8f", quote, spare, base)
+		} else {
+			// Slow path: we don't have enough to fund neededQuote → try to degrade to available spare
+			log.Printf("[WARN] FUNDS_SHORT BUY need=%.2f quote, spare=%.2f → attempting degrade-to-spare",
+				neededQuote, spare)
+
+			useQuote := spare
+
+			// snap spare DOWN to quote step
 			if quoteStep > 0 {
-				steps := math.Ceil(neededQuote / quoteStep)
-				neededQuote = steps * quoteStep
+				u := math.Floor(useQuote / quoteStep) * quoteStep
+				if u > 0 {
+					useQuote = u
+				}
 			}
-			if spare+spareEps < neededQuote {
-				// --- breadcrumb ---
-				log.Printf("[WARN] FUNDS_EXHAUSTED BUY need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
-					neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
-				log.Printf("[DEBUG] GATE BUY: need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
-					neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
-				log.Printf("TRACE buy.gate.block minNotional need=%.2f spare=%.2f", neededQuote, spare)
-				
+
+			// must still satisfy minNotional after snapping
+			if useQuote < minNotional {
+				log.Printf("[WARN] FUNDS_EXHAUSTED BUY even after degrade: useQuote=%.2f < minNotional=%.2f (avail=%.2f, reserved_shorts=%.6f)",
+					useQuote, minNotional, availQuote, reservedShortQuoteWithFee)
+				log.Printf("[DEBUG] GATE BUY: degrade failed; HOLD")
+
 				short := neededQuote - spare
-				if short > 0 && short > t.refundBuyUSD{
-					// remember that a BUY was blocked by this amount
+				if short > 0 {
+					// only now (true failure) remember that a BUY was blocked
 					t.refundBuyUSD = short
 				}
+
 				t.mu.Unlock()
 				return "HOLD", nil
 			}
+
+			// ok, we can place a smaller order using the spare
+			quote = useQuote
+			base = quote / price
+
+			log.Printf("TRACE buy.gate.post.degraded useQuote=%.2f spare=%.2f base=%.8f", quote, spare, base)
 		}
-
-		// Use the final neededQuote; recompute base.
-		quote = neededQuote
-		base = quote / price
-
-		// TODO: remove TRACE
-		log.Printf("TRACE buy.gate.post needQuote=%.2f spare=%.2f base=%.8f", quote, spare, base)
 	}
+
 
 	// If SELL, require spare base inventory (spot safe)
 	if side == SideSell && t.cfg.RequireBaseForShort {
@@ -1499,7 +1522,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		log.Printf("TRACE sell.gate.pre availBase=%.8f reservedLong=%.8f needBaseRaw=%.8f baseStep=%.8f",
 			availBase, reservedLongBase, base, baseStep)
 
-		// Floor the *needed* base to baseStep (if known) and cap by spare availability
+		// Floor the *needed* base to baseStep (if known)
 		neededBase := base
 		if baseStep > 0 {
 			n := math.Floor(neededBase/baseStep) * baseStep
@@ -1511,65 +1534,87 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		if spare < 0 {
 			spare = 0
 		}
-		
-		if spare+spareEps < neededBase {
-			// --- breadcrumb ---
-			log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
-				neededBase, spare, availBase, reservedLongBase, baseStep)
-			log.Printf("[DEBUG] GATE SELL: need=%.8f base, spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
-				neededBase, spare, availBase, reservedLongBase, baseStep)
-			log.Printf("TRACE sell.gate.block need=%.8f spare=%.8f", neededBase, spare)
 
-			// convert the short to USD at current price so we can reuse later on BUY
-			shortBase := neededBase - spare
-			shortUSD := shortBase * price
-			if shortUSD > 0 && shortUSD > t.refundSellUSD {
-				t.refundSellUSD = shortUSD
-			}
+		// Fast path: we have enough spare base to fund neededBase
+		if spare+spareEps >= neededBase {
+			// Use the floored base for the order by updating quote
+			quote = neededBase * price
+			base = neededBase
 
-			t.mu.Unlock()
-			return "HOLD", nil
-		}
+			// Ensure SELL meets exchange min funds and step rules (and re-check spare symmetry)
+			if quote < minNotional {
+				quote = minNotional
+				base = quote / price
+				if baseStep > 0 {
+					b := math.Floor(base/baseStep) * baseStep
+					if b > 0 {
+						base = b
+						quote = base * price
+					}
+				}
+				// >>> Symmetry: re-check spare after min-notional snap <<<
+				if spare+spareEps < base {
+					// --- breadcrumb ---
+					log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
+						base, spare, availBase, reservedLongBase, baseStep)
+					log.Printf("[DEBUG] GATE SELL: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
+						base, spare, availBase, reservedLongBase, baseStep)
+					log.Printf("TRACE sell.gate.block minNotional need=%.8f spare=%.8f", base, spare)
 
-		// Use the floored base for the order by updating quote
-		quote = neededBase * price
-		base = neededBase
+					// convert the short to USD at current price so we can reuse later on BUY
+					shortBase := base - spare
+					shortUSD := shortBase * price
+					if shortUSD > 0 {
+						t.refundSellUSD = shortUSD
+					}
 
-		// Ensure SELL meets exchange min funds and step rules (and re-check spare symmetry)
-		if quote < minNotional {
-			quote = minNotional
-			base = quote / price
-			if baseStep > 0 {
-				b := math.Floor(base/baseStep) * baseStep
-				if b > 0 {
-					base = b
-					quote = base * price
+					t.mu.Unlock()
+					return "HOLD", nil
 				}
 			}
-			// >>> Symmetry: re-check spare after min-notional snap <<<
-			if spare+spareEps < base {
-				// --- breadcrumb ---
-				log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
-					base, spare, availBase, reservedLongBase, baseStep)
-				log.Printf("[DEBUG] GATE SELL: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
-					base, spare, availBase, reservedLongBase, baseStep)
-				log.Printf("TRACE sell.gate.block minNotional need=%.8f spare=%.8f", base, spare)
-				
-				// convert the short to USD at current price so we can reuse later on BUY
+
+			log.Printf("TRACE sell.gate.post needBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
+		} else {
+			// Slow path: not enough spare for neededBase → try degrade-to-spare
+			log.Printf("[WARN] FUNDS_SHORT SELL need=%.8f base, spare=%.8f → attempting degrade-to-spare",
+				neededBase, spare)
+
+			useBase := spare
+
+			// snap spare DOWN to baseStep
+			if baseStep > 0 {
+				b := math.Floor(useBase / baseStep) * baseStep
+				if b > 0 {
+					useBase = b
+				} else {
+					useBase = 0
+				}
+			}
+
+			// must still satisfy minNotional after snapping
+			if useBase <= 0 || useBase*price < minNotional {
+				log.Printf("[WARN] FUNDS_EXHAUSTED SELL even after degrade: useBase=%.8f (quote=%.2f) < minNotional=%.2f (avail=%.8f, reserved_longs=%.8f)",
+					useBase, useBase*price, minNotional, availBase, reservedLongBase)
+
+				// convert the shortfall to USD only on true failure
 				shortBase := neededBase - spare
 				shortUSD := shortBase * price
-				if shortUSD > 0 && shortUSD > t.refundSellUSD {
+				if shortUSD > 0 {
 					t.refundSellUSD = shortUSD
 				}
 
 				t.mu.Unlock()
 				return "HOLD", nil
 			}
-		}
 
-		// TODO: remove TRACE
-		log.Printf("TRACE sell.gate.post needBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
+			// ok, we can place a smaller order using the spare
+			base = useBase
+			quote = base * price
+
+			log.Printf("TRACE sell.gate.post.degraded useBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
+		}
 	}
+
 
 	var take float64
 	if t.cfg.ScalpTPDecayEnable && !((equityTriggerBuy && side == SideBuy) || (equityTriggerSell && side == SideSell)) {
@@ -1642,10 +1687,20 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			d.HighPeak, d.PriceUpGoingDown, mirrorProfitOverride,
 		)
 	}
-	refundFromOpposite := 0.0
-	if t.refundBuyUSD > 0 && side == SideSell{
+
+	refundFromOpposite := 0.0 
+	if t.refundBuyUSD > 0 && side == SideSell {
 		// turn refund USD into extra base at current price
 		extraBase := t.refundBuyUSD / price
+
+		// how much room do we actually have (in base)?
+		room := spare - base
+		if room < 0 {
+			room = 0
+		}
+		if extraBase > room {
+			extraBase = room
+		}
 
 		// snap to step if we know it
 		if baseStep > 0 {
@@ -1653,34 +1708,63 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		}
 
 		if extraBase > 0 {
-			// check spare again: we can only add it if we still fit
-			if spare >= base+extraBase {
-				base  += extraBase
-				quote  = base * price
-				refundFromOpposite = t.refundBuyUSD
+			base += extraBase
+			quote = base * price
+
+			consumedUSD := extraBase * price
+			refundFromOpposite = consumedUSD
+
+			// reduce stored refund
+			t.refundBuyUSD -= consumedUSD
+			if t.refundBuyUSD < 0 {
 				t.refundBuyUSD = 0
-				// optional: tag reason
-				gatesReason = strings.TrimSpace(gatesReason + "|refund=buy")
+			}
+
+			if t.refundBuyUSD == 0 {
+				gatesReason = strings.TrimSpace(gatesReason + "|refund=buy-full")
+			} else {
+				gatesReason = strings.TrimSpace(gatesReason + "|refund=buy-partial")
 			}
 		}
 	}
 
-	if t.refundSellUSD > 0 && side == SideBuy{
+	if t.refundSellUSD > 0 && side == SideBuy {
 		extraQuote := t.refundSellUSD
+
+		// how much room do we actually have (in quote)?
+		room := spare - quote
+		if room < 0 {
+			room = 0
+		}
+		if extraQuote > room {
+			extraQuote = room
+		}
+
 		// snap to quoteStep
 		if quoteStep > 0 {
 			extraQuote = math.Floor(extraQuote/quoteStep) * quoteStep
 		}
 		if extraQuote > 0 {
-			if spare >= quote+extraQuote {
-				quote += extraQuote
-				base   = quote / price
-				refundFromOpposite = t.refundSellUSD
+			quote += extraQuote
+			base = quote / price
+
+			consumedUSD := extraQuote
+			refundFromOpposite = consumedUSD
+
+			// reduce stored refund
+			t.refundSellUSD -= consumedUSD
+			if t.refundSellUSD < 0 {
 				t.refundSellUSD = 0
-				gatesReason = strings.TrimSpace(gatesReason + "|refund=sell")
+			}
+
+			if t.refundSellUSD == 0 {
+				gatesReason = strings.TrimSpace(gatesReason + "|refund=sell-full")
+			} else {
+				gatesReason = strings.TrimSpace(gatesReason + "|refund=sell-partial")
 			}
 		}
 	}
+
 	if side == SideBuy{
 		buySpareUSD := spare
 		if buySpareUSD < 0 {
