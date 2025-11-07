@@ -227,8 +227,8 @@ func loadConfigFromEnv() Config {
 	if cfg.MirrorGateMaxUSD == 0 { cfg.MirrorGateMaxUSD = cfg.ProfitGateUSD + cfg.MirrorGateSlopeUSD * 8 }
 
 	//dependency
-	if cfg.TrailActivateUSDRunner == 0 { cfg.TrailActivateUSDRunner = 25.0 * cfg.ProfitGateUSD }                               
-	if cfg.TrailActivateUSDScalp == 0 { cfg.TrailActivateUSDScalp = 12.5 * cfg.ProfitGateUSD }
+	if cfg.TrailActivateUSDRunner == 0 { cfg.TrailActivateUSDRunner = 20.0 * cfg.ProfitGateUSD }                               
+	if cfg.TrailActivateUSDScalp == 0 { cfg.TrailActivateUSDScalp = 10.0 * cfg.ProfitGateUSD }
 
 	// Historical carry-over: if someone still sets BROKER=X, we may still
 	// want to validate it's present, but we no longer use it to select knobs.

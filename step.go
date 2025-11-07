@@ -2489,7 +2489,7 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 		a.OpenNotionalUSD = a.SizeBase * a.OpenPrice
 
 		// tag reason
-		a.Reason = strings.TrimSpace(a.Reason + " merge:" + strconv.Itoa(b.LotID))
+		a.Reason = strings.TrimSpace(a.Reason + "|merge:" + strconv.Itoa(b.LotID))
 
 		// drop fromIdx
 		book.Lots = append(book.Lots[:fromIdx], book.Lots[fromIdx+1:]...)

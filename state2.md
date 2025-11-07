@@ -278,5 +278,4 @@ chidi@localhost:~$ cat /opt/coinbase/state/bot_state.newbinance.json
  "PendingRecheckSell": false,
  "RefundBuyUSD": 85.4610556772729,
  "RefundSellUSD": 124.78998
-}chidi@localhost:~$ ^C
-chidi@localhost:~$
+}
