@@ -527,6 +527,229 @@ func (t *Trader) book(side OrderSide) *SideBook {
 	}
 	return b
 }
+// mergeLots merges lot at fromIdx into lot at toIdx inside the given book.
+// toIdx is the survivor.
+func mergeLots(book *SideBook, fromIdx, toIdx int, px float64) {
+	if book == nil {
+		return
+	}
+	if fromIdx < 0 || fromIdx >= len(book.Lots) {
+		return
+	}
+	if toIdx < 0 || toIdx >= len(book.Lots) {
+		return
+	}
+	if fromIdx == toIdx {
+		return
+	}
+
+	// --- helper: ensure runner id exists ---
+	ensureRunner := func(idx int) {
+		for _, r := range book.RunnerIDs {
+			if r == idx {
+				return
+			}
+		}
+		book.RunnerIDs = append(book.RunnerIDs, idx)
+	}
+
+	// --- helper: shift runner ids after removal ---
+	shiftAfterRemoval := func(removedIdx int) {
+		if len(book.RunnerIDs) == 0 {
+			return
+		}
+		out := book.RunnerIDs[:0]
+		for _, r := range book.RunnerIDs {
+			if r == removedIdx {
+				continue
+			}
+			if r > removedIdx {
+				r--
+			}
+			out = append(out, r)
+		}
+		book.RunnerIDs = append([]int(nil), out...)
+	}
+
+	a := book.Lots[toIdx]   // survivor
+	b := book.Lots[fromIdx] // absorbed
+
+	// see if any was runner
+	wereRunner := false
+	for _, r := range book.RunnerIDs {
+		if r == fromIdx || r == toIdx {
+			wereRunner = true
+			break
+		}
+	}
+
+	// VWAP the two
+	totalBase := a.SizeBase + b.SizeBase
+	if totalBase > 0 {
+		totalQuote := a.OpenPrice*a.SizeBase + b.OpenPrice*b.SizeBase
+		a.OpenPrice = totalQuote / totalBase
+	}
+	a.SizeBase += b.SizeBase
+	a.EntryFee += b.EntryFee
+	// keep USD persistence based on entry price
+	a.OpenNotionalUSD = a.SizeBase * a.OpenPrice
+
+	// tag reason with the absorbed lot's original LotID
+	a.Reason = strings.TrimSpace(a.Reason + "|merge:" + strconv.Itoa(b.LotID))
+
+	// drop fromIdx
+	book.Lots = append(book.Lots[:fromIdx], book.Lots[fromIdx+1:]...)
+	shiftAfterRemoval(fromIdx)
+
+	// re-assert runner if any of the two was runner
+	if wereRunner {
+		ensureRunner(toIdx)
+	}
+}
+
+// consolidateRunners collapses multiple small runner lots on a side.
+// Rules (per user spec):
+// 1) use t.cfg.RiskPerTradeUSD as the threshold
+// 2) keep full VWAP merge logic
+// 3) merge those NOT meeting the threshold into the OLDEST among those small ones
+// 4) keep the NEWEST OpenTime among merged lots
+// 5) do NOT touch trader-level equity baselines (lastAddEquity*)
+func (t *Trader) consolidateRunners(book *SideBook, px float64) {
+	if book == nil {
+		return
+	}
+	if px <= 0 {
+		return
+	}
+	riskUSD := t.cfg.RiskPerTradeUSD
+	if riskUSD <= 0 {
+		return
+	}
+	if len(book.RunnerIDs) <= 1 {
+		// nothing to consolidate
+		return
+	}
+
+	// helper: ensure this lot index is recorded as runner
+	ensureRunner := func(idx int) {
+		for _, r := range book.RunnerIDs {
+			if r == idx {
+				return
+			}
+		}
+		book.RunnerIDs = append(book.RunnerIDs, idx)
+	}
+
+	// shift runner ids after removal to keep them aligned with book.Lots
+	shiftAfterRemoval := func(removedIdx int) {
+		if len(book.RunnerIDs) == 0 {
+			return
+		}
+		out := book.RunnerIDs[:0]
+		for _, r := range book.RunnerIDs {
+			if r == removedIdx {
+				// drop it
+				continue
+			}
+			if r > removedIdx {
+				r--
+			}
+			out = append(out, r)
+		}
+		// reassign to a clean slice
+		book.RunnerIDs = append([]int(nil), out...)
+	}
+
+	// STEP 1: detect which runners are "small" (below threshold)
+	var smallRunnerIdxs []int
+	for _, rid := range book.RunnerIDs {
+		if rid < 0 || rid >= len(book.Lots) {
+			continue
+		}
+		notional := book.Lots[rid].SizeBase * px
+		if notional < riskUSD {
+			smallRunnerIdxs = append(smallRunnerIdxs, rid)
+		}
+	}
+
+	// if 0 or 1 small runner → nothing to consolidate
+	if len(smallRunnerIdxs) <= 1 {
+		return
+	}
+
+	// STEP 2: find the OLDEST among those small ones → this is the sink
+	sink := smallRunnerIdxs[0]
+	for _, idx := range smallRunnerIdxs[1:] {
+		if idx < sink {
+			sink = idx
+		}
+	}
+
+	// merge fromIdx -> toIdx (toIdx survives)
+	mergeInto := func(fromIdx, toIdx int) {
+		// take copies
+		survivor := book.Lots[toIdx]
+		source := book.Lots[fromIdx]
+
+		// VWAP over size
+		totalBase := survivor.SizeBase + source.SizeBase
+		if totalBase > 0 {
+			totalQuote := survivor.OpenPrice*survivor.SizeBase + source.OpenPrice*source.SizeBase
+			survivor.OpenPrice = totalQuote / totalBase
+		}
+
+		// sum size & fee
+		survivor.SizeBase += source.SizeBase
+		survivor.EntryFee += source.EntryFee
+
+		// recompute notional
+		survivor.OpenNotionalUSD = survivor.SizeBase * survivor.OpenPrice
+
+		// keep NEWEST OpenTime
+		if !survivor.OpenTime.IsZero() && !source.OpenTime.IsZero() {
+			if source.OpenTime.After(survivor.OpenTime) {
+				survivor.OpenTime = source.OpenTime
+			}
+		} else if survivor.OpenTime.IsZero() && !source.OpenTime.IsZero() {
+			survivor.OpenTime = source.OpenTime
+		}
+
+		// tag reason
+		survivor.Reason = strings.TrimSpace(survivor.Reason + "|mergedRunner:" + strconv.Itoa(source.LotID))
+
+		// write back survivor before we change the slice
+		book.Lots[toIdx] = survivor
+
+		// remove source
+		book.Lots = append(book.Lots[:fromIdx], book.Lots[fromIdx+1:]...)
+		shiftAfterRemoval(fromIdx)
+
+		// after removal, if source was left of survivor, survivor shifts left by 1
+		actualSurvivorIdx := toIdx
+		if fromIdx < toIdx {
+			actualSurvivorIdx = toIdx - 1
+		}
+
+		// re-assert runner on survivor
+		ensureRunner(actualSurvivorIdx)
+	}
+
+	// STEP 3: merge all other small runners into the sink
+	// do it in descending order so removals don't break later indices
+	for i := len(smallRunnerIdxs) - 1; i >= 0; i-- {
+		src := smallRunnerIdxs[i]
+		if src == sink {
+			continue
+		}
+		// since we go descending and sink is the smallest among small ones,
+		// we can safely merge straight into current sink
+		mergeInto(src, sink)
+	}
+
+	// NOTE:
+	// - we did NOT touch t.lastAddEquityBuy / t.lastAddEquitySell / t.equityStage*
+	// - only per-lot fields on this side's book were rewritten
+}
 
 // mirrorEffectiveGate returns the dynamic (ramped) mirror gate based on nearest lot index.
 func (t *Trader) mirrorEffectiveGate(side OrderSide) float64 {

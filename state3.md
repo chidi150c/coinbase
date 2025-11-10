@@ -1,5 +1,4 @@
 
-chidi@localhost:~/coinbase/monitoring$ cat /opt/coinbase/state/bot_state.newbinance.json
 {
  "EquityUSD": 1131.408151318,
  "DailyStart": "2025-11-07T00:00:00Z",

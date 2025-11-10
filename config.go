@@ -27,7 +27,7 @@ type Config struct {
 	// Safety & sizing
 	DryRun              bool
 	MaxDailyLossPct     float64
-	RiskPerTradePct     float64
+	RiskPerTradeUSD     float64
 	USDEquity           float64
 	TakeProfitPct       float64
 	StopLossPct         float64
@@ -133,7 +133,7 @@ func loadConfigFromEnv() Config {
 		// Universal, unprefixed knobs
 		DryRun:              getEnvBool("DRY_RUN", true),
 		MaxDailyLossPct:     getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
-		RiskPerTradePct:     getEnvFloat("RISK_PER_TRADE_PCT", 0.25),
+		RiskPerTradeUSD:     getEnvFloat("RISK_PER_TRADE_USD", 80.0),
 		USDEquity:           getEnvFloat("USD_EQUITY", 1000.0),
 		TakeProfitPct:       getEnvFloat("TAKE_PROFIT_PCT", 0.8),
 		StopLossPct:         getEnvFloat("STOP_LOSS_PCT", 0.4),
