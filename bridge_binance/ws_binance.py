@@ -5,8 +5,9 @@ import os, asyncio, json, time, hmac, hashlib, logging
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 from urllib import request as urlreq, parse as urlparse
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from datetime import datetime, timezone
+import http.client
 
 from fastapi import FastAPI, HTTPException, Query, Path, Body
 import websockets
@@ -184,6 +185,61 @@ def _sum_available(accts: List[Dict], asset: str) -> str:
         if a.get("currency","").upper() == asset:
             return str(a.get("available_balance",{}).get("value","0"))
     return "0"
+
+# --- NEW: in-memory cache + retry for /api/v3/account ---
+_accounts_cache: Optional[Dict] = None
+_accounts_cache_ts_ms: Optional[int] = None
+_ACCOUNTS_CACHE_TTL_MS = 2000  # ms
+
+# Simple build tag/banner so we can confirm which image is running
+BUILD_TAG = "bridge-binance-accounts-cache-v1"
+
+def _binance_accounts_cached() -> Dict:
+    """
+    Best-effort retry wrapper + ≤2000ms success-only in-memory cache
+    around the /api/v3/account call.
+
+    Behavior constraints:
+      - Only successful responses are cached.
+      - TTL <= 2000ms.
+      - Only transient network errors are retried:
+          http.client.RemoteDisconnected, urllib.error.URLError, OSError.
+      - HTTPException and other errors are re-raised immediately so
+        existing error behavior is preserved.
+    """
+    global _accounts_cache, _accounts_cache_ts_ms
+    now = _now_ms()
+
+    # Fast path: valid cache
+    if _accounts_cache is not None and _accounts_cache_ts_ms is not None:
+        if now - _accounts_cache_ts_ms <= _ACCOUNTS_CACHE_TTL_MS:
+            return _accounts_cache
+
+    last_exc: Optional[BaseException] = None
+
+    # Live path with small fixed retry count
+    for attempt in range(3):  # initial + 2 retries
+        try:
+            payload = _binance_signed("/api/v3/account", {})
+            # Cache only successful responses
+            _accounts_cache = payload
+            _accounts_cache_ts_ms = _now_ms()
+            return payload
+        except HTTPException:
+            # Preserve existing HTTPException behavior (auth, 4xx/5xx, etc.)
+            raise
+        except (http.client.RemoteDisconnected, URLError, OSError) as e:
+            last_exc = e
+            if attempt >= 2:
+                # After retries, re-raise the last transient error
+                raise
+            # Short backoff between attempts (within requested 100–300ms range)
+            time.sleep(0.2)
+
+    # Should be unreachable, but for completeness re-raise last transient or fall back
+    if last_exc is not None:
+        raise last_exc
+    return _binance_signed("/api/v3/account", {})
 
 def _get_symbol_steps(sym: str) -> Tuple[str, str]:
     """
@@ -575,7 +631,7 @@ def get_candles(
 
 @app.get("/accounts")
 def accounts(limit: int = 250):
-    payload = _binance_signed("/api/v3/account", {})
+    payload = _binance_accounts_cached()
     bals = payload.get("balances") or []
     out = []
     for b in bals:
@@ -811,6 +867,12 @@ def order_cancel(order_id: str, product_id: str = Query(default=SYMBOL)):
 
 # ---- Runner ----
 async def _runner():
+    # Startup banner to confirm build + cache settings in logs
+    log.info(
+        f"[bridge-binance] startup build={BUILD_TAG} "
+        f"SYMBOL={SYMBOL} PORT={PORT} "
+        f"ACCOUNTS_CACHE_TTL_MS={_ACCOUNTS_CACHE_TTL_MS}"
+    )
     task = asyncio.create_task(_ws_loop())
     cfg  = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
     srv  = uvicorn.Server(cfg)
