@@ -956,12 +956,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-31",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-32",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
 
-	// Determine the side and its book
+	// Determine the side and its boo
 	side := d.SignalToSide()
 	book := t.book(side)
 
@@ -1046,7 +1046,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --- NEW (minimal): equity strategy trigger detection (SELL runner add of entire spare base)
 	equityTriggerSell := false
 	var equitySpareBase float64
-	if t.lastAddEquitySell > 0 && t.equityUSD >= t.lastAddEquitySell*1.01 && d.Signal == Sell {
+	if t.lastAddEquitySell > 0 && t.equityUSD >= t.lastAddEquitySell*1.05 && d.Signal == Sell {
 		// Only proceed if not long-only; respect existing guard
 		if t.cfg.LongOnly {
 			t.mu.Unlock()
@@ -1067,7 +1067,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --- NEW (minimal): BUY equity-trigger flag ---(Buy runner of entire spare quote on dip)
 	equityTriggerBuy := false
 	var equitySpareQuote float64
-	if t.lastAddEquityBuy > 0 && t.equityUSD <= t.lastAddEquityBuy*0.99 && d.Signal == Buy {
+	if t.lastAddEquityBuy > 0 && t.equityUSD <= t.lastAddEquityBuy*0.95 && d.Signal == Buy {
 		if spare < 0 {
 			spare = 0
 		}
