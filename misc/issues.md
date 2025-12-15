@@ -23,3 +23,6 @@ Market EXITs/OPENs → Usually a single broker call; if the broker returns a par
 “Dust” consolidation (consolidateDust) → Only runs after appends (you call it when adding a lot, including async BUY/SELL drains and market/limit opens). It does not run after a partial exit, so a tiny leftover lot isn’t merged then. Also, the implementation currently only does “newest dust → merge backward”; it doesn’t sweep older dust forward into the newest lot.
 
 If you want parity with OPENs, the upgrade would be to make the maker-first EXIT loop accumulate sessBase/sessQuote/sessFee until filled/timeout (like the open poller) and then close that consolidated amount in one go.
+
+
+
