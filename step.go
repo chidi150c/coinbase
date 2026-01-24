@@ -956,7 +956,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-32",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-33",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
@@ -1317,26 +1317,47 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	}
 
-	baseRiskPct := (t.cfg.RiskPerTradeUSD / t.equityUSD) * 100.0
-	// Sizing (risk % of current equity, with optional volatility adjust already supported).
-	riskPct := baseRiskPct
+		// --- Fixed-USD risk sizing & ramping (no equity dependency) ---
+	// Base dollar size for the first lot
+	baseUSD := t.cfg.RiskPerTradeUSD
+	if baseUSD <= 0 {
+		// safety fallback: at least minNotional
+		baseUSD = minNotional
+	}
+
+	// Start with baseUSD as our target notional
+	quote := baseUSD
+
+	// Optional: volatility adjust as a multiplier on USD (not on equity)
 	if t.cfg.Extended().VolRiskAdjust {
 		f := volRiskFactor(c)
-		riskPct = riskPct * f
+		if f <= 0 {
+			f = 1.0
+		}
+		quote = quote * f
 		SetVolRiskFactorMetric(f)
 	}
 
-	// --- NEW: side-aware risk ramping (optional) ---
+	// --- Fixed-USD ramping: scale around baseUSD, independent of equityUSD ---
 	if t.cfg.RampEnable && !(equityTriggerSell || equityTriggerBuy) {
 		k := len(book.Lots) // number of existing lots on THIS SIDE
 		// exclude all runner(s) on this side from k
 		if rc := runnerCount(book); rc > 0 && k >= rc {
 			k = k - rc
 		}
+
 		switch strings.ToLower(strings.TrimSpace(t.cfg.RampMode)) {
 		case "exp":
+			// Interpret RampStartPct / RampMaxPct as percent multipliers of baseUSD.
+			// Example:
+			//   RAMP_START_PCT = 100  => 1.0x baseUSD
+			//   RAMP_GROWTH    = 1.25 => grow by 25% per add
+			//   RAMP_MAX_PCT   = 200  => cap at 2.0x baseUSD
 			start := t.cfg.RampStartPct
 			g := t.cfg.RampGrowth
+			if start <= 0 {
+				start = 100.0 // 1.0x
+			}
 			if g <= 0 {
 				g = 1.0
 			}
@@ -1347,25 +1368,39 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			if max := t.cfg.RampMaxPct; max > 0 && f > max {
 				f = max
 			}
-			if f > 0 {
-				riskPct = f
+			if f <= 0 {
+				f = 100.0
 			}
+			quote = baseUSD * (f / 100.0)
+
 		default: // linear
+			// Interpret RampStartPct / RampStepPct / RampMaxPct as percent multipliers of baseUSD.
+			// Example:
+			//   RAMP_START_PCT = 100  => 1.0x baseUSD (first lot)
+			//   RAMP_STEP_PCT  = 25   => +0.25x per existing lot
+			//   RAMP_MAX_PCT   = 200  => cap at 2.0x baseUSD
 			start := t.cfg.RampStartPct
 			step := t.cfg.RampStepPct
-			f := start + float64(k)*step
-			f = clamp(f, 0, t.cfg.RampMaxPct)
-			if f > 0 {
-				riskPct = f
+			if start <= 0 {
+				start = 100.0 // 1.0x
 			}
+			f := start + float64(k)*step
+			if max := t.cfg.RampMaxPct; max > 0 && f > max {
+				f = max
+			}
+			if f <= 0 {
+				f = 100.0
+			}
+			quote = baseUSD * (f / 100.0)
 		}
 	}
 
-	quote := (riskPct / 100.0) * t.equityUSD
+	// Ensure we respect the exchange minimum notional
 	if quote < minNotional {
 		quote = minNotional
 	}
 	base := quote / price
+
 
 	// --- NEW: staged sizing for EQUITY triggers (SELL in BASE, BUY in QUOTE) ---
 	// --- NEW: override sizing for normal Sell using stage function of spare base as the order size (SELL only) ---
