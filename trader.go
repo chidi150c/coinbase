@@ -962,7 +962,21 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	t.dailyPnL += pl
 	t.equityUSD += pl
 
-	
+	// --- NEW: update spare inventories to reflect freed funds on close ---
+	// BUY lot close frees quote → SpareBuyUSD (in USD units).
+	// SELL lot close frees base for future shorts → SpareSellUSD (stored in USD via base*price).
+	if lot.Side == SideBuy {
+		t.SpareBuyUSD += quoteExec
+		if t.SpareBuyUSD < 0 {
+			t.SpareBuyUSD = 0
+		}
+	} else if lot.Side == SideSell {
+		t.SpareSellUSD += quoteExec
+		if t.SpareSellUSD < 0 {
+			t.SpareSellUSD = 0
+		}
+	}
+
 	// Track if we removed the runner and adjust book.RunnerID accordingly after removal.
 	removedWasRunner := false
 	// NEW: also consider multi-runner slice

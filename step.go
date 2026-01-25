@@ -668,18 +668,18 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		minNotional = t.cfg.OrderMinUSD
 	}
 
-	// One-time dust consolidation right after startup (uses current price snapshot)
-	if !t.didConsolidateStartup {
-		// We already hold t.mu here
-		t.consolidateDust(t.book(SideBuy),  price, minNotional)
-		t.consolidateDust(t.book(SideSell), price, minNotional)
+	// // One-time dust consolidation right after startup (uses current price snapshot)
+	// if !t.didConsolidateStartup {
+	// 	// We already hold t.mu here
+	// 	t.consolidateDust(t.book(SideBuy),  price, minNotional)
+	// 	t.consolidateDust(t.book(SideSell), price, minNotional)
 	
-		if err := t.saveStateNoLock(); err != nil {
-			log.Printf("[WARN] saveState (startup consolidate): %v", err)
-		}
-		t.didConsolidateStartup = true
-		log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
-	}
+	// 	if err := t.saveStateNoLock(); err != nil {
+	// 		log.Printf("[WARN] saveState (startup consolidate): %v", err)
+	// 	}
+	// 	t.didConsolidateStartup = true
+	// 	log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
+	// }
 
 	// --------------------------------------------------------------------------------------------------------
 	// --- EXIT path: evaluate profit gate and trailing/TP logic per lot (side-aware) and close at most one.
@@ -977,7 +977,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-35",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-36",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
