@@ -108,6 +108,27 @@ func runnerCount(book *SideBook) int {
 	}
 	return len(book.RunnerIDs)
 }
+// rampCount returns the number of non-dust lots on a side book for ramp / k
+// purposes. Lots whose current notional (SizeBase * px) is < minNotional do
+// NOT count toward k; this is a belt-and-braces guard in case any dust
+// survives consolidation.
+func rampCount(book *SideBook, px, minNotional float64) int {
+	if book == nil {
+		return 0
+	}
+	if px <= 0 || minNotional <= 0 {
+		// No meaningful notion of "dust" → fall back to raw count.
+		return len(book.Lots)
+	}
+	n := 0
+	for _, lot := range book.Lots {
+		if lot.SizeBase*px >= minNotional {
+			n++
+		}
+	}
+	return n
+}
+
 
 // ---- Core tick ----
 // safeSend ensures we deliver a result even if the buffer is momentarily full.
@@ -184,7 +205,7 @@ func (t *Trader) maybeRepriceOnce(
 	if t.cfg.RepriceMaxCount > 0 && repriceCount >= t.cfg.RepriceMaxCount {
 		return orderID, lastLimitPx, repriceCount, false
 	}
-	
+
 	bid, ask, bErr := t.broker.GetBBO(pctx, t.cfg.ProductID)
 	useBBO := (bErr == nil && bid > 0 && ask > bid)
 	var newLimitPx float64
@@ -258,7 +279,7 @@ func (t *Trader) maybeRepriceOnce(
 		newBase = math.Floor(newBase/t.cfg.BaseStep) * t.cfg.BaseStep
 	}
 
-
+	
 	// Ensure min-notional for the reprice candidate
 	if shouldReprice && !(newBase > 0 && newBase*newLimitPx >= t.cfg.MinNotional) {
 		shouldReprice = false
@@ -564,7 +585,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					newLot.Take = t.pendingSell.Take
 					newLot.RefundPortionUSD = t.pendingSell.RefundPortionUSD
 				}
-				                      
+
 				idx := len(book.Lots) // the new lot’s index after append
 				if idx >= 2 {
 					if !strings.Contains(newLot.Reason, "mode=choppy") {
@@ -647,18 +668,18 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		minNotional = t.cfg.OrderMinUSD
 	}
 
-	// // One-time dust consolidation right after startup (uses current price snapshot)
-	// if !t.didConsolidateStartup {
-	// 	// We already hold t.mu here
-	// 	t.consolidateDust(t.book(SideBuy),  price, minNotional)
-	// 	t.consolidateDust(t.book(SideSell), price, minNotional)
-
-	// 	if err := t.saveStateNoLock(); err != nil {
-	// 		log.Printf("[WARN] saveState (startup consolidate): %v", err)
-	// 	}
-	// 	t.didConsolidateStartup = true
-	// 	log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
-	// }
+	// One-time dust consolidation right after startup (uses current price snapshot)
+	if !t.didConsolidateStartup {
+		// We already hold t.mu here
+		t.consolidateDust(t.book(SideBuy),  price, minNotional)
+		t.consolidateDust(t.book(SideSell), price, minNotional)
+	
+		if err := t.saveStateNoLock(); err != nil {
+			log.Printf("[WARN] saveState (startup consolidate): %v", err)
+		}
+		t.didConsolidateStartup = true
+		log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
+	}
 
 	// --------------------------------------------------------------------------------------------------------
 	// --- EXIT path: evaluate profit gate and trailing/TP logic per lot (side-aware) and close at most one.
@@ -768,12 +789,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				setExitMode(book, i, lot)
 
 				// compute gate
-				
+
 				net, pass := computeGate(lot)
 
 				// gather nearest TAKE/mode/net while we're already here (no extra loops later)
 				updateNearest(book, side, i, lot, net, price)
-				
+
 				// Override gating for FixedTP buckets:
 				// - idx == 1 → stricter 25× gate (gate = 0.02 now)
 				// - idx ≥ 2  → normal 1× gate (ScalpChoppyTP semantics)
@@ -910,9 +931,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			return msg, err
 		}
 		// single-pass enriched summary (collected in-loop; no extra scans)
-		 log.Printf("[DEBUG] Nearest Takes | CLOSE-BUY=%.2f (%s, net=%.2f, idx=%d) | CLOSE-SELL=%.2f (%s, net=%.2f, idx=%d) | Buy-Lots=%d Sell-Lots=%d",
-		   nearestTakeBuy, buyModeLabel, buyNet, buyNearestIdx,
-		   nearestTakeSell, sellModeLabel, sellNet, sellNearestIdx, lsb, lss)
+		log.Printf("[DEBUG] Nearest Takes | CLOSE-BUY=%.2f (%s, net=%.2f, idx=%d) | CLOSE-SELL=%.2f (%s, net=%.2f, idx=%d) | Buy-Lots=%d Sell-Lots=%d",
+			nearestTakeBuy, buyModeLabel, buyNet, buyNearestIdx,
+			nearestTakeSell, sellModeLabel, sellNet, sellNearestIdx, lsb, lss)
 
 		// Persist snapshots for Gate2 use (under lock; we are holding t.mu in step())
 		t.nearestTakeBuy = nearestTakeBuy
@@ -922,7 +943,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		t.nearestTakeSell = nearestTakeSell
 		t.nearestNetSell  = sellNet
 		t.nearestIdxSell  = sellNearestIdx
-		
+
 	}
 
 	feeMult := 1.0 + (t.cfg.FeeRatePct / 100.0)
@@ -956,7 +977,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-34",
+	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-35",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
@@ -1312,12 +1333,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					}
 				}
 			}
-		
+
 		}
 
 	}
 
-		// --- Fixed-USD risk sizing & ramping (no equity dependency) ---
+	// --- Fixed-USD risk sizing & ramping (no equity dependency) ---
 	// Base dollar size for the first lot
 	baseUSD := t.cfg.RiskPerTradeUSD
 	if baseUSD <= 0 {
@@ -1340,7 +1361,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	// --- Fixed-USD ramping: scale around baseUSD, independent of equityUSD ---
 	if t.cfg.RampEnable && !(equityTriggerSell || equityTriggerBuy) {
-		k := len(book.Lots) // number of existing lots on THIS SIDE
+		// number of existing non-dust lots on THIS SIDE
+    	k := rampCount(book, price, minNotional)
 		// exclude all runner(s) on this side from k
 		if rc := runnerCount(book); rc > 0 && k >= rc {
 			k = k - rc
@@ -1658,8 +1680,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 	var take float64
 	if t.cfg.ScalpTPDecayEnable && !((equityTriggerBuy && side == SideBuy) || (equityTriggerSell && side == SideSell)) {
-		// This is a scalp add on THIS SIDE: compute k = number of existing scalps in this side
-		k := len(book.Lots)
+		// number of existing non-dust lots on THIS SIDE
+    	k := rampCount(book, price, minNotional)
 		// exclude all runner(s) on this side from k
 		if rc := runnerCount(book); rc > 0 && k >= rc {
 			k = len(book.Lots) - rc
@@ -1728,7 +1750,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		)
 	}
 
-	refundFromOpposite := 0.0 
+	refundFromOpposite := 0.0
 	if t.refundBuyUSD > 0 && side == SideSell {
 		// turn refund USD into extra base at current price
 		extraBase := t.refundBuyUSD / price
@@ -1836,19 +1858,19 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		recheckNow := false
 		if side == SideBuy && t.pendingRecheckBuy { recheckNow = true }
 		if side == SideSell && t.pendingRecheckSell { recheckNow = true }
-		
-		if wantLimit && recheckNow { 
-		    wantLimit = false
-		    log.Printf("TRACE postonly.skip reason=recheck_market_next_tick side=%s", side)
+
+		if wantLimit && recheckNow {
+			wantLimit = false
+			log.Printf("TRACE postonly.skip reason=recheck_market_next_tick side=%s", side)
 		}
 		// consume the one-shot preference immediately so it never lingers
 		t.mu.Lock()
-		if recheckNow { 
-		    if side == SideBuy {
-		        t.pendingRecheckBuy = false
+		if recheckNow {
+			if side == SideBuy {
+				t.pendingRecheckBuy = false
 			} else {
-		        t.pendingRecheckSell = false
-		    }
+				t.pendingRecheckSell = false
+			}
 		}
 		t.mu.Unlock()
 
@@ -1896,12 +1918,12 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 						t.pendingBuyCtx = pctx
 						t.pendingBuyCancel = cancel
 						t.pendingBuy = &PendingOpen{
-							Side:        side,
-							LimitPx:     limitPx,
-							BaseAtLimit: baseAtLimit,
-							Quote:       quote,
-							Take:        take,
-							Reason:      gatesReason, // set later below
+							Side:             side,
+							LimitPx:          limitPx,
+							BaseAtLimit:      baseAtLimit,
+							Quote:            quote,
+							Take:             take,
+							Reason:           gatesReason, // set later below
 							RefundPortionUSD: refundFromOpposite,
 							ProductID:   t.cfg.ProductID,
 							CreatedAt:   time.Now().UTC(),
@@ -1961,7 +1983,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 						log.Printf("TRACE postonly.poll.start side=%s init_id=%s init_limit=%.8f init_base=%.8f deadline=%s offset_bps=%.3f",
 							side, initOrderID, initLimitPx, initBaseAtLimit, deadline.Format(time.RFC3339), offsetBps)
 						defer func (){log.Printf("TRACE postonly.poll.stopped side=%s initial_id=%s", side, initOrderID)}()
-								
+
 
 						orderID := initOrderID
 						lastLimitPx := initLimitPx
@@ -2053,7 +2075,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 											pend,
 											repriceCount,
 										)
-										if did && newID != orderID {												
+										if did && newID != orderID {
 											log.Printf("TRACE postonly.reprice.swap.partially side=%s old_id=%s new_id=%s new_limit=%.8f count=%d",
 												side, orderID, newID, newLastLimitPx, newRepriceCount)
 											// switched to a new order: reset per-order deltas (session aggregates stay)
@@ -2103,7 +2125,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 									}
 
 								case "CANCELED", "REJECTED", "EXPIRED":
-									
+
 									// terminal without remaining open quantity → emit VWAP if any session fills, else non-fill
 									if sessBase > 0 || sessQuote > 0 {
 										vwap := 0.0
@@ -2243,8 +2265,8 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			mtxTrades.WithLabelValues("open").Inc()
 		}
 	} else {
-				mtxTrades.WithLabelValues("open").Inc()
-			}
+		mtxTrades.WithLabelValues("open").Inc()
+	}
 
 	// Re-lock to mutate state (append new lot to THIS SIDE).
 	t.mu.Lock()
@@ -2416,9 +2438,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	}
 	// (If not equityTriggerSell/equityTriggerBuy, leave RunnerIDs unchanged so first lot is NOT the runner.)
 
-	// Rebuild legacy aggregate view for logs/compat
-	// t.refreshAggregateFromBooks()
-
 	msg := ""
 	if t.cfg.DryRun {
 		mtxOrders.WithLabelValues("paper", string(side)).Inc()
@@ -2437,7 +2456,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		log.Printf("TRACE state.save error=%v", err)
 	}
 	log.Printf("[KPI] summary equity=%.2f daily_pnl=%.2f lots_buy=%d lots_sell=%d product=%s",
-    t.equityUSD, t.dailyPnL, len(t.book(SideBuy).Lots), len(t.book(SideSell).Lots), t.cfg.ProductID)
+		t.equityUSD, t.dailyPnL, len(t.book(SideBuy).Lots), len(t.book(SideSell).Lots), t.cfg.ProductID)
 	t.mu.Unlock()
 	return msg, nil
 }
@@ -2564,13 +2583,17 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 		return
 	}
 
-	// 2) sweep older dust forward into newest
-	newestIdx := len(book.Lots) - 1
+	// 2) sweep older dust forward into the next valid lot (forward-merge)
 	i := 0
-	for i < newestIdx {
+	for i < len(book.Lots)-1 {
 		if notionalAt(i) < minNotional {
-			mergeInto(i, newestIdx)
-			newestIdx = len(book.Lots) - 1
+			// find next index j>i; prefer the first non-dust, fall back to the tail
+			j := i + 1
+			for j < len(book.Lots)-1 && notionalAt(j) < minNotional {
+				j++
+			}
+			mergeInto(i, j)
+			// after merge, a new lot now occupies index i; re-check this index
 			continue
 		}
 		i++

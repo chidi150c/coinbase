@@ -853,7 +853,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		if placed == nil {
 			var err error
 			placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote)
-			
+
 			// TODO: remove TRACE
 			log.Printf("TRACE order.close request side=%s baseReq=%.8f quoteEst=%.2f priceSnap=%.8f", closeSide, baseRequested, quote, price)
 			// just before market close in closeLot(), if placed == nil and you’re about to PlaceMarketQuote
@@ -1036,6 +1036,11 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 
 		lot.OpenNotionalUSD = lot.SizeBase * lot.OpenPrice
 
+		// --- NEW: normalize sub-minNotional dust on this side after partial close ---
+		if priceExec > 0 && minNotional > 0 {
+			t.consolidateDust(book, priceExec, minNotional)
+		}
+
 		// Do NOT remove the lot; do NOT shift RunnerID; do NOT re-anchor timers/stages
 		msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
 			c[len(c)-1].Time.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, entryPortion+exitFee)
@@ -1074,6 +1079,10 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 
 	// NOTE: Do NOT auto-promote any lot to runner.
 	// If RunnerIDs becomes empty, the side simply has no runners now.
+	// --- NEW: normalize sub-minNotional dust on this side after full close ---
+	if priceExec > 0 && minNotional > 0 {
+		t.consolidateDust(book, priceExec, minNotional)
+	}
 
 	// --- if the closed lot was the most recent add FOR THAT SIDE, re-anchor pyramiding timers/state ---
 	if wasNewest {
