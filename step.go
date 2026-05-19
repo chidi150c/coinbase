@@ -1682,7 +1682,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	if t.cfg.ScalpTPDecayEnable && !((equityTriggerBuy && side == SideBuy) || (equityTriggerSell && side == SideSell)) {
 		// number of existing non-dust lots on THIS SIDE
     	k := rampCount(book, price, minNotional)
-		// exclude all runner(s) on this side from k
+		
 		if rc := runnerCount(book); rc > 0 && k >= rc {
 			k = len(book.Lots) - rc
 		}
