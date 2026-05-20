@@ -86,7 +86,7 @@ func buildDataset(c []Candle) ([][]float64, []float64) {
 
 	const horizon = 15
 	const feeRatePct = 0.10
-	const minEdgePct = 0.10
+	const minEdgePct = 0.05
 
 	edge := (feeRatePct*2.0 + minEdgePct) / 100.0
 
