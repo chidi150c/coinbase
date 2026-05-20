@@ -7,6 +7,7 @@
 package main
 
 import (
+	"log"
 	"math"
 	"math/rand"
 	"time"
@@ -51,10 +52,16 @@ func (m *AIMicroModel) predict(features []float64) float64 {
 
 // fit performs a simple gradient step on cross-entropy loss.
 func (m *AIMicroModel) fit(c []Candle, lr float64, epochs int) {
-	if len(c) < 40 {
+	if len(c) < 60 {
 		return
 	}
+
 	feats, labels := buildDataset(c)
+	if len(feats) < 100 {
+		log.Printf("TRACE dataset.train.skip reason=too_few_rows labeled=%d min=100", len(feats))
+		return
+	}
+
 	for e := 0; e < epochs; e++ {
 		for i := range feats {
 			p := m.predict(feats[i])
@@ -69,22 +76,62 @@ func (m *AIMicroModel) fit(c []Candle, lr float64, epochs int) {
 }
 
 // buildDataset creates (features, labels) from candles.
+// Labels are fee-aware horizon labels:
+//   1.0 = future move up exceeds required edge
+//   0.0 = future move down exceeds required edge
+// Neutral/no-edge samples are skipped.
 func buildDataset(c []Candle) ([][]float64, []float64) {
 	var feats [][]float64
 	var labels []float64
+
+	const horizon = 15
+	const feeRatePct = 0.10
+	const minEdgePct = 0.10
+
+	edge := (feeRatePct*2.0 + minEdgePct) / 100.0
+
+	if len(c) < 22+horizon {
+		log.Printf("TRACE dataset.rows total=%d labeled=0 up=0 down=0 skipped=0 horizon=%d edge=%.6f reason=too_few_candles",
+			len(c), horizon, edge)
+		return feats, labels
+	}
+
 	rsis := RSI(c, 14)
 	zs := ZScore(c, 20)
-	for i := 21; i < len(c)-1; i++ {
+
+	upRows := 0
+	downRows := 0
+	skippedRows := 0
+	badRows := 0
+
+	for i := 21; i < len(c)-horizon; i++ {
+		if c[i-1].Close <= 0 || c[i-5].Close <= 0 || c[i].Close <= 0 {
+			badRows++
+			continue
+		}
+
 		ret1 := (c[i].Close - c[i-1].Close) / c[i-1].Close
 		ret5 := (c[i].Close - c[i-5].Close) / c[i-5].Close
 		f := []float64{ret1, ret5, rsis[i] / 100.0, zs[i]}
-		up := 0.0
-		if c[i+1].Close > c[i].Close {
-			up = 1.0
+
+		futureRet := (c[i+horizon].Close - c[i].Close) / c[i].Close
+
+		if futureRet > edge {
+			feats = append(feats, f)
+			labels = append(labels, 1.0)
+			upRows++
+		} else if futureRet < -edge {
+			feats = append(feats, f)
+			labels = append(labels, 0.0)
+			downRows++
+		} else {
+			skippedRows++
 		}
-		feats = append(feats, f)
-		labels = append(labels, up)
 	}
+
+	log.Printf("TRACE dataset.rows total=%d labeled=%d up=%d down=%d skipped=%d bad=%d horizon=%d edge=%.6f fee_pct=%.4f min_edge_pct=%.4f",
+		len(c), len(feats), upRows, downRows, skippedRows, badRows, horizon, edge, feeRatePct, minEdgePct)
+
 	return feats, labels
 }
 
