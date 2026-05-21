@@ -95,7 +95,6 @@ func decide(c []Candle, mdl *LogisticModel, buyThreshold float64, sellThreshold 
 	// inference here and for training in dataset.go.
 	pUp := 0.5
 	if mdl != nil {
-		log.Printf("TRACE predict.shape feat_len=%d model_dim=%d weight_len=%d", len(snap.X), mdl.FeatDim, len(mdl.W))
 		pUp = mdl.Predict(snap.X)
 	}
 
