@@ -1,7 +1,7 @@
 	baseRiskPct := (t.cfg.RiskPerTradeUSD / t.equityUSD) * 100.0
 	// Sizing (risk % of current equity, with optional volatility adjust already supported).
 	riskPct := baseRiskPct
-	if t.cfg.Extended().VolRiskAdjust {
+	if t.cfg.VolRiskAdjust {
 		f := volRiskFactor(c)
 		riskPct = riskPct * f
 		SetVolRiskFactorMetric(f)

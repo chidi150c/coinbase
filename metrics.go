@@ -2,18 +2,17 @@
 // Package main – Prometheus metrics for observability.
 //
 // Exposes primary metrics the bot updates during operation:
-//   • bot_orders_total{mode,side}   – Count of orders placed (mode: paper|live)
-//   • bot_decisions_total{signal}   – Count of decisions (buy|sell|flat)
-//   • bot_equity_usd                – Current equity snapshot (gauge)
-//   • bot_trades_total{result}      – Trades by result (open|win|loss)
+//   • bot_orders_total{mode,side}        – Count of orders placed (mode: paper|live)
+//   • bot_decisions_total{signal}        – Count of decisions (buy|sell|flat)
+//   • bot_equity_usd                     – Current equity snapshot (gauge)
+//   • bot_trades_total{result}           – Trades by result (open|win|loss)
 //   • bot_exit_reasons_total{reason,side} – Exits split by reason and side
-//   • bot_model_mode{mode}          – Model mode indicator (baseline/extended)
-//   • bot_vol_risk_factor           – Volatility-adjusted risk factor
-//   • bot_walk_forward_fits_total   – Count of walk-forward refits
-//   • bot_limit_orders_*_total{side} – Post-only limit flow metrics (placed/filled/timeout)
+//   • bot_vol_risk_factor                – Volatility-adjusted risk factor
+//   • bot_walk_forward_fits_total        – Count of walk-forward refits
+//   • bot_limit_orders_*_total{side}     – Post-only limit flow metrics
 //
-// These are registered in init() and served by the HTTP handler started in main.go
-// at /metrics (Prometheus text exposition format).
+// The old bot_model_mode{mode} metric was removed because the AI architecture
+// now has one unified logistic model path only.
 
 package main
 
@@ -53,17 +52,7 @@ var (
 		[]string{"reason", "side"}, // side: buy|sell (the side of the CLOSED lot)
 	)
 
-	// bot_model_mode indicates which model path is active; we expose two labeled
-	// time series and flip them between 0/1 to keep dashboards simple.
-	botModelMode = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "bot_model_mode",
-			Help: "Model mode indicator (baseline/extended as separate labeled series).",
-		},
-		[]string{"mode"},
-	)
-
-	// bot_vol_risk_factor reports the current multiplicative factor applied to RiskPerTradePct.
+	// bot_vol_risk_factor reports the current multiplicative factor applied to risk sizing.
 	botVolRiskFactor = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "bot_vol_risk_factor",
@@ -88,7 +77,7 @@ var (
 		[]string{"result"},
 	)
 
-	// --- New: post-only limit flow ---
+	// --- Post-only limit flow ---
 	limitPlaced = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "bot_limit_orders_placed_total",
@@ -119,27 +108,17 @@ func init() {
 	prometheus.MustRegister(mtxOrders, mtxDecisions, mtxPnL)
 	prometheus.MustRegister(mtxTrades)
 	prometheus.MustRegister(mtxExitReasons)
-	prometheus.MustRegister(botModelMode, botVolRiskFactor, botWalkForwardFits)
+	prometheus.MustRegister(botVolRiskFactor, botWalkForwardFits)
 
-	// Register new post-only metrics
+	// Register post-only metrics
 	prometheus.MustRegister(limitPlaced, limitFilled, limitTimeout)
 }
 
-// Helper setters (optional use by other files; do not impact existing behavior)
-func SetModelModeMetric(mode string) {
-	if mode == "extended" {
-		botModelMode.WithLabelValues("extended").Set(1)
-		botModelMode.WithLabelValues("baseline").Set(0)
-	} else {
-		botModelMode.WithLabelValues("baseline").Set(1)
-		botModelMode.WithLabelValues("extended").Set(0)
-	}
-}
-
+// Helper setters
 func SetVolRiskFactorMetric(v float64) { botVolRiskFactor.Set(v) }
 func IncWalkForwardFits()              { botWalkForwardFits.Inc() }
 
-// New helpers for the limit flow
+// Limit-flow helpers
 func IncLimitPlaced(side string)  { limitPlaced.WithLabelValues(side).Inc() }
 func IncLimitFilled(side string)  { limitFilled.WithLabelValues(side).Inc() }
 func IncLimitTimeout(side string) { limitTimeout.WithLabelValues(side).Inc() }

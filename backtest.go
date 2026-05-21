@@ -4,7 +4,7 @@
 // What’s here:
 //   • loadCSV(path) -> []Candle   : reads time,open,high,low,close,volume
 //   • runBacktest(ctx, csvPath, trader, model)
-//       - trains the micro-model on 70% of data
+//       - trains the unified logistic model on 70% of data
 //       - runs a simple walk-forward on the remaining 30%
 //       - logs periodic progress and updates bot_equity_usd gauge
 //
@@ -115,8 +115,8 @@ func first(m map[string]string, keys ...string) string {
 	return ""
 }
 
-// runBacktest trains the model and simulates decisions on the test split.
-func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *AIMicroModel) {
+// runBacktest trains the unified model and simulates decisions on the test split.
+func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *LogisticModel) {
 	candles, err := loadCSV(csvPath)
 	if err != nil {
 		log.Fatalf("backtest load: %v", err)
@@ -133,11 +133,8 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *AIM
 	train := candles[:split]
 	test := candles[split:]
 
-	// Train the tiny model (baseline path unchanged)
+	// Train the unified logistic model.
 	model.fit(train, 0.05, 4)
-
-	// (Phase-7 opt-in) Train extended head if enabled (no behavior change unless other files use it)
-	trader.mdlExt = trainExtendedIfEnabled(trader.cfg, train)
 
 	// Force paper for backtest accounting
 	trader.cfg.DryRun = true
@@ -211,24 +208,4 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *AIM
 		log.Printf("Backtest done; holding for %s so Prometheus can scrape...", hold)
 		time.Sleep(hold)
 	}
-}
-
-// ---- Phase-7: extended training path (opt-in; non-breaking) ----
-
-// trainExtendedIfEnabled trains the optional extended logistic head when
-// MODEL_MODE=extended is set. It also sets a model-mode metric.
-// Return value can be ignored if the caller doesn't use extended predictions.
-func trainExtendedIfEnabled(cfg Config, candles []Candle) *ExtendedLogit {
-	if cfg.Extended().ModelMode != ModelModeExtended {
-		SetModelModeMetric("baseline")
-		return nil
-	}
-	SetModelModeMetric("extended")
-	fe, la := BuildExtendedFeatures(candles, true)
-	if len(fe) == 0 {
-		return nil
-	}
-	mdl := NewExtendedLogit(len(fe[0]))
-	mdl.FitMiniBatch(fe, la, 0.05, 8, 64)
-	return mdl
 }

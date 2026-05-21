@@ -277,3 +277,337 @@ step.go
 - Keep exchange/risk/funding/pending-order gates here.
 - Keep order placement and close/open execution here.
 - Do not move hard gates into the AI model.
+
+
+Goal
+
+We decided to simplify the AI architecture and stop maintaining:
+
+basic model
+vs
+extended model
+
+We agreed to move to:
+
+ONE model
+ONE dataset builder
+ONE feature builder
+ONE prediction path
+
+You explicitly said:
+
+state compatibility is NOT important
+production tampering is acceptable
+losing current state is acceptable
+
+So we are intentionally doing a hard simplification.
+
+What already happened
+1. Backup / restore point created
+
+Safe rollback branch:
+
+restore-before-ai-label-rework
+
+Working branch:
+
+ai-label-feature-rework
+2. Fee-aware labels were implemented
+
+Old label:
+
+if c[i+1].Close > c[i].Close {
+    up = 1.0
+}
+
+Problem:
+
+predicted next candle direction only
+not profitability
+
+New idea:
+
+Train on:
+
+future move over N candles
+that exceeds fees + minimum edge
+
+Current live settings:
+
+const horizon = 15
+const feeRatePct = 0.10
+const minEdgePct = 0.05
+
+Edge:
+
+0.25%
+
+Meaning:
+
+BUY label:
+future return > +0.25%
+
+SELL label:
+future return < -0.25%
+
+neutral:
+skip sample
+3. Dataset stats after deployment
+
+Observed:
+
+total candles = 6000
+labeled rows = 515
+up = 233
+down = 282
+skipped = 5449
+bad = 0
+
+Interpretation:
+
+healthy enough
+balanced
+not overfit-risky
+4. AI behavior improved
+
+Before:
+
+pUp hovered around 0.49–0.51
+weak/noisy
+
+After fee-aware labels:
+
+Observed:
+
+0.486 → FLAT
+0.534 → BUY
+0.541 → BUY
+0.434 → SELL
+
+Meaning:
+
+signal separation improved
+AI became more directional
+less next-candle noise
+5. Gate stack mental model
+
+We clarified:
+
+Current architecture:
+
+AI
+↓
+signal decision
+↓
+gate stack
+↓
+execute or HOLD
+
+Example observed:
+
+AI → SELL
+↓
+Decision=SELL
+↓
+pyramiding gate blocked
+↓
+HOLD
+
+So:
+
+AI works
+gates still control execution
+Curse of dimensionality discussion
+
+Your “dimension concern” meant:
+
+rows × columns
+
+(statistical dimensionality)
+
+not:
+
+feature length mismatch
+
+We agreed:
+
+Current:
+
+515 rows
+8 features
+
+Safe expansion target:
+
+12–16 features
+
+Avoid:
+
+30–50 features
+
+without enough rows.
+
+Feature mining agreement
+
+We agreed to convert soft judgment gates into AI features.
+
+Soft gates to mine
+HighPeak
+LowBottom
+PriceDownGoingUp
+PriceUpGoingDown
+EMA spread
+
+Maybe later:
+
+adverse move %
+distance from recent high/low
+volatility regime
+spare buy/sell ratio
+Hard gates stay hard
+
+Do NOT convert:
+
+funds checks
+min notional
+exchange safety
+execution constraints
+Major architecture decision (important)
+
+We decided:
+
+REMOVE split architecture
+
+Delete conceptual distinction between:
+
+AIMicroModel
+ExtendedLogit
+basic
+extended
+MODEL_MODE
+
+Replace with:
+
+ONE logistic model
+Target architecture
+One model
+
+Use only:
+
+type LogisticModel struct {
+    W       []float64 `json:"W"`
+    B       float64   `json:"B"`
+    L2      float64   `json:"L2"`
+    FeatDim int       `json:"FeatDim"`
+}
+
+No:
+
+AIMicroModel
+ExtendedLogit
+One dataset builder
+
+Replace:
+
+buildDataset()
+BuildExtendedFeatures()
+
+with:
+
+BuildFeaturesAndLabels(c, train)
+
+This function must do:
+
+feature creation
++
+fee-aware horizon labels
+One prediction path
+
+Replace:
+
+micro-model path
+extended path
+MODEL_MODE branching
+
+with:
+
+ComputePUp(c, mdl)
+
+single path only.
+
+decide()
+
+Target:
+
+func decide(
+    c []Candle,
+    mdl *LogisticModel,
+    buyThreshold float64,
+    sellThreshold float64,
+    useMAFilter bool,
+) Decision
+
+No:
+
+m *AIMicroModel
+mdl *ExtendedLogit
+MODEL_MODE
+State
+
+We agreed:
+
+State compatibility does NOT matter.
+
+Old:
+
+Model
+MdlExt
+
+New:
+
+Model
+
+only.
+
+You are okay with:
+
+resetting state
+losing current weights
+fresh retraining
+Current blocker before code surgery
+
+We stopped because we needed to inspect:
+
+Trader struct
+State struct
+where model fields are wired
+
+We planned to run:
+
+grep -R "type .*State" -n .
+grep -R "AIMicroModel\|ExtendedLogit\|mdlExt\|model" -n *.go
+
+to safely refactor:
+
+state serialization
+trader fields
+load/save state
+training calls
+decide() wiring
+
+without guessing.
+
+Current objective
+
+Next session starts with:
+
+hard refactor to unified AI architecture
+(one model / one builder / one prediction path)
+
+Then after stabilization:
+
+mine soft gates into features
+HighPeak
+LowBottom
+PriceDownGoingUp
+PriceUpGoingDown
+EMA spread

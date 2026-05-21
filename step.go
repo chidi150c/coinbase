@@ -465,7 +465,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 				msg := fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
 					side, quoteSpent, newLot.Take, entryFee, newLot.Reason, "async postonly filled")
-				if t.cfg.Extended().UseDirectSlack {
+				if t.cfg.UseDirectSlack {
 					postSlack(msg)
 				}
 				// save
@@ -623,7 +623,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 				msg := fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
 					side, quoteSpent, newLot.Take, entryFee, newLot.Reason, "async postonly filled")
-				if t.cfg.Extended().UseDirectSlack {
+				if t.cfg.UseDirectSlack {
 					postSlack(msg)
 				}
 				// save
@@ -975,7 +975,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	// --------------------------------------------------------------------------------------------------------
 	//---ADD path continues-----
 	// --------------------------------------------------------------------------------------------------------
-	d := decide(c, t.model, t.mdlExt, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
+	d := decide(c, t.model, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.UseMAFilter)
 	totalLots := lsb + lss
 	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-36",
 		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
@@ -1350,7 +1350,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 	quote := baseUSD
 
 	// Optional: volatility adjust as a multiplier on USD (not on equity)
-	if t.cfg.Extended().VolRiskAdjust {
+	if t.cfg.VolRiskAdjust {
 		f := volRiskFactor(c)
 		if f <= 0 {
 			f = 1.0
@@ -2250,7 +2250,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 					placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
 				}
 				if err != nil {
-					if t.cfg.Extended().UseDirectSlack {
+					if t.cfg.UseDirectSlack {
 						postSlack(fmt.Sprintf("ERR step: %v", err))
 					}
 					return "", err
@@ -2447,7 +2447,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		msg = fmt.Sprintf("[LIVE ORDER] %s notional=%.2f take=%.2f fee=%.4f reason=%s",
 			side, newLot.OpenNotionalUSD, newLot.Take, entryFee, newLot.Reason)
 	}
-	if t.cfg.Extended().UseDirectSlack {
+	if t.cfg.UseDirectSlack {
 		postSlack(msg)
 	}
 	// persist new state (no locking while writing; snapshot constructed here under lock)

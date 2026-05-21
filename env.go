@@ -96,6 +96,11 @@ func loadBotEnv() {
 		"STOP_LOSS_PCT": {}, "ORDER_MIN_USD": {}, "LONG_ONLY": {}, "PORT": {}, "BRIDGE_URL": {},
 		"BUY_THRESHOLD": {}, "SELL_THRESHOLD": {}, "USE_MA_FILTER": {}, "BACKTEST_SLEEP_MS": {},
 
+		// unified AI / fee-aware labels
+		"AI_LABEL_HORIZON": {},
+		"AI_FEE_RATE_PCT":  {},
+		"AI_MIN_EDGE_PCT":  {},
+
 		// ---- pyramiding/env-driven knobs ----
 		"ALLOW_PYRAMIDING":            {},
 		"PYRAMID_MIN_SECONDS_BETWEEN": {},
@@ -105,13 +110,13 @@ func loadBotEnv() {
 		"PYRAMID_DECAY_MIN_PCT": {},
 
 		// tick/candle sync & risk
-		"USE_TICK_PRICE":                 {},
-		"TICK_INTERVAL_SEC":              {},
-		"CANDLE_RESYNC_SEC":              {},
-		"DAILY_BREAKER_MARK_TO_MARKET":   {},
-		"FEE_RATE_PCT":                   {},
-		"MAX_CONCURRENT_LOTS":            {},
-		"STATE_FILE":                     {},
+		"USE_TICK_PRICE":               {},
+		"TICK_INTERVAL_SEC":            {},
+		"CANDLE_RESYNC_SEC":            {},
+		"DAILY_BREAKER_MARK_TO_MARKET": {},
+		"FEE_RATE_PCT":                 {},
+		"MAX_CONCURRENT_LOTS":          {},
+		"STATE_FILE":                   {},
 
 		// trailing & tp-decay (optional)
 		"TRAIL_ACTIVATE_PCT":    {},
@@ -171,8 +176,8 @@ func loadBotEnv() {
 		"QUOTE_STEP":             {},
 
 		// normalized venue filters (added)
-		"PRICE_TICK":   {},
-		"MIN_NOTIONAL": {},
+		"PRICE_TICK":           {},
+		"MIN_NOTIONAL":         {},
 		"FORCE_FILTERS_REMOTE": {},
 
 		// broker selection + Binance keys
@@ -223,4 +228,3 @@ func loadBotEnv() {
 }
 
 // --------- Tunable strategy thresholds (initialized in main) ---------
-

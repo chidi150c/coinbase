@@ -1,9 +1,4 @@
 // FILE: model.go
-// Package main – Tiny in-memory ML “micro-model” for directional bias.
-//
-// Minimal logistic-regression–style model used to produce pUp from
-// hand-crafted features. Kept simple and fast.
-
 package main
 
 import (
@@ -13,21 +8,38 @@ import (
 	"time"
 )
 
-type AIMicroModel struct {
-	W []float64 `json:"W"` // weights
-	B float64   `json:"B"` // bias
+type LogisticModel struct {
+	W       []float64 `json:"W"`
+	B       float64   `json:"B"`
+	L2      float64   `json:"L2"`
+	FeatDim int       `json:"FeatDim"`
 }
 
-func newModel() *AIMicroModel {
+func newModel() *LogisticModel {
+	return &LogisticModel{
+		W:       nil,
+		B:       0,
+		L2:      1e-3,
+		FeatDim: 0,
+	}
+}
+
+func NewLogisticModel(featDim int) *LogisticModel {
 	rand.Seed(time.Now().UnixNano())
-	w := make([]float64, 4) // features: ret1, ret5, rsi14/100, zscore20
+
+	w := make([]float64, featDim)
 	for i := range w {
 		w[i] = rand.NormFloat64() * 0.01
 	}
-	return &AIMicroModel{W: w}
+
+	return &LogisticModel{
+		W:       w,
+		B:       0,
+		L2:      1e-3,
+		FeatDim: featDim,
+	}
 }
 
-// sigmoid returns 1/(1+e^-x) with simple clamping for numerical stability.
 func sigmoid(x float64) float64 {
 	if x > 20 {
 		return 1
@@ -38,198 +50,158 @@ func sigmoid(x float64) float64 {
 	return 1 / (1 + math.Exp(-x))
 }
 
-// predict expects exactly len(W) features; otherwise returns 0.5.
-func (m *AIMicroModel) predict(features []float64) float64 {
-	if len(features) != len(m.W) {
+func (m *LogisticModel) Predict(x []float64) float64 {
+	if m == nil {
 		return 0.5
 	}
-	z := m.B
-	for i := range features {
-		z += m.W[i] * features[i]
-	}
-	return sigmoid(z)
-}
-
-// fit performs a simple gradient step on cross-entropy loss.
-func (m *AIMicroModel) fit(c []Candle, lr float64, epochs int) {
-	if len(c) < 60 {
-		return
-	}
-
-	feats, labels := buildDataset(c)
-	if len(feats) < 100 {
-		log.Printf("TRACE dataset.train.skip reason=too_few_rows labeled=%d min=100", len(feats))
-		return
-	}
-
-	for e := 0; e < epochs; e++ {
-		for i := range feats {
-			p := m.predict(feats[i])
-			y := labels[i]
-			grad := p - y
-			for j := range m.W {
-				m.W[j] -= lr * grad * feats[i][j]
-			}
-			m.B -= lr * grad
-		}
-	}
-}
-
-// buildDataset creates (features, labels) from candles.
-// Labels are fee-aware horizon labels:
-//   1.0 = future move up exceeds required edge
-//   0.0 = future move down exceeds required edge
-// Neutral/no-edge samples are skipped.
-func buildDataset(c []Candle) ([][]float64, []float64) {
-	var feats [][]float64
-	var labels []float64
-
-	const horizon = 15
-	const feeRatePct = 0.10
-	const minEdgePct = 0.05
-
-	edge := (feeRatePct*2.0 + minEdgePct) / 100.0
-
-	if len(c) < 22+horizon {
-		log.Printf("TRACE dataset.rows total=%d labeled=0 up=0 down=0 skipped=0 horizon=%d edge=%.6f reason=too_few_candles",
-			len(c), horizon, edge)
-		return feats, labels
-	}
-
-	rsis := RSI(c, 14)
-	zs := ZScore(c, 20)
-
-	upRows := 0
-	downRows := 0
-	skippedRows := 0
-	badRows := 0
-
-	for i := 21; i < len(c)-horizon; i++ {
-		if c[i-1].Close <= 0 || c[i-5].Close <= 0 || c[i].Close <= 0 {
-			badRows++
-			continue
-		}
-
-		ret1 := (c[i].Close - c[i-1].Close) / c[i-1].Close
-		ret5 := (c[i].Close - c[i-5].Close) / c[i-5].Close
-		f := []float64{ret1, ret5, rsis[i] / 100.0, zs[i]}
-
-		futureRet := (c[i+horizon].Close - c[i].Close) / c[i].Close
-
-		if futureRet > edge {
-			feats = append(feats, f)
-			labels = append(labels, 1.0)
-			upRows++
-		} else if futureRet < -edge {
-			feats = append(feats, f)
-			labels = append(labels, 0.0)
-			downRows++
-		} else {
-			skippedRows++
-		}
-	}
-
-	log.Printf("TRACE dataset.rows total=%d labeled=%d up=%d down=%d skipped=%d bad=%d horizon=%d edge=%.6f fee_pct=%.4f min_edge_pct=%.4f",
-		len(c), len(feats), upRows, downRows, skippedRows, badRows, horizon, edge, feeRatePct, minEdgePct)
-
-	return feats, labels
-}
-
-// ---- Phase-7: tiny L2-regularized logistic head (opt-in; append-only) ----
-
-// ExtendedLogit is an optional, regularized logistic model used when the
-// extended path is enabled. Baseline behavior remains unchanged.
-type ExtendedLogit struct {
-	W       []float64 `json:"W"`
-	B       float64   `json:"B"`
-	L2      float64   `json:"L2"`
-	FeatDim int       `json:"FeatDim"`
-}
-
-func NewExtendedLogit(featDim int) *ExtendedLogit {
-	w := make([]float64, featDim)
-	rand.Seed(time.Now().UnixNano())
-	for i := range w {
-		w[i] = rand.NormFloat64() * 0.01
-	}
-	return &ExtendedLogit{W: w, B: 0, L2: 1e-3, FeatDim: featDim}
-}
-
-func (m *ExtendedLogit) Predict(x []float64) float64 {
-	if len(x) != m.FeatDim {
+	if len(x) == 0 {
 		return 0.5
 	}
+	if m.FeatDim <= 0 || len(m.W) == 0 {
+		return 0.5
+	}
+	if len(x) != m.FeatDim || len(m.W) != m.FeatDim {
+		return 0.5
+	}
+
 	z := m.B
 	for i := 0; i < m.FeatDim; i++ {
 		z += m.W[i] * x[i]
 	}
-	// numeric clamps
-	if z > 20 {
-		return 1.0
-	}
-	if z < -20 {
-		return 0.0
-	}
-	return 1.0 / (1.0 + math.Exp(-z))
+	return sigmoid(z)
 }
 
-func (m *ExtendedLogit) FitMiniBatch(feats [][]float64, labels []float64, lr float64, epochs int, batch int) {
+// predict is kept as a small compatibility wrapper.
+func (m *LogisticModel) predict(x []float64) float64 {
+	return m.Predict(x)
+}
+
+func ComputePUp(c []Candle, mdl *LogisticModel) float64 {
+	if mdl == nil {
+		return 0.5
+	}
+	if len(c) == 0 {
+		return 0.5
+	}
+
+	x, ok := BuildFeatures(c, len(c)-1)
+	if !ok || len(x) == 0 {
+		log.Printf("[DEBUG] pUp: no unified features available")
+		return 0.5
+	}
+
+	return mdl.Predict(x)
+}
+
+// fit keeps the old call style alive while using the new unified dataset path.
+func (m *LogisticModel) fit(c []Candle, lr float64, epochs int) {
+	cfg := FeatureLabelConfig{
+		Horizon:     15,
+		FeeRatePct:  0.10,
+		MinEdgePct: 0.05,
+		MinRows:    100,
+	}
+
+	feats, labels := BuildFeaturesAndLabels(c, cfg)
+	if len(feats) == 0 || len(labels) == 0 {
+		log.Printf("TRACE model.train.skip reason=no_dataset")
+		return
+	}
+
+	m.FitMiniBatch(feats, labels, lr, epochs, 32)
+}
+
+func (m *LogisticModel) FitMiniBatch(feats [][]float64, labels []float64, lr float64, epochs int, batch int) {
+	if m == nil {
+		return
+	}
 	if len(feats) == 0 || len(labels) == 0 {
 		return
 	}
+	if len(feats) != len(labels) {
+		log.Printf("[ERROR] model.fit shape mismatch rows=%d labels=%d", len(feats), len(labels))
+		return
+	}
+
+	featDim := len(feats[0])
+	if featDim == 0 {
+		log.Printf("[WARN] model.fit empty feature dimension")
+		return
+	}
+
+	for i := range feats {
+		if len(feats[i]) != featDim {
+			log.Printf("[ERROR] model.fit inconsistent feature dimension row=%d got=%d want=%d", i, len(feats[i]), featDim)
+			return
+		}
+	}
+
+	if m.FeatDim != featDim || len(m.W) != featDim {
+		log.Printf("[INFO] model.init feat_dim=%d old_feat_dim=%d", featDim, m.FeatDim)
+		nm := NewLogisticModel(featDim)
+		m.W = nm.W
+		m.B = nm.B
+		if m.L2 <= 0 {
+			m.L2 = nm.L2
+		}
+		m.FeatDim = featDim
+	}
+
+	if batch <= 0 {
+		batch = 32
+	}
+	if lr <= 0 {
+		lr = 0.05
+	}
+	if epochs <= 0 {
+		epochs = 10
+	}
+
 	bestW := append([]float64(nil), m.W...)
 	bestB := m.B
 	bestLoss := math.MaxFloat64
+
 	patience := 3
 	wait := 0
 
 	for e := 0; e < epochs; e++ {
 		perm := rand.Perm(len(feats))
+
 		for off := 0; off < len(feats); off += batch {
 			end := off + batch
 			if end > len(feats) {
 				end = len(feats)
 			}
+
 			gW := make([]float64, m.FeatDim)
 			var gB float64
+
 			for k := off; k < end; k++ {
 				i := perm[k]
+
 				p := m.Predict(feats[i])
 				y := labels[i]
 				grad := p - y
+
 				for j := 0; j < m.FeatDim; j++ {
 					gW[j] += grad * feats[i][j]
 				}
 				gB += grad
 			}
-			// L2 regularization
+
 			for j := 0; j < m.FeatDim; j++ {
 				gW[j] += m.L2 * m.W[j]
 			}
+
 			eta := lr / float64(end-off)
+
 			for j := 0; j < m.FeatDim; j++ {
 				m.W[j] -= eta * gW[j]
 			}
 			m.B -= eta * gB
 		}
-		// evaluate simple loss + L2
-		loss := 0.0
-		for i := range feats {
-			p := m.Predict(feats[i])
-			if p < 1e-8 {
-				p = 1e-8
-			}
-			if p > 1-1e-8 {
-				p = 1 - 1e-8
-			}
-			y := labels[i]
-			loss += -(y*math.Log(p) + (1-y)*math.Log(1-p))
-		}
-		reg := 0.0
-		for j := 0; j < m.FeatDim; j++ {
-			reg += 0.5 * m.L2 * m.W[j] * m.W[j]
-		}
-		loss += reg
+
+		loss := m.loss(feats, labels)
 
 		if loss < bestLoss-1e-3 {
 			bestLoss = loss
@@ -243,7 +215,37 @@ func (m *ExtendedLogit) FitMiniBatch(feats [][]float64, labels []float64, lr flo
 			}
 		}
 	}
-	m.W, m.B = bestW, bestB
+
+	m.W = bestW
+	m.B = bestB
+
+	log.Printf("[MODEL] trained rows=%d feat_dim=%d loss=%.6f", len(feats), m.FeatDim, bestLoss)
 }
 
-// ---- Minimal additions to support decide() extended-branch wiring ----
+func (m *LogisticModel) loss(feats [][]float64, labels []float64) float64 {
+	if m == nil || len(feats) == 0 || len(labels) == 0 {
+		return math.MaxFloat64
+	}
+
+	loss := 0.0
+
+	for i := range feats {
+		p := m.Predict(feats[i])
+		if p < 1e-8 {
+			p = 1e-8
+		}
+		if p > 1-1e-8 {
+			p = 1 - 1e-8
+		}
+
+		y := labels[i]
+		loss += -(y*math.Log(p) + (1-y)*math.Log(1-p))
+	}
+
+	reg := 0.0
+	for j := 0; j < m.FeatDim; j++ {
+		reg += 0.5 * m.L2 * m.W[j] * m.W[j]
+	}
+
+	return loss + reg
+}

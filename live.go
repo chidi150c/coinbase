@@ -31,7 +31,7 @@ import (
 )
 
 // runLive executes the real-time loop with cadence intervalSec (seconds).
-func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalSec int) {
+func runLive(ctx context.Context, trader *Trader, model *LogisticModel, intervalSec int) {
 	if intervalSec <= 0 {
 		intervalSec = 60
 	}
@@ -182,13 +182,6 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 	// Fit the tiny model
 	model.fit(history, 0.05, 4)
 
-	// (Phase-7 opt-in) initial extended head training (no effect unless MODEL_MODE=extended)
-	if trader.cfg.Extended().ModelMode == ModelModeExtended {
-		if fe, la := BuildExtendedFeatures(history, true); len(fe) > 0 {
-			trader.mdlExt = NewExtendedLogit(len(fe[0]))
-			trader.mdlExt.FitMiniBatch(fe, la, 0.05, 6, 64)
-		}
-	}
 	var lastRefit *time.Time
 
 	// Track if we've successfully rebased equity from live balances (metrics gate).
@@ -296,7 +289,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				cancelPx()
 
 				// Walk-forward refit (optional)
-				lastRefit, trader.mdlExt = maybeWalkForwardRefit(trader.cfg, trader.mdlExt, history, lastRefit)
+				lastRefit, model = maybeWalkForwardRefit(trader.cfg, model, history, lastRefit)
 
 				// Step trader
 				msg, err := trader.step(ctx, history)
@@ -403,7 +396,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				// TODO: remove TRACE
 				log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
 
-				lastRefit, trader.mdlExt = maybeWalkForwardRefit(trader.cfg, trader.mdlExt, history, lastRefit)
+				lastRefit, model = maybeWalkForwardRefit(trader.cfg, model, history, lastRefit)
 
 				msg, err := trader.step(ctx, history)
 				if err != nil {
@@ -636,24 +629,25 @@ func fetchBrokerBalances(ctx context.Context, trader *Trader, productID string) 
 
 // ---- Phase-7: walk-forward refit ----
 
-func maybeWalkForwardRefit(cfg Config, mdl *ExtendedLogit, history []Candle, lastRefit *time.Time) (*time.Time, *ExtendedLogit) {
-	if cfg.Extended().ModelMode != ModelModeExtended || cfg.Extended().WalkForwardMin <= 0 {
+func maybeWalkForwardRefit(cfg Config, mdl *LogisticModel, history []Candle, lastRefit *time.Time) (*time.Time, *LogisticModel) {
+	if cfg.WalkForwardMin <= 0 {
 		return lastRefit, mdl
 	}
+
 	now := time.Now().UTC()
-	if lastRefit == nil || now.Sub(*lastRefit) >= time.Duration(cfg.Extended().WalkForwardMin)*time.Minute {
-		fe, la := BuildExtendedFeatures(history, true)
-		if len(fe) >= 100 {
-			if mdl == nil {
-				mdl = NewExtendedLogit(len(fe[0]))
-			}
-			mdl.FitMiniBatch(fe, la, 0.05, 6, 64)
-			IncWalkForwardFits()
-		}
-		t := now
-		return &t, mdl
+	if lastRefit != nil && now.Sub(*lastRefit) < time.Duration(cfg.WalkForwardMin)*time.Minute {
+		return lastRefit, mdl
 	}
-	return lastRefit, mdl
+
+	if mdl == nil {
+		mdl = newModel()
+	}
+
+	mdl.fit(history, 0.05, 6)
+	IncWalkForwardFits()
+
+	t := now
+	return &t, mdl
 }
 
 // ---- Tick-price helpers ----

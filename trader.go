@@ -93,8 +93,7 @@ type BotState struct {
 	EquityUSD      float64
 	DailyStart     time.Time
 	DailyPnL       float64
-	Model          *AIMicroModel
-	MdlExt         *ExtendedLogit
+	Model          *LogisticModel
 	WalkForwardMin int
 	LastFit        time.Time
 
@@ -164,15 +163,13 @@ type OpenResult struct {
 type Trader struct {
 	cfg    Config
 	broker Broker
-	model  *AIMicroModel
+	model  *LogisticModel
 	didConsolidateStartup bool
 	pos    *Position // kept for backward compatibility with earlier logic (represents last lot in aggregate)
 	// lots      []*Position // legacy aggregate view (derived from books; do not mutate directly)
 	mu        sync.RWMutex
 	equityUSD float64
 
-	// NEW (minimal): optional extended head passed through to decide(); nil if unused.
-	mdlExt *ExtendedLogit
 
 	// NEW: path to persisted state file
 	stateFile string
@@ -238,7 +235,7 @@ type Trader struct {
 
 }
 
-func NewTrader(cfg Config, broker Broker, model *AIMicroModel) *Trader {
+func NewTrader(cfg Config, broker Broker, model *LogisticModel) *Trader {
 	t := &Trader{
 		cfg:        cfg,
 		broker:     broker,
@@ -356,12 +353,6 @@ func (t *Trader) apply(fn func(*Trader)) {
 	}
 }
 
-// NEW (minimal): allow live loop to inject/refresh the optional extended model.
-func (t *Trader) SetExtendedModel(m *ExtendedLogit) {
-	t.mu.Lock()
-	t.mdlExt = m
-	t.mu.Unlock()
-}
 
 func midnightUTC(ts time.Time) time.Time {
 	y, m, d := ts.Date()
@@ -860,7 +851,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 			log.Printf("[KPI] taker.exit side=%s base=%.8f quote_est=%.2f reason=fallback_from_postonly", closeSide, baseRequested, quote)
 
 			if err != nil {
-				if t.cfg.Extended().UseDirectSlack {
+				if t.cfg.UseDirectSlack {
 					postSlack(fmt.Sprintf("ERR step: %v", err))
 				}
 				// Re-lock before returning so caller's Unlock matches.
@@ -1058,7 +1049,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 		// Do NOT remove the lot; do NOT shift RunnerID; do NOT re-anchor timers/stages
 		msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
 			c[len(c)-1].Time.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, entryPortion+exitFee)
-		if t.cfg.Extended().UseDirectSlack {
+		if t.cfg.UseDirectSlack {
 			postSlack(msg)
 		}
 		// persist updated lot state
@@ -1135,7 +1126,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	// Include reason in message for operator visibility
 	msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
 		c[len(c)-1].Time.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, entryPortion+exitFee)
-	if t.cfg.Extended().UseDirectSlack {
+	if t.cfg.UseDirectSlack {
 		postSlack(msg)
 	}
 	// persist new state
@@ -1218,8 +1209,7 @@ func (t *Trader) snapshotStateLocked() BotState {
 		DailyStart:     t.dailyStart,
 		DailyPnL:       t.dailyPnL,
 		Model:          t.model,
-		MdlExt:         t.mdlExt,
-		WalkForwardMin: t.cfg.Extended().WalkForwardMin,
+		WalkForwardMin: t.cfg.WalkForwardMin,
 		LastFit:        t.lastFit,
 
 		BookBuy:  *t.book(SideBuy),
@@ -1291,9 +1281,6 @@ func (t *Trader) loadState() error {
 
 	if st.Model != nil {
 		t.model = st.Model
-	}
-	if st.MdlExt != nil {
-		t.mdlExt = st.MdlExt
 	}
 	if !st.LastFit.IsZero() {
 		t.lastFit = st.LastFit
@@ -1471,13 +1458,13 @@ func volRiskFactor(c []Candle) float64 {
 
 // shouldRefit returns true only when we allow a model (re)fit:
 // 1) len(history) >= cfg.MaxHistoryCandles, and
-// 2) optional walk-forward cadence satisfied (cfg.Extended().WalkForwardMin).
+// 2) optional walk-forward cadence satisfied (cfg.WalkForwardMin).
 // This is a guard only; it performs no fitting and emits no logs/metrics.
 func (t *Trader) shouldRefit(historyLen int) bool {
 	if historyLen < t.cfg.MaxHistoryCandles {
 		return false
 	}
-	min := t.cfg.Extended().WalkForwardMin
+	min := t.cfg.WalkForwardMin
 	if min <= 0 {
 		return true
 	}

@@ -8,7 +8,6 @@
 // Typical flow (see main.go):
 //
 //	loadBotEnv()
-//	initThresholdsFromEnv()
 //	cfg := loadConfigFromEnv()
 package main
 
@@ -111,16 +110,28 @@ type Config struct {
 	RepriceMinEdgeUSD     float64
 	RepriceMaxDriftBps    float64
 	RepriceMaxCount       int
-	BuyThreshold          float64
-	SellThreshold         float64
-	UseMAFilter           bool
-	
-    // Mirror (Gate2 bypass) ramping
-    MirrorEnabled           bool    // turn on/off
-    MirrorGateUSD           float64 // base gate, e.g., 0.020
-    MirrorGateSlopeUSD      float64 // per-index increment, e.g., 0.003
-    MirrorGateStartIdx      int     // start ramping at this nearest idx, e.g., 2
-    MirrorGateMaxUSD        float64 // cap the gate, e.g., 0.050
+
+	// Strategy thresholds
+	BuyThreshold  float64
+	SellThreshold float64
+	UseMAFilter   bool
+
+	// Unified AI — fee-aware horizon labels
+	AILabelHorizon int
+	AIFeeRatePct   float64
+	AIMinEdgePct   float64
+
+	// Runtime optional toggles retained from the old Extended() holder, but no model mode.
+	WalkForwardMin int  // minutes between live refits; 0 disables
+	VolRiskAdjust  bool // enable volatility-aware risk sizing
+	UseDirectSlack bool // true if SLACK_WEBHOOK is set
+
+	// Mirror (Gate2 bypass) ramping
+	MirrorEnabled      bool    // turn on/off
+	MirrorGateUSD      float64 // base gate, e.g., 0.020
+	MirrorGateSlopeUSD float64 // per-index increment, e.g., 0.003
+	MirrorGateStartIdx int     // start ramping at this nearest idx, e.g., 2
+	MirrorGateMaxUSD   float64 // cap the gate, e.g., 0.050
 }
 
 // loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
@@ -216,19 +227,50 @@ func loadConfigFromEnv() Config {
 		RepriceMaxDriftBps:    getEnvFloat("REPRICE_MAX_DRIFT_BPS", 1.5),
 		RepriceMaxCount:       getEnvInt("REPRICE_MAX_COUNT", 0),
 
+		// Strategy thresholds
 		BuyThreshold:  getEnvFloat("BUY_THRESHOLD", 0.55),
 		SellThreshold: getEnvFloat("SELL_THRESHOLD", 0.45),
 		UseMAFilter:   getEnvBool("USE_MA_FILTER", true),
-	}
-	// sensible defaults if unset
-	if cfg.MirrorGateUSD == 0 { cfg.MirrorGateUSD = cfg.ProfitGateUSD }
-	if cfg.MirrorGateSlopeUSD == 0 { cfg.MirrorGateSlopeUSD = 0.25 * cfg.MirrorGateUSD }
-	if cfg.MirrorGateStartIdx == 0 { cfg.MirrorGateStartIdx = 1 }
-	if cfg.MirrorGateMaxUSD == 0 { cfg.MirrorGateMaxUSD = cfg.ProfitGateUSD + cfg.MirrorGateSlopeUSD * 8 }
 
-	//dependency
-	if cfg.TrailActivateUSDRunner == 0 { cfg.TrailActivateUSDRunner = 8.0 * cfg.ProfitGateUSD }                               
-	if cfg.TrailActivateUSDScalp == 0 { cfg.TrailActivateUSDScalp = 4.0 * cfg.ProfitGateUSD }
+		// Unified AI — fee-aware labels
+		AILabelHorizon: getEnvInt("AI_LABEL_HORIZON", 15),
+		AIFeeRatePct:   getEnvFloat("AI_FEE_RATE_PCT", 0.10),
+		AIMinEdgePct:   getEnvFloat("AI_MIN_EDGE_PCT", 0.05),
+
+		// Runtime optional toggles
+		WalkForwardMin: getEnvInt("WALK_FORWARD_MIN", 0),
+		VolRiskAdjust:  getEnvBool("VOL_RISK_ADJUST", false),
+		UseDirectSlack: getEnv("SLACK_WEBHOOK", "") != "",
+
+		// Mirror (Gate2 bypass) ramping
+		MirrorEnabled:      getEnvBool("MIRROR_ENABLED", true),
+		MirrorGateUSD:      getEnvFloat("MIRROR_GATE_USD", 0.0),
+		MirrorGateSlopeUSD: getEnvFloat("MIRROR_GATE_SLOPE_USD", 0.0),
+		MirrorGateStartIdx: getEnvInt("MIRROR_GATE_START_IDX", 0),
+		MirrorGateMaxUSD:   getEnvFloat("MIRROR_GATE_MAX_USD", 0.0),
+	}
+
+	// sensible defaults if unset
+	if cfg.MirrorGateUSD == 0 {
+		cfg.MirrorGateUSD = cfg.ProfitGateUSD
+	}
+	if cfg.MirrorGateSlopeUSD == 0 {
+		cfg.MirrorGateSlopeUSD = 0.25 * cfg.MirrorGateUSD
+	}
+	if cfg.MirrorGateStartIdx == 0 {
+		cfg.MirrorGateStartIdx = 1
+	}
+	if cfg.MirrorGateMaxUSD == 0 {
+		cfg.MirrorGateMaxUSD = cfg.ProfitGateUSD + cfg.MirrorGateSlopeUSD*8
+	}
+
+	// dependency defaults
+	if cfg.TrailActivateUSDRunner == 0 {
+		cfg.TrailActivateUSDRunner = 8.0 * cfg.ProfitGateUSD
+	}
+	if cfg.TrailActivateUSDScalp == 0 {
+		cfg.TrailActivateUSDScalp = 4.0 * cfg.ProfitGateUSD
+	}
 
 	// Historical carry-over: if someone still sets BROKER=X, we may still
 	// want to validate it's present, but we no longer use it to select knobs.
@@ -286,35 +328,24 @@ func (c *Config) CandleResync() int {
 	return cr
 }
 
-// ---- Phase-7 toggles (append-only; no behavior changes unless envs set) ----
-
-// ModelMode selects the prediction path; baseline is the default.
-type ModelMode string
-
-const (
-	ModelModeBaseline ModelMode = "baseline"
-	ModelModeExtended ModelMode = "extended"
-)
-
-// ExtendedToggles exposes optional Phase-7 features without altering existing behavior.
-type ExtendedToggles struct {
-	ModelMode      ModelMode // baseline (default) or extended
-	WalkForwardMin int       // minutes between live refits; 0 disables
-	VolRiskAdjust  bool      // enable volatility-aware risk sizing
-	UseDirectSlack bool      // true if SLACK_WEBHOOK is set (optional direct pings)
+func (c *Config) WalkForwardCadenceMin() int {
+	return getEnvInt("WALK_FORWARD_MIN", c.WalkForwardMin)
 }
 
-// Extended reads optional Phase-7 toggles from env. Defaults preserve baseline behavior.
-func (c *Config) Extended() ExtendedToggles {
-	mm := ModelMode(getEnv("MODEL_MODE", string(ModelModeBaseline)))
-	if mm != ModelModeExtended {
-		mm = ModelModeBaseline
-	}
-	return ExtendedToggles{
-		ModelMode:      mm,
-		WalkForwardMin: getEnvInt("WALK_FORWARD_MIN", 0),
-		VolRiskAdjust:  getEnvBool("VOL_RISK_ADJUST", false),
-		UseDirectSlack: getEnv("SLACK_WEBHOOK", "") != "",
+func (c *Config) EnableVolRiskAdjust() bool {
+	return getEnvBool("VOL_RISK_ADJUST", c.VolRiskAdjust)
+}
+
+func (c *Config) DirectSlackEnabled() bool {
+	return getEnv("SLACK_WEBHOOK", "") != "" || c.UseDirectSlack
+}
+
+func (c *Config) FeatureLabelConfig() FeatureLabelConfig {
+	return FeatureLabelConfig{
+		Horizon:     getEnvInt("AI_LABEL_HORIZON", c.AILabelHorizon),
+		FeeRatePct:  getEnvFloat("AI_FEE_RATE_PCT", c.AIFeeRatePct),
+		MinEdgePct: getEnvFloat("AI_MIN_EDGE_PCT", c.AIMinEdgePct),
+		MinRows:    100,
 	}
 }
 
