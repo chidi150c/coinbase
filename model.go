@@ -96,8 +96,8 @@ func ComputePUp(c []Candle, mdl *LogisticModel) float64 {
 // fit keeps the old call style alive while using the new unified dataset path.
 func (m *LogisticModel) fit(c []Candle, lr float64, epochs int) {
 	cfg := FeatureLabelConfig{
-		Horizon:     15,
-		FeeRatePct:  0.10,
+		Horizon:    15,
+		FeeRatePct: 0.10,
 		MinEdgePct: 0.05,
 		MinRows:    100,
 	}
@@ -219,7 +219,95 @@ func (m *LogisticModel) FitMiniBatch(feats [][]float64, labels []float64, lr flo
 	m.W = bestW
 	m.B = bestB
 
-	log.Printf("[MODEL] trained rows=%d feat_dim=%d loss=%.6f", len(feats), m.FeatDim, bestLoss)
+	log.Printf(
+		"[MODEL] trained rows=%d feat_dim=%d loss=%.6f",
+		len(feats),
+		m.FeatDim,
+		bestLoss,
+	)
+	m.logFitReport(feats, labels)
+}
+
+func (m *LogisticModel) logFitReport(feats [][]float64, labels []float64) {
+	if m == nil || len(feats) == 0 || len(labels) == 0 || len(feats) != len(labels) {
+		return
+	}
+
+	var correct, tp, tn, fp, fn int
+	var upSum, downSum float64
+	var upN, downN int
+
+	for i := range feats {
+		p := m.Predict(feats[i])
+
+		pred := 0.0
+		if p >= 0.5 {
+			pred = 1.0
+		}
+
+		y := labels[i]
+
+		if pred == y {
+			correct++
+		}
+
+		switch {
+		case pred == 1 && y == 1:
+			tp++
+		case pred == 0 && y == 0:
+			tn++
+		case pred == 1 && y == 0:
+			fp++
+		case pred == 0 && y == 1:
+			fn++
+		}
+
+		if y == 1 {
+			upSum += p
+			upN++
+		} else {
+			downSum += p
+			downN++
+		}
+	}
+
+	acc := float64(correct) / float64(len(labels))
+
+	precision := 0.0
+	if tp+fp > 0 {
+		precision = float64(tp) / float64(tp+fp)
+	}
+
+	recall := 0.0
+	if tp+fn > 0 {
+		recall = float64(tp) / float64(tp+fn)
+	}
+
+	avgUp := 0.0
+	if upN > 0 {
+		avgUp = upSum / float64(upN)
+	}
+
+	avgDown := 0.0
+	if downN > 0 {
+		avgDown = downSum / float64(downN)
+	}
+
+	log.Printf(
+		"[MODEL_FIT] rows=%d feat_dim=%d acc=%.4f precision=%.4f recall=%.4f tp=%d tn=%d fp=%d fn=%d avg_up=%.5f avg_down=%.5f separation=%.5f",
+		len(labels),
+		m.FeatDim,
+		acc,
+		precision,
+		recall,
+		tp,
+		tn,
+		fp,
+		fn,
+		avgUp,
+		avgDown,
+		avgUp-avgDown,
+	)
 }
 
 func (m *LogisticModel) loss(feats [][]float64, labels []float64) float64 {
