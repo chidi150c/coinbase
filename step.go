@@ -1417,6 +1417,18 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		}
 	}
 
+	if !(equityTriggerSell || equityTriggerBuy) {
+		confMult := confidenceRiskMultiplier(d.Signal, d.PUp)
+		if confMult > 0 {
+			oldQuote := quote
+			quote *= confMult
+			log.Printf(
+				"TRACE sizing.confidence side=%s pUp=%.5f mult=%.2f quote_before=%.2f quote_after=%.2f",
+				side, d.PUp, confMult, oldQuote, quote,
+			)
+		}
+	}
+
 	// Ensure we respect the exchange minimum notional
 	if quote < minNotional {
 		quote = minNotional
@@ -2603,5 +2615,39 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 	if len(book.Lots) == 1 {
 		padSingleLot(book.Lots[0])
 	}
+}
+
+func confidenceRiskMultiplier(sig Signal, pUp float64) float64 {
+	if sig == Buy {
+		switch {
+		case pUp >= 0.62:
+			return 1.00
+		case pUp >= 0.58:
+			return 0.85
+		case pUp >= 0.55:
+			return 0.65
+		case pUp >= 0.52:
+			return 0.40
+		default:
+			return 1.00
+		}
+	}
+
+	if sig == Sell {
+		switch {
+		case pUp <= 0.38:
+			return 1.00
+		case pUp <= 0.42:
+			return 0.85
+		case pUp <= 0.45:
+			return 0.65
+		case pUp <= 0.47:
+			return 0.40
+		default:
+			return 1.00
+		}
+	}
+
+	return 1.00
 }
 

@@ -10,3 +10,18 @@ chidi@localhost:~/coinbase/monitoring$ ls
 alertmanager  docker-compose.override.yml  docker-compose.prod.yml  docker-compose.yml  grafana  nohup.out  order.json  order_response.json  prometheus
 chidi@localhost:~/coinbase/monitoring$
 
+
+
+Stop only the monitoring containers and leave trading alive.
+
+Run:
+
+docker stop monitoring-grafana-1 \
+monitoring-prometheus-1 \
+monitoring-alertmanager-1 \
+monitoring-bot-1 \
+monitoring-bridge-1
+
+Then verify:
+
+docker ps
