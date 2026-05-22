@@ -36,18 +36,16 @@ package main
 
 import "math"
 
-const UnifiedFeatureDim = 16
+const UnifiedFeatureDim = 20
 
 // FeatureSnapshot contains the unified feature vector plus the soft-gate booleans
 // that are useful for decision audit strings and logs.
 type FeatureSnapshot struct {
 	X []float64
-
 	HighPeak         bool
 	LowBottom        bool
 	PriceDownGoingUp bool
 	PriceUpGoingDown bool
-
 	EMAFast          float64
 	EMASlow          float64
 	EMAFastPrev3     float64
@@ -56,6 +54,14 @@ type FeatureSnapshot struct {
 	EMAAlignStrength float64
 	MACDHist      float64
 	MACDHistDelta float64
+	EMA20           float64
+	EMA50           float64
+	EMA20Prev3      float64
+	EMA50Prev3      float64
+	EMA2050Spread   float64
+	EMA2050Strength float64
+	EMA20Slope      float64
+	EMA50Slope      float64
 }
 
 // BuildFeatureSnapshot builds the unified feature vector at candle index idx.
@@ -82,6 +88,8 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	ema4 := EMA(close, 4)
 	ema8 := EMA(close, 8)
 	_, _, macdHist := MACD(close, 12, 26, 9)
+	ema20 := EMA(close, 20)
+	ema50 := EMA(close, 50)	
 
 	fast := ema4[idx]
 	slow := ema8[idx]
@@ -92,6 +100,10 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	histNow := macdHist[idx]
 	histPrev := macdHist[idx-1]
 	histDelta := histNow - histPrev
+	mid := ema20[idx]
+	long := ema50[idx]
+	midPrev3 := ema20[idx-3]
+	longPrev3 := ema50[idx-3]
 
 	highPeak := false
 	lowBottom := false
@@ -111,6 +123,10 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	volPct := safeRatio(std20[idx], c[idx].Close)
 	emaSpreadPct := safeRatio(fast-slow, c[idx].Close)
 	emaAlignStrength := math.Abs(emaSpreadPct)
+	ema2050Spread := safeRatio(mid-long, c[idx].Close)
+	ema2050Strength := math.Abs(ema2050Spread)
+	ema20Slope := safeRatio(mid-midPrev3, midPrev3)
+	ema50Slope := safeRatio(long-longPrev3, longPrev3)
 
 	recentHigh, recentLow := recentHighLow(c, idx, 20)
 	distHighPct := 0.0
@@ -139,6 +155,10 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 		distLowPct,
 		histNow,
 		histDelta,
+		ema2050Spread,
+		ema2050Strength,
+		ema20Slope,
+		ema50Slope,
 	}
 
 	if len(x) != UnifiedFeatureDim || hasBadFloat(x) {
@@ -159,6 +179,14 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 		EMAAlignStrength: emaAlignStrength,
 		MACDHist:         histNow,
 		MACDHistDelta:    histDelta,
+		EMA20:            mid,
+		EMA50:            long,
+		EMA20Prev3:       midPrev3,
+		EMA50Prev3:       longPrev3,
+		EMA2050Spread:    ema2050Spread,
+		EMA2050Strength:  ema2050Strength,
+		EMA20Slope:       ema20Slope,
+		EMA50Slope:       ema50Slope,
 	}
 	return out, true
 }
