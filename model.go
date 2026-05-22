@@ -95,12 +95,8 @@ func ComputePUp(c []Candle, mdl *LogisticModel) float64 {
 
 // fit keeps the old call style alive while using the new unified dataset path.
 func (m *LogisticModel) fit(c []Candle, lr float64, epochs int) {
-	cfg := FeatureLabelConfig{
-		Horizon:    15,
-		FeeRatePct: 0.10,
-		MinEdgePct: 0.05,
-		MinRows:    100,
-	}
+	cfgObj := loadConfigFromEnv()
+	cfg := cfgObj.FeatureLabelConfig()
 
 	feats, labels := BuildFeaturesAndLabels(c, cfg)
 	if len(feats) == 0 || len(labels) == 0 {
