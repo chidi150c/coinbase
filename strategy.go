@@ -112,7 +112,7 @@ func decide(c []Candle, mdl *LogisticModel, buyThreshold float64, sellThreshold 
 	}
 
 	reason := fmt.Sprintf(
-		"pUp=%.5f, ema4=%.2f vs ema8=%.2f, ema4_3rd=%.2f vs ema8_3rd=%.2f, emaSpreadPct=%.6f, emaAlign=%.6f, macdHist=%.5f, macdDelta=%.5f",
+		"pUp=%.5f, ema4=%.2f vs ema8=%.2f, ema4_3rd=%.2f vs ema8_3rd=%.2f, emaSpreadPct=%.6f, emaAlign=%.6f, macdHist=%.5f, macdDelta=%.5f, ema2050Spread=%.6f, ema20Slope=%.6f, ema50Slope=%.6f",
 		pUp,
 		snap.EMAFast,
 		snap.EMASlow,
@@ -122,6 +122,9 @@ func decide(c []Candle, mdl *LogisticModel, buyThreshold float64, sellThreshold 
 		snap.EMAAlignStrength,
 		snap.MACDHist,
 		snap.MACDHistDelta,
+		snap.EMA2050Spread,
+		snap.EMA20Slope,
+		snap.EMA50Slope,
 	)
 
 	base := Decision{
