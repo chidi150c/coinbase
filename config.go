@@ -340,12 +340,15 @@ func (c *Config) DirectSlackEnabled() bool {
 
 func (c *Config) FeatureLabelConfig() FeatureLabelConfig {
 	return FeatureLabelConfig{
-		Horizon:     getEnvInt("AI_LABEL_HORIZON", c.AILabelHorizon),
-		FeeRatePct: getEnvFloat("FEE_RATE_PCT", c.FeeRatePct),
-		MinEdgePct: getEnvFloat("AI_MIN_EDGE_PCT", c.AIMinEdgePct),
-		MinRows:    100,
-		ProfitGateUSD: getEnvFloat("PROFIT_GATE_USD", c.ProfitGateUSD),
-		BaseSizeUSD:   getEnvFloat("RISK_PER_TRADE_USD", c.RiskPerTradeUSD),
+		Horizon:         getEnvInt("AI_LABEL_HORIZON", c.AILabelHorizon),
+		FeeRatePct:      getEnvFloat("FEE_RATE_PCT", c.FeeRatePct),
+		MinEdgePct:      getEnvFloat("AI_MIN_EDGE_PCT", c.AIMinEdgePct),
+		MinRows:         100,
+		ProfitGateUSD:   getEnvFloat("PROFIT_GATE_USD", c.ProfitGateUSD),
+		BaseSizeUSD:     getEnvFloat("RISK_PER_TRADE_USD", c.RiskPerTradeUSD),
+		MinedLabelsFile: getEnv("AI_MINED_LABELS_FILE", "/opt/coinbase/state/mined_labels_binance.jsonl"),
+		MinedMaxRows:    getEnvInt("AI_MINED_MAX_ROWS", 10000),
+		Symbol:          getEnv("PRODUCT_ID", c.ProductID),
 	}
 }
 

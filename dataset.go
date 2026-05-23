@@ -4,6 +4,7 @@ package main
 import (
 	"log"
 	"math"
+	"time"
 )
 
 type FeatureLabelConfig struct {
@@ -13,8 +14,11 @@ type FeatureLabelConfig struct {
 	MinRows    int
 
 	// Path-based net-profit labeling.
-	ProfitGateUSD float64
-	BaseSizeUSD   float64
+	ProfitGateUSD   float64
+	BaseSizeUSD     float64
+	MinedLabelsFile string
+	MinedMaxRows    int
+	Symbol          string
 }
 
 func BuildFeaturesAndLabels(c []Candle, cfg FeatureLabelConfig) ([][]float64, []float64) {
@@ -134,6 +138,20 @@ func BuildFeaturesAndLabels(c []Candle, cfg FeatureLabelConfig) ([][]float64, []
 		if !good {
 			bad++
 			continue
+		}
+
+		if cfg.MinedLabelsFile != "" {
+			appendMinedLabel(cfg.MinedLabelsFile, MinedLabelRow{
+				TS:         c[i].Time.Format(time.RFC3339),
+				Symbol:     cfg.Symbol,
+				Y:          label,
+				X:          features,
+				LabelType:  "path_net_profit",
+				ProfitUSD:  profitUSD,
+				BaseUSD:    baseUSD,
+				Horizon:    horizon,
+				FeatureDim: len(features),
+			}, cfg.MinedMaxRows)
 		}
 
 		X = append(X, features)

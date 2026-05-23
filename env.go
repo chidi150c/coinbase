@@ -99,6 +99,9 @@ func loadBotEnv() {
 		// unified AI / fee-aware labels
 		"AI_LABEL_HORIZON": {},
 		"AI_MIN_EDGE_PCT":  {},
+		// persistent mined labels
+		"AI_MINED_LABELS_FILE": {},
+		"AI_MINED_MAX_ROWS":    {},
 
 		// ---- pyramiding/env-driven knobs ----
 		"ALLOW_PYRAMIDING":            {},
