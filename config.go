@@ -118,7 +118,6 @@ type Config struct {
 
 	// Unified AI — fee-aware horizon labels
 	AILabelHorizon int
-	AIFeeRatePct   float64
 	AIMinEdgePct   float64
 
 	// Runtime optional toggles retained from the old Extended() holder, but no model mode.
@@ -152,7 +151,7 @@ func loadConfigFromEnv() Config {
 		MinNotional:         getEnvFloat("MIN_NOTIONAL", 10.0), // preferred when > 0
 		LongOnly:            getEnvBool("LONG_ONLY", true),
 		RequireBaseForShort: getEnvBool("REQUIRE_BASE_FOR_SHORT", true),
-		FeeRatePct:          getEnvFloat("FEE_RATE_PCT", 0.3),
+		FeeRatePct:          getEnvFloat("FEE_RATE_PCT", 0.10),
 
 		// Venue filters (can be hydrated by bridge and/or env file)
 		PriceTick: getEnvFloat("PRICE_TICK", 0.01),
@@ -234,7 +233,6 @@ func loadConfigFromEnv() Config {
 
 		// Unified AI — fee-aware labels
 		AILabelHorizon: getEnvInt("AI_LABEL_HORIZON", 15),
-		AIFeeRatePct:   getEnvFloat("AI_FEE_RATE_PCT", 0.10),
 		AIMinEdgePct:   getEnvFloat("AI_MIN_EDGE_PCT", 0.05),
 
 		// Runtime optional toggles
@@ -343,9 +341,11 @@ func (c *Config) DirectSlackEnabled() bool {
 func (c *Config) FeatureLabelConfig() FeatureLabelConfig {
 	return FeatureLabelConfig{
 		Horizon:     getEnvInt("AI_LABEL_HORIZON", c.AILabelHorizon),
-		FeeRatePct:  getEnvFloat("AI_FEE_RATE_PCT", c.AIFeeRatePct),
+		FeeRatePct: getEnvFloat("FEE_RATE_PCT", c.FeeRatePct),
 		MinEdgePct: getEnvFloat("AI_MIN_EDGE_PCT", c.AIMinEdgePct),
 		MinRows:    100,
+		ProfitGateUSD: getEnvFloat("PROFIT_GATE_USD", c.ProfitGateUSD),
+		BaseSizeUSD:   getEnvFloat("RISK_PER_TRADE_USD", c.RiskPerTradeUSD),
 	}
 }
 

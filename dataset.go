@@ -7,10 +7,14 @@ import (
 )
 
 type FeatureLabelConfig struct {
-	Horizon     int
-	FeeRatePct  float64
+	Horizon    int
+	FeeRatePct float64
 	MinEdgePct float64
-	MinRows     int
+	MinRows    int
+
+	// Path-based net-profit labeling.
+	ProfitGateUSD float64
+	BaseSizeUSD   float64
 }
 
 func BuildFeaturesAndLabels(c []Candle, cfg FeatureLabelConfig) ([][]float64, []float64) {
@@ -39,7 +43,21 @@ func BuildFeaturesAndLabels(c []Candle, cfg FeatureLabelConfig) ([][]float64, []
 		minRows = 100
 	}
 
+	profitUSD := cfg.ProfitGateUSD
+	if profitUSD <= 0 {
+		profitUSD = 1.0
+	}
+
+	baseUSD := cfg.BaseSizeUSD
+	if baseUSD <= 0 {
+		baseUSD = 80.0
+	}
+
+	// Kept for logging/comparison. This is the old final-close edge threshold.
 	edge := (feeRatePct*2.0 + minEdgePct) / 100.0
+
+	// Round-trip fee fraction used by the path-based target calculation.
+	fee := (feeRatePct * 2.0) / 100.0
 
 	var X [][]float64
 	var y []float64
@@ -60,31 +78,42 @@ func BuildFeaturesAndLabels(c []Candle, cfg FeatureLabelConfig) ([][]float64, []
 
 	for i := start; i < end; i++ {
 		curClose := c[i].Close
-		futureClose := c[i+horizon].Close
-
-		if curClose <= 0 || futureClose <= 0 {
+		if curClose <= 0 {
 			bad++
 			continue
 		}
 
-		futureRet := (futureClose - curClose) / curClose
+		size := baseUSD / curClose
+		if size <= 0 {
+			bad++
+			continue
+		}
+
+		buyTarget := curClose * (1.0 + (profitUSD / (curClose * size)) + fee)
+
+		sellTarget := curClose * (1.0 - (profitUSD / (curClose * size)) - fee)
 
 		var label float64
 		keep := false
 
-		if futureRet > edge {
-			label = 1.0
-			up++
-			keep = true
-		} else if futureRet < -edge {
-			label = 0.0
-			down++
-			keep = true
-		} else {
-			skipped++
+		for j := i + 1; j <= i+horizon; j++ {
+			if c[j].High >= buyTarget {
+				label = 1.0
+				up++
+				keep = true
+				break
+			}
+
+			if c[j].Low <= sellTarget {
+				label = 0.0
+				down++
+				keep = true
+				break
+			}
 		}
 
 		if !keep {
+			skipped++
 			continue
 		}
 
@@ -117,8 +146,8 @@ func BuildFeaturesAndLabels(c []Candle, cfg FeatureLabelConfig) ([][]float64, []
 	}
 
 	log.Printf(
-		"[DATASET] total=%d labeled=%d up=%d down=%d skipped=%d bad=%d edge=%.4f horizon=%d feat_dim=%d",
-		total, len(X), up, down, skipped, bad, edge, horizon, featDim,
+		"[DATASET] total=%d labeled=%d up=%d down=%d skipped=%d bad=%d edge=%.4f horizon=%d feat_dim=%d profitUSD=%.2f baseUSD=%.2f",
+		total, len(X), up, down, skipped, bad, edge, horizon, featDim, profitUSD, baseUSD,
 	)
 
 	if len(X) < minRows {

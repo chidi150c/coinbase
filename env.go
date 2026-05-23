@@ -98,7 +98,6 @@ func loadBotEnv() {
 
 		// unified AI / fee-aware labels
 		"AI_LABEL_HORIZON": {},
-		"AI_FEE_RATE_PCT":  {},
 		"AI_MIN_EDGE_PCT":  {},
 
 		// ---- pyramiding/env-driven knobs ----
