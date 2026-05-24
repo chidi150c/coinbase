@@ -98,7 +98,59 @@ func (m *LogisticModel) fit(c []Candle, lr float64, epochs int) {
 	cfgObj := loadConfigFromEnv()
 	cfg := cfgObj.FeatureLabelConfig()
 
-	feats, labels := BuildFeaturesAndLabels(c, cfg)
+	
+
+	rollingFeats, rollingLabels := BuildFeaturesAndLabels(c, cfg)
+
+	feats := rollingFeats
+	labels := rollingLabels
+
+	mined := loadMinedLabels(cfg.MinedLabelsFile)
+
+	var minedUp, minedDown int
+	for _, r := range mined {
+		if r.Y >= 0.5 {
+			minedUp++
+		} else {
+			minedDown++
+		}
+	}
+
+	const minedMinRows = 500
+
+	if len(mined) >= minedMinRows &&
+		minedUp > 0 &&
+		minedDown > 0 {
+
+		for _, r := range mined {
+			if len(r.X) == 0 {
+				continue
+			}
+
+			feats = append(feats, r.X)
+			labels = append(labels, r.Y)
+		}
+
+		log.Printf(
+			"[MINED_LABELS] loaded rows=%d up=%d down=%d",
+			len(mined),
+			minedUp,
+			minedDown,
+		)
+	} else {
+		log.Printf(
+			"[MINED_LABELS] skipped rows=%d up=%d down=%d min_rows=%d",
+			len(mined),
+			minedUp,
+			minedDown,
+			minedMinRows,
+		)
+	}
+
+
+
+
+
 	if len(feats) == 0 || len(labels) == 0 {
 		log.Printf("TRACE model.train.skip reason=no_dataset")
 		return

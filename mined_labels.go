@@ -4,6 +4,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 )
@@ -26,11 +27,26 @@ func appendMinedLabel(path string, row MinedLabelRow, maxRows int) {
 	}
 
 	rows := loadMinedLabels(path)
-	key := row.TS + "|" + row.Symbol + "|" + stringLabel(row.Y)
+
+	makeKey := func(r MinedLabelRow) string {
+		return r.TS + "|" +
+			r.Symbol + "|" +
+			r.LabelType + "|" +
+			stringLabel(r.Y) + "|" +
+			fmt.Sprintf(
+				"%.2f|%.2f|%d|%d",
+				r.ProfitUSD,
+				r.BaseUSD,
+				r.Horizon,
+				r.FeatureDim,
+			)
+	}
+
+	key := makeKey(row)
 
 	seen := make(map[string]bool, len(rows)+1)
 	for _, r := range rows {
-		seen[r.TS+"|"+r.Symbol+"|"+stringLabel(r.Y)] = true
+		seen[makeKey(r)] = true
 	}
 
 	if seen[key] {
