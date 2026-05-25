@@ -280,7 +280,7 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 						// TODO: remove TRACE
 						log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
 						log.Printf("[SYNC] latest=%s history_last=%s len=%d", latest.Time, history[len(history)-1].Time, len(history))
-					} else if err != nil {
+					}  if err != nil {
 						log.Fatalf("[SYNC] Candle update failed: error: %v", err)
 					}
 				}
@@ -860,7 +860,7 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 		return nil, fmt.Errorf("unsupported granularity: %s", granularity)
 	}
 
-	end := time.Now().UTC().Add(-20 * time.Second)
+	end := time.Now().UTC().Truncate(time.Duration(secPer) * time.Second) 
 	out := make([]Candle, 0, want+1024)
 	seen := make(map[int64]struct{})
 
@@ -1157,3 +1157,4 @@ func debugPUp(history []Candle, mdl *LogisticModel) float64 {
 
 	return mdl.Predict(snap.X)
 }
+else
