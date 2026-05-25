@@ -15,7 +15,10 @@ package main
 // API creds remain broker-prefixed (e.g., BINANCE_API_KEY/SECRET, HITBTC_API_KEY/SECRET)
 // and are consumed by the respective broker clients, not here.
 
-import "strings"
+import (
+	"log"
+	"strings"
+)
 
 // Config holds all runtime knobs for trading and operations.
 type Config struct {
@@ -283,6 +286,24 @@ func loadConfigFromEnv() Config {
 
 func (c *Config) UseLiveEquity() bool {
 	return getEnvBool("USE_LIVE_EQUITY", c.LiveEquity)
+}
+
+func (c *Config) SignalTF() string {
+	tf := strings.ToLower(
+		strings.TrimSpace(
+			getEnv("AI_SIGNAL_TF", "5m"),
+		),
+	)
+
+	if timeframeToGranularity(tf) == "" {
+		log.Printf(
+			"[WARN] invalid AI_SIGNAL_TF=%s fallback=5m",
+			tf,
+		)
+		return "5m"
+	}
+
+	return tf
 }
 
 func (c *Config) SetPriceTick() {

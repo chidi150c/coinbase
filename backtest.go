@@ -162,7 +162,7 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *Log
 			return
 		default:
 		}
-		msg, _ := trader.step(ctx, test[:i+1])
+		msg, _ := trader.step(ctx, test[:i+1], test[:i+1])
 
 		// Keep Prometheus equity gauge in sync each tick
 		mtxPnL.Set(trader.EquityUSD())

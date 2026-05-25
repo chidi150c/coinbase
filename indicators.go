@@ -2,9 +2,9 @@
 // Package main – Technical indicators for the trading bot.
 //
 // This file implements lightweight TA helpers used by the strategy/model:
-//   • SMA(c, n)     – Simple Moving Average of Close
-//   • RSI(c, n)     – Relative Strength Index (Wilder’s smoothing)
-//   • ZScore(c, n)  – Rolling Z-Score of Close
+//   - SMA(c, n)     – Simple Moving Average of Close
+//   - RSI(c, n)     – Relative Strength Index (Wilder’s smoothing)
+//   - ZScore(c, n)  – Rolling Z-Score of Close
 //
 // Notes
 //   - All functions accept a slice of Candle (defined in strategy.go).
@@ -178,6 +178,25 @@ func MACD(close []float64, fast, slow, signal int) (macd, signalLine, hist []flo
 		hist[i] = macd[i] - signalLine[i]
 	}
 	return
+}
+
+func macdHistSlope(c []Candle) (float64, bool) {
+	if len(c) < 40 {
+		return 0, false
+	}
+
+	closePx := make([]float64, len(c))
+	for i := range c {
+		closePx[i] = c[i].Close
+	}
+
+	_, _, hist := MACD(closePx, 12, 26, 9)
+	if len(hist) < 2 {
+		return 0, false
+	}
+
+	n := len(hist)
+	return hist[n-1] - hist[n-2], true
 }
 
 // OBV computes On-Balance Volume over candles and returns a cumulative series.

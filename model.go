@@ -83,15 +83,6 @@ func (m *LogisticModel) fit(c []Candle, lr float64, epochs int) {
 
 	rollingFeats, rollingLabels := BuildFeaturesAndLabels(c, cfg)
 
-	cfg3m := cfg
-	cfg3m.Horizon = getEnvInt("AI_LABEL_HORIZON_3M", 20)
-	cfg3m.MinedLabelsFile = getEnv("AI_MINED_LABELS_FILE_3M", "/opt/coinbase/state/mined_labels_binance_3m.jsonl")
-
-	candles3m := AggregateCandles(c, 3*time.Minute)
-	if len(candles3m) > 0 {
-		_, _ = BuildFeaturesAndLabels(candles3m, cfg3m)
-	}
-
 	feats := rollingFeats
 	labels := rollingLabels
 

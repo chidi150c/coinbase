@@ -32,6 +32,10 @@ import (
 
 // runLive executes the real-time loop with cadence intervalSec (seconds).
 func runLive(ctx context.Context, trader *Trader, model *LogisticModel, intervalSec int) {
+
+	var history []Candle       // keep as 1m/tick execution history
+	var signalHistory []Candle // new 5m decision history
+
 	if intervalSec <= 0 {
 		intervalSec = 60
 	}
@@ -106,11 +110,17 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 		log.Fatalf("[BOOT] exchange filters unavailable for %s last Check; refusing to trade without LOT_SIZE.stepSize and PRICE_FILTER.tickSize (post-only limits disabled) — ensure bridge /exchange/filters is populated or provide valid overrides: error: %v", trader.cfg.ProductID, err)
 	}
 	// Warmup candles (paged backfill from bridge to MaxHistoryCandles; else large single fetch from the broker)
-	var history []Candle
 	target := trader.cfg.MaxHistoryCandles
 	if target <= 0 {
 		target = 6000
 	}
+
+	signalTF := trader.cfg.SignalTF()
+	signalGranularity := timeframeToGranularity(signalTF)
+	if signalGranularity == "" {
+		log.Fatalf("unsupported AI_SIGNAL_TF=%s", signalTF)
+	}
+	log.Printf("[SIGNAL] tf=%s granularity=%s", signalTF, signalGranularity)
 
 	if trader.cfg.BridgeURL != "" {
 		log.Printf("TRACE WARMUP using bridge paged fetch tries=10 pageLimit=300 target=%d", target)
@@ -179,8 +189,61 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 		log.Fatalf("warmup failed: no candles returned")
 	}
 
-	// Fit the tiny model
-	model.fit(history, 0.05, 4)
+	// Warmup signal candles separately.
+	// history remains the execution history (1m/tick); signalHistory is used only for ML direction.
+	if trader.cfg.BridgeURL != "" {
+		log.Printf("TRACE SIGNAL_WARMUP using bridge paged fetch tries=10 pageLimit=300 target=%d tf=%s granularity=%s", target, signalTF, signalGranularity)
+		const tries = 10
+		for i := 0; i < tries && len(signalHistory) == 0; i++ {
+			log.Printf("TRACE SIGNAL_WARMUP attempt=%d (bridge paged)", i+1)
+			if hs, err := fetchHistoryPaged(trader.cfg.BridgeURL, trader.cfg.ProductID, signalGranularity, 300, target); err == nil && len(hs) > 0 {
+				signalHistory = hs
+				log.Printf("[BOOT] signal_history=%d tf=%s granularity=%s (paged to %d target)", len(signalHistory), signalTF, signalGranularity, target)
+				break
+			} else if err != nil {
+				log.Printf("[BOOT] signal paged warmup error: %v", err)
+				time.Sleep(3 * time.Second)
+			} else {
+				log.Printf("TRACE SIGNAL_WARMUP bridge paged returned 0 rows (attempt=%d)", i+1)
+				time.Sleep(1 * time.Second)
+			}
+		}
+	}
+
+	if len(signalHistory) == 0 {
+		limitTry := target
+		if limitTry < 200 {
+			limitTry = 200
+		}
+		log.Printf("TRACE SIGNAL_WARMUP broker large batch path limitTry=%d product=%s tf=%s granularity=%s", limitTry, trader.cfg.ProductID, signalTF, signalGranularity)
+		if cs, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, signalGranularity, limitTry); err == nil && len(cs) > 0 {
+			signalHistory = cs
+			log.Printf("[BOOT] signal_history=%d tf=%s granularity=%s (broker large batch, limit=%d)", len(signalHistory), signalTF, signalGranularity, limitTry)
+		} else if err != nil {
+			log.Printf("TRACE SIGNAL_WARMUP broker large batch error: %v", err)
+			log.Printf("TRACE SIGNAL_WARMUP broker fallback limit=350")
+			if cs2, err2 := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, signalGranularity, 350); err2 == nil && len(cs2) > 0 {
+				signalHistory = cs2
+				log.Printf("[BOOT] signal_history=%d tf=%s granularity=%s (broker fallback, limit=350)", len(signalHistory), signalTF, signalGranularity)
+			} else {
+				log.Printf("signal warmup GetRecentCandles error: %v", err)
+				if err2 != nil {
+					log.Printf("TRACE SIGNAL_WARMUP broker fallback error: %v", err2)
+				} else {
+					log.Printf("TRACE SIGNAL_WARMUP broker fallback returned 0 rows")
+				}
+			}
+		} else {
+			log.Printf("TRACE SIGNAL_WARMUP broker large batch returned 0 rows (limitTry=%d)", limitTry)
+		}
+	}
+
+	if len(signalHistory) == 0 {
+		log.Fatalf("signal warmup failed: no candles returned for tf=%s granularity=%s", signalTF, signalGranularity)
+	}
+
+	// Fit the tiny model on the signal history only.
+	model.fit(signalHistory, 0.05, 4)
 
 	var lastRefit *time.Time
 
@@ -280,6 +343,27 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 						// TODO: remove TRACE
 						log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
 						log.Printf("[SYNC] latest=%s history_last=%s len=%d", latest.Time, history[len(history)-1].Time, len(history))
+
+						if sigSlice, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, signalGranularity, 1); err == nil && len(sigSlice) > 0 {
+							sigLatest := sigSlice[len(sigSlice)-1]
+							if sigLatest.Time.IsZero() {
+								sigLatest.Time = time.Now().UTC()
+							}
+							beforeSignalPUp := debugPUp(signalHistory, model)
+							if len(signalHistory) == 0 || sigLatest.Time.After(signalHistory[len(signalHistory)-1].Time) {
+								signalHistory = append(signalHistory, sigLatest)
+							} else {
+								signalHistory[len(signalHistory)-1] = sigLatest
+							}
+							if len(signalHistory) > trader.cfg.MaxHistoryCandles {
+								signalHistory = signalHistory[len(signalHistory)-trader.cfg.MaxHistoryCandles:]
+							}
+							afterSignalPUp := debugPUp(signalHistory, model)
+							log.Printf("[SIGNAL_SYNC] tf=%s granularity=%s latest=%s signal_last=%s len=%d pUpBefore=%.5f pUpAfter=%.5f deltaPUp=%.5f",
+								signalTF, signalGranularity, sigLatest.Time, signalHistory[len(signalHistory)-1].Time, len(signalHistory), beforeSignalPUp, afterSignalPUp, afterSignalPUp-beforeSignalPUp)
+						} else if err != nil {
+							log.Fatalf("[SIGNAL_SYNC] signal candle update failed tf=%s granularity=%s error=%v", signalTF, signalGranularity, err)
+						}
 					} else if err != nil {
 						log.Fatalf("[SYNC] Candle update failed: error: %v", err)
 					}
@@ -329,10 +413,10 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 				cancelPx()
 
 				// Walk-forward refit (optional)
-				lastRefit, model = maybeWalkForwardRefit(trader.cfg, model, history, lastRefit)
+				lastRefit, model = maybeWalkForwardRefit(trader.cfg, model, signalHistory, lastRefit)
 
 				// Step trader
-				msg, err := trader.step(ctx, history)
+				msg, err := trader.step(ctx, history, signalHistory)
 				if err != nil {
 					log.Printf("step err: %v", err)
 					time.Sleep(time.Duration(trader.cfg.TickInterval()) * time.Second)
@@ -435,12 +519,30 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 					history = history[len(history)-trader.cfg.MaxHistoryCandles:]
 				}
 
+				if sigSlice, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, signalGranularity, 1); err == nil && len(sigSlice) > 0 {
+					sigLatest := sigSlice[len(sigSlice)-1]
+					if sigLatest.Time.IsZero() {
+						sigLatest.Time = time.Now().UTC()
+					}
+					if len(signalHistory) == 0 || sigLatest.Time.After(signalHistory[len(signalHistory)-1].Time) {
+						signalHistory = append(signalHistory, sigLatest)
+					} else {
+						signalHistory[len(signalHistory)-1] = sigLatest
+					}
+					if len(signalHistory) > trader.cfg.MaxHistoryCandles {
+						signalHistory = signalHistory[len(signalHistory)-trader.cfg.MaxHistoryCandles:]
+					}
+					log.Printf("[SIGNAL_SYNC] tf=%s granularity=%s latest=%s signal_last=%s len=%d", signalTF, signalGranularity, sigLatest.Time, signalHistory[len(signalHistory)-1].Time, len(signalHistory))
+				} else if err != nil {
+					log.Fatalf("[SIGNAL_SYNC] signal candle update failed tf=%s granularity=%s error=%v", signalTF, signalGranularity, err)
+				}
+
 				// TODO: remove TRACE
-				log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
+				log.Printf("TRACE history readiness len=%d need=%d signal_len=%d", len(history), trader.cfg.MaxHistoryCandles, len(signalHistory))
 
-				lastRefit, model = maybeWalkForwardRefit(trader.cfg, model, history, lastRefit)
+				lastRefit, model = maybeWalkForwardRefit(trader.cfg, model, signalHistory, lastRefit)
 
-				msg, err := trader.step(ctx, history)
+				msg, err := trader.step(ctx, history, signalHistory)
 				if err != nil {
 					log.Printf("step err: %v", err)
 					continue

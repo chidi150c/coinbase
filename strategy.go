@@ -80,7 +80,7 @@ func (d Decision) SignalToSide() OrderSide {
 }
 
 // decide computes a trading decision from recent candles and the unified model.
-func decide(c []Candle, mdl *LogisticModel, buyThreshold float64, sellThreshold float64, useMAFilter bool) Decision {
+func decide(c []Candle, mdl *LogisticModel, buyThreshold float64, sellThreshold float64) Decision {
 	if len(c) < 60 {
 		return Decision{Signal: Flat, Confidence: 0, Reason: "not_enough_data", PUp: 0.0}
 	}
@@ -96,19 +96,6 @@ func decide(c []Candle, mdl *LogisticModel, buyThreshold float64, sellThreshold 
 	pUp := 0.5
 	if mdl != nil {
 		pUp = mdl.Predict(snap.X)
-	}
-
-	buyMASignal := snap.LowBottom || snap.PriceDownGoingUp
-	sellMASignal := snap.HighPeak || snap.PriceUpGoingDown
-
-	if snap.LowBottom {
-		logSoftGate("LowBottom", "BUY", snap)
-	} else if snap.HighPeak {
-		logSoftGate("HighPeak", "SELL", snap)
-	} else if snap.PriceDownGoingUp {
-		logSoftGate("PriceDownGoingUp", "BUY", snap)
-	} else if snap.PriceUpGoingDown {
-		logSoftGate("PriceUpGoingDown", "SELL", snap)
 	}
 
 	reason := fmt.Sprintf(
@@ -137,15 +124,15 @@ func decide(c []Candle, mdl *LogisticModel, buyThreshold float64, sellThreshold 
 		PriceUpGoingDown: snap.PriceUpGoingDown,
 	}
 
-	// BUY if pUp clears threshold and the transitional MA filter allows it.
-	if pUp > buyThreshold && (!useMAFilter || buyMASignal) {
+	// BUY if pUp clears threshold.
+	if pUp > buyThreshold{
 		base.Signal = Buy
 		base.Confidence = pUp
 		return base
 	}
 
-	// SELL if pUp falls below threshold and the transitional MA filter allows it.
-	if pUp < sellThreshold && (!useMAFilter || sellMASignal) {
+	// SELL if pUp falls below threshold.
+	if pUp < sellThreshold {
 		base.Signal = Sell
 		base.Confidence = 1 - pUp
 		return base
@@ -165,4 +152,113 @@ func logSoftGate(name string, side string, snap FeatureSnapshot) {
 		snap.LowBottom,
 		snap.PriceUpGoingDown,
 	)
+}
+
+func (t *Trader) applyMACDSlopeGate(d Decision,	execHistory []Candle) Decision {
+
+	if !getEnvBool("USE_MACD_SLOPE_GATE", false) {
+		return d
+	}
+
+	if d.Signal != Buy && d.Signal != Sell {
+		return d
+	}
+
+	slope, ok := macdHistSlope(execHistory)
+	if !ok {
+		log.Printf(
+			"[MACD_GATE] skip insufficient_history len=%d",
+			len(execHistory),
+		)
+		return d
+	}
+
+	eps := getEnvFloat("MACD_SLOPE_EPS", 0.0)
+
+	raw := d.Signal
+	reason := ""
+
+	switch d.Signal {
+
+	case Sell:
+		if slope > eps {
+			d.Signal = Flat
+			reason = d.Reason + " | " + "bullish_macd_against_sell"
+		}
+
+	case Buy:
+		if slope < -eps {
+			d.Signal = Flat
+			reason = d.Reason + " | " + "bearish_macd_against_buy"
+		}
+	}
+
+	log.Printf(
+		"[MACD_GATE] raw=%s final=%s slope=%.8f eps=%.8f reason=%s",
+		raw,
+		d.Signal,
+		slope,
+		eps,
+		reason,
+	)
+
+	return d
+}
+
+func (t *Trader) applyMAFilterGate(d Decision, execHistory []Candle) Decision {
+	if !t.cfg.UseMAFilter {
+		return d
+	}
+
+	if d.Signal != Buy && d.Signal != Sell {
+		return d
+	}
+
+	if len(execHistory) < 60 {
+		return d
+	}
+
+	snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1)
+	if !ok {
+		return d
+	}
+
+	buyMASignal := snap.LowBottom || snap.PriceDownGoingUp
+	sellMASignal := snap.HighPeak || snap.PriceUpGoingDown
+
+	if snap.LowBottom {
+		logSoftGate("LowBottom", "BUY", snap)
+	} else if snap.HighPeak {
+		logSoftGate("HighPeak", "SELL", snap)
+	} else if snap.PriceDownGoingUp {
+		logSoftGate("PriceDownGoingUp", "BUY", snap)
+	} else if snap.PriceUpGoingDown {
+		logSoftGate("PriceUpGoingDown", "SELL", snap)
+	}
+
+	raw := d.Signal
+
+	if d.Signal == Buy && !buyMASignal {
+		d.Signal = Flat
+		d.Reason += " | ma_gate_block_buy"
+	}
+
+	if d.Signal == Sell && !sellMASignal {
+		d.Signal = Flat
+		d.Reason += " | ma_gate_block_sell"
+	}
+
+	log.Printf(
+		"[MA_GATE] raw=%s final=%s buyMA=%v sellMA=%v lowBottom=%v priceDownGoingUp=%v highPeak=%v priceUpGoingDown=%v",
+		raw,
+		d.Signal,
+		buyMASignal,
+		sellMASignal,
+		snap.LowBottom,
+		snap.PriceDownGoingUp,
+		snap.HighPeak,
+		snap.PriceUpGoingDown,
+	)
+
+	return d
 }
