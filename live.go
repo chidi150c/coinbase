@@ -822,6 +822,8 @@ func setCandleStyle(bridgeURL string, style int) {
 
 func binanceIntervalToken(g string) string {
 	switch strings.ToUpper(strings.TrimSpace(g)) {
+	case "THREE_MINUTE":
+		return "3m"
 	case "ONE_MINUTE":
 		return "1m"
 	case "FIVE_MINUTE":
@@ -1048,6 +1050,8 @@ func asStr(v any) string {
 
 func granularitySeconds(g string) int {
 	switch strings.ToUpper(strings.TrimSpace(g)) {
+	case "THREE_MINUTE":
+		return 3 * 60
 	case "ONE_MINUTE":
 		return 60
 	case "FIVE_MINUTE":
