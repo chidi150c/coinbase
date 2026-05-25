@@ -70,13 +70,13 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 		log.Fatalf("[BOOT] exchange filters unavailable for %s; refusing to trade without LOT_SIZE.stepSize and PRICE_FILTER.tickSize (post-only limits disabled) — ensure bridge /exchange/filters is populated or provide valid overrides: error: %v", trader.cfg.ProductID, err)
 	}
 	// Populate cfg fields from filters when available; otherwise set cfg values from env.
-	
+
 	// Prefer PriceTick if present, else TickSize for backward compatibility.
 	if v := getFilterFloat(filters, "PriceTick"); v > 0 {
 		trader.cfg.PriceTick = v
 	} else if v := getFilterFloat(filters, "TickSize"); v > 0 {
 		trader.cfg.PriceTick = v
-	}else{
+	} else {
 		trader.cfg.SetPriceTick()
 	}
 
@@ -85,23 +85,23 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 		trader.cfg.BaseStep = v
 	} else if v := getFilterFloat(filters, "StepSize"); v > 0 {
 		trader.cfg.BaseStep = v
-	} else{
+	} else {
 		trader.cfg.SetBaseStep()
 	}
-	
+
 	if v := getFilterFloat(filters, "QuoteStep"); v > 0 {
 		trader.cfg.QuoteStep = v
-	}else{
+	} else {
 		trader.cfg.SetQuoteStep()
 	}
 
 	if v := getFilterFloat(filters, "MinNotional"); v > 0 {
 		trader.cfg.MinNotional = v
-	}else{
+	} else {
 		trader.cfg.SetMinNotional()
 	}
 
-	if trader.cfg.PriceTick <= 0 || trader.cfg.BaseStep <= 0 || trader.cfg.QuoteStep <= 0 || trader.cfg.MinNotional <= 0{
+	if trader.cfg.PriceTick <= 0 || trader.cfg.BaseStep <= 0 || trader.cfg.QuoteStep <= 0 || trader.cfg.MinNotional <= 0 {
 		log.Printf("PriceTick: %.8f, BaseStep: %.8f, QuoteStep: %.8f, MinNotional: %.8f", trader.cfg.PriceTick, trader.cfg.BaseStep, trader.cfg.QuoteStep, trader.cfg.MinNotional)
 		log.Fatalf("[BOOT] exchange filters unavailable for %s last Check; refusing to trade without LOT_SIZE.stepSize and PRICE_FILTER.tickSize (post-only limits disabled) — ensure bridge /exchange/filters is populated or provide valid overrides: error: %v", trader.cfg.ProductID, err)
 	}
@@ -228,6 +228,30 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 						if latest.Time.IsZero() {
 							latest.Time = time.Now().UTC()
 						}
+
+						beforePUp := debugPUp(history, model)
+						var beforeLast Candle
+						if len(history) > 0 {
+							beforeLast = history[len(history)-1]
+						}
+
+						log.Printf(
+							"[SYNC_DIAG before] pUp=%.5f lastTime=%s O=%.2f H=%.2f L=%.2f C=%.2f V=%.4f officialTime=%s officialO=%.2f officialH=%.2f officialL=%.2f officialC=%.2f officialV=%.4f",
+							beforePUp,
+							beforeLast.Time,
+							beforeLast.Open,
+							beforeLast.High,
+							beforeLast.Low,
+							beforeLast.Close,
+							beforeLast.Volume,
+							latest.Time,
+							latest.Open,
+							latest.High,
+							latest.Low,
+							latest.Close,
+							latest.Volume,
+						)
+
 						if len(history) == 0 || latest.Time.After(history[len(history)-1].Time) {
 							history = append(history, latest)
 						} else {
@@ -236,6 +260,22 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 						if len(history) > trader.cfg.MaxHistoryCandles {
 							history = history[len(history)-trader.cfg.MaxHistoryCandles:]
 						}
+
+						afterPUp := debugPUp(history, model)
+						afterLast := history[len(history)-1]
+
+						log.Printf(
+							"[SYNC_DIAG after] pUp=%.5f lastTime=%s O=%.2f H=%.2f L=%.2f C=%.2f V=%.4f deltaPUp=%.5f",
+							afterPUp,
+							afterLast.Time,
+							afterLast.Open,
+							afterLast.High,
+							afterLast.Low,
+							afterLast.Close,
+							afterLast.Volume,
+							afterPUp-beforePUp,
+						)
+
 						lastCandleSync = time.Now().UTC()
 						// TODO: remove TRACE
 						log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
@@ -319,23 +359,25 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 					if err == nil {
 						base, quote := splitProductID(trader.cfg.ProductID)
 						px := history[len(history)-1].Close
-					    if traceOn() {
-					        // print a compact map snapshot for base/quote/USDC/USB
-					        lb := bal[strings.ToUpper(base)]
-					        lq := bal[strings.ToUpper(quote)]
-					        lusd  := bal["USD"]
-					        lusdc := bal["USDC"]
-					        log.Printf("[TRACE] equity: balances base=%s=%.8f | quote=%s=%.8f | USD=%.8f | USDC=%.8f | lastPrice=%.8f",
-					            strings.ToUpper(base), lb, strings.ToUpper(quote), lq, lusd, lusdc, px)
-					    }
-					    eq := computeLiveEquity(bal, base, quote, px)
+						if traceOn() {
+							// print a compact map snapshot for base/quote/USDC/USB
+							lb := bal[strings.ToUpper(base)]
+							lq := bal[strings.ToUpper(quote)]
+							lusd := bal["USD"]
+							lusdc := bal["USDC"]
+							log.Printf("[TRACE] equity: balances base=%s=%.8f | quote=%s=%.8f | USD=%.8f | USDC=%.8f | lastPrice=%.8f",
+								strings.ToUpper(base), lb, strings.ToUpper(quote), lq, lusd, lusdc, px)
+						}
+						eq := computeLiveEquity(bal, base, quote, px)
 						if eq > 0 {
 							if !eqReady {
 								log.Printf("[EQUITY] live balances received; rebased equity to %.2f", eq)
 							}
 							trader.SetEquityUSD(eq)
 							eqReady = true
-							if traceOn() { log.Printf("[TRACE] equity: computed=%.8f (ready=%v)", eq, eqReady) }
+							if traceOn() {
+								log.Printf("[TRACE] equity: computed=%.8f (ready=%v)", eq, eqReady)
+							}
 						} else if !eqReady {
 							// TRACE: break down balances and price to see why eq<=0
 							lb := bal[strings.ToUpper(base)]
@@ -551,8 +593,8 @@ func splitProductID(pid string) (base, quote string) {
 	// Order matters: match the longest known suffixes first.
 	knownQuotes := []string{
 		"FDUSD", "USDT", "USDC", "BUSD", "TUSD", // 5/4-letter stablecoins
-		"EUR", "GBP", "TRY", "BRL",              // fiat
-		"BTC", "ETH", "BNB", "USD",              // crypto/fiat 3-letter
+		"EUR", "GBP", "TRY", "BRL", // fiat
+		"BTC", "ETH", "BNB", "USD", // crypto/fiat 3-letter
 	}
 	for _, q := range knownQuotes {
 		if strings.HasSuffix(p, q) && len(p) > len(q) {
@@ -1095,4 +1137,19 @@ func getFilterFloat(f any, field string) float64 {
 		}
 	}
 	return 0
+}
+
+func debugPUp(history []Candle, mdl *LogisticModel) float64 {
+	if mdl == nil || len(history) < 60 {
+		return 0.5
+	}
+
+	i := len(history) - 1
+
+	snap, ok := BuildFeatureSnapshot(history, i)
+	if !ok || len(snap.X) == 0 {
+		return 0.5
+	}
+
+	return mdl.Predict(snap.X)
 }

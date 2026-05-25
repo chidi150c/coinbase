@@ -76,31 +76,21 @@ func (m *LogisticModel) predict(x []float64) float64 {
 	return m.Predict(x)
 }
 
-func ComputePUp(c []Candle, mdl *LogisticModel) float64 {
-	if mdl == nil {
-		return 0.5
-	}
-	if len(c) == 0 {
-		return 0.5
-	}
-
-	x, ok := BuildFeatures(c, len(c)-1)
-	if !ok || len(x) == 0 {
-		log.Printf("[DEBUG] pUp: no unified features available")
-		return 0.5
-	}
-
-	return mdl.Predict(x)
-}
-
 // fit keeps the old call style alive while using the new unified dataset path.
 func (m *LogisticModel) fit(c []Candle, lr float64, epochs int) {
 	cfgObj := loadConfigFromEnv()
 	cfg := cfgObj.FeatureLabelConfig()
 
-	
-
 	rollingFeats, rollingLabels := BuildFeaturesAndLabels(c, cfg)
+
+	cfg3m := cfg
+	cfg3m.Horizon = getEnvInt("AI_LABEL_HORIZON_3M", 20)
+	cfg3m.MinedLabelsFile = getEnv("AI_MINED_LABELS_FILE_3M", "/opt/coinbase/state/mined_labels_binance_3m.jsonl")
+
+	candles3m := AggregateCandles(c, 3*time.Minute)
+	if len(candles3m) > 0 {
+		_, _ = BuildFeaturesAndLabels(candles3m, cfg3m)
+	}
 
 	feats := rollingFeats
 	labels := rollingLabels
@@ -146,10 +136,6 @@ func (m *LogisticModel) fit(c []Candle, lr float64, epochs int) {
 			minedMinRows,
 		)
 	}
-
-
-
-
 
 	if len(feats) == 0 || len(labels) == 0 {
 		log.Printf("TRACE model.train.skip reason=no_dataset")

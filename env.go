@@ -100,8 +100,10 @@ func loadBotEnv() {
 		"AI_LABEL_HORIZON": {},
 		"AI_MIN_EDGE_PCT":  {},
 		// persistent mined labels
-		"AI_MINED_LABELS_FILE": {},
-		"AI_MINED_MAX_ROWS":    {},
+		"AI_MINED_LABELS_FILE":    {},
+		"AI_MINED_MAX_ROWS":       {},
+		"AI_LABEL_HORIZON_3M":     {},
+		"AI_MINED_LABELS_FILE_3M": {},
 
 		// ---- pyramiding/env-driven knobs ----
 		"ALLOW_PYRAMIDING":            {},
