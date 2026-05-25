@@ -23,12 +23,14 @@ func main() {
 	var intervalSec int
 	var mine3m bool
 	var mineLimit int
+	var mineTF string
 
 	flag.StringVar(&csvBacktest, "backtest", "", "Path to CSV (time,open,high,low,close,volume)")
 	flag.BoolVar(&live, "live", false, "Run live loop (ignores -backtest)")
 	flag.IntVar(&intervalSec, "interval", 60, "Live loop interval in seconds")
 	flag.BoolVar(&mine3m, "mine3m", false, "Backfill/mine 3-minute labels and exit")
 	flag.IntVar(&mineLimit, "limit", 50000, "Number of 1-minute candles to backfill for mining")
+	flag.StringVar(&mineTF, "mine-tf", "", "Backfill/mine labels for timeframe: 3m,5m,15m,30m,1h")
 	flag.Parse()
 
 	loadBotEnv()
@@ -45,11 +47,14 @@ func main() {
 		log.Fatalf("No Broker %s !!!!!!!!!", br)
 	}
 
-	if mine3m {
+	if mine3m || mineTF != "" {
+		if mineTF == "" {
+			mineTF = "3m"
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 
-		if err := runMine3m(ctx, cfg, broker, mineLimit); err != nil {
+		if err := runMineTF(ctx, cfg, broker, mineTF, mineLimit); err != nil {
 			log.Fatalf("mine3m failed: %v", err)
 		}
 		return
