@@ -611,3 +611,14 @@ LowBottom
 PriceDownGoingUp
 PriceUpGoingDown
 EMA spread
+============================================================================
+
+The future architecture we discussed is:
+
+new 5m candle closes
+↓
+append ONE mined label automatically
+↓
+walkforward sees new row
+↓
+retrain
