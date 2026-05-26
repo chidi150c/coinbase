@@ -1070,7 +1070,7 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 			})
 		}
 
-		end = start
+		end = start.Add(-time.Duration(secPer) * time.Second)
 		if len(rows) < pageLimit {
 			break
 		}
