@@ -957,60 +957,105 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 	if want <= 0 {
 		want = 5000
 	}
+
 	secPer := granularitySeconds(granularity)
 	if secPer <= 0 {
 		return nil, fmt.Errorf("unsupported granularity: %s", granularity)
 	}
 
-	end := time.Now().UTC().Truncate(time.Duration(secPer) * time.Second)
+	end := time.Now().UTC().
+		Truncate(time.Duration(secPer) * time.Second).
+		Add(-time.Duration(secPer) * time.Second)
+
 	out := make([]Candle, 0, want+1024)
 	seen := make(map[int64]struct{})
 
-	style := getCandleStyle(bridgeURL) // 0=unknown; prefer to probe
+	style := getCandleStyle(bridgeURL)
 
 	for len(out) < want {
-		start := end.Add(-time.Duration((pageLimit+5)*secPer) * time.Second)
+
+		// Exact page boundary (NO overlap).
+		// Dedupe already exists at:
+		// 1. candle timestamp level (seen map)
+		// 2. mined label file level (appendMinedLabel)
+		start := end.Add(
+			-time.Duration(pageLimit*secPer) * time.Second,
+		)
 
 		var (
 			rows    []candleJSON
 			lastErr error
 		)
 
-		// We try up to two styles in a defined order:
-		//  - if unknown: binance then legacy
-		//  - if known=binance: binance then legacy (fallback if empty)
-		//  - if known=legacy: legacy then binance (fallback if empty)
-		tryOrder := []int{candleStyleBinance, candleStyleLegacy}
+		// Schema probing order.
+		tryOrder := []int{
+			candleStyleBinance,
+			candleStyleLegacy,
+		}
+
 		if style == candleStyleLegacy {
-			tryOrder = []int{candleStyleLegacy, candleStyleBinance}
+			tryOrder = []int{
+				candleStyleLegacy,
+				candleStyleBinance,
+			}
 		}
 
 		for _, try := range tryOrder {
 			var u string
+
 			switch try {
 			case candleStyleBinance:
 				iv := binanceIntervalToken(granularity)
 				if iv == "" {
 					continue
 				}
-				u = fmt.Sprintf("%s/candles?symbol=%s&interval=%s&limit=%d&startTime=%d&endTime=%d",
-					strings.TrimRight(bridgeURL, "/"), productID, iv, pageLimit, start.Unix()*1000, end.Unix()*1000)
+
+				u = fmt.Sprintf(
+					"%s/candles?symbol=%s&interval=%s&limit=%d&startTime=%d&endTime=%d",
+					strings.TrimRight(bridgeURL, "/"),
+					productID,
+					iv,
+					pageLimit,
+					start.Unix()*1000,
+					end.Unix()*1000,
+				)
+
 			default: // candleStyleLegacy
-				u = fmt.Sprintf("%s/candles?product_id=%s&granularity=%s&limit=%d&start=%d&end=%d",
-					strings.TrimRight(bridgeURL, "/"), productID, granularity, pageLimit, start.Unix(), end.Unix())
+				u = fmt.Sprintf(
+					"%s/candles?product_id=%s&granularity=%s&limit=%d&start=%d&end=%d",
+					strings.TrimRight(bridgeURL, "/"),
+					productID,
+					granularity,
+					pageLimit,
+					start.Unix(),
+					end.Unix(),
+				)
 			}
 
-			log.Printf("TRACE WARMUP PAGE url=%s (style=%s)", u, map[int]string{candleStyleLegacy: "legacy", candleStyleBinance: "binance"}[try])
+			log.Printf(
+				"TRACE WARMUP PAGE url=%s (style=%s)",
+				u,
+				map[int]string{
+					candleStyleLegacy:  "legacy",
+					candleStyleBinance: "binance",
+				}[try],
+			)
 
 			resp, err := http.Get(u)
 			if err != nil {
 				lastErr = err
 				continue
 			}
+
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				b, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
-				lastErr = fmt.Errorf("bridge /candles %d: %s", resp.StatusCode, string(b))
+
+				lastErr = fmt.Errorf(
+					"bridge /candles %d: %s",
+					resp.StatusCode,
+					string(b),
+				)
 				continue
 			}
 
@@ -1023,43 +1068,70 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 			resp.Body.Close()
 
 			rows = normalizeCandles(raw)
-			log.Printf("TRACE WARMUP PAGE rows=%d window=[%d,%d] limit=%d (style=%s)", len(rows), start.Unix(), end.Unix(), pageLimit, map[int]string{candleStyleLegacy: "legacy", candleStyleBinance: "binance"}[try])
 
-			// Select this style once we see non-empty data
+			log.Printf(
+				"TRACE WARMUP PAGE rows=%d window=[%d,%d] limit=%d (style=%s)",
+				len(rows),
+				start.Unix(),
+				end.Unix(),
+				pageLimit,
+				map[int]string{
+					candleStyleLegacy:  "legacy",
+					candleStyleBinance: "binance",
+				}[try],
+			)
+
+			// Lock schema once data is seen.
 			if len(rows) > 0 && style != try {
 				setCandleStyle(bridgeURL, try)
-				log.Printf("TRACE WARMUP schema selected=%s", map[int]string{candleStyleLegacy: "legacy", candleStyleBinance: "binance"}[try])
+
+				log.Printf(
+					"TRACE WARMUP schema selected=%s",
+					map[int]string{
+						candleStyleLegacy:  "legacy",
+						candleStyleBinance: "binance",
+					}[try],
+				)
 			}
 
-			// If rows is non-nil (even if empty), stop trying alternates and use it.
+			// Use rows even if empty.
 			if rows != nil {
 				break
 			}
 		}
 
-		// If we couldn't even decode (both attempts errored), return the last error.
 		if rows == nil && lastErr != nil {
 			return nil, lastErr
 		}
-		// If rows is empty, stop paging (no more data).
+
+		// No more historical data.
 		if len(rows) == 0 {
 			break
 		}
 
 		for _, r := range rows {
-			ts, _ := strconv.ParseInt(strings.TrimSpace(r.Start), 10, 64)
+			ts, _ := strconv.ParseInt(
+				strings.TrimSpace(r.Start),
+				10,
+				64,
+			)
+
 			if ts == 0 {
 				continue
 			}
+
 			if _, ok := seen[ts]; ok {
 				continue
 			}
+
 			seen[ts] = struct{}{}
+
 			o, _ := strconv.ParseFloat(r.Open, 64)
 			h, _ := strconv.ParseFloat(r.High, 64)
 			l, _ := strconv.ParseFloat(r.Low, 64)
 			c, _ := strconv.ParseFloat(r.Close, 64)
 			v, _ := strconv.ParseFloat(r.Volume, 64)
+
 			out = append(out, Candle{
 				Time:   time.Unix(ts, 0).UTC(),
 				Open:   o,
@@ -1070,17 +1142,31 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 			})
 		}
 
-		end = start.Add(-time.Duration(secPer) * time.Second)
+		// Move to previous non-overlapping page.
+		end = start.Add(
+			-time.Duration(secPer) * time.Second,
+		)
+
 		if len(rows) < pageLimit {
 			break
 		}
 	}
 
-	sort.Slice(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Time.Before(out[j].Time)
+	})
+
 	if len(out) > want {
 		out = out[len(out)-want:]
 	}
-	log.Printf("TRACE WARMUP SUMMARY collected=%d want=%d granularity=%s", len(out), want, granularity)
+
+	log.Printf(
+		"TRACE WARMUP SUMMARY collected=%d want=%d granularity=%s",
+		len(out),
+		want,
+		granularity,
+	)
+
 	return out, nil
 }
 
