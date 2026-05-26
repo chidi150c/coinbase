@@ -115,9 +115,11 @@ type Config struct {
 	RepriceMaxCount       int
 
 	// Strategy thresholds
-	BuyThreshold  float64
-	SellThreshold float64
-	UseMAFilter   bool
+	BuyThreshold     float64
+	SellThreshold    float64
+	UseMAFilter      bool
+	UseMACDSlopeGate bool
+	MACDSlopeEPS     float64
 
 	// Unified AI — fee-aware horizon labels
 	AILabelHorizon int
@@ -230,9 +232,11 @@ func loadConfigFromEnv() Config {
 		RepriceMaxCount:       getEnvInt("REPRICE_MAX_COUNT", 0),
 
 		// Strategy thresholds
-		BuyThreshold:  getEnvFloat("BUY_THRESHOLD", 0.55),
-		SellThreshold: getEnvFloat("SELL_THRESHOLD", 0.45),
-		UseMAFilter:   getEnvBool("USE_MA_FILTER", true),
+		BuyThreshold:     getEnvFloat("BUY_THRESHOLD", 0.55),
+		SellThreshold:    getEnvFloat("SELL_THRESHOLD", 0.45),
+		UseMAFilter:      getEnvBool("USE_MA_FILTER", true),
+		UseMACDSlopeGate: getEnvBool("USE_MACD_SLOPE_GATE", false),
+		MACDSlopeEPS:     getEnvFloat("MACD_SLOPE_EPS", 0.0),
 
 		// Unified AI — fee-aware labels
 		AILabelHorizon: getEnvInt("AI_LABEL_HORIZON", 15),

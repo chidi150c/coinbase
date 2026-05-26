@@ -65,6 +65,8 @@ type Decision struct {
 	PriceDownGoingUp bool
 	LowBottom        bool
 	PriceUpGoingDown bool
+	MACDHist         float64
+	MACDHistDelta    float64
 }
 
 // SignalToSide converts the intent into a broker side.
@@ -79,39 +81,49 @@ func (d Decision) SignalToSide() OrderSide {
 	}
 }
 
-// decide computes a trading decision from recent candles and the unified model.
-func decide(c []Candle, mdl *LogisticModel, buyThreshold float64, sellThreshold float64) Decision {
-	if len(c) < 60 {
-		return Decision{Signal: Flat, Confidence: 0, Reason: "not_enough_data", PUp: 0.0}
+// decide computes a trading decision from signal timeframe candles and the unified model.
+func (t *Trader) decide(signalHistory []Candle) Decision {
+	if len(signalHistory) < 60 {
+		return Decision{
+			Signal:     Flat,
+			Confidence: 0,
+			Reason:     "not_enough_data",
+			PUp:        0.0,
+		}
 	}
 
-	idx := len(c) - 1
-	snap, ok := BuildFeatureSnapshot(c, idx)
+	idx := len(signalHistory) - 1
+	snap, ok := BuildFeatureSnapshot(signalHistory, idx)
 	if !ok {
-		return Decision{Signal: Flat, Confidence: 0, Reason: "not_enough_features", PUp: 0.0}
+		return Decision{
+			Signal:     Flat,
+			Confidence: 0,
+			Reason:     "not_enough_features",
+			PUp:        0.0,
+		}
 	}
 
-	// Single prediction path: the same unified feature vector is used for
-	// inference here and for training in dataset.go.
 	pUp := 0.5
-	if mdl != nil {
-		pUp = mdl.Predict(snap.X)
+	if t.model != nil {
+		pUp = t.model.Predict(snap.X)
 	}
+
+	signalTF := t.cfg.SignalTF()
 
 	reason := fmt.Sprintf(
-		"pUp=%.5f, ema4=%.2f vs ema8=%.2f, ema4_3rd=%.2f vs ema8_3rd=%.2f, emaSpreadPct=%.6f, emaAlign=%.6f, macdHist=%.5f, macdDelta=%.5f, ema2050Spread=%.6f, ema20Slope=%.6f, ema50Slope=%.6f",
+		"pUp=%.5f, ema4_%s=%.2f vs ema8_%s=%.2f, ema4_3rd_%s=%.2f vs ema8_3rd_%s=%.2f, emaSpreadPct_%s=%.6f, emaAlign_%s=%.6f, macdHist_%s=%.5f, macdDelta_%s=%.5f, ema2050Spread_%s=%.6f, ema20Slope_%s=%.6f, ema50Slope_%s=%.6f",
 		pUp,
-		snap.EMAFast,
-		snap.EMASlow,
-		snap.EMAFastPrev3,
-		snap.EMASlowPrev3,
-		snap.EMASpreadPct,
-		snap.EMAAlignStrength,
-		snap.MACDHist,
-		snap.MACDHistDelta,
-		snap.EMA2050Spread,
-		snap.EMA20Slope,
-		snap.EMA50Slope,
+		signalTF, snap.EMAFast,
+		signalTF, snap.EMASlow,
+		signalTF, snap.EMAFastPrev3,
+		signalTF, snap.EMASlowPrev3,
+		signalTF, snap.EMASpreadPct,
+		signalTF, snap.EMAAlignStrength,
+		signalTF, snap.MACDHist,
+		signalTF, snap.MACDHistDelta,
+		signalTF, snap.EMA2050Spread,
+		signalTF, snap.EMA20Slope,
+		signalTF, snap.EMA50Slope,
 	)
 
 	base := Decision{
@@ -124,15 +136,13 @@ func decide(c []Candle, mdl *LogisticModel, buyThreshold float64, sellThreshold 
 		PriceUpGoingDown: snap.PriceUpGoingDown,
 	}
 
-	// BUY if pUp clears threshold.
-	if pUp > buyThreshold{
+	if pUp > t.cfg.BuyThreshold {
 		base.Signal = Buy
 		base.Confidence = pUp
 		return base
 	}
 
-	// SELL if pUp falls below threshold.
-	if pUp < sellThreshold {
+	if pUp < t.cfg.SellThreshold {
 		base.Signal = Sell
 		base.Confidence = 1 - pUp
 		return base
@@ -154,9 +164,8 @@ func logSoftGate(name string, side string, snap FeatureSnapshot) {
 	)
 }
 
-func (t *Trader) applyMACDSlopeGate(d Decision,	execHistory []Candle) Decision {
-
-	if !getEnvBool("USE_MACD_SLOPE_GATE", false) {
+func (t *Trader) applyMACDSlopeGate(d Decision, execHistory []Candle) Decision {
+	if !t.cfg.UseMACDSlopeGate {
 		return d
 	}
 
@@ -164,45 +173,68 @@ func (t *Trader) applyMACDSlopeGate(d Decision,	execHistory []Candle) Decision {
 		return d
 	}
 
-	slope, ok := macdHistSlope(execHistory)
-	if !ok {
+	if len(execHistory) < 60 {
 		log.Printf(
-			"[MACD_GATE] skip insufficient_history len=%d",
+			"[MACD_GATE] skip insufficient_history len=%d gateTF=%s",
 			len(execHistory),
+			t.cfg.Granularity,
 		)
 		return d
 	}
 
-	eps := getEnvFloat("MACD_SLOPE_EPS", 0.0)
+	snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1)
+	if !ok {
+		log.Printf(
+			"[MACD_GATE] skip no_feature_snapshot len=%d gateTF=%s",
+			len(execHistory),
+			t.cfg.Granularity,
+		)
+		return d
+	}
 
+	eps := t.cfg.MACDSlopeEPS
 	raw := d.Signal
 	reason := ""
 
 	switch d.Signal {
 
 	case Sell:
-		if slope > eps {
+		if snap.MACDHistDelta > eps {
 			d.Signal = Flat
-			reason = d.Reason + " | " + "bullish_macd_against_sell"
+			reason = "bullish_macd_delta_against_sell"
 		}
 
 	case Buy:
-		if slope < -eps {
+		if snap.MACDHistDelta < -eps {
 			d.Signal = Flat
-			reason = d.Reason + " | " + "bearish_macd_against_buy"
+			reason = "bearish_macd_delta_against_buy"
 		}
 	}
 
+	d.Reason = appendReason(d.Reason, reason)
+
 	log.Printf(
-		"[MACD_GATE] raw=%s final=%s slope=%.8f eps=%.8f reason=%s",
+		"[MACD_GATE] gateTF=%s raw=%s final=%s macdHist_1m=%.5f macdDelta_1m=%.5f eps=%.8f reason=%s",
+		t.cfg.Granularity,
 		raw,
 		d.Signal,
-		slope,
+		snap.MACDHist,
+		snap.MACDHistDelta,
 		eps,
 		reason,
 	)
 
 	return d
+}
+
+func appendReason(base, reason string) string {
+	if reason == "" {
+		return base
+	}
+	if base == "" {
+		return reason
+	}
+	return base + " | " + reason
 }
 
 func (t *Trader) applyMAFilterGate(d Decision, execHistory []Candle) Decision {
@@ -237,19 +269,23 @@ func (t *Trader) applyMAFilterGate(d Decision, execHistory []Candle) Decision {
 	}
 
 	raw := d.Signal
+	reason := ""
 
 	if d.Signal == Buy && !buyMASignal {
 		d.Signal = Flat
-		d.Reason += " | ma_gate_block_buy"
+		reason = "ma_gate_block_buy"
 	}
 
 	if d.Signal == Sell && !sellMASignal {
 		d.Signal = Flat
-		d.Reason += " | ma_gate_block_sell"
+		reason = "ma_gate_block_sell"
 	}
 
+	d.Reason = appendReason(d.Reason, reason)
+
 	log.Printf(
-		"[MA_GATE] raw=%s final=%s buyMA=%v sellMA=%v lowBottom=%v priceDownGoingUp=%v highPeak=%v priceUpGoingDown=%v",
+		"[MA_GATE] gateTF=%s raw=%s final=%s buyMA=%v sellMA=%v lowBottom=%v priceDownGoingUp=%v highPeak=%v priceUpGoingDown=%v reason=%s",
+		t.cfg.Granularity,
 		raw,
 		d.Signal,
 		buyMASignal,
@@ -258,6 +294,7 @@ func (t *Trader) applyMAFilterGate(d Decision, execHistory []Candle) Decision {
 		snap.PriceDownGoingUp,
 		snap.HighPeak,
 		snap.PriceUpGoingDown,
+		reason,
 	)
 
 	return d
