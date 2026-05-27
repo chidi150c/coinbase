@@ -181,7 +181,7 @@ func (t *Trader) applyMACDSlopeGate(d Decision, execHistory []Candle) Decision {
 			return d
 		}
 		log.Printf(
-			"[MACD_GATE] gateTF=%s macdHist_1m=%.5f macdDelta_1m=%.5f eps=%.8f | MACD_Gate_Not_Applied",
+			"[MACD_GATE] gateTF=%s raw=%s macdHist_1m=%.5f macdDelta_1m=%.5f eps=%.8f | MACD_Gate_Not_Applied",
 			t.cfg.Granularity,
 			d.Raw,
 			snap.MACDHist,
