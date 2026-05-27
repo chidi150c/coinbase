@@ -23,8 +23,8 @@ import (
 // Config holds all runtime knobs for trading and operations.
 type Config struct {
 	// Trading target
-	ProductID   string // e.g., "BTC-USD" or "BTCUSDT"
-	Granularity string // e.g., "ONE_MINUTE"
+	ProductID string // e.g., "BTC-USD" or "BTCUSDT"
+	GateTF    string // e.g., "ONE_MINUTE"
 
 	// Safety & sizing
 	DryRun              bool
@@ -142,8 +142,8 @@ type Config struct {
 // and returns a Config with sane defaults if keys are missing.
 func loadConfigFromEnv() Config {
 	cfg := Config{
-		ProductID:   getEnv("PRODUCT_ID", "BTC-USD"),
-		Granularity: getEnv("GRANULARITY", "ONE_MINUTE"),
+		ProductID: getEnv("PRODUCT_ID", "BTC-USD"),
+		GateTF:    getEnv("GATE_TF", "ONE_MINUTE"),
 
 		// Universal, unprefixed knobs
 		DryRun:              getEnvBool("DRY_RUN", true),
