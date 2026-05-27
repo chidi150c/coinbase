@@ -1002,21 +1002,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	//---ADD path continues-----
 	// --------------------------------------------------------------------------------------------------------
 	d := t.decide(signalHistory)
-
-	rawDecision := d
-	log.Printf(
-		"[RAW_SIGNAL] signalTF=%s raw=%s pUp=%.5f reason=%s",
-		t.cfg.SignalTF(),
-		rawDecision.Signal,
-		rawDecision.PUp,
-		rawDecision.Reason,
-	)
-
 	d = t.applyMAFilterGate(d, c)
 	d = t.applyMACDSlopeGate(d, c)
 	totalLots := lsb + lss
-	log.Printf("[DEBUG] Total Lots=%d, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-45",
-		totalLots, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
+	log.Printf("[DEBUG] Total Lots=%d, Raw=%s, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-45",
+		totalLots, d.Raw, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
 

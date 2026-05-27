@@ -56,6 +56,7 @@ const (
 // Decision captures what to do and why.
 type Decision struct {
 	Signal     Signal
+	Raw 	   Signal
 	Confidence float64
 	Reason     string
 
@@ -138,17 +139,20 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 
 	if pUp > t.cfg.BuyThreshold {
 		base.Signal = Buy
+		base.Raw = Buy
 		base.Confidence = pUp
 		return base
 	}
 
 	if pUp < t.cfg.SellThreshold {
 		base.Signal = Sell
+		base.Raw = Sell
 		base.Confidence = 1 - pUp
 		return base
 	}
 
 	base.Signal = Flat
+	base.Raw = Flat
 	return base
 }
 
