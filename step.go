@@ -1002,8 +1002,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	//---ADD path continues-----
 	// --------------------------------------------------------------------------------------------------------
 	d := t.decide(signalHistory)
-	d = t.applyMAFilterGate(d, c)
 	d = t.applyMACDSlopeGate(d, c)
+	d = t.applyMAFilterGate(d, c)
 	totalLots := lsb + lss
 	log.Printf("[DEBUG] Total Lots=%d, Raw=%s, Decision=%s Reason = %s, buyThresh=%.3f, sellThresh=%.3f, LongOnly=%v ver-45",
 		totalLots, d.Raw, d.Signal, d.Reason, t.cfg.BuyThreshold, t.cfg.SellThreshold, t.cfg.LongOnly)

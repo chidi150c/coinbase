@@ -156,24 +156,8 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 	return base
 }
 
-func logSoftGate(name string, side string, snap FeatureSnapshot) {
-	log.Printf(
-		"[DEBUG] MA Signalled %s: %s: HighPeak: %v, PriceDownGoingUp: %v, LowBottom: %v, PriceUpGoingDown: %v",
-		name,
-		side,
-		snap.HighPeak,
-		snap.PriceDownGoingUp,
-		snap.LowBottom,
-		snap.PriceUpGoingDown,
-	)
-}
-
 func (t *Trader) applyMACDSlopeGate(d Decision, execHistory []Candle) Decision {
 	if !t.cfg.UseMACDSlopeGate {
-		return d
-	}
-
-	if d.Signal != Buy && d.Signal != Sell {
 		return d
 	}
 
@@ -182,6 +166,27 @@ func (t *Trader) applyMACDSlopeGate(d Decision, execHistory []Candle) Decision {
 			"[MACD_GATE] skip insufficient_history len=%d gateTF=%s",
 			len(execHistory),
 			t.cfg.Granularity,
+		)
+		return d
+	}
+
+	if d.Signal != Buy && d.Signal != Sell {
+		snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1)
+		if !ok {
+			log.Printf(
+				"[MACD_GATE] skip no_feature_snapshot len=%d gateTF=%s",
+				len(execHistory),
+				t.cfg.Granularity,
+			)
+			return d
+		}
+		log.Printf(
+			"[MACD_GATE] gateTF=%s macdHist_1m=%.5f macdDelta_1m=%.5f eps=%.8f | MACD_Gate_Not_Applied",
+			t.cfg.Granularity,
+			d.Raw,
+			snap.MACDHist,
+			snap.MACDHistDelta,
+			t.cfg.MACDSlopeEPS,
 		)
 		return d
 	}
@@ -231,22 +236,8 @@ func (t *Trader) applyMACDSlopeGate(d Decision, execHistory []Candle) Decision {
 	return d
 }
 
-func appendReason(base, reason string) string {
-	if reason == "" {
-		return base
-	}
-	if base == "" {
-		return reason
-	}
-	return base + " | " + reason
-}
-
 func (t *Trader) applyMAFilterGate(d Decision, execHistory []Candle) Decision {
 	if !t.cfg.UseMAFilter {
-		return d
-	}
-
-	if d.Signal != Buy && d.Signal != Sell {
 		return d
 	}
 
@@ -254,23 +245,40 @@ func (t *Trader) applyMAFilterGate(d Decision, execHistory []Candle) Decision {
 		return d
 	}
 
+	if d.Signal != Buy && d.Signal != Sell {
+		snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1)
+		if !ok {
+			log.Printf(
+				"[MA_GATE] skip no_feature_snapshot len=%d gateTF=%s",
+				len(execHistory),
+				t.cfg.Granularity,
+			)
+			return d
+		}
+		log.Printf(
+			"[MA_GATE] gateTF=%s raw=%s lowBottom=%v priceDownGoingUp=%v highPeak=%v priceUpGoingDown=%v | MA_Gate_Not_Applied",
+			t.cfg.Granularity,
+			d.Raw,
+			snap.LowBottom,
+			snap.PriceDownGoingUp,
+			snap.HighPeak,
+			snap.PriceUpGoingDown,
+		)
+		return d
+	}
+
 	snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1)
 	if !ok {
+		log.Printf(
+			"[MA_GATE] skip no_feature_snapshot len=%d gateTF=%s",
+			len(execHistory),
+			t.cfg.Granularity,
+		)
 		return d
 	}
 
 	buyMASignal := snap.LowBottom || snap.PriceDownGoingUp
 	sellMASignal := snap.HighPeak || snap.PriceUpGoingDown
-
-	if snap.LowBottom {
-		logSoftGate("LowBottom", "BUY", snap)
-	} else if snap.HighPeak {
-		logSoftGate("HighPeak", "SELL", snap)
-	} else if snap.PriceDownGoingUp {
-		logSoftGate("PriceDownGoingUp", "BUY", snap)
-	} else if snap.PriceUpGoingDown {
-		logSoftGate("PriceUpGoingDown", "SELL", snap)
-	}
 
 	raw := d.Signal
 	reason := ""
@@ -302,4 +310,14 @@ func (t *Trader) applyMAFilterGate(d Decision, execHistory []Candle) Decision {
 	)
 
 	return d
+}
+
+func appendReason(base, reason string) string {
+	if reason == "" {
+		return base
+	}
+	if base == "" {
+		return reason
+	}
+	return base + " | " + reason
 }
