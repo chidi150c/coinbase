@@ -622,3 +622,59 @@ append ONE mined label automatically
 walkforward sees new row
 ↓
 retrain
+
+===========================================================================================
+Step 1 — Run one final raw-signal audit
+
+Use the 6h/24h logs to test:
+
+When Raw=BUY, was price higher 30m/60m later?
+When Raw=SELL, was price lower 30m/60m later?
+
+Proceeding with the raw directional audit on test1_raw_6h(3).log.
+
+I’ll measure:
+
+For every Raw=BUY:
+Was price higher 30m later?
+Was price higher 60m later?
+
+For every Raw=SELL:
+Was price lower 30m later?
+Was price lower 60m later?
+
+Ignoring:
+
+FLAT
+MA gate
+MACD gate
+actual trade execution
+fees
+
+This isolates:
+
+"Did the AI direction itself have predictive power?"
+
+Output will include:
+
+BUY accuracy @30m
+BUY accuracy @60m
+SELL accuracy @30m
+SELL accuracy @60m
+Overall directional accuracy
+Average move after signal
+Verdict:
+signal edge or no edge
+
+______
+cd ~/coinbase/monitoring
+
+docker compose logs --since "6h" bot_binance \
+| grep -E '\[TICK\] px=|\[DEBUG\] Total Lots=.*Raw=' \
+> /tmp/test1_raw_6h.log
+
+cp /tmp/test1_raw_6h.log ~/coinbase/test1_raw_6h.log
+
+wc -l /tmp/test1_raw_6h.log
+ls -lh /tmp/test1_raw_6h.log
+______

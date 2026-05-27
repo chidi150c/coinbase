@@ -2672,35 +2672,46 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 }
 
 func confidenceRiskMultiplier(sig Signal, pUp float64) float64 {
-	if sig == Buy {
+	switch sig {
+
+	case Buy:
 		switch {
+		// Strong BUY only
 		case pUp >= 0.62:
 			return 1.00
-		case pUp >= 0.58:
-			return 0.85
-		case pUp >= 0.55:
-			return 0.65
-		case pUp >= 0.52:
-			return 0.40
-		default:
-			return 1.00
-		}
-	}
 
-	if sig == Sell {
+		// Good BUY
+		case pUp >= 0.60:
+			return 0.80
+
+		// Borderline but acceptable
+		case pUp >= 0.58:
+			return 0.50
+
+		// Weak = effectively ignore
+		case pUp >= 0.52:
+			return 0.00
+		}
+
+	case Sell:
 		switch {
+		// Strong SELL only
 		case pUp <= 0.38:
 			return 1.00
+
+		// Good SELL
+		case pUp <= 0.40:
+			return 0.80
+
+		// Borderline but acceptable
 		case pUp <= 0.42:
-			return 0.85
-		case pUp <= 0.45:
-			return 0.65
+			return 0.50
+
+		// Weak = effectively ignore
 		case pUp <= 0.47:
-			return 0.40
-		default:
-			return 1.00
+			return 0.00
 		}
 	}
 
-	return 1.00
+	return 0.00
 }
