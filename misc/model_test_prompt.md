@@ -279,3 +279,28 @@ fit()
 adjusts weights
 ↓
 weights persisted to state
+________________
+MINING LABELS:
+
+cd ~/coinbase/monitoring
+
+cd ~/coinbase/monitoring
+
+IMAGE_SHA=0f3628bc6100246daed0bffe620361e3cfbd6361 \
+docker compose run --rm --no-deps \
+  --entrypoint /app/bot \
+  bot_binance \
+  -mine-tf 5m \
+  -limit 50000
+
+
+  then do this to check:
+
+wc -l /opt/coinbase/state/mined_labels_binance_5m.jsonl
+
+grep '"y":1' /opt/coinbase/state/mined_labels_binance_5m.jsonl | wc -l
+grep '"y":0' /opt/coinbase/state/mined_labels_binance_5m.jsonl | wc -l
+
+
+docker compose logs --since "10m" bot_binance \
+| grep -E 'MINED_LABELS|loaded rows|loaded mined'
