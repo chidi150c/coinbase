@@ -93,10 +93,12 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 
 	fast := ema4[idx]
 	slow := ema8[idx]
-	fast2rd := ema4[idx-2]
-	slow2rd := ema8[idx-2]
-	fast3rd := ema4[idx-3]
-	slow3rd := ema8[idx-3]
+	fast2 := ema4[idx-2]
+	slow2 := ema8[idx-2]
+	fast4 := ema4[idx-4]
+	slow4 := ema8[idx-4]
+	fast6 := ema4[idx-6]
+	slow6 := ema8[idx-6]
 	histNow := macdHist[idx]
 	histPrev := macdHist[idx-1]
 	histDelta := histNow - histPrev
@@ -110,11 +112,13 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	priceDownGoingUp := false
 	priceUpGoingDown := false
 
-	if !badFloat(fast) && !badFloat(slow) && !badFloat(fast2rd) && !badFloat(slow2rd) && !badFloat(fast3rd) && !badFloat(slow3rd) {
-		highPeak = (slow3rd < fast3rd) && (slow2rd-fast2rd > slow3rd-fast3rd) && (slow-fast < slow2rd-fast2rd) && (slow < fast)
-		priceDownGoingUp = (slow > fast) && (slow-fast < slow3rd-fast3rd) && (slow3rd > fast3rd)
-		lowBottom = (fast3rd < slow3rd) && (fast2rd-slow2rd > fast3rd-slow3rd) && (fast-slow < fast2rd-slow2rd) && (fast < slow)
-		priceUpGoingDown = (fast > slow) && (fast-slow < fast3rd-slow3rd) && (fast3rd > slow3rd)
+	if !badFloat(fast) && !badFloat(slow) && !badFloat(fast2) && !badFloat(slow2) && !badFloat(fast4) && !badFloat(slow4) && !badFloat(fast6) && !badFloat(slow6){
+		fastIsHigher := (fast > slow) && (fast4 > slow4) && (fast6 > slow6) 
+		fastIsLower := (fast < slow) && (fast4 < slow4) && (fast6 < slow6) 
+		priceDownGoingUp = (fast < slow) && (fast6 < slow6) && (slow-fast < slow6-fast6)
+		priceUpGoingDown = (fast > slow) && (fast6 > slow6)  && (fast-slow < fast6-slow6)
+		highPeak = fastIsHigher && (fast4-slow4 > fast6-slow6) && (fast2-slow2 > fast4-slow4) && (fast-slow < fast2-slow2) 
+		lowBottom = fastIsLower && (slow4-fast4 > slow6-fast6) && (slow2-fast2 > slow4-fast4) && (slow-fast < slow2-fast2) 
 	}
 
 	ret1 := safeRatio(c[idx].Close-c[idx-1].Close, c[idx-1].Close)
@@ -173,8 +177,8 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 		PriceUpGoingDown: priceUpGoingDown,
 		EMAFast:          fast,
 		EMASlow:          slow,
-		EMAFastPrev3:     fast3rd,
-		EMASlowPrev3:     slow3rd,
+		EMAFastPrev3:     fast4,
+		EMASlowPrev3:     slow4,
 		EMASpreadPct:     emaSpreadPct,
 		EMAAlignStrength: emaAlignStrength,
 		MACDHist:         histNow,
