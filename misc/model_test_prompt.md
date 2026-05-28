@@ -262,3 +262,20 @@ jq '
 mv /tmp/state_reset.json \
 /opt/coinbase/state/bot_state.newbinance.json
 ___________
+
+MODEL PATH:
+
+new candles arrive
+↓
+BuildFeaturesAndLabels()
+↓
+new labels mined
+(path_net_profit objective)
+↓
+dataset rebuilt
+(old + new labeled rows)
+↓
+fit()
+adjusts weights
+↓
+weights persisted to state

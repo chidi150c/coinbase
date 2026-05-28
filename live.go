@@ -838,6 +838,13 @@ func maybeWalkForwardRefit(cfg Config, mdl *LogisticModel, history []Candle, las
 	}
 
 	mdl.fit(history, 0.05, 6)
+
+	if mdl.FeatDim != UnifiedFeatureDim || len(mdl.W) != UnifiedFeatureDim {
+		log.Printf("[MODEL_REFIT] invalid after fit feat_dim=%d weights=%d; skip state update",
+			mdl.FeatDim, len(mdl.W))
+		return lastRefit, nil
+	}
+
 	IncWalkForwardFits()
 
 	t := now

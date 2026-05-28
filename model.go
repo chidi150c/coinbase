@@ -16,12 +16,7 @@ type LogisticModel struct {
 }
 
 func newModel() *LogisticModel {
-	return &LogisticModel{
-		W:       nil,
-		B:       0,
-		L2:      1e-3,
-		FeatDim: 0,
-	}
+	return NewLogisticModel(UnifiedFeatureDim)
 }
 
 func NewLogisticModel(featDim int) *LogisticModel {
