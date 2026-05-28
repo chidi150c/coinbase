@@ -412,8 +412,26 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 				}
 				cancelPx()
 
+				prevLastFit := trader.lastFit
+
 				// Walk-forward refit (optional)
 				lastRefit, model = maybeWalkForwardRefit(trader.cfg, model, signalHistory, lastRefit)
+
+				if lastRefit != nil && lastRefit.After(prevLastFit) && model != nil {
+					trader.mu.Lock()
+					trader.model = model
+					trader.lastFit = *lastRefit
+					if err := trader.saveStateNoLock(); err != nil {
+						log.Printf("[WARN] saveState after walk-forward refit: %v", err)
+					} else {
+						log.Printf("[MODEL_STATE] saved lastFit=%s feat_dim=%d weights=%d",
+							trader.lastFit.Format(time.RFC3339),
+							trader.model.FeatDim,
+							len(trader.model.W),
+						)
+					}
+					trader.mu.Unlock()
+				}
 
 				// Step trader
 				msg, err := trader.step(ctx, history, signalHistory)
@@ -540,7 +558,25 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 				// TODO: remove TRACE
 				log.Printf("TRACE history readiness len=%d need=%d signal_len=%d", len(history), trader.cfg.MaxHistoryCandles, len(signalHistory))
 
+				prevLastFit := trader.lastFit
+
 				lastRefit, model = maybeWalkForwardRefit(trader.cfg, model, signalHistory, lastRefit)
+
+				if lastRefit != nil && lastRefit.After(prevLastFit) && model != nil {
+					trader.mu.Lock()
+					trader.model = model
+					trader.lastFit = *lastRefit
+					if err := trader.saveStateNoLock(); err != nil {
+						log.Printf("[WARN] saveState after walk-forward refit: %v", err)
+					} else {
+						log.Printf("[MODEL_STATE] saved lastFit=%s feat_dim=%d weights=%d",
+							trader.lastFit.Format(time.RFC3339),
+							trader.model.FeatDim,
+							len(trader.model.W),
+						)
+					}
+					trader.mu.Unlock()
+				}
 
 				msg, err := trader.step(ctx, history, signalHistory)
 				if err != nil {
