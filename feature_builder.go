@@ -30,7 +30,7 @@
 //   14 MACD histogram
 //   15 MACD histogram delta
 //
-// Feature count: 16
+// Feature count: 20
 
 package main
 
@@ -41,7 +41,7 @@ const UnifiedFeatureDim = 20
 // FeatureSnapshot contains the unified feature vector plus the soft-gate booleans
 // that are useful for decision audit strings and logs.
 type FeatureSnapshot struct {
-	X []float64
+	X                []float64
 	HighPeak         bool
 	LowBottom        bool
 	PriceDownGoingUp bool
@@ -52,16 +52,16 @@ type FeatureSnapshot struct {
 	EMASlowPrev3     float64
 	EMASpreadPct     float64
 	EMAAlignStrength float64
-	MACDHist      float64
-	MACDHistDelta float64
-	EMA20           float64
-	EMA50           float64
-	EMA20Prev3      float64
-	EMA50Prev3      float64
-	EMA2050Spread   float64
-	EMA2050Strength float64
-	EMA20Slope      float64
-	EMA50Slope      float64
+	MACDHist         float64
+	MACDHistDelta    float64
+	EMA20            float64
+	EMA50            float64
+	EMA20Prev3       float64
+	EMA50Prev3       float64
+	EMA2050Spread    float64
+	EMA2050Strength  float64
+	EMA20Slope       float64
+	EMA50Slope       float64
 }
 
 // BuildFeatureSnapshot builds the unified feature vector at candle index idx.
@@ -69,7 +69,7 @@ type FeatureSnapshot struct {
 func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	var out FeatureSnapshot
 
-	if len(c) < 60 || idx < 26 || idx >= len(c) || idx-5 < 0 || idx-3 < 0 {
+	if len(c) < 60 || idx < 50 || idx >= len(c) || idx-6 < 0 {
 		return out, false
 	}
 	if c[idx].Close <= 0 || c[idx-1].Close <= 0 || c[idx-5].Close <= 0 {
@@ -89,7 +89,7 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	ema8 := EMA(close, 8)
 	_, _, macdHist := MACD(close, 12, 26, 9)
 	ema20 := EMA(close, 20)
-	ema50 := EMA(close, 50)	
+	ema50 := EMA(close, 50)
 
 	fast := ema4[idx]
 	slow := ema8[idx]
@@ -112,13 +112,13 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	priceDownGoingUp := false
 	priceUpGoingDown := false
 
-	if !badFloat(fast) && !badFloat(slow) && !badFloat(fast2) && !badFloat(slow2) && !badFloat(fast4) && !badFloat(slow4) && !badFloat(fast6) && !badFloat(slow6){
-		fastIsHigher := (fast > slow) && (fast4 > slow4) && (fast6 > slow6) 
-		fastIsLower := (fast < slow) && (fast4 < slow4) && (fast6 < slow6) 
+	if !badFloat(fast) && !badFloat(slow) && !badFloat(fast2) && !badFloat(slow2) && !badFloat(fast4) && !badFloat(slow4) && !badFloat(fast6) && !badFloat(slow6) {
+		fastIsHigher := (fast > slow) && (fast4 > slow4) && (fast6 > slow6)
+		fastIsLower := (fast < slow) && (fast4 < slow4) && (fast6 < slow6)
 		priceDownGoingUp = (fast < slow) && (fast6 < slow6) && (slow-fast < slow6-fast6)
-		priceUpGoingDown = (fast > slow) && (fast6 > slow6)  && (fast-slow < fast6-slow6)
-		highPeak = fastIsHigher && (fast4-slow4 > fast6-slow6) && (fast2-slow2 > fast4-slow4) && (fast-slow < fast2-slow2) 
-		lowBottom = fastIsLower && (slow4-fast4 > slow6-fast6) && (slow2-fast2 > slow4-fast4) && (slow-fast < slow2-fast2) 
+		priceUpGoingDown = (fast > slow) && (fast6 > slow6) && (fast-slow < fast6-slow6)
+		highPeak = fastIsHigher && (fast4-slow4 > fast6-slow6) && (fast2-slow2 > fast4-slow4) && (fast-slow < fast2-slow2)
+		lowBottom = fastIsLower && (slow4-fast4 > slow6-fast6) && (slow2-fast2 > slow4-fast4) && (slow-fast < slow2-fast2)
 	}
 
 	ret1 := safeRatio(c[idx].Close-c[idx-1].Close, c[idx-1].Close)

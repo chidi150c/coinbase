@@ -819,7 +819,21 @@ func maybeWalkForwardRefit(cfg Config, mdl *LogisticModel, history []Candle, las
 		return lastRefit, mdl
 	}
 
-	if mdl == nil {
+	if mdl == nil || mdl.FeatDim != UnifiedFeatureDim || len(mdl.W) != UnifiedFeatureDim {
+		log.Printf("[MODEL_REFIT] resetting invalid model feat_dim=%d weights=%d",
+			func() int {
+				if mdl == nil {
+					return 0
+				}
+				return mdl.FeatDim
+			}(),
+			func() int {
+				if mdl == nil || mdl.W == nil {
+					return 0
+				}
+				return len(mdl.W)
+			}(),
+		)
 		mdl = newModel()
 	}
 
