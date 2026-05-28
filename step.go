@@ -147,6 +147,38 @@ func safeSend(ch chan OpenResult, res OpenResult) {
 	}
 }
 
+// creditRefundService records the opposite-side spare created by the refund-service
+// portion of an entry order. The refund-service portion is removed from the open
+// lot exposure, but its net proceeds/inventory must remain available for the
+// side that was previously short/blocked.
+//
+// BUY entry + refund portion  => restores base inventory for future SELLs, tracked as SpareSellUSD.
+// SELL entry + refund portion => restores quote inventory for future BUYs, tracked as SpareBuyUSD.
+func (t *Trader) creditRefundService(side OrderSide, refundQuote, refundFee float64) {
+	if refundQuote <= 0 {
+		return
+	}
+	if refundFee < 0 {
+		refundFee = 0
+	}
+
+	refundNet := refundQuote - refundFee
+	if refundNet < 0 {
+		refundNet = 0
+	}
+
+	if side == SideBuy {
+		t.SpareSellUSD += refundNet
+		log.Printf("TRACE refund.sell.service_credited side=%s gross=%.8f fee=%.8f net=%.8f spareSell_after=%.8f",
+			side, refundQuote, refundFee, refundNet, t.SpareSellUSD)
+		return
+	}
+
+	t.SpareBuyUSD += refundNet
+	log.Printf("TRACE refund.buy.service_credited side=%s gross=%.8f fee=%.8f net=%.8f spareBuy_after=%.8f",
+		side, refundQuote, refundFee, refundNet, t.SpareBuyUSD)
+}
+
 // helper (recommended): persist pending changes safely under lock
 func (t *Trader) repriceUpdatePending(side OrderSide, newID string, newLimitPx, newBase float64) {
 	t.mu.Lock()
@@ -402,22 +434,34 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				if t.pendingBuy != nil {
 					if t.pendingBuy.RefundPortionUSD > 0 {
+						origBase := baseToUse
+						origQuote := quoteSpent
+						origFee := entryFee
+
 						refundBase := t.pendingBuy.RefundPortionUSD / priceToUse
 						if refundBase > baseToUse {
 							refundBase = baseToUse
 						}
+
 						keptBase := baseToUse - refundBase
 						if keptBase < 0 {
 							keptBase = 0
 						}
+
 						keptQuote := quoteSpent
-						if baseToUse > 0 {
-							keptQuote = quoteSpent * (keptBase / baseToUse)
-						}
 						keptFee := entryFee
-						if baseToUse > 0 {
-							keptFee = entryFee * (keptBase / baseToUse)
+						refundQuote := t.pendingBuy.RefundPortionUSD
+						refundFee := refundQuote * (t.cfg.FeeRatePct / 100.0)
+
+						if origBase > 0 {
+							keptQuote = origQuote * (keptBase / origBase)
+							keptFee = origFee * (keptBase / origBase)
+							refundQuote = origQuote * (refundBase / origBase)
+							refundFee = origFee * (refundBase / origBase)
 						}
+
+						t.creditRefundService(SideBuy, refundQuote, refundFee)
+
 						baseToUse = keptBase
 						quoteSpent = keptQuote
 						entryFee = keptFee
@@ -563,22 +607,34 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				)
 				if t.pendingSell != nil {
 					if t.pendingSell.RefundPortionUSD > 0 {
+						origBase := baseToUse
+						origQuote := quoteSpent
+						origFee := entryFee
+
 						refundBase := t.pendingSell.RefundPortionUSD / priceToUse
 						if refundBase > baseToUse {
 							refundBase = baseToUse
 						}
+
 						keptBase := baseToUse - refundBase
 						if keptBase < 0 {
 							keptBase = 0
 						}
+
 						keptQuote := quoteSpent
-						if baseToUse > 0 {
-							keptQuote = quoteSpent * (keptBase / baseToUse)
-						}
 						keptFee := entryFee
-						if baseToUse > 0 {
-							keptFee = entryFee * (keptBase / baseToUse)
+						refundQuote := t.pendingSell.RefundPortionUSD
+						refundFee := refundQuote * (t.cfg.FeeRatePct / 100.0)
+
+						if origBase > 0 {
+							keptQuote = origQuote * (keptBase / origBase)
+							keptFee = origFee * (keptBase / origBase)
+							refundQuote = origQuote * (refundBase / origBase)
+							refundFee = origFee * (refundBase / origBase)
 						}
+
+						t.creditRefundService(SideSell, refundQuote, refundFee)
+
 						baseToUse = keptBase
 						quoteSpent = keptQuote
 						entryFee = keptFee
@@ -1007,7 +1063,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f signalTF=%s gateTF=%s Reason=%s buyThresh=%.3f sellThresh=%.3f LongOnly=%v ver-50",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f signalTF=%s gateTF=%s Reason=%s buyThresh=%.3f sellThresh=%.3f LongOnly=%v ver-51",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -2398,22 +2454,34 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	}
 
 	if refundFromOpposite > 0 {
+		origBase := baseToUse
+		origQuote := actualQuote
+		origFee := entryFee
+
 		refundBase := refundFromOpposite / priceToUse
 		if refundBase > baseToUse {
 			refundBase = baseToUse
 		}
+
 		keptBase := baseToUse - refundBase
 		if keptBase < 0 {
 			keptBase = 0
 		}
+
 		keptQuote := actualQuote
-		if baseToUse > 0 {
-			keptQuote = actualQuote * (keptBase / baseToUse)
-		}
 		keptFee := entryFee
-		if baseToUse > 0 {
-			keptFee = entryFee * (keptBase / baseToUse)
+		refundQuote := refundFromOpposite
+		refundFee := refundQuote * (t.cfg.FeeRatePct / 100.0)
+
+		if origBase > 0 {
+			keptQuote = origQuote * (keptBase / origBase)
+			keptFee = origFee * (keptBase / origBase)
+			refundQuote = origQuote * (refundBase / origBase)
+			refundFee = origFee * (refundBase / origBase)
 		}
+
+		t.creditRefundService(side, refundQuote, refundFee)
+
 		baseToUse = keptBase
 		actualQuote = keptQuote
 		entryFee = keptFee
