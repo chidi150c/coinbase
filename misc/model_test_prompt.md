@@ -251,15 +251,14 @@ cp /opt/coinbase/state/bot_state.newbinance.json \
 
 Then this:
 
-jq '
-.Model.W = [] |
-.Model.B = 0 |
-.Model.FeatDim = 20 |
-.LastFit = "0001-01-01T00:00:00Z"
-' /opt/coinbase/state/bot_state.newbinance.json \
-> /tmp/state_reset.json
+jq '.Model.W=null | .Model.B=0 | .Model.FeatDim=14 | .LastFit="0001-01-01T00:00:00Z"' \
+/opt/coinbase/state/bot_state.newbinance.json \
+> /tmp/state_reset.json && \
+sudo mv -f /tmp/state_reset.json /opt/coinbase/state/bot_state.newbinance.json
 
-mv /tmp/state_reset.json \
+And then confirm with this:
+
+jq '.Model,.LastFit' \
 /opt/coinbase/state/bot_state.newbinance.json
 ___________
 

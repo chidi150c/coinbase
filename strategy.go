@@ -114,29 +114,25 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 	signalTF := t.cfg.SignalTF()
 
 	reason := fmt.Sprintf(
-		"pUp=%.5f, ema4_%s=%.2f vs ema8_%s=%.2f, ema4_3rd_%s=%.2f vs ema8_3rd_%s=%.2f, emaSpreadPct_%s=%.6f, emaAlign_%s=%.6f, macdHist_%s=%.5f, macdDelta_%s=%.5f, ema2050Spread_%s=%.6f, ema20Slope_%s=%.6f, ema50Slope_%s=%.6f",
+		"pUp=%.5f, highPeak_%s=%t, lowBottom_%s=%t, distHighPct_%s=%.6f, distLowPct_%s=%.6f, macdLine_%s=%.5f, macdHist_%s=%.5f, macdD1_%s=%.5f, macdD2_%s=%.5f, macdD3_%s=%.5f",
 		pUp,
-		signalTF, snap.EMAFast,
-		signalTF, snap.EMASlow,
-		signalTF, snap.EMAFastPrev3,
-		signalTF, snap.EMASlowPrev3,
-		signalTF, snap.EMASpreadPct,
-		signalTF, snap.EMAAlignStrength,
+		signalTF, snap.HighPeak,
+		signalTF, snap.LowBottom,
+		signalTF, snap.DistHighPct,
+		signalTF, snap.DistLowPct,
+		signalTF, snap.MACDLine,
 		signalTF, snap.MACDHist,
-		signalTF, snap.MACDHistDelta,
-		signalTF, snap.EMA2050Spread,
-		signalTF, snap.EMA20Slope,
-		signalTF, snap.EMA50Slope,
+		signalTF, snap.MACDD1,
+		signalTF, snap.MACDD2,
+		signalTF, snap.MACDD3,
 	)
 
 	base := Decision{
-		Confidence:       0.5,
-		Reason:           reason,
-		PUp:              pUp,
-		HighPeak:         snap.HighPeak,
-		PriceDownGoingUp: snap.PriceDownGoingUp,
-		LowBottom:        snap.LowBottom,
-		PriceUpGoingDown: snap.PriceUpGoingDown,
+		Confidence: 0.5,
+		Reason:     reason,
+		PUp:        pUp,
+		HighPeak:   snap.HighPeak,
+		LowBottom:  snap.LowBottom,
 	}
 
 	if pUp > t.cfg.BuyThreshold {
@@ -183,12 +179,14 @@ func (t *Trader) applyMACDSlopeGate(d Decision, execHistory []Candle) Decision {
 			return d
 		}
 		log.Printf(
-			"[MACD_GATE] gateTF=%s raw=%s macdHist_1m=%.5f macdDelta_1m=%.5f eps=%.8f | MACD_Gate_Not_Applied",
+			"[MACD_GATE] gateTF=%s raw=%s macdHist_%s=%.5f d1_%s=%.5f d2_%s=%.5f d3_%s=%.5f eps=%.8f | MACD_Gate_Not_Applied",
 			t.cfg.GateTF,
 			d.Raw,
-			snap.MACDHist,
-			snap.MACDHistDelta,
-			t.cfg.MACDSlopeEPS,
+			t.cfg.GateTF, snap.MACDHist,
+			t.cfg.GateTF, snap.MACDD1,
+			t.cfg.GateTF, snap.MACDD2,
+			t.cfg.GateTF, snap.MACDD3,
+			t.cfg.MACDLineEPS,
 		)
 		return d
 	}
@@ -203,34 +201,44 @@ func (t *Trader) applyMACDSlopeGate(d Decision, execHistory []Candle) Decision {
 		return d
 	}
 
-	eps := t.cfg.MACDSlopeEPS
+	// eps := t.cfg.MACDSlopeEPS
+	eps := t.cfg.MACDLineEPS
 	reason := ""
 
 	switch d.Signal {
 
 	case Sell:
-		if snap.MACDHistDelta > eps {
+		// Require strong positive MACD regime
+		// plus rollover/top pattern.
+		if snap.MACDLine <= eps || !snap.HighPeak {
 			d.Signal = Flat
-			reason = "bullish_macd_delta_against_sell"
+			reason = "macd_not_high_peak_for_sell"
 		}
 
 	case Buy:
-		if snap.MACDHistDelta < -eps {
+		// Require strong negative MACD regime
+		// plus bottom reversal pattern.
+		if snap.MACDLine >= -eps || !snap.LowBottom {
 			d.Signal = Flat
-			reason = "bearish_macd_delta_against_buy"
+			reason = "macd_not_low_bottom_for_buy"
 		}
 	}
 
 	d.Reason = appendReason(d.Reason, reason)
 
 	log.Printf(
-		"[MACD_GATE] gateTF=%s raw=%s final=%s macdHist_1m=%.5f macdDelta_1m=%.5f eps=%.8f reason=%s",
+		"[MACD_GATE] gateTF=%s raw=%s final=%s macdLine_%s=%.5f macdHist_%s=%.5f d1_%s=%.5f d2_%s=%.5f d3_%s=%.5f eps=%.5f highPeak=%t lowBottom=%t reason=%s",
 		t.cfg.GateTF,
 		d.Raw,
 		d.Signal,
-		snap.MACDHist,
-		snap.MACDHistDelta,
+		t.cfg.GateTF, snap.MACDLine,
+		t.cfg.GateTF, snap.MACDHist,
+		t.cfg.GateTF, snap.MACDD1,
+		t.cfg.GateTF, snap.MACDD2,
+		t.cfg.GateTF, snap.MACDD3,
 		eps,
+		snap.HighPeak,
+		snap.LowBottom,
 		reason,
 	)
 
@@ -257,13 +265,11 @@ func (t *Trader) applyMAFilterGate(d Decision, execHistory []Candle) Decision {
 			return d
 		}
 		log.Printf(
-			"[MA_GATE] gateTF=%s raw=%s lowBottom=%v priceDownGoingUp=%v highPeak=%v priceUpGoingDown=%v | MA_Gate_Not_Applied",
+			"[MA_GATE] gateTF=%s raw=%s lowBottom=%v highPeak=%v | MA_Gate_Not_Applied",
 			t.cfg.GateTF,
 			d.Raw,
 			snap.LowBottom,
-			snap.PriceDownGoingUp,
 			snap.HighPeak,
-			snap.PriceUpGoingDown,
 		)
 		return d
 	}
@@ -278,17 +284,14 @@ func (t *Trader) applyMAFilterGate(d Decision, execHistory []Candle) Decision {
 		return d
 	}
 
-	buyMASignal := snap.LowBottom || snap.PriceDownGoingUp
-	sellMASignal := snap.HighPeak || snap.PriceUpGoingDown
-
 	reason := ""
 
-	if d.Signal == Buy && !buyMASignal {
+	if d.Signal == Buy && !snap.LowBottom {
 		d.Signal = Flat
 		reason = "ma_gate_block_buy"
 	}
 
-	if d.Signal == Sell && !sellMASignal {
+	if d.Signal == Sell && !snap.HighPeak {
 		d.Signal = Flat
 		reason = "ma_gate_block_sell"
 	}
@@ -296,16 +299,14 @@ func (t *Trader) applyMAFilterGate(d Decision, execHistory []Candle) Decision {
 	d.Reason = appendReason(d.Reason, reason)
 
 	log.Printf(
-		"[MA_GATE] gateTF=%s raw=%s final=%s buyMA=%v sellMA=%v lowBottom=%v priceDownGoingUp=%v highPeak=%v priceUpGoingDown=%v reason=%s",
+		"[MA_GATE] gateTF=%s raw=%s final=%s buyMA=%v sellMA=%v lowBottom=%v highPeak=%v reason=%s",
 		t.cfg.GateTF,
 		d.Raw,
 		d.Signal,
-		buyMASignal,
-		sellMASignal,
 		snap.LowBottom,
-		snap.PriceDownGoingUp,
 		snap.HighPeak,
-		snap.PriceUpGoingDown,
+		snap.LowBottom,
+		snap.HighPeak,
 		reason,
 	)
 

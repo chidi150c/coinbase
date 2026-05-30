@@ -104,7 +104,7 @@ func loadBotEnv() {
 		"AI_MINED_MAX_ROWS":    {},
 		"AI_SIGNAL_TF":         {},
 		"USE_MACD_SLOPE_GATE":  {},
-		"MACD_SLOPE_EPS":       {},
+		"MACD_LINE_EPS":        {},
 
 		// ---- pyramiding/env-driven knobs ----
 		"ALLOW_PYRAMIDING":            {},

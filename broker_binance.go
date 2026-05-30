@@ -70,7 +70,6 @@ func (b *BinanceBridge) GetBBO(ctx context.Context, product string) (float64, fl
 	return payload.Bid, payload.Ask, nil
 }
 
-
 // --- Price / Product ---
 func (b *BinanceBridge) GetNowPrice(ctx context.Context, product string) (float64, error) {
 	u := fmt.Sprintf("%s/product/%s", b.base, url.PathEscape(product))
@@ -458,8 +457,8 @@ func (b *BinanceBridge) GetExchangeFilters(ctx context.Context, product string) 
 				StepSize:    envStep,
 				TickSize:    envTick,
 				PriceTick:   envPriceTick,
-				BaseStep:    envStep,       // alias
-				QuoteStep:   envQuoteStep,  // may be 0
+				BaseStep:    envStep,      // alias
+				QuoteStep:   envQuoteStep, // may be 0
 				MinNotional: envMinNotional,
 			}
 			// If price_tick missing but tick_size present, alias

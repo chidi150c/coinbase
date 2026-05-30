@@ -52,7 +52,7 @@ type Position struct {
 	Take      float64
 	OpenTime  time.Time
 	// --- NEW: record entry fee for later P/L adjustment ---
-	EntryFee float64
+	EntryFee        float64
 	OpenNotionalUSD float64
 	// --- NEW (runner-only trailing fields; used only when this lot is the runner) ---
 	TrailActive bool    // becomes true after TRAIL_ACTIVATE_PCT threshold (legacy flag; now also used by USD-activate)
@@ -73,8 +73,8 @@ type Position struct {
 	TrailDistancePct     float64 `json:"distance_pct"`      // from TRAIL_DISTANCE_PCT (runner/scalp)
 
 	// --- NEW: track maker-first TP exit order id (post-only limit attempt) ---
-	FixedTPOrderID string `json:"-"`
-	RefundPortionUSD float64 `json:"refund_portion_usd"` 
+	FixedTPOrderID   string  `json:"-"`
+	RefundPortionUSD float64 `json:"refund_portion_usd"`
 
 	// --- NEW: stable lot identifier & entry order id (persisted) ---
 	LotID        int    `json:"lot_id,omitempty"`
@@ -83,7 +83,7 @@ type Position struct {
 
 // --- NEW: per-side book (authoritative store) ---
 type SideBook struct {
-	RunnerIDs []int       `json:"runner_ids,omitempty"`  // NEW: multiple runner indices (authoritative for multi-runner mode)
+	RunnerIDs []int       `json:"runner_ids,omitempty"` // NEW: multiple runner indices (authoritative for multi-runner mode)
 	Lots      []*Position `json:"lots"`
 }
 
@@ -123,34 +123,34 @@ type BotState struct {
 	PendingSell        *PendingOpen
 	PendingRecheckBuy  bool
 	PendingRecheckSell bool
-	RefundBuyUSD  float64
-	RefundSellUSD float64
-	SpareBuyUSD  float64
-	SpareSellUSD float64
+	RefundBuyUSD       float64
+	RefundSellUSD      float64
+	SpareBuyUSD        float64
+	SpareSellUSD       float64
 }
 
 // --- NEW (Phase 1): pending async maker-first open support ---
 type PendingOpen struct {
-	Side         OrderSide
-	LimitPx      float64
-	BaseAtLimit  float64
-	Quote        float64
-	Take         float64
-	Reason       string
-	RefundPortionUSD float64 `json:"refund_portion_usd"` 
-	ProductID    string
-	CreatedAt    time.Time
-	Deadline     time.Time
-	EquityBuy    bool // whether this was equityTriggerBuy
-	EquitySell   bool // whether this was equityTriggerSell
+	Side             OrderSide
+	LimitPx          float64
+	BaseAtLimit      float64
+	Quote            float64
+	Take             float64
+	Reason           string
+	RefundPortionUSD float64 `json:"refund_portion_usd"`
+	ProductID        string
+	CreatedAt        time.Time
+	Deadline         time.Time
+	EquityBuy        bool // whether this was equityTriggerBuy
+	EquitySell       bool // whether this was equityTriggerSell
 	// --- NEW: persisted working order id to allow rehydration ---
 	OrderID string
-	    // NEW: keep last few order IDs so we accept late fills after a cancel/reprice.
-    History []string `json:"history,omitempty"` // capped (e.g., last 5)
-    // NEW: accumulate fills across reprices
-    AccumBase   float64 // sum of executed base over all prior order IDs
-    AccumQuote  float64 // sum of executed quote
-    AccumFeeUSD float64 // sum of fees (if provided)
+	// NEW: keep last few order IDs so we accept late fills after a cancel/reprice.
+	History []string `json:"history,omitempty"` // capped (e.g., last 5)
+	// NEW: accumulate fills across reprices
+	AccumBase   float64 // sum of executed base over all prior order IDs
+	AccumQuote  float64 // sum of executed quote
+	AccumFeeUSD float64 // sum of fees (if provided)
 }
 
 type OpenResult struct {
@@ -161,15 +161,14 @@ type OpenResult struct {
 }
 
 type Trader struct {
-	cfg    Config
-	broker Broker
-	model  *LogisticModel
+	cfg                   Config
+	broker                Broker
+	model                 *LogisticModel
 	didConsolidateStartup bool
-	pos    *Position // kept for backward compatibility with earlier logic (represents last lot in aggregate)
+	pos                   *Position // kept for backward compatibility with earlier logic (represents last lot in aggregate)
 	// lots      []*Position // legacy aggregate view (derived from books; do not mutate directly)
 	mu        sync.RWMutex
 	equityUSD float64
-
 
 	// NEW: path to persisted state file
 	stateFile string
@@ -221,18 +220,17 @@ type Trader struct {
 	// --- NEW: centralized state manager channel ---
 	stateApplyCh chan func(*Trader)
 	// Persist snapshots for Gate2 use (under lock; we are holding t.mu in step())
-	nearestTakeBuy float64
-	nearestNetBuy  float64
-	nearestIdxBuy  int
+	nearestTakeBuy  float64
+	nearestNetBuy   float64
+	nearestIdxBuy   int
 	nearestTakeSell float64
 	nearestNetSell  float64
 	nearestIdxSell  int
 
 	refundBuyUSD  float64
 	refundSellUSD float64
-	SpareBuyUSD  float64
-	SpareSellUSD float64
-
+	SpareBuyUSD   float64
+	SpareSellUSD  float64
 }
 
 func NewTrader(cfg Config, broker Broker, model *LogisticModel) *Trader {
@@ -290,19 +288,19 @@ func NewTrader(cfg Config, broker Broker, model *LogisticModel) *Trader {
 
 // ExitRecord captures a compact snapshot for an exited lot.
 type ExitRecord struct {
-	Time        time.Time `json:"time"`
-	Side        OrderSide `json:"side"`
-	OpenPrice   float64   `json:"open_price"`
-	ClosePrice  float64   `json:"close_price"`
-	SizeBase    float64   `json:"size_base"`
-	OpenNotionalUSD    float64   `json:"open_notional_usd"`
-	EntryFeeUSD float64   `json:"entry_fee_usd"`
-	ExitFeeUSD  float64   `json:"exit_fee_usd"`
-	PNLUSD      float64   `json:"pnl_usd"`
-	Reason      string    `json:"reason"`
-	ExitMode    ExitMode  `json:"exit_mode,omitempty"`
-	WasRunner   bool      `json:"was_runner"`
-	RefundPortionUSD float64 `json:"refund_portion_usd"` 
+	Time             time.Time `json:"time"`
+	Side             OrderSide `json:"side"`
+	OpenPrice        float64   `json:"open_price"`
+	ClosePrice       float64   `json:"close_price"`
+	SizeBase         float64   `json:"size_base"`
+	OpenNotionalUSD  float64   `json:"open_notional_usd"`
+	EntryFeeUSD      float64   `json:"entry_fee_usd"`
+	ExitFeeUSD       float64   `json:"exit_fee_usd"`
+	PNLUSD           float64   `json:"pnl_usd"`
+	Reason           string    `json:"reason"`
+	ExitMode         ExitMode  `json:"exit_mode,omitempty"`
+	WasRunner        bool      `json:"was_runner"`
+	RefundPortionUSD float64   `json:"refund_portion_usd"`
 	// --- NEW: identifiers for traceability ---
 	LotID        int    `json:"lot_id,omitempty"`
 	EntryOrderID string `json:"entry_order_id,omitempty"`
@@ -352,7 +350,6 @@ func (t *Trader) apply(fn func(*Trader)) {
 		t.mu.Unlock()
 	}
 }
-
 
 func midnightUTC(ts time.Time) time.Time {
 	y, m, d := ts.Date()
@@ -519,6 +516,7 @@ func (t *Trader) book(side OrderSide) *SideBook {
 	}
 	return b
 }
+
 // mergeLots merges lot at fromIdx into lot at toIdx inside the given book.
 // toIdx is the survivor.
 func mergeLots(book *SideBook, fromIdx, toIdx int, px float64) {
@@ -745,27 +743,28 @@ func (t *Trader) consolidateRunners(book *SideBook, px float64) {
 
 // mirrorEffectiveGate returns the dynamic (ramped) mirror gate based on nearest lot index.
 func (t *Trader) mirrorEffectiveGate(side OrderSide) float64 {
-    base  := t.cfg.MirrorGateUSD
-    slope := t.cfg.MirrorGateSlopeUSD
-    start := t.cfg.MirrorGateStartIdx
-    cap   := t.cfg.MirrorGateMaxUSD
+	base := t.cfg.MirrorGateUSD
+	slope := t.cfg.MirrorGateSlopeUSD
+	start := t.cfg.MirrorGateStartIdx
+	cap := t.cfg.MirrorGateMaxUSD
 
-    var idx int
-    if side == SideBuy {
-        idx = t.nearestIdxBuy
-    } else {
-        idx = t.nearestIdxSell
-    }
-    steps := idx - start
-    if steps < 0 {
-       steps = 0
-    }
-    gate := base + float64(steps)*slope
-    if cap > 0 && gate > cap {
-        gate = cap
-    }
-    return gate
+	var idx int
+	if side == SideBuy {
+		idx = t.nearestIdxBuy
+	} else {
+		idx = t.nearestIdxSell
+	}
+	steps := idx - start
+	if steps < 0 {
+		steps = 0
+	}
+	gate := base + float64(steps)*slope
+	if cap > 0 && gate > cap {
+		gate = cap
+	}
+	return gate
 }
+
 // --- NEW: side-aware lot closing (no global index) ---
 func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, localIdx int, exitReason string) (string, error) {
 	book := t.book(side)
@@ -982,18 +981,18 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 
 	// Build ExitRecord (use exec price/size actually filled)
 	rec := ExitRecord{
-		Time:        c[len(c)-1].Time,
-		Side:        lot.Side,
-		OpenPrice:   lot.OpenPrice,
-		ClosePrice:  priceExec,
-		SizeBase:    baseFilled,
-		OpenNotionalUSD: lot.OpenNotionalUSD,
-		EntryFeeUSD: entryPortion, // Phase 3: record proportional entry fee
-		ExitFeeUSD:  exitFee,
-		PNLUSD:      pl,
-		Reason:      exitReason + " | " + lot.Reason,
-		ExitMode:    lot.ExitMode,
-		WasRunner:   removedWasRunner,
+		Time:             c[len(c)-1].Time,
+		Side:             lot.Side,
+		OpenPrice:        lot.OpenPrice,
+		ClosePrice:       priceExec,
+		SizeBase:         baseFilled,
+		OpenNotionalUSD:  lot.OpenNotionalUSD,
+		EntryFeeUSD:      entryPortion, // Phase 3: record proportional entry fee
+		ExitFeeUSD:       exitFee,
+		PNLUSD:           pl,
+		Reason:           exitReason + " | " + lot.Reason,
+		ExitMode:         lot.ExitMode,
+		WasRunner:        removedWasRunner,
 		RefundPortionUSD: lot.RefundPortionUSD,
 		// NEW identifiers
 		LotID:        lot.LotID,
@@ -1139,6 +1138,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	_ = removedWasRunner // kept to emphasize runner path; no extra logs.
 	return msg, nil
 }
+
 // activationPrice returns the mark price that achieves a given NET USD gain (usdGate)
 // after subtracting the already-paid entry fee and estimating exit fee at feeRatePct.
 func activationPrice(lot *Position, usdGate float64, feeRatePct float64) float64 {
@@ -1236,10 +1236,10 @@ func (t *Trader) snapshotStateLocked() BotState {
 		PendingSell:        t.pendingSell,
 		PendingRecheckBuy:  t.pendingRecheckBuy,
 		PendingRecheckSell: t.pendingRecheckSell,
-        RefundBuyUSD:  t.refundBuyUSD,
-        RefundSellUSD: t.refundSellUSD,
-		SpareBuyUSD: t.SpareBuyUSD,
-		SpareSellUSD: t.SpareSellUSD,
+		RefundBuyUSD:       t.refundBuyUSD,
+		RefundSellUSD:      t.refundSellUSD,
+		SpareBuyUSD:        t.SpareBuyUSD,
+		SpareSellUSD:       t.SpareSellUSD,
 	}
 }
 
@@ -1362,9 +1362,9 @@ func (t *Trader) loadState() error {
 	t.pendingSell = st.PendingSell
 	t.pendingRecheckBuy = st.PendingRecheckBuy
 	t.pendingRecheckSell = st.PendingRecheckSell
-	
-    t.refundBuyUSD = st.RefundBuyUSD
-    t.refundSellUSD = st.RefundSellUSD
+
+	t.refundBuyUSD = st.RefundBuyUSD
+	t.refundSellUSD = st.RefundSellUSD
 	t.SpareBuyUSD = st.SpareBuyUSD
 	t.SpareSellUSD = st.SpareSellUSD
 
@@ -1397,7 +1397,6 @@ func (t *Trader) loadState() error {
 	// t.refreshAggregateFromBooks() // legacy aggregate (intentionally left disabled)
 	return nil
 }
-
 
 func (t *Trader) LastExits() []ExitRecord {
 	t.mu.RLock()
@@ -1583,7 +1582,7 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 			deadline := pcopy.Deadline
 
 			// --- ENV GUARDRAILS (read once per poller) ---
-			
+
 			var repriceCount int
 
 		poll:
@@ -1734,7 +1733,7 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 					tt.pendingSellCancel = nil
 				}
 				err := tt.saveStateFrom(tt.snapshotStateLocked())
-				if err !=nil{
+				if err != nil {
 					log.Fatalf("TRACE Unable to save state after order cancelling in RehydratePending!!! side=%s Error: %v", side, err)
 				}
 			})

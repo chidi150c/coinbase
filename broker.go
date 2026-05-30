@@ -40,11 +40,11 @@ type PlacedOrder struct {
 	ID            string    `json:"order_id,omitempty"`
 	ProductID     string    `json:"product_id,omitempty"`
 	Side          OrderSide `json:"side,omitempty"`
-	Price         float64   `json:"price,omitempty"`                // avg/exec price
-	BaseSize      float64   `json:"base_size,omitempty"`            // filled base
-	QuoteSpent    float64   `json:"quote_spent,omitempty"`          // spent quote
+	Price         float64   `json:"price,omitempty"`       // avg/exec price
+	BaseSize      float64   `json:"base_size,omitempty"`   // filled base
+	QuoteSpent    float64   `json:"quote_spent,omitempty"` // spent quote
 	CommissionUSD float64   `json:"commission_total_usd,string,omitempty"`
-	Liquidity     string    `json:"liquidity,omitempty"`            // "M" or "T"
+	Liquidity     string    `json:"liquidity,omitempty"` // "M" or "T"
 	Fills         []Fill    `json:"fills,omitempty"`
 	CreateTime    time.Time `json:"-"` // optional client-side timestamp; not from bridge
 	Status        string    `json:"status"`

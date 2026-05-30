@@ -97,7 +97,6 @@ func (b *BridgeBroker) GetBBO(ctx context.Context, product string) (float64, flo
 	return payload.Bid, payload.Ask, nil
 }
 
-
 // --- Price ---
 func (bb *BridgeBroker) GetNowPrice(ctx context.Context, product string) (float64, error) {
 	u := fmt.Sprintf("%s/product/%s", bb.base, url.PathEscape(product))
@@ -440,12 +439,18 @@ func (bb *BridgeBroker) GetExchangeFilters(ctx context.Context, product string) 
 		qs := strings.TrimSpace(os.Getenv("QUOTE_STEP"))
 		mn := strings.TrimSpace(os.Getenv("MIN_NOTIONAL"))
 		f := ExFilters{
-			StepSize:   parsePosFloat(bs),
-			TickSize:   parsePosFloat(ts),
-			PriceTick:  parsePosFloat(pt),
-			BaseStep:   parsePosFloat(bs),
-			QuoteStep:  parsePosFloat(qs),
-			MinNotional: func() float64 { v := parsePosFloat(mn); if v <= 0 { return 0 } ; return v }(),
+			StepSize:  parsePosFloat(bs),
+			TickSize:  parsePosFloat(ts),
+			PriceTick: parsePosFloat(pt),
+			BaseStep:  parsePosFloat(bs),
+			QuoteStep: parsePosFloat(qs),
+			MinNotional: func() float64 {
+				v := parsePosFloat(mn)
+				if v <= 0 {
+					return 0
+				}
+				return v
+			}(),
 		}
 		if f.StepSize > 0 || f.TickSize > 0 || f.PriceTick > 0 || f.BaseStep > 0 || f.QuoteStep > 0 || f.MinNotional > 0 {
 			fMuCoinbase.Lock()
@@ -525,7 +530,6 @@ func (bb *BridgeBroker) GetExchangeFilters(ctx context.Context, product string) 
 
 	return ExFilters{}, fmt.Errorf("filters unavailable for %s: %v", key, lastErr)
 }
-
 
 // --- Maker-first additions (post-only limit) ---
 

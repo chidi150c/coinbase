@@ -180,9 +180,9 @@ func MACD(close []float64, fast, slow, signal int) (macd, signalLine, hist []flo
 	return
 }
 
-func macdHistSlope(c []Candle) (float64, bool) {
-	if len(c) < 40 {
-		return 0, false
+func MACDLineHistAndSlopes(c []Candle) ([]float64, []float64, float64, float64, float64, bool) {
+	if len(c) < 60 {
+		return nil, nil, 0, 0, 0, false
 	}
 
 	closePx := make([]float64, len(c))
@@ -190,13 +190,17 @@ func macdHistSlope(c []Candle) (float64, bool) {
 		closePx[i] = c[i].Close
 	}
 
-	_, _, hist := MACD(closePx, 12, 26, 9)
-	if len(hist) < 2 {
-		return 0, false
+	macdLine, _, hist := MACD(closePx, 12, 26, 9)
+	if len(macdLine) < 4 || len(hist) < 4 {
+		return nil, nil, 0, 0, 0, false
 	}
 
 	n := len(hist)
-	return hist[n-1] - hist[n-2], true
+	d1 := hist[n-3] - hist[n-4]
+	d2 := hist[n-2] - hist[n-3]
+	d3 := hist[n-1] - hist[n-2]
+
+	return macdLine, hist, d1, d2, d3, true
 }
 
 // OBV computes On-Balance Volume over candles and returns a cumulative series.

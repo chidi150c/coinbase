@@ -38,30 +38,25 @@ import "math"
 
 const UnifiedFeatureDim = 20
 
-// FeatureSnapshot contains the unified feature vector plus the soft-gate booleans
-// that are useful for decision audit strings and logs.
+// FeatureSnapshot contains the unified feature vector plus
+// pattern-state values useful for audit logs and decisions.
 type FeatureSnapshot struct {
-	X                []float64
-	HighPeak         bool
-	LowBottom        bool
-	PriceDownGoingUp bool
-	PriceUpGoingDown bool
-	EMAFast          float64
-	EMASlow          float64
-	EMAFastPrev3     float64
-	EMASlowPrev3     float64
-	EMASpreadPct     float64
-	EMAAlignStrength float64
-	MACDHist         float64
-	MACDHistDelta    float64
-	EMA20            float64
-	EMA50            float64
-	EMA20Prev3       float64
-	EMA50Prev3       float64
-	EMA2050Spread    float64
-	EMA2050Strength  float64
-	EMA20Slope       float64
-	EMA50Slope       float64
+	X []float64
+
+	// Pattern booleans
+	HighPeak  bool
+	LowBottom bool
+
+	// MACD state
+	MACDLine float64
+	MACDHist float64
+	MACDD1   float64
+	MACDD2   float64
+	MACDD3   float64
+
+	// Optional context for logs/debug
+	DistHighPct float64
+	DistLowPct  float64
 }
 
 // BuildFeatureSnapshot builds the unified feature vector at candle index idx.
@@ -87,7 +82,10 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	std20 := RollingStd(close, 20)
 	ema4 := EMA(close, 4)
 	ema8 := EMA(close, 8)
-	_, _, macdHist := MACD(close, 12, 26, 9)
+	macdLine, macdHist, d1, d2, d3, ok := MACDLineHistAndSlopes(c)
+	if !ok {
+		return out, false
+	}
 	ema20 := EMA(close, 20)
 	ema50 := EMA(close, 50)
 
@@ -99,9 +97,8 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	slow4 := ema8[idx-4]
 	fast6 := ema4[idx-6]
 	slow6 := ema8[idx-6]
+	macdLineNow := macdLine[idx]
 	histNow := macdHist[idx]
-	histPrev := macdHist[idx-1]
-	histDelta := histNow - histPrev
 	mid := ema20[idx]
 	long := ema50[idx]
 	midPrev3 := ema20[idx-3]
@@ -109,16 +106,18 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 
 	highPeak := false
 	lowBottom := false
-	priceDownGoingUp := false
-	priceUpGoingDown := false
+	// priceDownGoingUp := false
+	// priceUpGoingDown := false
 
 	if !badFloat(fast) && !badFloat(slow) && !badFloat(fast2) && !badFloat(slow2) && !badFloat(fast4) && !badFloat(slow4) && !badFloat(fast6) && !badFloat(slow6) {
-		fastIsHigher := (fast > slow) && (fast4 > slow4) && (fast6 > slow6)
-		fastIsLower := (fast < slow) && (fast4 < slow4) && (fast6 < slow6)
-		priceDownGoingUp = (fast < slow) && (fast6 < slow6) && (slow-fast < slow6-fast6)
-		priceUpGoingDown = (fast > slow) && (fast6 > slow6) && (fast-slow < fast6-slow6)
-		highPeak = fastIsHigher && (fast4-slow4 > fast6-slow6) && (fast2-slow2 > fast4-slow4) && (fast-slow < fast2-slow2)
-		lowBottom = fastIsLower && (slow4-fast4 > slow6-fast6) && (slow2-fast2 > slow4-fast4) && (slow-fast < slow2-fast2)
+		// fastIsHigher := (fast > slow) && (fast4 > slow4) && (fast6 > slow6)
+		// fastIsLower := (fast < slow) && (fast4 < slow4) && (fast6 < slow6)
+		// priceDownGoingUp = (fast < slow) && (fast6 < slow6) && (slow-fast < slow6-fast6)
+		// priceUpGoingDown = (fast > slow) && (fast6 > slow6) && (fast-slow < fast6-slow6)
+		// highPeak = fastIsHigher && (fast4-slow4 > fast6-slow6) && (fast2-slow2 > fast4-slow4) && (fast-slow < fast2-slow2)
+		// lowBottom = fastIsLower && (slow4-fast4 > slow6-fast6) && (slow2-fast2 > slow4-fast4) && (slow-fast < slow2-fast2)
+		highPeak = d1 > 0 && d2 > 0 && d3 < 0 && histNow > 0
+		lowBottom = d1 < 0 && d2 < 0 && d3 > 0 && histNow < 0
 	}
 
 	ret1 := safeRatio(c[idx].Close-c[idx-1].Close, c[idx-1].Close)
@@ -153,12 +152,12 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 		emaAlignStrength,
 		boolToFloat(highPeak),
 		boolToFloat(lowBottom),
-		boolToFloat(priceDownGoingUp),
-		boolToFloat(priceUpGoingDown),
+		// boolToFloat(priceDownGoingUp),
+		// boolToFloat(priceUpGoingDown),
 		distHighPct,
 		distLowPct,
 		histNow,
-		histDelta,
+		// histDelta,
 		ema2050Spread,
 		ema2050Strength,
 		ema20Slope,
@@ -170,27 +169,16 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	}
 
 	out = FeatureSnapshot{
-		X:                x,
-		HighPeak:         highPeak,
-		LowBottom:        lowBottom,
-		PriceDownGoingUp: priceDownGoingUp,
-		PriceUpGoingDown: priceUpGoingDown,
-		EMAFast:          fast,
-		EMASlow:          slow,
-		EMAFastPrev3:     fast4,
-		EMASlowPrev3:     slow4,
-		EMASpreadPct:     emaSpreadPct,
-		EMAAlignStrength: emaAlignStrength,
-		MACDHist:         histNow,
-		MACDHistDelta:    histDelta,
-		EMA20:            mid,
-		EMA50:            long,
-		EMA20Prev3:       midPrev3,
-		EMA50Prev3:       longPrev3,
-		EMA2050Spread:    ema2050Spread,
-		EMA2050Strength:  ema2050Strength,
-		EMA20Slope:       ema20Slope,
-		EMA50Slope:       ema50Slope,
+		X:           x,
+		HighPeak:    highPeak,
+		LowBottom:   lowBottom,
+		MACDHist:    histNow,
+		MACDLine:    macdLineNow,
+		MACDD1:      d1,
+		MACDD2:      d2,
+		MACDD3:      d3,
+		DistHighPct: distHighPct,
+		DistLowPct:  distLowPct,
 	}
 	return out, true
 }

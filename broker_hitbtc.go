@@ -5,6 +5,7 @@
 //   - PlaceLimitPostOnly(ctx, product, side, limitPrice, baseSize) (string, error)
 //   - GetOrder(ctx, product, orderID) (*PlacedOrder, error)
 //   - CancelOrder(ctx, product, orderID) error
+//
 // These enable post-only (maker) entries with a cancel-and-market fallback in trader.go.
 package main
 
@@ -22,7 +23,7 @@ import (
 
 type HitbtcBridge struct {
 	base string
-	hc   *http.Client 
+	hc   *http.Client
 }
 
 func NewHitbtcBridge(base string) *HitbtcBridge {
@@ -206,9 +207,10 @@ func (h *HitbtcBridge) PlaceMarketQuote(ctx context.Context, product string, sid
 	return &ord, nil
 }
 
-func (h *HitbtcBridge) GetExchangeFilters(ctx context.Context, product string)(ExFilters, error){
+func (h *HitbtcBridge) GetExchangeFilters(ctx context.Context, product string) (ExFilters, error) {
 	return ExFilters{}, nil
 }
+
 // --- Maker-first additions ---
 
 // PlaceLimitPostOnly places a post-only limit order via the HitBTC bridge.
@@ -217,7 +219,7 @@ func (h *HitbtcBridge) PlaceLimitPostOnly(ctx context.Context, product string, s
 	// Snap base size to the exchange base step (floor).
 	_, _, step, err := h.GetAvailableBase(ctx, product)
 	if err == nil && step > 0 {
-		steps := mathFloorSafe(baseSize/step)
+		steps := mathFloorSafe(baseSize / step)
 		b := steps * step
 		if b > 0 {
 			baseSize = b
