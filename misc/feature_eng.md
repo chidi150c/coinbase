@@ -127,21 +127,7 @@ out = FeatureSnapshot{
     DistLowPct:  distLowPct,
 }
 ```
-
----
-
-## 6. Update logs and reason strings
-
-Search for old fields:
-
-```bash
-grep -RIn "EMAFast\|EMASlow\|MACDHistDelta\|PriceDownGoingUp\|PriceUpGoingDown\|EMA2050\|EMA20Slope\|EMA50Slope" .
-```
-
-If those fields were removed from `FeatureSnapshot`, all references must be removed or replaced.
-
-Example updated reason:
-
+## 6. Update reason
 ```go
 reason := fmt.Sprintf(
     "pUp=%.5f, highPeak_%s=%t, lowBottom_%s=%t, distHighPct_%s=%.6f, distLowPct_%s=%.6f, macdLine_%s=%.5f, macdHist_%s=%.5f, macdD1_%s=%.5f, macdD2_%s=%.5f, macdD3_%s=%.5f",

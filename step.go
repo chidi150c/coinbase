@@ -1059,7 +1059,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// --------------------------------------------------------------------------------------------------------
 	d := t.decide(signalHistory)
 	d = t.applyMACDSlopeGate(d, c)
-	d = t.applyMAFilterGate(d, c)
 	totalLots := lsb + lss
 
 	log.Printf(

@@ -11,10 +11,10 @@
 //   - Soft judgment gates encoded as numeric model features
 //   - Hard execution/risk gates remain outside the model, primarily in step.go
 //   - Keep feature count disciplined to reduce rows-vs-columns overfitting risk
-//   - Reduce multicollinearity from overlapping EMA-derived features
-//   - Use MACD as a compressed momentum/trend representation
+//   - Restore useful EMA structure that was lost in the MACD-only compression experiment
+//   - Keep MACD line/histogram shape as compact momentum context
 //
-// Current feature vector, in order:
+// Current hybrid feature vector, in order:
 //
 //   0  ret1
 //      1-candle return
@@ -34,56 +34,87 @@
 //   5  realizedVol20 / Close
 //      rolling standard deviation normalized by price
 //
-//   6  HighPeak bool
-//      MACD histogram top rollover pattern:
-//      rising → rising → falling above zero
+//   6  distance from recent high, pct
 //
-//   7  LowBottom bool
-//      MACD histogram bottom reversal pattern:
-//      falling → falling → rising below zero
+//   7  distance from recent low, pct
 //
-//   8  distance from recent high, pct
+//   8  MACD line / Close
+//      normalized MACD trend/momentum regime
 //
-//   9  distance from recent low, pct
+//   9  MACD histogram / Close
+//      normalized MACD momentum spread
 //
-//   10 MACD line
-//      primary trend/momentum regime
+//   10 MACD histogram slope d1 / Close
+//      normalized: hist[idx-2] - hist[idx-3]
 //
-//   11 MACD histogram slope d1
-//      hist[idx-2] - hist[idx-3]
+//   11 MACD histogram slope d2 / Close
+//      normalized: hist[idx-1] - hist[idx-2]
 //
-//   12 MACD histogram slope d2
-//      hist[idx-1] - hist[idx-2]
+//   12 MACD histogram slope d3 / Close
+//      normalized: hist[idx] - hist[idx-1]
 //
-//   13 MACD histogram slope d3
-//      hist[idx] - hist[idx-1]
+//   13 EMA4/EMA8 spread pct
+//      (EMA4 - EMA8) / Close
 //
-// Feature count: 14
+//   14 EMA20/EMA50 spread pct
+//      (EMA20 - EMA50) / Close
+//
+//   15 EMA20 slope
+//      (EMA20[idx] - EMA20[idx-3]) / EMA20[idx-3]
+//
+//   16 EMA50 slope
+//      (EMA50[idx] - EMA50[idx-3]) / EMA50[idx-3]
+//
+// Feature count: 17
 
 package main
 
 import "math"
 
-const UnifiedFeatureDim = 14
+const UnifiedFeatureDim = 17
 
-// FeatureSnapshot contains the unified feature vector plus
-// pattern-state values useful for audit logs and decisions.
+// FeatureSnapshot contains the unified feature vector plus state values useful
+// for audit logs, gates, and decision reason strings.
+//
+// Keep this struct broader than the model vector so gate/log code can inspect
+// values without forcing every audit field to become a model feature.
 type FeatureSnapshot struct {
 	X []float64
 
 	// Pattern booleans
-	HighPeak  bool
-	LowBottom bool
+	HighPeak         bool
+	LowBottom        bool
+	PriceDownGoingUp bool
+	PriceUpGoingDown bool
+
+	// Short EMA state
+	EMAFast          float64
+	EMASlow          float64
+	EMAFastPrev3     float64
+	EMASlowPrev3     float64
+	EMASpreadPct     float64
+	EMAAlignStrength float64
 
 	// MACD state
-	MACDLine float64
+	MACDLine         float64
 	MACDTurningPoint float64
-	MACDHist float64
-	MACDD1   float64
-	MACDD2   float64
-	MACDD3   float64
+	MACDHist         float64
+	MACDHistDelta    float64
+	MACDD1           float64
+	MACDD2           float64
+	MACDD3           float64
 
-	// Optional context for logs/debug
+	// Medium/long EMA trend context
+	EMA20           float64
+	EMA50           float64
+	EMA20Prev3      float64
+	EMA50Prev3      float64
+	EMA2050Spread   float64
+	EMA2050Strength float64
+	EMA20Slope      float64
+	EMA50Slope      float64
+
+	// Range context
 	DistHighPct float64
 	DistLowPct  float64
 }
@@ -93,7 +124,7 @@ type FeatureSnapshot struct {
 func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	var out FeatureSnapshot
 
-	if len(c) < 60 || idx < 50 || idx >= len(c) || idx-5 < 0 {
+	if len(c) < 60 || idx < 50 || idx >= len(c) || idx-6 < 0 {
 		return out, false
 	}
 	if c[idx].Close <= 0 || c[idx-1].Close <= 0 || c[idx-5].Close <= 0 {
@@ -110,23 +141,85 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	atr := ATR(c, 14)
 	std20 := RollingStd(closePx, 20)
 
+	ema4 := EMA(closePx, 4)
+	ema8 := EMA(closePx, 8)
+	ema20 := EMA(closePx, 20)
+	ema50 := EMA(closePx, 50)
+
 	macdLine, macdHist, d1, d2, d3, ok := MACDLineHistAndSlopesAt(c, idx)
 	if !ok {
 		return out, false
 	}
 
+	fast := ema4[idx]
+	slow := ema8[idx]
+	fast2 := ema4[idx-2]
+	slow2 := ema8[idx-2]
+	fast4 := ema4[idx-4]
+	slow4 := ema8[idx-4]
+	fast6 := ema4[idx-6]
+	slow6 := ema8[idx-6]
+
+	mid := ema20[idx]
+	long := ema50[idx]
+	midPrev3 := ema20[idx-3]
+	longPrev3 := ema50[idx-3]
+
 	macdLineNow := macdLine[idx]
 	macdTurningPoint := macdLine[idx-2]
 	histNow := macdHist[idx]
+	histPrev := macdHist[idx-1]
+	histDelta := histNow - histPrev
 
+	highPeak := false
+	lowBottom := false
+	priceDownGoingUp := false
+	priceUpGoingDown := false
 
-	highPeak := d1 > 0 && d2 < 0 && d3 < 0 && histNow > 0
-	lowBottom := d1 < 0 && d2 < 0 && d3 > 0 && histNow < 0
+	if !badFloat(fast) && !badFloat(slow) &&
+		!badFloat(fast2) && !badFloat(slow2) &&
+		!badFloat(fast4) && !badFloat(slow4) &&
+		!badFloat(fast6) && !badFloat(slow6) {
+
+		fastIsHigher := (fast > slow) && (fast4 > slow4) && (fast6 > slow6)
+		fastIsLower := (fast < slow) && (fast4 < slow4) && (fast6 < slow6)
+
+		// Restored EMA geometry from the pre-compression model.
+		priceDownGoingUp = (fast < slow) && (fast6 < slow6) && (slow-fast < slow6-fast6)
+		priceUpGoingDown = (fast > slow) && (fast6 > slow6) && (fast-slow < fast6-slow6)
+
+		emaHighPeak := fastIsHigher &&
+			(fast4-slow4 > fast6-slow6) &&
+			(fast2-slow2 > fast4-slow4) &&
+			(fast-slow < fast2-slow2)
+
+		emaLowBottom := fastIsLower &&
+			(slow4-fast4 > slow6-fast6) &&
+			(slow2-fast2 > slow4-fast4) &&
+			(slow-fast < slow2-fast2)
+
+		// MACD turning-shape confirmation. This is retained for audit/gates,
+		// but it is not directly included as a boolean feature in the 17-dim vector.
+		macdHighPeak := d1 > 0 && d2 < 0 && d3 < 0 && histNow > 0
+		macdLowBottom := d1 < 0 && d2 < 0 && d3 > 0 && histNow < 0
+
+		// Preserve sensitivity by allowing either old EMA shape or MACD shape
+		// to mark the turn.
+		highPeak = emaHighPeak || macdHighPeak
+		lowBottom = emaLowBottom || macdLowBottom
+	}
 
 	ret1 := safeRatio(c[idx].Close-c[idx-1].Close, c[idx-1].Close)
 	ret5 := safeRatio(c[idx].Close-c[idx-5].Close, c[idx-5].Close)
 	atrPct := safeRatio(atr[idx], c[idx].Close)
 	volPct := safeRatio(std20[idx], c[idx].Close)
+
+	emaSpreadPct := safeRatio(fast-slow, c[idx].Close)
+	emaAlignStrength := math.Abs(emaSpreadPct)
+	ema2050Spread := safeRatio(mid-long, c[idx].Close)
+	ema2050Strength := math.Abs(ema2050Spread)
+	ema20Slope := safeRatio(mid-midPrev3, midPrev3)
+	ema50Slope := safeRatio(long-longPrev3, longPrev3)
 
 	recentHigh, recentLow := recentHighLow(c, idx, 20)
 	distHighPct := 0.0
@@ -137,7 +230,7 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	if recentLow > 0 {
 		distLowPct = safeRatio(c[idx].Close-recentLow, recentLow)
 	}
-	
+
 	macdScale := c[idx].Close
 
 	x := []float64{
@@ -147,14 +240,17 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 		zs[idx],
 		atrPct,
 		volPct,
-		boolToFloat(highPeak),
-		boolToFloat(lowBottom),
 		distHighPct,
 		distLowPct,
 		safeRatio(macdLineNow, macdScale),
+		safeRatio(histNow, macdScale),
 		safeRatio(d1, macdScale),
 		safeRatio(d2, macdScale),
 		safeRatio(d3, macdScale),
+		emaSpreadPct,
+		ema2050Spread,
+		ema20Slope,
+		ema50Slope,
 	}
 
 	if len(x) != UnifiedFeatureDim || hasBadFloat(x) {
@@ -162,15 +258,36 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	}
 
 	out = FeatureSnapshot{
-		X:           x,
-		HighPeak:    highPeak,
-		LowBottom:   lowBottom,
-		MACDLine:    macdLineNow,
-		MACDTurningPoint:    macdTurningPoint,
-		MACDHist:    safeRatio(histNow, macdScale),
-		MACDD1:      d1,
-		MACDD2:      d2,
-		MACDD3:      d3,
+		X:                x,
+		HighPeak:         highPeak,
+		LowBottom:        lowBottom,
+		PriceDownGoingUp: priceDownGoingUp,
+		PriceUpGoingDown: priceUpGoingDown,
+
+		EMAFast:          fast,
+		EMASlow:          slow,
+		EMAFastPrev3:     fast4,
+		EMASlowPrev3:     slow4,
+		EMASpreadPct:     emaSpreadPct,
+		EMAAlignStrength: emaAlignStrength,
+
+		MACDLine:         macdLineNow,
+		MACDTurningPoint: macdTurningPoint,
+		MACDHist:         histNow,
+		MACDHistDelta:    histDelta,
+		MACDD1:           d1,
+		MACDD2:           d2,
+		MACDD3:           d3,
+
+		EMA20:           mid,
+		EMA50:           long,
+		EMA20Prev3:      midPrev3,
+		EMA50Prev3:      longPrev3,
+		EMA2050Spread:   ema2050Spread,
+		EMA2050Strength: ema2050Strength,
+		EMA20Slope:      ema20Slope,
+		EMA50Slope:      ema50Slope,
+
 		DistHighPct: distHighPct,
 		DistLowPct:  distLowPct,
 	}
