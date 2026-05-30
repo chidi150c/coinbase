@@ -85,9 +85,7 @@ sellMA=false
 Used to confirm/reject AI signals using:
 
 LowBottom
-PriceDownGoingUp
 HighPeak
-PriceUpGoingDown
 MACD Gate
 
 Captures momentum-based trade blocking:

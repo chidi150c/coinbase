@@ -1722,9 +1722,9 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 		)
 	} else { // SideSell
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|HighPeak=%v|PriceUpGoingDown=%v|mirror=%v",
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|HighPeak=%v|mirror=%v",
 			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr,
-			d.HighPeak, d.PriceUpGoingDown, mirrorProfitOverride,
+			d.HighPeak, mirrorProfitOverride,
 		)
 	}
 

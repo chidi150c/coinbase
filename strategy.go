@@ -61,13 +61,13 @@ type Decision struct {
 	Reason     string
 
 	// Carry raw pUp and soft-gate flags for downstream gate-audit strings.
-	PUp              float64
-	HighPeak         bool
-	PriceDownGoingUp bool
-	LowBottom        bool
-	PriceUpGoingDown bool
-	MACDHist         float64
-	MACDHistDelta    float64
+	PUp       float64
+	HighPeak  bool
+	LowBottom bool
+	MACDHist  float64
+	MACDD1    float64
+	MACDD2    float64
+	MACDD3    float64
 }
 
 // SignalToSide converts the intent into a broker side.

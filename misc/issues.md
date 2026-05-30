@@ -73,8 +73,6 @@ Add the following soft judgment signals as features:
 Market structure / reversal:
 - HighPeak
 - LowBottom
-- PriceDownGoingUp
-- PriceUpGoingDown
 
 Trend context:
 - EMA spread
@@ -453,9 +451,6 @@ We agreed to convert soft judgment gates into AI features.
 Soft gates to mine
 HighPeak
 LowBottom
-PriceDownGoingUp
-PriceUpGoingDown
-EMA spread
 
 Maybe later:
 
@@ -608,9 +603,6 @@ Then after stabilization:
 mine soft gates into features
 HighPeak
 LowBottom
-PriceDownGoingUp
-PriceUpGoingDown
-EMA spread
 ============================================================================
 
 The future architecture we discussed is:

@@ -180,8 +180,13 @@ func MACD(close []float64, fast, slow, signal int) (macd, signalLine, hist []flo
 	return
 }
 
-func MACDLineHistAndSlopes(c []Candle) ([]float64, []float64, float64, float64, float64, bool) {
-	if len(c) < 60 {
+// MACDLineHistAndSlopesAt returns MACD line, MACD histogram, and the last
+// three causal histogram slope deltas ending at idx.
+//
+// Important: the slopes are calculated at idx, not at the end of the slice,
+// so training rows do not leak future candles into historical feature vectors.
+func MACDLineHistAndSlopesAt(c []Candle, idx int) ([]float64, []float64, float64, float64, float64, bool) {
+	if len(c) < 60 || idx < 50 || idx >= len(c) || idx-3 < 0 {
 		return nil, nil, 0, 0, 0, false
 	}
 
@@ -191,14 +196,17 @@ func MACDLineHistAndSlopes(c []Candle) ([]float64, []float64, float64, float64, 
 	}
 
 	macdLine, _, hist := MACD(closePx, 12, 26, 9)
-	if len(macdLine) < 4 || len(hist) < 4 {
+	if len(macdLine) <= idx || len(hist) <= idx {
 		return nil, nil, 0, 0, 0, false
 	}
 
-	n := len(hist)
-	d1 := hist[n-3] - hist[n-4]
-	d2 := hist[n-2] - hist[n-3]
-	d3 := hist[n-1] - hist[n-2]
+	d1 := hist[idx-2] - hist[idx-3]
+	d2 := hist[idx-1] - hist[idx-2]
+	d3 := hist[idx] - hist[idx-1]
+
+	if badFloat(macdLine[idx]) || badFloat(hist[idx]) || badFloat(d1) || badFloat(d2) || badFloat(d3) {
+		return nil, nil, 0, 0, 0, false
+	}
 
 	return macdLine, hist, d1, d2, d3, true
 }
