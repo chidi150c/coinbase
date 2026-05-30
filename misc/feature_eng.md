@@ -240,7 +240,7 @@ Then re-mine:
 ```bash
 cd ~/coinbase/monitoring
 
-IMAGE_SHA=<current_sha_or_local> \
+IMAGE_SHA=7a3d66fcd765a6782fe7b238e55adae03cbdc2b1 \
 docker compose run --rm --no-deps \
   --entrypoint /app/bot \
   bot_binance \

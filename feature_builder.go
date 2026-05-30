@@ -77,6 +77,7 @@ type FeatureSnapshot struct {
 
 	// MACD state
 	MACDLine float64
+	MACDTurningPoint float64
 	MACDHist float64
 	MACDD1   float64
 	MACDD2   float64
@@ -115,9 +116,11 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	}
 
 	macdLineNow := macdLine[idx]
+	macdTurningPoint := macdLine[idx-2]
 	histNow := macdHist[idx]
 
-	highPeak := d1 > 0 && d2 > 0 && d3 < 0 && histNow > 0
+
+	highPeak := d1 > 0 && d2 < 0 && d3 < 0 && histNow > 0
 	lowBottom := d1 < 0 && d2 < 0 && d3 > 0 && histNow < 0
 
 	ret1 := safeRatio(c[idx].Close-c[idx-1].Close, c[idx-1].Close)
@@ -134,6 +137,8 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 	if recentLow > 0 {
 		distLowPct = safeRatio(c[idx].Close-recentLow, recentLow)
 	}
+	
+	macdScale := c[idx].Close
 
 	x := []float64{
 		ret1,
@@ -146,10 +151,10 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 		boolToFloat(lowBottom),
 		distHighPct,
 		distLowPct,
-		macdLineNow,
-		d1,
-		d2,
-		d3,
+		safeRatio(macdLineNow, macdScale),
+		safeRatio(d1, macdScale),
+		safeRatio(d2, macdScale),
+		safeRatio(d3, macdScale),
 	}
 
 	if len(x) != UnifiedFeatureDim || hasBadFloat(x) {
@@ -161,7 +166,8 @@ func BuildFeatureSnapshot(c []Candle, idx int) (FeatureSnapshot, bool) {
 		HighPeak:    highPeak,
 		LowBottom:   lowBottom,
 		MACDLine:    macdLineNow,
-		MACDHist:    histNow,
+		MACDTurningPoint:    macdTurningPoint,
+		MACDHist:    safeRatio(histNow, macdScale),
 		MACDD1:      d1,
 		MACDD2:      d2,
 		MACDD3:      d3,

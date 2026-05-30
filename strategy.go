@@ -114,13 +114,14 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 	signalTF := t.cfg.SignalTF()
 
 	reason := fmt.Sprintf(
-		"pUp=%.5f, highPeak_%s=%t, lowBottom_%s=%t, distHighPct_%s=%.6f, distLowPct_%s=%.6f, macdLine_%s=%.5f, macdHist_%s=%.5f, macdD1_%s=%.5f, macdD2_%s=%.5f, macdD3_%s=%.5f",
+		"pUp=%.5f, highPeak_%s=%t, lowBottom_%s=%t, distHighPct_%s=%.6f, distLowPct_%s=%.6f, macdLine_%s=%.5f, macdTurning_%s=%.5f, macdHist_%s=%.5f, macdD1_%s=%.5f, macdD2_%s=%.5f, macdD3_%s=%.5f",
 		pUp,
 		signalTF, snap.HighPeak,
 		signalTF, snap.LowBottom,
 		signalTF, snap.DistHighPct,
 		signalTF, snap.DistLowPct,
 		signalTF, snap.MACDLine,
+		signalTF, snap.MACDTurningPoint,
 		signalTF, snap.MACDHist,
 		signalTF, snap.MACDD1,
 		signalTF, snap.MACDD2,
@@ -208,30 +209,39 @@ func (t *Trader) applyMACDSlopeGate(d Decision, execHistory []Candle) Decision {
 	switch d.Signal {
 
 	case Sell:
-		// Require strong positive MACD regime
+ 		// Require strong positive MACD regime
 		// plus rollover/top pattern.
-		if snap.MACDLine <= eps || !snap.HighPeak {
+		if snap.MACDTurningPoint <= eps {
 			d.Signal = Flat
-			reason = "macd_not_high_peak_for_sell"
+			reason = appendReason(reason, "macd_not_strong_positive_for_sell")
+		}
+		if !snap.HighPeak {
+			d.Signal = Flat
+			reason = appendReason(reason, "macd_not_high_peak_for_sell")
 		}
 
 	case Buy:
 		// Require strong negative MACD regime
 		// plus bottom reversal pattern.
-		if snap.MACDLine >= -eps || !snap.LowBottom {
+		if snap.MACDTurningPoint >= -eps {
 			d.Signal = Flat
-			reason = "macd_not_low_bottom_for_buy"
+			reason = appendReason(reason, "macd_not_strong_negative_for_buy")
+		}
+		if !snap.LowBottom {
+			d.Signal = Flat
+			reason = appendReason(reason, "macd_not_low_bottom_for_buy")
 		}
 	}
 
 	d.Reason = appendReason(d.Reason, reason)
 
 	log.Printf(
-		"[MACD_GATE] gateTF=%s raw=%s final=%s macdLine_%s=%.5f macdHist_%s=%.5f d1_%s=%.5f d2_%s=%.5f d3_%s=%.5f eps=%.5f highPeak=%t lowBottom=%t reason=%s",
+		"[MACD_GATE] gateTF=%s raw=%s final=%s macdLine_%s=%.5f macdTurning_%s=%.5f macdHist_%s=%.5f d1_%s=%.5f d2_%s=%.5f d3_%s=%.5f eps=%.5f highPeak=%t lowBottom=%t reason=%s",
 		t.cfg.GateTF,
 		d.Raw,
 		d.Signal,
 		t.cfg.GateTF, snap.MACDLine,
+		t.cfg.GateTF, snap.MACDTurningPoint,
 		t.cfg.GateTF, snap.MACDHist,
 		t.cfg.GateTF, snap.MACDD1,
 		t.cfg.GateTF, snap.MACDD2,
