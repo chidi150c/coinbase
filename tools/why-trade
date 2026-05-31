@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# why-trade — explain trading decision/gates near a price, timestamp, or order-id
+# Default audit log: /opt/coinbase/logs/audit/binance_audit.log
+# Supports: price|ts|oid + optional chunking, rotated .gz audits, and side-aware filtering.
+
+set -euo pipefail
+
+LOG_DEFAULT="/opt/coinbase/logs/audit/binance_audit.log"
+SIDE_DEFAULT="BUY"
+WINDOW_DEFAULT=90
+CHUNK_MODE="none"   # none | raw | filter
+
+usage() {
+  cat <<EOF
+Usage:
+  why-trade price <PRICE> [-s BUY|SELL] [-l LOGFILE] [-w LINES] [--chunk | --chunk-filter]
+  why-trade ts    <TIMESTAMP_SUBSTR> [-s BUY|SELL] [-l LOGFILE] [-w LINES] [--chunk | --chunk-filter]
+  why-trade oid   <ORDER_ID> [-s BUY|SELL] [-l LOGFILE] [--chunk | --chunk-filter]
+
+Description:
+  why-trade explains what the bot was doing near a price, timestamp, or order ID.
+
+  It searches the Binance audit log, finds the closest trading step, then shows
+  the surrounding decision, gate, order, funding, pyramid, and post-only events.
+
+  Default log:
+    ${LOG_DEFAULT}
+
+Modes:
+  price <PRICE>
+    Finds the TRACE step.start line whose price is closest to PRICE.
+
+  ts <TIMESTAMP_SUBSTR>
+    Finds the first log line matching the timestamp substring, then shows the
+    nearby trading step.
+
+  oid <ORDER_ID>
+    Searches current and rotated audit logs for an order ID, then walks backward
+    to the nearest step.start.
+
+Flags:
+  -s BUY|SELL
+    Side-aware filtering for gate/order patterns.
+    Default: ${SIDE_DEFAULT}
+
+  -l LOGFILE
+    Use a different audit log.
+    Default: ${LOG_DEFAULT}
+
+  -w LINES
+    Half-window context around the matched step.
+    Default: ${WINDOW_DEFAULT}
+
+  --chunk
+    Show the full raw step chunk from nearest step.start to the next step.start.
+
+  --chunk-filter
+    Show only key lines from the step chunk:
+      decisions
+      gates
+      order opens/closes
+      post-only events
+      funding errors
+      pyramid blocks
+      flat/hold output
+
+Examples:
+  why-trade price 74068.07 --chunk-filter
+
+  why-trade price 115,303.99 -s SELL --chunk-filter
+
+  why-trade ts 2026-05-31T09:25 --chunk-filter
+
+  why-trade oid 50919131900 -s BUY --chunk-filter
+
+  why-trade price 74068.07 -w 150
+
+Typical workflow:
+  1. Use audit-grep to find a suspicious BUY/SELL/order:
+       audit-grep binance 'Decision=SELL|Decision=BUY|LIVE ORDER|postonly\.filled' -n
+
+  2. Copy the price, timestamp, or order ID.
+
+  3. Use why-trade to explain that moment:
+       why-trade price <PRICE> --chunk-filter
+       why-trade ts <TIME> --chunk-filter
+       why-trade oid <ORDER_ID> --chunk-filter
+
+Notes:
+  Use --chunk-filter first for clean output.
+  Use --chunk when you need the full raw step.
+  Use -s SELL when investigating sell-side gates.
+  Use -s BUY when investigating buy-side gates.
+EOF
+}
+
+# --- Arg parse ---
+[[ $# -lt 2 ]] && { usage; exit 1; }
+MODE="$1"; shift
+SIDE="$SIDE_DEFAULT"; LOG="$LOG_DEFAULT"; W="$WINDOW_DEFAULT"
+
+POS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s) SIDE="${2:-}"; shift 2;;
+    -l) LOG="${2:-}"; shift 2;;
+    -w) W="${2:-}"; shift 2;;
+    --chunk) CHUNK_MODE="raw"; shift;;
+    --chunk-filter) CHUNK_MODE="filter"; shift;;
+    -h|--help) usage; exit 0;;
+    *) POS+=("$1"); shift;;
+  esac
+done
+
+[[ -f "$LOG" || -f "${LOG}.1" || -n "$(compgen -G "${LOG}*.gz" || true)" ]] || { echo "No audit logs at base: $LOG" >&2; exit 1; }
+
+# --- Helpers ---
+nearest_step_line_by_price() {
+  local price="$1" log="$2"
+  nl -ba "$log" | awk -v p="$price" '
+    /TRACE step.start/ && match($0,/price=([0-9]+\.[0-9]+)/,m) {
+      px=m[1]+0; d=px-p; if (d<0) d=-d; print d "\t" $1
+    }' | sort -n | head -1 | cut -f2
+}
+
+first_line_matching_ts() {
+  local ts="$1" log="$2"
+  nl -ba "$log" | grep -n -- "$ts" | head -1 | cut -d: -f1
+}
+
+next_step_line_after() {
+  local ln="$1" log="$2"
+  sed -n "$((ln+1)),\$p" "$log" | nl -ba -v $((ln+1)) | awk '/TRACE step.start/ {print $1; exit}'
+}
+
+filter_block() {
+  local side="$1"
+  local SIDE_LC; SIDE_LC=$(echo "$side" | tr '[:upper:]' '[:lower:]')
+  local PENDING="OPEN-PENDING side=${side}"
+  local MFALL="postonly\\.market_fallback\\.blocked side=${side}"
+  local PEND_SET="postonly\\.pending\\.set side=${side}"
+  grep -E "TRACE step.start|Decision=|${PENDING}|${MFALL}|${PEND_SET}|\
+FUNDS_EXHAUSTED ${side}|${SIDE_LC}\\.gate\\.(pre|block|post)|\
+pyramid\\.(spacing|adverse|block\\.${SIDE_LC})|GATE1 lot cap reached|EQUITY GATE: blocked|^FLAT \\[|HOLD$|order\\.(open|close)|postonly\\."
+}
+
+# Search current audit and rotated .gz for an order id; print "FILE:LINE:matched-line"
+search_oid_in_audit() {
+  local oid="$1" base="$2"
+  # Try plain file if present
+  if [[ -f "$base" ]] && grep -nq "$oid" "$base"; then
+    grep -n "$oid" "$base" | awk -v f="$base" '{print f":"$0}'
+    return 0
+  fi
+  # Try rotated .gz
+  shopt -s nullglob
+  local gz
+  for gz in "$base".*.gz; do
+    if zgrep -nq "$oid" "$gz"; then
+      zgrep -n "$oid" "$gz" | awk -v f="$gz" '{print f":"$0}'
+      return 0
+    fi
+  done
+  # Try .1 (uncompressed rotation)
+  if [[ -f "${base}.1" ]] && grep -nq "$oid" "${base}.1"; then
+    grep -n "$oid" "${base}.1" | awk -v f="${base}.1" '{print f":"$0}'
+    return 0
+  fi
+  return 1
+}
+
+print_chunk_around_line() {
+  local file="$1" line="$2" mode="$3" side="$4"
+  local next; next="$(next_step_line_after "$line" "${file%%.gz}" 2>/dev/null || true)"
+  local end
+  if [[ "$file" == *.gz ]]; then
+    end="$(zcat "$file" | wc -l | awk '{print $1}')"
+  else
+    end="$(wc -l < "$file")"
+  fi
+  local stop="${next:-$end}"
+  if [[ "$file" == *.gz ]]; then
+    if [[ "$mode" == "raw" ]]; then
+      zcat "$file" | sed -n "${line},$(( stop - 1 ))p"
+    else
+      zcat "$file" | sed -n "${line},$(( stop - 1 ))p" | filter_block "$side"
+    fi
+  else
+    if [[ "$mode" == "raw" ]]; then
+      sed -n "${line},$(( stop - 1 ))p" "$file"
+    else
+      sed -n "${line},$(( stop - 1 ))p" "$file" | filter_block "$side"
+    fi
+  fi
+}
+
+# Ensure our primary file has step markers if we’ll use price/ts modes on it
+ensure_has_steps_or_die() {
+  local f="$1"
+  if [[ -f "$f" ]] && grep -q "TRACE step.start" "$f"; then
+    return 0
+  fi
+  echo "No 'TRACE step.start' in $f; try rotated logs or use OID mode." >&2
+  exit 1
+}
+
+# --- Main ---
+case "$MODE" in
+  price)
+    [[ ${#POS[@]} -ge 1 ]] || { echo "Missing PRICE"; usage; exit 1; }
+    PRICE="${POS[0]}"; PRICE="${PRICE//,/}"; PRICE="${PRICE//_/}"
+    ensure_has_steps_or_die "$LOG"
+
+    LN="$(nearest_step_line_by_price "$PRICE" "$LOG" || true)"
+    [[ -n "$LN" ]] || { echo "No step.start near price=$PRICE" >&2; exit 1; }
+
+    if [[ "$CHUNK_MODE" != "none" ]]; then
+      NL="$(next_step_line_after "$LN" "$LOG" || true)"
+      END="${NL:-$(wc -l < "$LOG")}"
+      if [[ "$CHUNK_MODE" == "raw" ]]; then
+        sed -n "${LN},$(( (${NL:-$END}) - 1 ))p" "$LOG"
+      else
+        sed -n "${LN},$(( (${NL:-$END}) - 1 ))p" "$LOG" | filter_block "$SIDE"
+      fi
+      exit 0
+    fi
+
+    START=$((LN - W)); (( START < 1 )) && START=1
+    END=$((LN + W))
+    sed -n "${START},${END}p" "$LOG" | filter_block "$SIDE"
+    ;;
+
+  ts)
+    [[ ${#POS[@]} -ge 1 ]] || { echo "Missing TIMESTAMP substring"; usage; exit 1; }
+    TS="${POS[0]}"
+    ensure_has_steps_or_die "$LOG"
+
+    LN="$(first_line_matching_ts "$TS" "$LOG" || true)"
+    [[ -n "$LN" ]] || { echo "No lines matching '$TS'." >&2; exit 1; }
+
+    CHUNK_START="$LN"
+    if ! sed -n "${LN}p" "$LOG" | grep -q "TRACE step.start"; then
+      NS="$(next_step_line_after "$LN" "$LOG" || true)"
+      [[ -n "$NS" ]] && CHUNK_START="$NS"
+    fi
+
+    if [[ "$CHUNK_MODE" != "none" ]]; then
+      NL="$(next_step_line_after "$CHUNK_START" "$LOG" || true)"
+      END="${NL:-$(wc -l < "$LOG")}"
+      if [[ "$CHUNK_MODE" == "raw" ]]; then
+        sed -n "${CHUNK_START},$(( (${NL:-$END}) - 1 ))p" "$LOG"
+      else
+        sed -n "${CHUNK_START},$(( (${NL:-$END}) - 1 ))p" "$LOG" | filter_block "$SIDE"
+      fi
+      exit 0
+    fi
+
+    START=$((CHUNK_START - W)); (( START < 1 )) && START=1
+    END=$((CHUNK_START + W))
+    sed -n "${START},${END}p" "$LOG" | filter_block "$SIDE"
+    ;;
+
+  oid)
+    [[ ${#POS[@]} -ge 1 ]] || { echo "Missing ORDER_ID"; usage; exit 1; }
+    OID="${POS[0]}"
+
+    MATCH="$(search_oid_in_audit "$OID" "$LOG" || true)"
+    if [[ -n "$MATCH" ]]; then
+      IFS=$'\n' read -r first <<< "$MATCH"
+      FILE="${first%%:*}"
+      REST="${first#*:}"
+      LINE="${REST%%:*}"
+
+      # Walk backward to nearest preceding step.start as chunk anchor
+      local_start=$(( LINE - 2000 )); (( local_start < 1 )) && local_start=1
+      if [[ "$FILE" == *.gz ]]; then
+        STEP_LINE="$(zcat "$FILE" | sed -n "${local_start},${LINE}p" | nl -ba -v "$local_start" | awk '/TRACE step.start/ {ln=$1} END{if(ln) print ln}')"
+      else
+        STEP_LINE="$(sed -n "${local_start},${LINE}p" "$FILE" | nl -ba -v "$local_start" | awk '/TRACE step.start/ {ln=$1} END{if(ln) print ln}')"
+      fi
+      [[ -z "$STEP_LINE" ]] && STEP_LINE="$LINE"
+
+      if [[ "$CHUNK_MODE" == "none" ]]; then
+        START=$((STEP_LINE - W)); (( START < 1 )) && START=1
+        END=$((STEP_LINE + W))
+        if [[ "$FILE" == *.gz ]]; then
+          zcat "$FILE" | sed -n "${START},${END}p" | filter_block "$SIDE"
+        else
+          sed -n "${START},${END}p" "$FILE" | filter_block "$SIDE"
+        fi
+      else
+        print_chunk_around_line "$FILE" "$STEP_LINE" "$CHUNK_MODE" "$SIDE"
+      fi
+      exit 0
+    fi
+
+    echo "OrderId '$OID' not found in audit rotations. Consider docker logs window, e.g.:" >&2
+    echo "  docker compose logs --no-color --since '2025-10-28T15:12:00Z' --until '2025-10-28T15:14:00Z' bot_binance | grep -n \"$OID\"" >&2
+    exit 2
+    ;;
+
+  *) usage; exit 1;;
+esac

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+STATE_DEFAULT="/opt/coinbase/state/bot_state.newbinance.json"
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") YYYY-MM-DD [--state PATH]
+
+Examples:
+  $(basename "$0") 2025-10-30
+  $(basename "$0") 2025-10-30 --state /opt/coinbase/state/bot_state.newbinance.json
+EOF
+}
+
+# --- args ---
+if [[ $# -lt 1 ]]; then usage; exit 1; fi
+DATE="$1"; shift || true
+
+STATE="$STATE_DEFAULT"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --state)
+      STATE="${2:-}"; shift 2 || true
+      ;;
+    -h|--help)
+      usage; exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage; exit 1
+      ;;
+  esac
+done
+
+# --- preflight ---
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: jq is required (sudo apt-get install -y jq)" >&2
+  exit 1
+fi
+if [[ ! -f "$STATE" ]]; then
+  echo "Error: state file not found: $STATE" >&2
+  exit 1
+fi
+
+# --- compute ---
+# Build a JSON summary in one jq pass, then pretty-print it and also emit a compact summary.
+JSON_SUMMARY="$(jq -r --arg d "$DATE" '
+  [ .Exits[]? | select(.time | startswith($d)) | .pnl_usd ] as $p
+  | [ .Exits[]? | select(.time | startswith($d)) | .open_notional_usd ] as $n
+  | {
+      date: $d,
+      count: ($p|length),
+      wins: ($p|map(select(.>0))|length),
+      losses: ($p|map(select(.<0))|length),
+      sum: (($p|add) // 0),
+      mean: (if ($p|length)>0 then (($p|add)/($p|length)) else 0 end),
+      min: (if ($p|length)>0 then ($p|min) else 0 end),
+      max: (if ($p|length)>0 then ($p|max) else 0 end),
+      avg_open_notional: (if ($n|length)>0 then (($n|add)/($n|length)) else 0 end),
+      pnls: $p,
+      target_per_day: 20,
+      trades_needed_for_target:
+        (if ($p|length)>0 and (($p|add)/($p|length))>0
+         then (20 / ((($p|add)/($p|length))))
+         else null end)
+    }
+' "$STATE")"
+
+# Pretty view
+echo "===== PnL (fee-aware) for $DATE ====="
+echo "$JSON_SUMMARY" | jq -r '
+  "Per-trade PnLs:",
+  ( .pnls[]? | tostring ),
+  "",
+  "Summary:",
+  "  count=\(.count)  wins=\(.wins)  losses=\(.losses)",
+  "  sum=\(.sum)  mean/expectancy=\(.mean)  min=\(.min)  max=\(.max)",
+  "  avg_open_notional=\(.avg_open_notional)",
+  "  target_per_day=\(.target_per_day)  trades_needed_for_target=" +
+    (if .trades_needed_for_target == null then "n/a"
+     else ( (.trades_needed_for_target) | tostring ) end)
+'
+
+# Machine-readable one-liner (handy for piping elsewhere)
+echo
+echo "JSON_SUMMARY:"
+echo "$JSON_SUMMARY"

@@ -202,3 +202,83 @@ What we verified:
    compress
    copytruncate
    maxsize 100M
+
+=====================================================
+AUDIT-GREP USAGE:
+
+Usage:
+  audit-grep <coinbase|binance|hitbtc> <regex> [grep-flags...]
+
+Description:
+  Search audit logs (current + rotated .gz logs) under:
+
+    /opt/coinbase/logs/audit
+
+  Supports:
+    • Current logs
+    • Rotated .gz logs
+    • Regex searches
+    • Standard grep flags
+
+Examples:
+
+  # BUY/SELL decisions + pUp
+  audit-grep binance 'Decision=|Raw=|pUp=' -n --color=always
+
+  # BUY / SELL activity
+  audit-grep binance 'Raw=(BUY|SELL)|Decision=(BUY|SELL)' -n --color=always
+
+  # MACD gate activity
+  audit-grep binance 'MACD_GATE' -n -A2 -B2 --color=always
+
+  # MA gate activity
+  audit-grep binance 'MA_GATE' -n -A2 -B2 --color=always
+
+  # Trailing stop events
+  audit-grep binance 'trail\.(activate|raise|trigger)' -n -A2 -B2
+
+  # Funding / close skips
+  audit-grep binance 'FUNDS_EXHAUSTED|CLOSE-SKIP' -n --color=always
+
+  # Live orders
+  audit-grep binance 'LIVE ORDER|order\.open|postonly\.' -n --color=always
+
+  # Errors / crashes
+  audit-grep binance 'panic:|runtime error:|fatal error|SIGSEGV|ERROR|FATAL' -n -A5 -B5 --color=always
+
+  # Around a timestamp
+  audit-grep binance '2026-05-31T09:2' -n
+
+Useful grep flags:
+  -n                Show line numbers
+  -A5               Show 5 lines after match
+  -B5               Show 5 lines before match
+  -i                Case-insensitive
+  --color=always    Highlight matches
+
+Tip:
+  Use: | less -R
+  to scroll while preserving colors.
+
+=======================================================================
+
+Another tool, why-trade, uses the same audit logs that audit-grep searches.
+
+But:
+
+audit-grep does not produce the logs.
+
+The logs are produced by:
+
+binance-audit-tail.service
+
+Pipeline:
+
+bot_binance docker logs
+→ binance-audit-tail.service
+→ /opt/coinbase/logs/audit/binance_audit.log
+
+Then both tools read that same file:
+
+audit-grep  → searches the audit log
+why-trade   → analyzes the audit log around a time/price/order

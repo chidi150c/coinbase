@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+LOGDIR="/opt/coinbase/logs/audit"
+
+if [[ $# -lt 2 ]]; then
+cat <<'EOF'
+Usage:
+  audit-grep <coinbase|binance|hitbtc> <regex> [grep-flags...]
+
+Description:
+  Search audit logs (current + rotated .gz logs) under:
+
+    /opt/coinbase/logs/audit
+
+  Supports:
+    • Current logs
+    • Rotated .gz logs
+    • Regex searches
+    • Standard grep flags
+
+Examples:
+
+  # BUY/SELL decisions + pUp
+  audit-grep binance 'Decision=|Raw=|pUp=' -n --color=always
+
+  # BUY / SELL activity
+  audit-grep binance 'Raw=(BUY|SELL)|Decision=(BUY|SELL)' -n --color=always
+
+  # MACD gate activity
+  audit-grep binance 'MACD_GATE' -n -A2 -B2 --color=always
+
+  # MA gate activity
+  audit-grep binance 'MA_GATE' -n -A2 -B2 --color=always
+
+  # Trailing stop events
+  audit-grep binance 'trail\.(activate|raise|trigger)' -n -A2 -B2
+
+  # Funding / close skips
+  audit-grep binance 'FUNDS_EXHAUSTED|CLOSE-SKIP' -n --color=always
+
+  # Live orders
+  audit-grep binance 'LIVE ORDER|order\.open|postonly\.' -n --color=always
+
+  # Errors / crashes
+  audit-grep binance 'panic:|runtime error:|fatal error|SIGSEGV|ERROR|FATAL' -n -A5 -B5 --color=always
+
+  # Around a timestamp
+  audit-grep binance '2026-05-31T09:2' -n
+
+Useful grep flags:
+  -n                Show line numbers
+  -A5               Show 5 lines after match
+  -B5               Show 5 lines before match
+  -i                Case-insensitive
+  --color=always    Highlight matches
+
+Tip:
+  Use: | less -R
+  to scroll while preserving colors.
+
+EOF
+exit 1
+fi
+
+svc="$1"; shift
+pattern="$1"; shift || true
+
+# Gather current log + all rotated (plain & .gz), sort naturally
+mapfile -t files < <(ls -1 "${LOGDIR}/${svc}_audit.log"* 2>/dev/null | sort -V)
+if ((${#files[@]}==0)); then
+  echo "No logs found for ${svc} under ${LOGDIR}"
+  exit 2
+fi
+
+# Grep each file, using zgrep for .gz and grep for plain files
+for f in "${files[@]}"; do
+  if [[ "$f" == *.gz ]]; then
+    zgrep -nH --line-buffered -E "$pattern" "$@" -- "$f" || true
+  else
+    grep  -nH --line-buffered -E "$pattern" "$@" -- "$f" || true
+  fi
+done
