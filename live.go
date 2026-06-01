@@ -275,7 +275,6 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 	trader.mu.Lock()
 	trader.model = model
 	trader.lastFit = time.Now().UTC()
-	trader.mu.Unlock()
 
 	if err := trader.saveStateNoLock(); err != nil {
 		log.Printf("[WARN] saveState after model boot fit: %v", err)
