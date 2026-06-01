@@ -15,17 +15,15 @@ type LogisticModel struct {
 	FeatDim int       `json:"FeatDim"`
 }
 
-func newModel(FeatureDim int) *LogisticModel {
-	return NewLogisticModel(FeatureDim)
+func newModel(featureDim int) *LogisticModel {
+	return NewLogisticModel(featureDim)
 }
 
 func NewLogisticModel(featDim int) *LogisticModel {
-	rand.Seed(time.Now().UnixNano())
-
+	// Logistic regression does not require random initialization.
+	// We intentionally start from zeros so training is deterministic
+	// and reproducible across restarts / experiments.
 	w := make([]float64, featDim)
-	for i := range w {
-		w[i] = rand.NormFloat64() * 0.01
-	}
 
 	return &LogisticModel{
 		W:       w,

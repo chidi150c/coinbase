@@ -233,11 +233,10 @@ type Trader struct {
 	SpareSellUSD  float64
 }
 
-func NewTrader(cfg Config, broker Broker, model *LogisticModel) *Trader {
+func NewTrader(cfg Config, broker Broker) *Trader {
 	t := &Trader{
 		cfg:        cfg,
 		broker:     broker,
-		model:      model,
 		equityUSD:  cfg.USDEquity,
 		dailyStart: midnightUTC(time.Now().UTC()),
 		stateFile:  cfg.StateFile,

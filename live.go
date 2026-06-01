@@ -31,7 +31,7 @@ import (
 )
 
 // runLive executes the real-time loop with cadence intervalSec (seconds).
-func runLive(ctx context.Context, trader *Trader, model *LogisticModel, intervalSec int) {
+func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 
 	var history []Candle       // keep as 1m/tick execution history
 	var signalHistory []Candle // new 5m decision history
@@ -242,10 +242,53 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 		log.Fatalf("signal warmup failed: no candles returned for tf=%s GateTF=%s", signalTF, signalGateTF)
 	}
 
-	// Fit the tiny model on the signal history only.
-	model.fit(signalHistory, 0.05, 4)
+// Initialize/warm-start the AI model after signalHistory is available.
+// Prefer persisted mined labels; fallback to signalHistory-derived labels.
+model := trader.model
 
-	var lastRefit *time.Time
+if model == nil {
+	log.Printf(
+		"[MODEL_BOOT] model=nil → initializing feat_dim=%d",
+		trader.cfg.AIFeatureDim,
+	)
+
+	model = newModel(trader.cfg.AIFeatureDim)
+}
+
+if model.FeatDim != trader.cfg.AIFeatureDim ||
+	len(model.W) != trader.cfg.AIFeatureDim {
+
+	log.Printf(
+		"[MODEL_BOOT] feat mismatch old=%d new=%d weights=%d → rebuilding",
+		model.FeatDim,
+		trader.cfg.AIFeatureDim,
+		len(model.W),
+	)
+
+	model = newModel(trader.cfg.AIFeatureDim)
+}
+
+// warm-start training
+model.fit(signalHistory, 0.05, 6)
+
+// assign back to trader
+trader.mu.Lock()
+trader.model = model
+trader.lastFit = time.Now().UTC()
+trader.mu.Unlock()
+
+if err := trader.saveStateNoLock(); err != nil {
+	log.Printf("[WARN] saveState after model boot fit: %v", err)
+} else {
+	log.Printf("[MODEL_STATE] boot saved lastFit=%s feat_dim=%d weights=%d",
+		trader.lastFit.Format(time.RFC3339),
+		trader.model.FeatDim,
+		len(trader.model.W),
+	)
+}
+trader.mu.Unlock()
+
+lastRefit := &trader.lastFit
 
 	// Track if we've successfully rebased equity from live balances (metrics gate).
 	eqReady := !(trader.cfg.UseLiveEquity() && !trader.cfg.DryRun)

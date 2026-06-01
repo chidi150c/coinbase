@@ -116,7 +116,7 @@ func first(m map[string]string, keys ...string) string {
 }
 
 // runBacktest trains the unified model and simulates decisions on the test split.
-func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *LogisticModel) {
+func runBacktest(ctx context.Context, csvPath string, trader *Trader) {
 	candles, err := loadCSV(csvPath)
 	if err != nil {
 		log.Fatalf("backtest load: %v", err)
@@ -134,7 +134,7 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader, model *Log
 	test := candles[split:]
 
 	// Train the unified logistic model.
-	model.fit(train, 0.05, 4)
+	// model.fit(train, 0.05, 4)
 
 	// Force paper for backtest accounting
 	trader.cfg.DryRun = true

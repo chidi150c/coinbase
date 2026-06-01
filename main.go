@@ -60,8 +60,7 @@ func main() {
 		return
 	}
 
-	model := newModel(cfg.AIFeatureDim)
-	trader := NewTrader(cfg, broker, model)
+	trader := NewTrader(cfg, broker)
 
 	bootCtx, bootCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer bootCancel()
@@ -85,9 +84,9 @@ func main() {
 	defer cancel()
 
 	if csvBacktest != "" && !live {
-		runBacktest(ctx, csvBacktest, trader, model)
+		runBacktest(ctx, csvBacktest, trader)
 	} else {
-		runLive(ctx, trader, model, intervalSec)
+		runLive(ctx, trader, intervalSec)
 	}
 
 	shutdownCtx, c := context.WithTimeout(context.Background(), 2*time.Second)

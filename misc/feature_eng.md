@@ -194,7 +194,7 @@ jq '.Model.W=null | .Model.B=0 | .Model.FeatDim=18 | .LastFit="0001-01-01T00:00:
 sudo mv -f /tmp/state_reset.json /opt/coinbase/state/bot_state.newbinance.json
 ```
 
-Change `18` to the new `FeatureDim`.
+Change `18` to[text](../main.go) the new `FeatureDim`.
 
 Verify:
 
@@ -226,18 +226,45 @@ Remove or archive the old mined label file:
 sudo mv /opt/coinbase/state/mined_labels_binance_5m.jsonl \
 /opt/coinbase/state/mined_labels_binance_5m.jsonl.bak.$(date +%Y%m%d_%H%M%S)
 ```
+## 10.1 push to production to restore bot
 
-Then re-mine:
+git add .
+
+git commit -m "refactor(ai): simplify MACD features and move to 18-dim model
+
+- remove MACD d1/d2 overload
+- keep d3 (hist delta)
+- add smoothed MACD delta (d2+d3)/2
+- add MACD turning-regime flags using macdTurningPoint and MACDLineEPS
+- move unified feature vector to 18 dimensions
+- reset model state for retraining compatibility
+- align feature builder docs/comments"
+git push origin main
+
+
+afert confirm: 
+
+```bash
+jq '.Model,.LastFit' /opt/coinbase/state/bot_state.newbinance.json
+```
+
+## 10.2 Then re-mine:
+
+get the IMAGE_SHA value with:
+
+docker ps 
+
+then: 
 
 ```bash
 cd ~/coinbase/monitoring
 
-IMAGE_SHA=b821c8df26d732c2ccaf1565cdf688d860ed3981 \
+IMAGE_SHA=72cf8bacff1f7c609df5f2e2ee715cbbfb145cc3  \
 docker compose run --rm --no-deps \
   --entrypoint /app/bot \
   bot_binance \
   -mine-tf 5m \
-  -limit 50000
+  -limit 200000
 ```
 
 Verify label count:
