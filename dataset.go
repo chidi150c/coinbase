@@ -8,11 +8,11 @@ import (
 )
 
 type FeatureLabelConfig struct {
-	Horizon    int
-	FeeRatePct float64
-	MinEdgePct float64
-	MinRows    int
-	MACDLineEPS float64
+	Horizon      int
+	FeeRatePct   float64
+	MinEdgePct   float64
+	MinRows      int
+	MACDLineEPS  float64
 	AIFeatureDim int
 
 	// Path-based net-profit labeling.

@@ -61,12 +61,12 @@ type Decision struct {
 	Reason     string
 
 	// Carry raw pUp and selected soft-gate flags for downstream gate-audit strings.
-	PUp       float64
-	HighPeak  bool
-	LowBottom bool
-	MACDHist  float64
-	MACDHistDelta   float64
-	MACDHistDeltaSmooth   float64
+	PUp                 float64
+	HighPeak            bool
+	LowBottom           bool
+	MACDHist            float64
+	MACDHistDelta       float64
+	MACDHistDeltaSmooth float64
 }
 
 // SignalToSide converts the intent into a broker side.
@@ -134,13 +134,13 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 	)
 
 	base := Decision{
-		Confidence: 0.5,
-		Reason:     reason,
-		PUp:        pUp,
-		HighPeak:   snap.HighPeak,
-		LowBottom:  snap.LowBottom,
-		MACDHist:   snap.MACDHist,
-		MACDHistDelta: snap.MACDHistDelta,
+		Confidence:          0.5,
+		Reason:              reason,
+		PUp:                 pUp,
+		HighPeak:            snap.HighPeak,
+		LowBottom:           snap.LowBottom,
+		MACDHist:            snap.MACDHist,
+		MACDHistDelta:       snap.MACDHistDelta,
 		MACDHistDeltaSmooth: snap.MACDHistDeltaSmooth,
 	}
 
@@ -178,7 +178,7 @@ func (t *Trader) applyMACDSlopeGate(d Decision, execHistory []Candle) Decision {
 	}
 
 	if d.Signal != Buy && d.Signal != Sell {
-		snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1, t.cfg.MACDLineEPS, t.cfg.AIFeatureDim )
+		snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1, t.cfg.MACDLineEPS, t.cfg.AIFeatureDim)
 		if !ok {
 			log.Printf(
 				"[MACD_GATE] skip no_feature_snapshot len=%d gateTF=%s",

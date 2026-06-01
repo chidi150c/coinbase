@@ -120,7 +120,7 @@ type Config struct {
 	UseMAFilter      bool
 	UseMACDSlopeGate bool
 	MACDLineEPS      float64
-	AIFeatureDim int 
+	AIFeatureDim     int
 
 	// Unified AI — fee-aware horizon labels
 	AILabelHorizon int
@@ -238,7 +238,7 @@ func loadConfigFromEnv() Config {
 		UseMAFilter:      getEnvBool("USE_MA_FILTER", true),
 		UseMACDSlopeGate: getEnvBool("USE_MACD_SLOPE_GATE", false),
 		MACDLineEPS:      getEnvFloat("MACD_LINE_EPS", 0.0),
-		AIFeatureDim:      getEnvInt("AI_FEATURE_DIM", 18),
+		AIFeatureDim:     getEnvInt("AI_FEATURE_DIM", 18),
 
 		// Unified AI — fee-aware labels
 		AILabelHorizon: getEnvInt("AI_LABEL_HORIZON", 15),
@@ -376,8 +376,8 @@ func (c *Config) FeatureLabelConfig() FeatureLabelConfig {
 		MinedLabelsFile: getEnv("AI_MINED_LABELS_FILE", "/opt/coinbase/state/mined_labels_binance.jsonl"),
 		MinedMaxRows:    getEnvInt("AI_MINED_MAX_ROWS", 10000),
 		Symbol:          getEnv("PRODUCT_ID", c.ProductID),
-		MACDLineEPS: c.MACDLineEPS,
-		AIFeatureDim: c.AIFeatureDim,
+		MACDLineEPS:     c.MACDLineEPS,
+		AIFeatureDim:    c.AIFeatureDim,
 	}
 }
 

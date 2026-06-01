@@ -98,7 +98,7 @@ func loadBotEnv() {
 
 		// unified AI / fee-aware labels
 		"AI_LABEL_HORIZON": {},
-		"AI_FEATURE_DIM": {},
+		"AI_FEATURE_DIM":   {},
 		"AI_MIN_EDGE_PCT":  {},
 		// persistent mined labels
 		"AI_MINED_LABELS_FILE": {},

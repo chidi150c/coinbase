@@ -5,7 +5,6 @@ import (
 	"log"
 	"math"
 	"math/rand"
-	"time"
 )
 
 type LogisticModel struct {
