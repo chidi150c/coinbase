@@ -14,7 +14,7 @@ Restore the useful EMA structure that was removed by the MACD-compression experi
 
 ## Feature vector
 
-`UnifiedFeatureDim = 17`
+`UnifiedFeatureDim = 18`
 
 ```text
 0  ret1

@@ -1062,7 +1062,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f signalTF=%s gateTF=%s Reason=%s buyThresh=%.3f sellThresh=%.3f LongOnly=%v ver-53",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f signalTF=%s gateTF=%s Reason=%s buyThresh=%.3f sellThresh=%.3f LongOnly=%v ver-54",
 		totalLots,
 		d.Raw,
 		d.Signal,
