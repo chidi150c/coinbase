@@ -164,7 +164,13 @@ Do not hardcode an old dimension inside `newModel()`.
 
 After edits:
 
-```bash
+## 8.1 shutdown bot
+
+docker compose stop
+
+
+```bash in dev enivironment
+
 cd ~/coinbase
 
 gofmt -w feature_builder.go step.go model.go live.go
@@ -181,14 +187,14 @@ When feature dimension changes, old weights are invalid.
 
 Reset model state:
 
-```bash
-jq '.Model.W=null | .Model.B=0 | .Model.FeatDim=14 | .LastFit="0001-01-01T00:00:00Z"' \
+```bash in production
+jq '.Model.W=null | .Model.B=0 | .Model.FeatDim=18 | .LastFit="0001-01-01T00:00:00Z"' \
 /opt/coinbase/state/bot_state.newbinance.json \
 > /tmp/state_reset.json && \
 sudo mv -f /tmp/state_reset.json /opt/coinbase/state/bot_state.newbinance.json
 ```
 
-Change `14` to the new `UnifiedFeatureDim`.
+Change `18` to the new `FeatureDim`.
 
 Verify:
 

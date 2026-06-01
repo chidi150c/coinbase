@@ -292,7 +292,7 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 							latest.Time = time.Now().UTC()
 						}
 
-						beforePUp := debugPUp(history, model)
+						beforePUp := debugPUp(history, model, trader.cfg.MACDLineEPS, trader.cfg.AIFeatureDim)
 						var beforeLast Candle
 						if len(history) > 0 {
 							beforeLast = history[len(history)-1]
@@ -324,7 +324,7 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 							history = history[len(history)-trader.cfg.MaxHistoryCandles:]
 						}
 
-						afterPUp := debugPUp(history, model)
+						afterPUp := debugPUp(history, model, trader.cfg.MACDLineEPS, trader.cfg.AIFeatureDim)
 						afterLast := history[len(history)-1]
 
 						log.Printf(
@@ -349,7 +349,7 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 							if sigLatest.Time.IsZero() {
 								sigLatest.Time = time.Now().UTC()
 							}
-							beforeSignalPUp := debugPUp(signalHistory, model)
+							beforeSignalPUp := debugPUp(signalHistory, model, trader.cfg.MACDLineEPS, trader.cfg.AIFeatureDim)
 							if len(signalHistory) == 0 || sigLatest.Time.After(signalHistory[len(signalHistory)-1].Time) {
 								signalHistory = append(signalHistory, sigLatest)
 							} else {
@@ -358,7 +358,7 @@ func runLive(ctx context.Context, trader *Trader, model *LogisticModel, interval
 							if len(signalHistory) > trader.cfg.MaxHistoryCandles {
 								signalHistory = signalHistory[len(signalHistory)-trader.cfg.MaxHistoryCandles:]
 							}
-							afterSignalPUp := debugPUp(signalHistory, model)
+							afterSignalPUp := debugPUp(signalHistory, model, trader.cfg.MACDLineEPS, trader.cfg.AIFeatureDim)
 							log.Printf("[SIGNAL_SYNC] tf=%s GateTF=%s latest=%s signal_last=%s len=%d pUpBefore=%.5f pUpAfter=%.5f deltaPUp=%.5f",
 								signalTF, signalGateTF, sigLatest.Time, signalHistory[len(signalHistory)-1].Time, len(signalHistory), beforeSignalPUp, afterSignalPUp, afterSignalPUp-beforeSignalPUp)
 						} else if err != nil {
@@ -819,7 +819,7 @@ func maybeWalkForwardRefit(cfg Config, mdl *LogisticModel, history []Candle, las
 		return lastRefit, mdl
 	}
 
-	if mdl == nil || mdl.FeatDim != UnifiedFeatureDim || len(mdl.W) != UnifiedFeatureDim {
+	if mdl == nil || mdl.FeatDim != cfg.AIFeatureDim || len(mdl.W) != cfg.AIFeatureDim {
 		log.Printf("[MODEL_REFIT] resetting invalid model feat_dim=%d weights=%d",
 			func() int {
 				if mdl == nil {
@@ -834,12 +834,12 @@ func maybeWalkForwardRefit(cfg Config, mdl *LogisticModel, history []Candle, las
 				return len(mdl.W)
 			}(),
 		)
-		mdl = newModel()
+		mdl = newModel(cfg.AIFeatureDim)
 	}
 
 	mdl.fit(history, 0.05, 6)
 
-	if mdl.FeatDim != UnifiedFeatureDim || len(mdl.W) != UnifiedFeatureDim {
+	if mdl.FeatDim != cfg.AIFeatureDim || len(mdl.W) != cfg.AIFeatureDim {
 		log.Printf("[MODEL_REFIT] invalid after fit feat_dim=%d weights=%d; skip state update",
 			mdl.FeatDim, len(mdl.W))
 		return lastRefit, nil
@@ -1388,14 +1388,14 @@ func getFilterFloat(f any, field string) float64 {
 	return 0
 }
 
-func debugPUp(history []Candle, mdl *LogisticModel) float64 {
+func debugPUp(history []Candle, mdl *LogisticModel, MACDLineEPS float64, FeatureDim int) float64 {
 	if mdl == nil || len(history) < 60 {
 		return 0.5
 	}
 
 	i := len(history) - 1
 
-	snap, ok := BuildFeatureSnapshot(history, i)
+	snap, ok := BuildFeatureSnapshot(history, i, MACDLineEPS, FeatureDim)
 	if !ok || len(snap.X) == 0 {
 		return 0.5
 	}

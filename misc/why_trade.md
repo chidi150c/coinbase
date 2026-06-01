@@ -1,104 +1,307 @@
-why-trade is a diagnostic helper that explains why the bot did or did not trade around a price, timestamp, or order ID. It searches Binance audit logs, finds the nearest TRACE step.start, then prints the decision/gate/order chunk around that moment.
+why-trade — trading forensic & decision analysis tool
+======================================================
 
-Usage:
-  why-trade price <PRICE> [-s BUY|SELL] [-l LOGFILE] [-w LINES] [--chunk | --chunk-filter]
-  why-trade ts    <TIMESTAMP_SUBSTR> [-s BUY|SELL] [-l LOGFILE] [-w LINES] [--chunk | --chunk-filter]
-  why-trade oid   <ORDER_ID> [-s BUY|SELL] [-l LOGFILE] [--chunk | --chunk-filter]
+why-trade explains why the bot did or did not trade around a
+price, timestamp, or order ID.
 
-Description:
-  why-trade explains what the bot was doing near a price, timestamp, or order ID.
+It searches Binance audit logs, finds the nearest
+TRACE step.start, then explains:
 
-  It searches the Binance audit log, finds the closest trading step, then shows
-  the surrounding decision, gate, order, funding, pyramid, and post-only events.
+  • what the bot saw
+  • what the AI predicted
+  • what gates blocked/allowed
+  • what orders happened
+  • whether the decision was correct afterward
+    (using future path analysis)
 
-  Default log:
-    ${LOG_DEFAULT}
+Usage
+-----
 
-Modes:
-  price <PRICE>
-    Finds the TRACE step.start line whose price is closest to PRICE.
+  why-trade price <PRICE> \
+    [-s BUY|SELL] [-l LOGFILE] [-w LINES] \
+    [--chunk | --chunk-filter | --after 60m]
 
-  ts <TIMESTAMP_SUBSTR>
-    Finds the first log line matching the timestamp substring, then shows the
-    nearby trading step.
+  why-trade ts <TIMESTAMP_SUBSTR> \
+    [-s BUY|SELL] [-l LOGFILE] [-w LINES] \
+    [--chunk | --chunk-filter | --after 60m]
 
-  oid <ORDER_ID>
-    Searches current and rotated audit logs for an order ID, then walks backward
-    to the nearest step.start.
+  why-trade oid <ORDER_ID> \
+    [-s BUY|SELL] [-l LOGFILE] \
+    [--chunk | --chunk-filter]
 
-Flags:
-  -s BUY|SELL
-    Side-aware filtering for gate/order patterns.
-    Default: ${SIDE_DEFAULT}
+Description
+-----------
 
-  -l LOGFILE
-    Use a different audit log.
-    Default: ${LOG_DEFAULT}
+why-trade is both:
 
-  -w LINES
-    Half-window context around the matched step.
-    Default: ${WINDOW_DEFAULT}
+  1. A forensic tool
+     ("What was the bot doing?")
 
-  --chunk
-    Show the full raw step chunk from nearest step.start to the next step.start.
+  2. A decision-analysis tool
+     ("Was the decision actually correct afterward?")
 
-  --chunk-filter
-    Show only key lines from the step chunk:
-      decisions
-      gates
-      order opens/closes
-      post-only events
-      funding errors
-      pyramid blocks
-      flat/hold output
+It searches the Binance audit log, finds the closest trading
+step, then analyzes:
+
+  • model prediction (Raw signal)
+  • final decision
+  • pUp probability
+  • gate decisions (MACD / MA / pyramid / equity)
+  • order placement
+  • funding blocks
+  • post-only behavior
+  • future path outcome (optional)
+
+Default log:
+
+  /opt/coinbase/logs/audit/binance_audit.log
+
+
+Modes
+-----
+
+price <PRICE>
+
+  Finds the TRACE step.start line whose price is closest
+  to PRICE.
+
+Example:
+
+  why-trade price 73586.82 --chunk-filter
+
+
+ts <TIMESTAMP_SUBSTR>
+
+  Finds the first log line matching the timestamp substring,
+  then analyzes the nearby trading step.
 
 Examples:
-  why-trade price 74068.07 --chunk-filter
 
-  why-trade price 115,303.99 -s SELL --chunk-filter
+  why-trade ts 2026-05-31T14:25 --chunk-filter
 
-  why-trade ts 2026-05-31T09:25 --chunk-filter
+  why-trade ts 2026-05-31T14:25 \
+    -s SELL \
+    --after 60m
+
+
+oid <ORDER_ID>
+
+  Searches current and rotated audit logs for an order ID,
+  then walks backward to the nearest step.start.
+
+Example:
 
   why-trade oid 50919131900 -s BUY --chunk-filter
 
-  why-trade price 74068.07 -w 150
 
-Typical workflow:
-  1. Use audit-grep to find a suspicious BUY/SELL/order:
-       audit-grep binance 'Decision=SELL|Decision=BUY|LIVE ORDER|postonly\.filled' -n
+Flags
+-----
 
-  2. Copy the price, timestamp, or order ID.
+-s BUY|SELL
 
-  3. Use why-trade to explain that moment:
-       why-trade price <PRICE> --chunk-filter
-       why-trade ts <TIME> --chunk-filter
-       why-trade oid <ORDER_ID> --chunk-filter
+  Side-aware filtering for gate/order patterns.
 
-Notes:
-  Use --chunk-filter first for clean output.
-  Use --chunk when you need the full raw step.
-  Use -s SELL when investigating sell-side gates.
-  Use -s BUY when investigating buy-side gates.
-  
-=======================================================================
+  Examples:
+
+    -s BUY
+    -s SELL
+
+  Default:
+
+    BUY
+
+
+-l LOGFILE
+
+  Use a different audit log.
+
+  Example:
+
+    -l /opt/coinbase/logs/audit/binance_audit.log
+
+
+-w LINES
+
+  Half-window context around the matched step.
+
+  Example:
+
+    -w 150
+
+  Default:
+
+    90
+
+
+--chunk
+
+  Show the full raw step chunk from nearest TRACE step.start
+  to the next TRACE step.start.
+
+  Best for:
+
+    deep debugging
+
+
+--chunk-filter
+
+  Show only key lines from the step chunk:
+
+    • Decision=
+    • Raw=
+    • pUp=
+    • gate blocks
+    • order opens/closes
+    • post-only activity
+    • funding errors
+    • pyramid logic
+    • HOLD / FLAT
+
+  Best for:
+
+    quick investigation
+
+
+--after 60m
+
+  Evaluate whether the decision was actually correct
+  afterward.
+
+  Uses future price path analysis over the next 60 minutes.
+
+  Why 60m?
+
+    Model training horizon:
+
+      AI_SIGNAL_TF = 5m
+      AI_LABEL_HORIZON = 12
+
+    Therefore:
+
+      12 × 5m = 60 minutes
+
+  Output includes:
+
+    • Decision Snapshot
+    • Raw signal
+    • Final decision
+    • pUp
+    • gate reasons
+    • future price path
+    • MFE (max favorable excursion)
+    • MAE (max adverse excursion)
+    • verdict
+
+Example:
+
+  why-trade ts 2026-05-31T14:25 \
+    -s SELL \
+    --after 60m
+
+
+Example output
+--------------
+
+Decision Snapshot
+-----------------
+ts=2026-05-31T14:25:00Z
+price=73586.82
+Raw=SELL
+Decision=FLAT
+pUp=0.33924
+
+Reason:
+macd_not_strong_positive_for_sell
+macd_not_high_peak_for_sell
+
+Path Outcome (+60m)
+-------------------
++5m   73582.79  -0.0055%
++10m  73658.49   0.0974%
++15m  73658.49   0.0974%
++20m  73658.49   0.0974%
++30m  73658.49   0.0974%
++45m  73658.49   0.0974%
++60m  73658.49   0.0974%
+
+MFE (SELL): 0.0464%
+MAE (SELL): 0.2568%
+
+Verdict:
+SELL would likely have failed or was risky.
+Gate may have protected the bot.
+
+
+Typical workflow
+----------------
+
+1. Find suspicious decisions
+
+   audit-grep binance \
+     'Decision=SELL|Decision=BUY|LIVE ORDER|postonly\.filled' -n
+
+2. Copy the:
+
+   • timestamp
+   • price
+   • order ID
+
+3. Investigate
+
+   why-trade ts 2026-05-31T14:25 --chunk-filter
+
+4. Evaluate correctness
+
+   why-trade ts 2026-05-31T14:25 \
+     -s SELL \
+     --after 60m
+
+
+Relationship to audit-grep
+---------------------------
 
 why-trade uses the same audit logs that audit-grep searches.
 
 But:
 
-audit-grep does not produce the logs.
+  audit-grep does NOT produce logs.
 
 The logs are produced by:
 
-binance-audit-tail.service
+  binance-audit-tail.service
 
-Pipeline:
+
+Pipeline
+--------
 
 bot_binance docker logs
-→ binance-audit-tail.service
-→ /opt/coinbase/logs/audit/binance_audit.log
+        ↓
+binance-audit-tail.service
+        ↓
+/opt/coinbase/logs/audit/binance_audit.log
+        ↓
+ ┌──────────────────────────────┐
+ │ audit-grep                   │
+ │ searches audit logs          │
+ └──────────────────────────────┘
+        ↓
+ ┌──────────────────────────────┐
+ │ why-trade                    │
+ │ explains & evaluates trades  │
+ └──────────────────────────────┘
 
-Then both tools read that same file:
 
-audit-grep  → searches the audit log
-why-trade   → analyzes the audit log around a time/price/order
+Mental model
+------------
+
+audit-grep answers:
+
+  "What happened?"
+
+why-trade answers:
+
+  "Why did it happen?"
+
+why-trade --after 60m answers:
+
+  "Was it actually the correct decision?"

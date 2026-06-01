@@ -12,6 +12,8 @@ type FeatureLabelConfig struct {
 	FeeRatePct float64
 	MinEdgePct float64
 	MinRows    int
+	MACDLineEPS float64
+	AIFeatureDim int
 
 	// Path-based net-profit labeling.
 	ProfitGateUSD   float64
@@ -121,7 +123,7 @@ func BuildFeaturesAndLabels(c []Candle, cfg FeatureLabelConfig) ([][]float64, []
 			continue
 		}
 
-		features, ok := BuildFeatures(c, i)
+		features, ok := BuildFeatures(c, i, cfg.MACDLineEPS, cfg.AIFeatureDim)
 		if !ok || len(features) == 0 {
 			bad++
 			continue

@@ -9,12 +9,14 @@ LOG_DEFAULT="/opt/coinbase/logs/audit/binance_audit.log"
 SIDE_DEFAULT="BUY"
 WINDOW_DEFAULT=90
 CHUNK_MODE="none"   # none | raw | filter
+AFTER_MODE=false
+AFTER_MIN=60
 
 usage() {
   cat <<EOF
 Usage:
-  why-trade price <PRICE> [-s BUY|SELL] [-l LOGFILE] [-w LINES] [--chunk | --chunk-filter]
-  why-trade ts    <TIMESTAMP_SUBSTR> [-s BUY|SELL] [-l LOGFILE] [-w LINES] [--chunk | --chunk-filter]
+  why-trade price <PRICE> [-s BUY|SELL] [-l LOGFILE] [-w LINES] [--chunk | --chunk-filter | --after 60m]
+  why-trade ts    <TIMESTAMP_SUBSTR> [-s BUY|SELL] [-l LOGFILE] [-w LINES] [--chunk | --chunk-filter | --after 60m]
   why-trade oid   <ORDER_ID> [-s BUY|SELL] [-l LOGFILE] [--chunk | --chunk-filter]
 
 Description:
@@ -106,6 +108,7 @@ while [[ $# -gt 0 ]]; do
     -l) LOG="${2:-}"; shift 2;;
     -w) W="${2:-}"; shift 2;;
     --chunk) CHUNK_MODE="raw"; shift;;
+    --after) AFTER_MODE=true; AFTER_VAL="${2:-60m}"; AFTER_MIN="${AFTER_VAL%m}"; shift 2;;
     --chunk-filter) CHUNK_MODE="filter"; shift;;
     -h|--help) usage; exit 0;;
     *) POS+=("$1"); shift;;
@@ -204,6 +207,123 @@ ensure_has_steps_or_die() {
   exit 1
 }
 
+analyze_after_path() {
+  local log="$1"
+  local start_line="$2"
+  local side="$3"
+  local after_min="$4"
+
+  local start_row
+  start_row="$(sed -n "${start_line}p" "$log")"
+
+  local t0 price raw final pup reason
+  t0="$(echo "$start_row" | sed -n 's/.*ts=\([^ ]*\).*/\1/p')"
+  price="$(echo "$start_row" | sed -n 's/.*price=\([0-9.]*\).*/\1/p')"
+
+  local debug_line
+  debug_line="$(sed -n "$((start_line+1)),$((start_line+20))p" "$log" | grep '\[DEBUG\] Total Lots=' | head -1)"
+
+  raw="$(echo "$debug_line" | grep -oE 'Raw=(BUY|SELL|FLAT)' | cut -d= -f2)"
+  final="$(echo "$debug_line" | grep -oE 'Decision=(BUY|SELL|FLAT)' | cut -d= -f2)"
+  pup="$(echo "$debug_line" | grep -oE 'pUp=[0-9.]+' | head -1 | cut -d= -f2)"
+  reason="$(echo "$debug_line" | sed -n 's/.*Reason=\(.*\) buyThresh=.*/\1/p')"
+
+  awk -v t0="$t0" -v entry="$price" -v side="$side" -v mins="$after_min" \
+      -v raw="$raw" -v final="$final" -v pup="$pup" -v reason="$reason" '
+    function pct(p) { return ((p-entry)/entry)*100.0 }
+    function fav(p) {
+      if (side=="SELL") return ((entry-p)/entry)*100.0
+      return ((p-entry)/entry)*100.0
+    }
+    function adv(p) {
+      if (side=="SELL") return ((p-entry)/entry)*100.0
+      return ((entry-p)/entry)*100.0
+    }
+    BEGIN {
+      print "Decision Snapshot"
+      print "-----------------"
+      print "ts=" t0
+      printf "price=%.2f\n", entry
+      print "Raw=" raw
+      print "Decision=" final
+      print "pUp=" pup
+      print ""
+      print "Reason:"
+      print reason
+      print ""
+      print "Path Outcome (+" mins "m)"
+      print "-------------------"
+    }
+    /TRACE step.start/ {
+      if (match($0,/ts=([^ ]+)/,tm) && match($0,/price=([0-9.]+)/,pm)) {
+        ts=tm[1]
+        px=pm[1]+0
+
+        gsub("T"," ",ts)
+        gsub("Z","",ts)
+        gsub("T"," ",t0)
+        gsub("Z","",t0)
+
+        cmd="date -u -d \"" ts "\" +%s"
+        cmd | getline now
+        close(cmd)
+
+        cmd="date -u -d \"" t0 "\" +%s"
+        cmd | getline start
+        close(cmd)
+
+        delta=int((now-start)/60)
+
+        if (delta >= 0 && delta <= mins) {
+          if (!(delta in seen)) {
+            seen[delta]=px
+          }
+
+          f=fav(px)
+          a=adv(px)
+
+          if (n==0 || f>mfe) mfe=f
+          if (n==0 || a>mae) mae=a
+          n++
+        }
+      }
+    }
+    END {
+      split("5 10 15 20 30 45 60", marks, " ")
+      for (i in marks) {
+        m=marks[i]
+        best=-1
+        for (d in seen) {
+          if (d <= m && d > best) best=d
+        }
+        if (best >= 0) {
+          px=seen[best]
+          printf "+%dm  %.2f  %.4f%%\n", m, px, pct(px)
+        }
+      }
+
+      print ""
+      printf "MFE (%s): %.4f%%\n", side, mfe
+      printf "MAE (%s): %.4f%%\n", side, mae
+      print ""
+      print "Verdict:"
+      if (mfe > mae && mfe >= 0.10) {
+        print side " would likely have worked."
+        if (raw==side && final=="FLAT") {
+          print "Gate blocked a favorable " side " setup."
+        }
+      } else if (mae > mfe) {
+        print side " would likely have failed or was risky."
+        if (raw==side && final=="FLAT") {
+          print "Gate may have protected the bot."
+        }
+      } else {
+        print "Outcome was inconclusive."
+      }
+    }
+  ' < <(sed -n "${start_line},\$p" "$log")
+}
+
 # --- Main ---
 case "$MODE" in
   price)
@@ -213,6 +333,11 @@ case "$MODE" in
 
     LN="$(nearest_step_line_by_price "$PRICE" "$LOG" || true)"
     [[ -n "$LN" ]] || { echo "No step.start near price=$PRICE" >&2; exit 1; }
+
+    if [[ "$AFTER_MODE" == true ]]; then
+      analyze_after_path "$LOG" "$LN" "$SIDE" "$AFTER_MIN"
+      exit 0
+    fi
 
     if [[ "$CHUNK_MODE" != "none" ]]; then
       NL="$(next_step_line_after "$LN" "$LOG" || true)"
@@ -242,6 +367,11 @@ case "$MODE" in
     if ! sed -n "${LN}p" "$LOG" | grep -q "TRACE step.start"; then
       NS="$(next_step_line_after "$LN" "$LOG" || true)"
       [[ -n "$NS" ]] && CHUNK_START="$NS"
+    fi
+
+    if [[ "$AFTER_MODE" == true ]]; then
+      analyze_after_path "$LOG" "$CHUNK_START" "$SIDE" "$AFTER_MIN"
+      exit 0
     fi
 
     if [[ "$CHUNK_MODE" != "none" ]]; then

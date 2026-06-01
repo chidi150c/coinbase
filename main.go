@@ -60,7 +60,7 @@ func main() {
 		return
 	}
 
-	model := newModel()
+	model := newModel(cfg.AIFeatureDim)
 	trader := NewTrader(cfg, broker, model)
 
 	bootCtx, bootCancel := context.WithTimeout(context.Background(), 15*time.Second)

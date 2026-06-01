@@ -15,8 +15,8 @@ type LogisticModel struct {
 	FeatDim int       `json:"FeatDim"`
 }
 
-func newModel() *LogisticModel {
-	return NewLogisticModel(UnifiedFeatureDim)
+func newModel(FeatureDim int) *LogisticModel {
+	return NewLogisticModel(FeatureDim)
 }
 
 func NewLogisticModel(featDim int) *LogisticModel {
