@@ -124,6 +124,35 @@ type FeatureSnapshot struct {
 
 // BuildFeatureSnapshot builds the unified feature vector at candle index idx.
 // It returns ok=false when there is not enough history or inputs are invalid.
+//
+// Feature vector vNext, in order:
+//
+//	0  ret1
+//	1  ret5
+//	2  RSI14 / 100
+//	3  ZScore20
+//	4  ATR14 / Close
+//	5  realizedVol20 / Close
+//	6  distance from recent high, pct
+//	7  distance from recent low, pct
+//	8  MACD line / Close
+//	9  MACD histogram / Close
+//	10 MACD histogram delta d3 / Close
+//	11 smoothed MACD histogram delta / Close, (d2+d3)/2
+//	12 EMA4/EMA8 spread pct
+//	13 EMA4/EMA8 alignment strength, abs(spread)
+//	14 EMA20/EMA50 spread pct
+//	15 EMA20/EMA50 alignment strength, abs(spread)
+//	16 EMA20 slope
+//	17 EMA50 slope
+//	18 EMA high-peak shape
+//	19 EMA low-bottom shape
+//	20 EMA price-down-going-up shape
+//	21 EMA price-up-going-down shape
+//	22 MACD high-peak shape
+//	23 MACD low-bottom shape
+//
+// Feature count: 24
 func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim int) (FeatureSnapshot, bool) {
 	var out FeatureSnapshot
 
@@ -174,10 +203,12 @@ func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim i
 	histDeltaNow := d3
 	histDeltaSmooth := (d2 + d3) / 2.0
 
-	highPeak := false
-	lowBottom := false
-	priceDownGoingUp := false
-	priceUpGoingDown := false
+	emaHighPeak := false
+	emaLowBottom := false
+	emaPriceDownGoingUp := false
+	emaPriceUpGoingDown := false
+	macdHighPeak := false
+	macdLowBottom := false
 
 	if !badFloat(fast) && !badFloat(slow) &&
 		!badFloat(fast2) && !badFloat(slow2) &&
@@ -187,30 +218,36 @@ func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim i
 		fastIsHigher := (fast > slow) && (fast4 > slow4) && (fast6 > slow6)
 		fastIsLower := (fast < slow) && (fast4 < slow4) && (fast6 < slow6)
 
-		// Restored EMA geometry from the pre-compression model.
-		priceDownGoingUp = (fast < slow) && (fast6 < slow6) && (slow-fast < slow6-fast6)
-		priceUpGoingDown = (fast > slow) && (fast6 > slow6) && (fast-slow < fast6-slow6)
+		// EMA reversal / exhaustion geometry restored from the stronger old feature era.
+		emaPriceDownGoingUp = (fast < slow) &&
+			(fast6 < slow6) &&
+			(slow-fast < slow6-fast6)
 
-		emaHighPeak := fastIsHigher &&
+		emaPriceUpGoingDown = (fast > slow) &&
+			(fast6 > slow6) &&
+			(fast-slow < fast6-slow6)
+
+		emaHighPeak = fastIsHigher &&
 			(fast4-slow4 > fast6-slow6) &&
 			(fast2-slow2 > fast4-slow4) &&
 			(fast-slow < fast2-slow2)
 
-		emaLowBottom := fastIsLower &&
+		emaLowBottom = fastIsLower &&
 			(slow4-fast4 > slow6-fast6) &&
 			(slow2-fast2 > slow4-fast4) &&
 			(slow-fast < slow2-fast2)
-
-		// MACD turning-shape confirmation. This is retained for audit/gates,
-		// but it is not directly included as a boolean feature in the 18-dim vector.
-		macdHighPeak := histDeltaSmooth < 0 && macdTurningPoint >= macdLineEPS
-		macdLowBottom := histDeltaSmooth > 0 && macdTurningPoint <= -macdLineEPS
-
-		// Preserve sensitivity by allowing either old EMA shape or MACD shape
-		// to mark the turn.
-		highPeak = emaHighPeak || macdHighPeak
-		lowBottom = emaLowBottom || macdLowBottom
 	}
+
+	// MACD turn-origin shape retained as separate facts, not merged before model input.
+	// The model sees EMA and MACD turn evidence independently and learns their payoff.
+	macdHighPeak = histDeltaSmooth < 0 && macdTurningPoint >= macdLineEPS
+	macdLowBottom = histDeltaSmooth > 0 && macdTurningPoint <= -macdLineEPS
+
+	// Combined fields remain useful for gates/logging only.
+	highPeak := emaHighPeak || macdHighPeak
+	lowBottom := emaLowBottom || macdLowBottom
+	priceDownGoingUp := emaPriceDownGoingUp
+	priceUpGoingDown := emaPriceUpGoingDown
 
 	ret1 := safeRatio(c[idx].Close-c[idx-1].Close, c[idx-1].Close)
 	ret5 := safeRatio(c[idx].Close-c[idx-5].Close, c[idx-5].Close)
@@ -245,16 +282,25 @@ func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim i
 		volPct,
 		distHighPct,
 		distLowPct,
+
 		safeRatio(macdLineNow, macdScale),
 		safeRatio(histNow, macdScale),
 		safeRatio(histDeltaNow, macdScale),
 		safeRatio(histDeltaSmooth, macdScale),
-		boolToFloat(macdTurningPoint >= macdLineEPS),
-		boolToFloat(macdTurningPoint <= -macdLineEPS),
+
 		emaSpreadPct,
+		emaAlignStrength,
 		ema2050Spread,
+		ema2050Strength,
 		ema20Slope,
 		ema50Slope,
+
+		boolToFloat(emaHighPeak),
+		boolToFloat(emaLowBottom),
+		boolToFloat(emaPriceDownGoingUp),
+		boolToFloat(emaPriceUpGoingDown),
+		boolToFloat(macdHighPeak),
+		boolToFloat(macdLowBottom),
 	}
 
 	if len(x) != FeatureDim || hasBadFloat(x) {

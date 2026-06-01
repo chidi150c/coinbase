@@ -1058,7 +1058,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	//---ADD path continues-----
 	// --------------------------------------------------------------------------------------------------------
 	d := t.decide(signalHistory)
-	d = t.applyMACDSlopeGate(d, c)
+	d = t.applyLogicGate(d, c)
 	totalLots := lsb + lss
 
 	log.Printf(

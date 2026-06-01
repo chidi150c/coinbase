@@ -163,7 +163,7 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 	return base
 }
 
-func (t *Trader) applyMACDSlopeGate(d Decision, execHistory []Candle) Decision {
+func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	if !t.cfg.UseMACDSlopeGate {
 		return d
 	}

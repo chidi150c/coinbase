@@ -209,7 +209,7 @@ Expected:
   "W": null,
   "B": 0,
   "L2": 0.001,
-  "FeatDim": 14
+  "FeatDim": 18
 }
 "0001-01-01T00:00:00Z"
 ```
@@ -223,9 +223,9 @@ Mined labels contain saved feature vectors. If feature shape changes, old mined 
 Remove or archive the old mined label file:
 
 ```bash
-sudo mv /opt/coinbase/state/mined_labels_binance_5m.jsonl \
-/opt/coinbase/state/mined_labels_binance_5m.jsonl.bak.$(date +%Y%m%d_%H%M%S)
+sudo rm -f /opt/coinbase/state/mined_labels_binance_5m.jsonl
 ```
+
 ## 10.1 push to production to restore bot
 
 git add .
@@ -259,7 +259,7 @@ then:
 ```bash
 cd ~/coinbase/monitoring
 
-IMAGE_SHA=72cf8bacff1f7c609df5f2e2ee715cbbfb145cc3  \
+IMAGE_SHA=976fd7a53dc1b322a77df95d393a3865bbbacb42 \
 docker compose run --rm --no-deps \
   --entrypoint /app/bot \
   bot_binance \
