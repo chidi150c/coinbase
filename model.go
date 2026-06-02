@@ -12,6 +12,8 @@ type LogisticModel struct {
 	B       float64   `json:"B"`
 	L2      float64   `json:"L2"`
 	FeatDim int       `json:"FeatDim"`
+	FeatureMean []float64 `json:"feature_mean,omitempty"`
+	FeatureStd  []float64 `json:"feature_std,omitempty"`
 }
 
 func newModel(featureDim int) *LogisticModel {
@@ -42,6 +44,84 @@ func sigmoid(x float64) float64 {
 	return 1 / (1 + math.Exp(-x))
 }
 
+func (m *LogisticModel) fitScalerFromArrays(feats [][]float64) {
+	if m == nil || m.FeatDim <= 0 || len(feats) == 0 {
+		return
+	}
+
+	mean := make([]float64, m.FeatDim)
+	std := make([]float64, m.FeatDim)
+
+	validRows := 0
+
+	// Mean
+	for _, x := range feats {
+		if len(x) != m.FeatDim {
+			continue
+		}
+
+		validRows++
+
+		for j, v := range x {
+			mean[j] += v
+		}
+	}
+
+	if validRows == 0 {
+		return
+	}
+
+	n := float64(validRows)
+
+	for j := range mean {
+		mean[j] /= n
+	}
+
+	// Std
+	for _, x := range feats {
+		if len(x) != m.FeatDim {
+			continue
+		}
+
+		for j, v := range x {
+			d := v - mean[j]
+			std[j] += d * d
+		}
+	}
+
+	for j := range std {
+		std[j] = math.Sqrt(std[j] / n)
+
+		if std[j] < 1e-9 ||
+			math.IsNaN(std[j]) ||
+			math.IsInf(std[j], 0) {
+			std[j] = 1.0
+		}
+	}
+
+	m.FeatureMean = mean
+	m.FeatureStd = std
+}
+
+func (m *LogisticModel) standardizeInPlace(x []float64) {
+	if m == nil || len(m.FeatureMean) != m.FeatDim || len(m.FeatureStd) != m.FeatDim {
+		return
+	}
+	if len(x) != m.FeatDim {
+		return
+	}
+
+	for j := range x {
+		x[j] = (x[j] - m.FeatureMean[j]) / m.FeatureStd[j]
+	}
+}
+
+func (m *LogisticModel) standardizedCopy(x []float64) []float64 {
+	out := append([]float64(nil), x...)
+	m.standardizeInPlace(out)
+	return out
+}
+
 func (m *LogisticModel) Predict(x []float64) float64 {
 	if m == nil {
 		return 0.5
@@ -56,10 +136,14 @@ func (m *LogisticModel) Predict(x []float64) float64 {
 		return 0.5
 	}
 
+	// NEW: standardize feature vector
+	xs := m.standardizedCopy(x)
+
 	z := m.B
 	for i := 0; i < m.FeatDim; i++ {
-		z += m.W[i] * x[i]
+		z += m.W[i] * xs[i]
 	}
+
 	return sigmoid(z)
 }
 
@@ -174,6 +258,9 @@ func (m *LogisticModel) FitMiniBatch(feats [][]float64, labels []float64, lr flo
 		epochs = 10
 	}
 
+	// Learn feature scaling from training dataset
+	m.fitScalerFromArrays(feats)
+
 	bestW := append([]float64(nil), m.W...)
 	bestB := m.B
 	bestLoss := math.MaxFloat64
@@ -196,12 +283,15 @@ func (m *LogisticModel) FitMiniBatch(feats [][]float64, labels []float64, lr flo
 			for k := off; k < end; k++ {
 				i := perm[k]
 
-				p := m.Predict(feats[i])
+				x := feats[i]
+				xs := m.standardizedCopy(x)
+
+				p := m.Predict(x)
 				y := labels[i]
 				grad := p - y
 
 				for j := 0; j < m.FeatDim; j++ {
-					gW[j] += grad * feats[i][j]
+					gW[j] += grad * xs[j]
 				}
 				gB += grad
 			}
