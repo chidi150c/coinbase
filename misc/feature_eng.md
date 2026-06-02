@@ -188,10 +188,18 @@ When feature dimension changes, old weights are invalid.
 Reset model state:
 
 ```bash in production
-jq '.Model.W=null | .Model.B=0 | .Model.FeatDim=18 | .LastFit="0001-01-01T00:00:00Z"' \
+jq '
+.Model.W=null |
+.Model.B=0 |
+.Model.FeatDim=24 |
+.Model.FeatureMean=null |
+.Model.FeatureStd=null |
+.LastFit="0001-01-01T00:00:00Z"
+' \
 /opt/coinbase/state/bot_state.newbinance.json \
-> /tmp/state_reset.json && \
-sudo mv -f /tmp/state_reset.json /opt/coinbase/state/bot_state.newbinance.json
+> /tmp/state_reset_scaler.json && \
+sudo mv -f /tmp/state_reset_scaler.json \
+/opt/coinbase/state/bot_state.newbinance.json
 ```
 
 Change `18` to[text](../main.go) the new `FeatureDim`.
