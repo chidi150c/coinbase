@@ -75,7 +75,7 @@ func (d Decision) SignalToSide() OrderSide {
 	}
 }
 
-// decide computes a trading decision from signal timeframe candles and the unified model.
+// decide computes a tradi]ng decision from signal timeframe candles and the unified model.
 func (t *Trader) decide(signalHistory []Candle) Decision {
 	if len(signalHistory) < 60 {
 		return Decision{
@@ -201,6 +201,15 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		logicOpinion = Sell
 	}
 
+	logicDisagreement :=
+	(d.Raw == Buy && logicOpinion == Sell) ||
+	(d.Raw == Sell && logicOpinion == Buy)
+
+	if logicDisagreement {
+		d.Signal = Flat
+		reason = appendReason(reason, "logic_disagreement")
+	}
+
 	switch d.Signal {
 	case Sell:
 		// 1. Must have strong MACD turn-origin evidence
@@ -246,11 +255,11 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		}
 	default:
 		reason = appendReason(reason,
-				fmt.Sprintf("ai_flat_logicOpinion=%s", logicOpinion))
+				fmt.Sprintf("ai_%s_logicOpinion=%s", d.Raw, logicOpinion))
 	}
 
 	reason = fmt.Sprintf(
-		"[LOGIC_GATE] gateTF=%s aiRaw=%s logicOpinion=%s final=%s | "+
+		"[LOGIC_GATE] gateTF=%s aiRaw=%s logicOpinion=%s logicDisagreement=%v final=%s | "+
 			"MACD{line=%.5f turn=%.5f hist=%.5f dHist=%.5f dSmooth=%.5f} | "+
 			"EMA{spread=%.6f ema2050=%.6f} | "+
 			"Pattern{emaHighPeak=%v emaLowBottom=%v emaPriceDownGoingUp=%v emaPriceUpGoingDown=%v emaSellPattern=%v emaBuyPattern=%v macdMomentumDown=%v macdMomentumUp=%v macdStrongPositive=%v macdStrongNegative=%v} | "+
@@ -259,6 +268,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		t.cfg.GateTF,
 		d.Raw,
 		logicOpinion,
+		logicDisagreement,	
 		d.Signal,
 
 		snap.MACDLine,
