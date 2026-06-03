@@ -1206,8 +1206,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					"winLowBuy=%.2f winHighSell=%.2f "+
 					"latchedBuy=%.2f latchedSell=%.2f "+
 					"nearestBuy{take=%.2f net=%.2f idx=%d} "+
-					"nearestSell{take=%.2f net=%.2f idx=%d} "+
-					"reason=%s",
+					"nearestSell{take=%.2f net=%.2f idx=%d} ",
 				d.PUp,
 				t.lastAddBuy.Format(time.RFC3339),
 				t.lastAddSell.Format(time.RFC3339),
@@ -1221,7 +1220,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				t.nearestTakeSell,
 				t.nearestNetSell,
 				t.nearestIdxSell,
-				d.Reason,
 			)
 		t.mu.Unlock()
 		return "FLAT", nil
