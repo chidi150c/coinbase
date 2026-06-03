@@ -105,7 +105,7 @@ then:
 ```bash
 cd ~/coinbase/monitoring
 
-IMAGE_SHA=c2831258698f6a8d141968121d2e8418cff10f56 \
+IMAGE_SHA=b635f07260556ba1848103a6c206604917c80f6b \
 docker compose run --rm --no-deps \
   --entrypoint /app/bot \
   bot_binance \

@@ -1201,7 +1201,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	}
 	if d.Signal == Flat && !equityTriggerSell && !equityTriggerBuy {
 		t.mu.Unlock()
-		return fmt.Sprintf("FLAT [%s]", d.Reason), nil
+		return "FLAT", nil
 	}
 
 	// GATE1 Respect lot cap (both sides)

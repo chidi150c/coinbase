@@ -18,7 +18,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"time"
 )
 
@@ -161,30 +160,35 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 }
 
 func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
+	
+	reason := ""
+
 	if !t.cfg.UseMACDSlopeGate {
 		return d
 	}
 
 	if len(execHistory) < 60 {
-		log.Printf(
-			"[MACD_GATE] skip insufficient_history len=%d gateTF=%s",
+		reason = fmt.Sprintf(
+			"[LOGIC_GATE] skip insufficient_history len=%d gateTF=%s",
 			len(execHistory),
 			t.cfg.GateTF,
 		)
+		d.Reason = appendReason(d.Reason, reason)
 		return d
 	}
 
 	if d.Signal != Buy && d.Signal != Sell {
 		snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1, t.cfg.MACDLineEPS, t.cfg.AIFeatureDim)
 		if !ok {
-			log.Printf(
-				"[MACD_GATE] skip no_feature_snapshot len=%d gateTF=%s",
+			reason = fmt.Sprintf(
+				"[LOGIC_GATE] skip no_feature_snapshot len=%d gateTF=%s",
 				len(execHistory),
 				t.cfg.GateTF,
 			)
+			d.Reason = appendReason(d.Reason, reason)
 			return d
 		}
-		log.Printf(
+		reason = fmt.Sprintf(
 			"[LOGIC_GATE] gateTF=%s raw=%s final=%s | "+
 				"MACD{line=%.5f turn=%.5f hist=%.5f dHist=%.5f dSmooth=%.5f} | "+
 				"EMA{spread=%.6f ema2050=%.6f} | "+
@@ -216,21 +220,22 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 			t.cfg.MACDLineEPS,
 			"NA",
 		)
+		d.Reason = appendReason(d.Reason, reason)
 		return d
 	}
 
 	snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1, t.cfg.MACDLineEPS, t.cfg.AIFeatureDim)
 	if !ok {
-		log.Printf(
-			"[MACD_GATE] skip no_feature_snapshot len=%d gateTF=%s",
+		reason=fmt.Sprintf(
+			"[LOGIC_GATE] skip no_feature_snapshot len=%d gateTF=%s",
 			len(execHistory),
 			t.cfg.GateTF,
 		)
+		d.Reason = appendReason(d.Reason, reason)
 		return d
 	}
 
 	// Gate remains execution-timeframe based. Do not feed signalHistory here.
-	reason := ""
 	emaSellPattern := snap.EMAHighPeak || snap.EMAPriceUpGoingDown
 	emaBuyPattern := snap.EMALowBottom || snap.EMAPriceDownGoingUp
 	switch d.Signal {
