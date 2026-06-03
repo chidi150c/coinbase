@@ -87,10 +87,10 @@ type FeatureSnapshot struct {
 	X []float64
 
 	// Pattern booleans
-	HighPeak         bool
-	LowBottom        bool
-	PriceDownGoingUp bool
-	PriceUpGoingDown bool
+	EMAHighPeak         bool
+	EMALowBottom        bool
+	EMAPriceDownGoingUp bool
+	EMAPriceUpGoingDown bool
 
 	// Short EMA state
 	EMAFast          float64
@@ -106,6 +106,10 @@ type FeatureSnapshot struct {
 	MACDHist            float64
 	MACDHistDelta       float64
 	MACDHistDeltaSmooth float64
+	MACDMomentumDown    bool
+	MACDMomentumUp      bool
+	MACDStrongPositive  bool
+	MACDStrongNegative  bool
 
 	// Medium/long EMA trend context
 	EMA20           float64
@@ -207,8 +211,6 @@ func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim i
 	emaLowBottom := false
 	emaPriceDownGoingUp := false
 	emaPriceUpGoingDown := false
-	macdHighPeak := false
-	macdLowBottom := false
 
 	if !badFloat(fast) && !badFloat(slow) &&
 		!badFloat(fast2) && !badFloat(slow2) &&
@@ -238,16 +240,19 @@ func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim i
 			(slow-fast < slow2-fast2)
 	}
 
-	// MACD turn-origin shape retained as separate facts, not merged before model input.
-	// The model sees EMA and MACD turn evidence independently and learns their payoff.
-	macdHighPeak = histDeltaSmooth < 0 && macdTurningPoint >= macdLineEPS
-	macdLowBottom = histDeltaSmooth > 0 && macdTurningPoint <= -macdLineEPS
+	// ---------------------------------------------------------------------
+	// MACD raw pattern materials
+	// Keep atomic facts separate so the model learns combinations itself
+	// instead of us pre-combining assumptions.
+	// ---------------------------------------------------------------------
 
-	// Combined fields remain useful for gates/logging only.
-	highPeak := emaHighPeak || macdHighPeak
-	lowBottom := emaLowBottom || macdLowBottom
-	priceDownGoingUp := emaPriceDownGoingUp
-	priceUpGoingDown := emaPriceUpGoingDown
+	// Momentum direction
+	macdMomentumDown := histDeltaSmooth < 0
+	macdMomentumUp := histDeltaSmooth > 0
+
+	// Strength / turning evidence
+	macdStrongPositive := macdTurningPoint >= macdLineEPS
+	macdStrongNegative := macdTurningPoint <= -macdLineEPS
 
 	ret1 := safeRatio(c[idx].Close-c[idx-1].Close, c[idx-1].Close)
 	ret5 := safeRatio(c[idx].Close-c[idx-5].Close, c[idx-5].Close)
@@ -299,8 +304,8 @@ func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim i
 		boolToFloat(emaLowBottom),
 		boolToFloat(emaPriceDownGoingUp),
 		boolToFloat(emaPriceUpGoingDown),
-		boolToFloat(macdHighPeak),
-		boolToFloat(macdLowBottom),
+		boolToFloat(macdStrongPositive),
+		boolToFloat(macdStrongNegative),
 	}
 
 	if len(x) != FeatureDim || hasBadFloat(x) {
@@ -309,10 +314,10 @@ func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim i
 
 	out = FeatureSnapshot{
 		X:                   x,
-		HighPeak:            highPeak,
-		LowBottom:           lowBottom,
-		PriceDownGoingUp:    priceDownGoingUp,
-		PriceUpGoingDown:    priceUpGoingDown,
+		EMAHighPeak:         emaHighPeak,
+		EMALowBottom:        emaLowBottom,
+		EMAPriceDownGoingUp: emaPriceDownGoingUp,
+		EMAPriceUpGoingDown: emaPriceUpGoingDown,
 		EMAFast:             fast,
 		EMASlow:             slow,
 		EMAFastPrev3:        fast4,
@@ -324,6 +329,10 @@ func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim i
 		MACDHist:            histNow,
 		MACDHistDelta:       histDeltaNow,
 		MACDHistDeltaSmooth: histDeltaSmooth,
+		MACDMomentumDown:    macdMomentumDown,
+		MACDMomentumUp:      macdMomentumUp,
+		MACDStrongPositive:  macdStrongPositive,
+		MACDStrongNegative:  macdStrongNegative,
 		EMA20:               mid,
 		EMA50:               long,
 		EMA20Prev3:          midPrev3,

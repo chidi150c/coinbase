@@ -1062,13 +1062,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f signalTF=%s gateTF=%s Reason=%s buyThresh=%.3f sellThresh=%.3f LongOnly=%v ver-55",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f Reason=%s buyThresh=%.3f sellThresh=%.3f LongOnly=%v ver-55",
 		totalLots,
 		d.Raw,
 		d.Signal,
 		d.PUp,
-		t.cfg.SignalTF(),
-		t.cfg.GateTF,
 		d.Reason,
 		t.cfg.BuyThreshold,
 		t.cfg.SellThreshold,
@@ -1845,17 +1843,18 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquityBuy=%.2f pct_diff_buy=%.6f equitySpareQuote=%.2f", t.equityUSD, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, equitySpareQuote)
 	} else if side == SideBuy {
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|LowBottom=%v|mirror=%v",
-			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, d.LowBottom, mirrorProfitOverride,
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|mirror=%v",
+			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, mirrorProfitOverride,
 		)
 	} else { // SideSell
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|HighPeak=%v|mirror=%v",
-			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr,
-			d.HighPeak, mirrorProfitOverride,
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|mirror=%v",
+			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, mirrorProfitOverride,
 		)
 	}
-
+	if d.Reason != "" {
+		gatesReason = appendReason(gatesReason, "decision{"+d.Reason+"}")
+	}
 	refundFromOpposite := 0.0
 	if t.refundBuyUSD > 0 && side == SideSell {
 		// turn refund USD into extra base at current price

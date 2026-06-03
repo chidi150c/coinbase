@@ -61,12 +61,7 @@ type Decision struct {
 	Reason     string
 
 	// Carry raw pUp and selected soft-gate flags for downstream gate-audit strings.
-	PUp                 float64
-	HighPeak            bool
-	LowBottom           bool
-	MACDHist            float64
-	MACDHistDelta       float64
-	MACDHistDeltaSmooth float64
+	PUp float64
 }
 
 // SignalToSide converts the intent into a broker side.
@@ -111,37 +106,39 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 	}
 
 	signalTF := t.cfg.SignalTF()
-
-	// Keep the reason string aligned with the 17-feature hybrid architecture:
-	// price/volatility + range + MACD line/hist/slope + restored EMA structure.
 	reason := fmt.Sprintf(
-		"pUp=%.5f, highPeak_%s=%t, lowBottom_%s=%t, priceDownGoingUp_%s=%t, priceUpGoingDown_%s=%t, distHighPct_%s=%.6f, distLowPct_%s=%.6f, macdLine_%s=%.5f, macdHist_%s=%.5f, macdHistDelta_%s=%.5f, macdHistDeltaSmooth_%s=%.5f, emaSpreadPct_%s=%.6f, ema2050Spread_%s=%.6f, ema20Slope_%s=%.6f, ema50Slope_%s=%.6f",
+		"[AI_GATE] signalTF=%s pUp=%.5f "+
+			"range{high=%.4f low=%.4f} "+
+			"macd{line=%.2f hist=%.2f dHist=%.2f dSmooth=%.2f} "+
+			"ema{spread=%.5f ema2050=%.5f slope20=%.5f slope50=%.5f} "+
+			"pattern{emaHighPeak=%t emaLowBottom=%t emaDownUp=%t emaUpDown=%t}",
+
+		signalTF,
 		pUp,
-		signalTF, snap.HighPeak,
-		signalTF, snap.LowBottom,
-		signalTF, snap.PriceDownGoingUp,
-		signalTF, snap.PriceUpGoingDown,
-		signalTF, snap.DistHighPct,
-		signalTF, snap.DistLowPct,
-		signalTF, snap.MACDLine,
-		signalTF, snap.MACDHist,
-		signalTF, snap.MACDHistDelta,
-		signalTF, snap.MACDHistDeltaSmooth,
-		signalTF, snap.EMASpreadPct,
-		signalTF, snap.EMA2050Spread,
-		signalTF, snap.EMA20Slope,
-		signalTF, snap.EMA50Slope,
+
+		snap.DistHighPct,
+		snap.DistLowPct,
+
+		snap.MACDLine,
+		snap.MACDHist,
+		snap.MACDHistDelta,
+		snap.MACDHistDeltaSmooth,
+
+		snap.EMASpreadPct,
+		snap.EMA2050Spread,
+		snap.EMA20Slope,
+		snap.EMA50Slope,
+
+		snap.EMAHighPeak,
+		snap.EMALowBottom,
+		snap.EMAPriceDownGoingUp,
+		snap.EMAPriceUpGoingDown,
 	)
 
 	base := Decision{
-		Confidence:          0.5,
-		Reason:              reason,
-		PUp:                 pUp,
-		HighPeak:            snap.HighPeak,
-		LowBottom:           snap.LowBottom,
-		MACDHist:            snap.MACDHist,
-		MACDHistDelta:       snap.MACDHistDelta,
-		MACDHistDeltaSmooth: snap.MACDHistDeltaSmooth,
+		Confidence: 0.5,
+		Reason:     reason,
+		PUp:        pUp,
 	}
 
 	if pUp > t.cfg.BuyThreshold {
@@ -188,17 +185,36 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 			return d
 		}
 		log.Printf(
-			"[MACD_GATE] gateTF=%s raw=%s macdLine_%s=%.5f macdTurning_%s=%.5f macdHist_%s=%.5f macdHistDelta_%s=%.5f macdHistDeltaSmooth_%s=%.5f emaSpreadPct_%s=%.6f ema2050Spread_%s=%.6f eps=%.8f | MACD_Gate_Not_Applied",
+			"[LOGIC_GATE] gateTF=%s raw=%s final=%s | "+
+				"MACD{line=%.5f turn=%.5f hist=%.5f dHist=%.5f dSmooth=%.5f} | "+
+				"EMA{spread=%.6f ema2050=%.6f} | "+
+				"Pattern{emaHighPeak=%v emaLowBottom=%v emaPriceDownGoingUp=%v emaPriceUpGoingDown=%v macdMomentumDown=%v macdMomentumUp=%v macdStrongPositive=%v macdStrongNegative=%v} | "+
+				"Gate{eps=%.5f blocked=%v}",
+
 			t.cfg.GateTF,
 			d.Raw,
-			t.cfg.GateTF, snap.MACDLine,
-			t.cfg.GateTF, snap.MACDTurningPoint,
-			t.cfg.GateTF, snap.MACDHist,
-			t.cfg.GateTF, snap.MACDHistDelta,
-			t.cfg.GateTF, snap.MACDHistDeltaSmooth,
-			t.cfg.GateTF, snap.EMASpreadPct,
-			t.cfg.GateTF, snap.EMA2050Spread,
+			d.Signal,
+
+			snap.MACDLine,
+			snap.MACDTurningPoint,
+			snap.MACDHist,
+			snap.MACDHistDelta,
+			snap.MACDHistDeltaSmooth,
+
+			snap.EMASpreadPct,
+			snap.EMA2050Spread,
+
+			snap.EMAHighPeak,
+			snap.EMALowBottom,
+			snap.EMAPriceDownGoingUp,
+			snap.EMAPriceUpGoingDown,
+			snap.MACDMomentumDown,
+			snap.MACDMomentumUp,
+			snap.MACDStrongPositive,
+			snap.MACDStrongNegative,
+
 			t.cfg.MACDLineEPS,
+			"NA",
 		)
 		return d
 	}
@@ -214,52 +230,90 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	}
 
 	// Gate remains execution-timeframe based. Do not feed signalHistory here.
-	eps := t.cfg.MACDLineEPS
 	reason := ""
-
+	emaSellPattern := snap.EMAHighPeak || snap.EMAPriceUpGoingDown
+	emaBuyPattern := snap.EMALowBottom || snap.EMAPriceDownGoingUp
 	switch d.Signal {
 	case Sell:
-		// Require strong positive MACD regime plus rollover/top pattern.
-		if snap.MACDTurningPoint <= eps {
+		// 1. Must have strong MACD turn-origin evidence
+		if !snap.MACDStrongPositive {
 			d.Signal = Flat
 			reason = appendReason(reason, "macd_not_strong_positive_for_sell")
 		}
-		if !snap.HighPeak {
+
+		// 2. Must have weakening momentum
+		if !snap.MACDMomentumDown {
 			d.Signal = Flat
-			reason = appendReason(reason, "macd_not_high_peak_for_sell")
+			reason = appendReason(reason, "macd_not_momentum_down_for_sell")
+		}
+
+		// 3. Need at least ONE EMA exhaustion pattern
+		if !emaSellPattern {
+			d.Signal = Flat
+			reason = appendReason(reason,
+				"ema_no_sell_exhaustion_pattern")
 		}
 
 	case Buy:
-		// Require strong negative MACD regime plus bottom reversal pattern.
-		if snap.MACDTurningPoint >= -eps {
+		// Must have strong MACD negative turn-origin
+		if !snap.MACDStrongNegative {
 			d.Signal = Flat
-			reason = appendReason(reason, "macd_not_strong_negative_for_buy")
+			reason = appendReason(reason,
+				"macd_not_strong_negative_for_buy")
 		}
-		if !snap.LowBottom {
+
+		// Must have improving momentum
+		if !snap.MACDMomentumUp {
 			d.Signal = Flat
-			reason = appendReason(reason, "macd_not_low_bottom_for_buy")
+			reason = appendReason(reason,
+				"macd_not_momentum_up_for_buy")
+		}
+
+		// Need at least one EMA recovery pattern
+		if !emaBuyPattern {
+
+			d.Signal = Flat
+			reason = appendReason(reason,
+				"ema_no_buy_recovery_pattern")
 		}
 	}
 
-	d.Reason = appendReason(d.Reason, reason)
+	reason = fmt.Sprintf(
+		"[LOGIC_GATE] gateTF=%s raw=%s final=%s | "+
+			"MACD{line=%.5f turn=%.5f hist=%.5f dHist=%.5f dSmooth=%.5f} | "+
+			"EMA{spread=%.6f ema2050=%.6f} | "+
+			"Pattern{emaHighPeak=%v emaLowBottom=%v emaPriceDownGoingUp=%v emaPriceUpGoingDown=%v emaSellPattern=%v emaBuyPattern=%v macdMomentumDown=%v macdMomentumUp=%v macdStrongPositive=%v macdStrongNegative=%v} | "+
+			"Gate{eps=%.5f blocked=%v}",
 
-	log.Printf(
-		"[MACD_GATE] gateTF=%s raw=%s final=%s macdLine_%s=%.5f macdTurning_%s=%.5f macdHist_%s=%.5f macdHistDelta_%s=%.5f macdHistDeltaSmooth_%s=%.5f emaSpreadPct_%s=%.6f ema2050Spread_%s=%.6f eps=%.5f highPeak=%t lowBottom=%t reason=%s",
 		t.cfg.GateTF,
 		d.Raw,
 		d.Signal,
-		t.cfg.GateTF, snap.MACDLine,
-		t.cfg.GateTF, snap.MACDTurningPoint,
-		t.cfg.GateTF, snap.MACDHist,
-		t.cfg.GateTF, snap.MACDHistDelta,
-		t.cfg.GateTF, snap.MACDHistDeltaSmooth,
-		t.cfg.GateTF, snap.EMASpreadPct,
-		t.cfg.GateTF, snap.EMA2050Spread,
-		eps,
-		snap.HighPeak,
-		snap.LowBottom,
+
+		snap.MACDLine,
+		snap.MACDTurningPoint,
+		snap.MACDHist,
+		snap.MACDHistDelta,
+		snap.MACDHistDeltaSmooth,
+
+		snap.EMASpreadPct,
+		snap.EMA2050Spread,
+
+		snap.EMAHighPeak,
+		snap.EMALowBottom,
+		snap.EMAPriceDownGoingUp,
+		snap.EMAPriceUpGoingDown,
+		emaSellPattern,
+		emaBuyPattern,
+		snap.MACDMomentumDown,
+		snap.MACDMomentumUp,
+		snap.MACDStrongPositive,
+		snap.MACDStrongNegative,
+
+		t.cfg.MACDLineEPS,
 		reason,
 	)
+
+	d.Reason = appendReason(d.Reason, reason)
 
 	return d
 }

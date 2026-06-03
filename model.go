@@ -8,12 +8,12 @@ import (
 )
 
 type LogisticModel struct {
-	W       []float64 `json:"W"`
-	B       float64   `json:"B"`
-	L2      float64   `json:"L2"`
-	FeatDim int       `json:"FeatDim"`
-	FeatureMean []float64 `json:"feature_mean,omitempty"`
-	FeatureStd  []float64 `json:"feature_std,omitempty"`
+	W           []float64 `json:"W"`
+	B           float64   `json:"B"`
+	L2          float64   `json:"L2"`
+	FeatDim     int       `json:"FeatDim"`
+	FeatureMean []float64 `json:"FeatureMean,omitempty"`
+	FeatureStd  []float64 `json:"FeatureStd,omitempty"`
 }
 
 func newModel(featureDim int) *LogisticModel {
