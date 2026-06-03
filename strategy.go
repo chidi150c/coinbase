@@ -108,7 +108,7 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 	reason := fmt.Sprintf(
 		"[AI_GATE] signalTF=%s pUp=%.5f "+
 			"range{high=%.4f low=%.4f} "+
-			"macd{line=%.2f hist=%.2f dHist=%.2f dSmooth=%.2f} "+
+			"macd{line=%.2f turn=%.5f hist=%.2f dHist=%.2f dSmooth=%.2f} "+
 			"ema{spread=%.5f ema2050=%.5f slope20=%.5f slope50=%.5f} "+
 			"pattern{emaHighPeak=%t emaLowBottom=%t emaDownUp=%t emaUpDown=%t}",
 
@@ -119,6 +119,7 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 		snap.DistLowPct,
 
 		snap.MACDLine,
+		snap.MACDTurningPoint,
 		snap.MACDHist,
 		snap.MACDHistDelta,
 		snap.MACDHistDeltaSmooth,
@@ -238,6 +239,15 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	// Gate remains execution-timeframe based. Do not feed signalHistory here.
 	emaSellPattern := snap.EMAHighPeak || snap.EMAPriceUpGoingDown
 	emaBuyPattern := snap.EMALowBottom || snap.EMAPriceDownGoingUp
+
+	logicOpinion := Flat
+
+	if snap.MACDStrongNegative && snap.MACDMomentumUp && emaBuyPattern {
+		logicOpinion = Buy
+	} else if snap.MACDStrongPositive && snap.MACDMomentumDown && emaSellPattern {
+		logicOpinion = Sell
+	}
+
 	switch d.Signal {
 	case Sell:
 		// 1. Must have strong MACD turn-origin evidence
@@ -284,7 +294,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	}
 
 	reason = fmt.Sprintf(
-		"[LOGIC_GATE] gateTF=%s raw=%s final=%s | "+
+		"[LOGIC_GATE] gateTF=%s aiRaw=%s logicOpinion=%s final=%s | "+
 			"MACD{line=%.5f turn=%.5f hist=%.5f dHist=%.5f dSmooth=%.5f} | "+
 			"EMA{spread=%.6f ema2050=%.6f} | "+
 			"Pattern{emaHighPeak=%v emaLowBottom=%v emaPriceDownGoingUp=%v emaPriceUpGoingDown=%v emaSellPattern=%v emaBuyPattern=%v macdMomentumDown=%v macdMomentumUp=%v macdStrongPositive=%v macdStrongNegative=%v} | "+
@@ -292,6 +302,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 
 		t.cfg.GateTF,
 		d.Raw,
+		logicOpinion,
 		d.Signal,
 
 		snap.MACDLine,
