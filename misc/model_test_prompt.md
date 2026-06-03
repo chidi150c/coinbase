@@ -303,3 +303,41 @@ grep '"y":0' /opt/coinbase/state/mined_labels_binance_5m.jsonl | wc -l
 
 docker compose logs --since "10m" bot_binance \
 | grep -E 'MINED_LABELS|loaded rows|loaded mined'
+
+=================================================
+
+Yes. Run 4-hour pUp distribution:
+
+docker compose logs --since "4h" bot_binance \
+| grep '\[DEBUG\] Total Lots=' \
+| grep -oE 'pUp=[0-9.]+' \
+| sed 's/pUp=//' \
+| awk '
+{
+  a[++n]=$1
+}
+END{
+  asort(a)
+  print "count="n,
+        "min="a[1],
+        "p10="a[int(n*.10)],
+        "p25="a[int(n*.25)],
+        "p50="a[int(n*.50)],
+        "p75="a[int(n*.75)],
+        "p90="a[int(n*.90)],
+        "max="a[n]
+}'
+
+Also check raw signal mix:
+
+docker compose logs --since "4h" bot_binance \
+| grep '\[DEBUG\] Total Lots=' \
+| grep -oE 'Raw=(BUY|SELL|FLAT)' \
+| sort | uniq -c
+
+And final decision mix:
+
+docker compose logs --since "4h" bot_binance \
+| grep '\[DEBUG\] Total Lots=' \
+| grep -oE 'Decision=(BUY|SELL|FLAT)' \
+| sort | uniq -c

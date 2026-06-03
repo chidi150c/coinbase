@@ -1200,6 +1200,29 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		return fmt.Sprintf("FLAT (long-only) [%s]", d.Reason), nil
 	}
 	if d.Signal == Flat && !equityTriggerSell && !equityTriggerBuy {
+			log.Printf(
+				"[TRADE_GATE] final=FLAT pUp=%.5f "+
+					"lastAddBuy=%s lastAddSell=%s "+
+					"winLowBuy=%.2f winHighSell=%.2f "+
+					"latchedBuy=%.2f latchedSell=%.2f "+
+					"nearestBuy{take=%.2f net=%.2f idx=%d} "+
+					"nearestSell{take=%.2f net=%.2f idx=%d} "+
+					"reason=%s",
+				d.PUp,
+				t.lastAddBuy.Format(time.RFC3339),
+				t.lastAddSell.Format(time.RFC3339),
+				t.winLowBuy,
+				t.winHighSell,
+				t.latchedGateBuy,
+				t.latchedGateSell,
+				t.nearestTakeBuy,
+				t.nearestNetBuy,
+				t.nearestIdxBuy,
+				t.nearestTakeSell,
+				t.nearestNetSell,
+				t.nearestIdxSell,
+				d.Reason,
+			)
 		t.mu.Unlock()
 		return "FLAT", nil
 	}
