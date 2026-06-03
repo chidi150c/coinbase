@@ -178,56 +178,9 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		return d
 	}
 
-	if d.Signal != Buy && d.Signal != Sell {
-		snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1, t.cfg.MACDLineEPS, t.cfg.AIFeatureDim)
-		if !ok {
-			reason = fmt.Sprintf(
-				"[LOGIC_GATE] skip no_feature_snapshot len=%d gateTF=%s",
-				len(execHistory),
-				t.cfg.GateTF,
-			)
-			d.Reason = appendReason(d.Reason, reason)
-			return d
-		}
-		reason = fmt.Sprintf(
-			"[LOGIC_GATE] gateTF=%s raw=%s final=%s | "+
-				"MACD{line=%.5f turn=%.5f hist=%.5f dHist=%.5f dSmooth=%.5f} | "+
-				"EMA{spread=%.6f ema2050=%.6f} | "+
-				"Pattern{emaHighPeak=%v emaLowBottom=%v emaPriceDownGoingUp=%v emaPriceUpGoingDown=%v macdMomentumDown=%v macdMomentumUp=%v macdStrongPositive=%v macdStrongNegative=%v} | "+
-				"Gate{eps=%.5f blocked=%v}",
-
-			t.cfg.GateTF,
-			d.Raw,
-			d.Signal,
-
-			snap.MACDLine,
-			snap.MACDTurningPoint,
-			snap.MACDHist,
-			snap.MACDHistDelta,
-			snap.MACDHistDeltaSmooth,
-
-			snap.EMASpreadPct,
-			snap.EMA2050Spread,
-
-			snap.EMAHighPeak,
-			snap.EMALowBottom,
-			snap.EMAPriceDownGoingUp,
-			snap.EMAPriceUpGoingDown,
-			snap.MACDMomentumDown,
-			snap.MACDMomentumUp,
-			snap.MACDStrongPositive,
-			snap.MACDStrongNegative,
-
-			t.cfg.MACDLineEPS,
-			"NA",
-		)
-		d.Reason = appendReason(d.Reason, reason)
-		return d
-	}
-
 	snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1, t.cfg.MACDLineEPS, t.cfg.AIFeatureDim)
 	if !ok {
-		reason=fmt.Sprintf(
+		reason = fmt.Sprintf(
 			"[LOGIC_GATE] skip no_feature_snapshot len=%d gateTF=%s",
 			len(execHistory),
 			t.cfg.GateTF,
@@ -291,6 +244,9 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 			reason = appendReason(reason,
 				"ema_no_buy_recovery_pattern")
 		}
+	default:
+		reason = appendReason(reason,
+				fmt.Sprintf("ai_flat_logicOpinion=%s", logicOpinion))
 	}
 
 	reason = fmt.Sprintf(
