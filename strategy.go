@@ -104,9 +104,34 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 		pUp = t.model.Predict(snap.X)
 	}
 
+	base := Decision{
+		Confidence: 0.5,
+		PUp:        pUp,
+	}
+
+	if pUp > t.cfg.BuyThreshold {
+		base.Signal = Buy
+		base.Raw = Buy
+		base.Confidence = pUp
+		return base
+	}else if pUp < t.cfg.SellThreshold {
+		base.Signal = Sell
+		base.Raw = Sell
+		base.Confidence = 1 - pUp
+		return base
+	}else{
+		base.Signal = Flat
+		base.Raw = Flat
+	}
+
+	lateSellExhaustion := false
+	if base.Raw == Sell && snap.MACDTurningPoint <= -120 && snap.DistLowPct <= 0.002 {
+		lateSellExhaustion = true
+	}
+
 	signalTF := t.cfg.SignalTF()
 	reason := fmt.Sprintf(
-		"[AI_GATE] signalTF=%s pUp=%.5f "+
+		"[AI_GATE] signalTF=%s pUp=%.5f exhaustion{lateSell=%v}"+
 			"range{high=%.4f low=%.4f} "+
 			"macd{line=%.2f turn=%.5f hist=%.2f dHist=%.2f dSmooth=%.2f} "+
 			"ema{spread=%.5f ema2050=%.5f slope20=%.5f slope50=%.5f} "+
@@ -114,7 +139,7 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 
 		signalTF,
 		pUp,
-
+		lateSellExhaustion,
 		snap.DistHighPct,
 		snap.DistLowPct,
 
@@ -134,29 +159,9 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 		snap.EMAPriceDownGoingUp,
 		snap.EMAPriceUpGoingDown,
 	)
+	
+	base.Reason = reason
 
-	base := Decision{
-		Confidence: 0.5,
-		Reason:     reason,
-		PUp:        pUp,
-	}
-
-	if pUp > t.cfg.BuyThreshold {
-		base.Signal = Buy
-		base.Raw = Buy
-		base.Confidence = pUp
-		return base
-	}
-
-	if pUp < t.cfg.SellThreshold {
-		base.Signal = Sell
-		base.Raw = Sell
-		base.Confidence = 1 - pUp
-		return base
-	}
-
-	base.Signal = Flat
-	base.Raw = Flat
 	return base
 }
 
