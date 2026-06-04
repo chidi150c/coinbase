@@ -113,12 +113,10 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 		base.Signal = Buy
 		base.Raw = Buy
 		base.Confidence = pUp
-		return base
 	}else if pUp < t.cfg.SellThreshold {
 		base.Signal = Sell
 		base.Raw = Sell
 		base.Confidence = 1 - pUp
-		return base
 	}else{
 		base.Signal = Flat
 		base.Raw = Flat
@@ -131,7 +129,7 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 
 	signalTF := t.cfg.SignalTF()
 	reason := fmt.Sprintf(
-		"[AI_GATE] signalTF=%s pUp=%.5f exhaustion{lateSell=%v}"+
+		"[AI_GATE] signalTF=%s pUp=%.5f exhaustion{lateSell=%v} "+
 			"range{high=%.4f low=%.4f} "+
 			"macd{line=%.2f turn=%.5f hist=%.2f dHist=%.2f dSmooth=%.2f} "+
 			"ema{spread=%.5f ema2050=%.5f slope20=%.5f slope50=%.5f} "+
@@ -159,7 +157,7 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 		snap.EMAPriceDownGoingUp,
 		snap.EMAPriceUpGoingDown,
 	)
-	
+
 	base.Reason = reason
 
 	return base
