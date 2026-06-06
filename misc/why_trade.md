@@ -311,8 +311,24 @@ why-trade --after 60m answers:
 
 how to use zip file with ts:
 
-gunzip -c /opt/coinbase/logs/audit/binance_audit.log-20260604.gz > /tmp/audit_0604.log
+gunzip -c /opt/coinbase/logs/audit/binance_audit.log-20260605.gz > /tmp/audit_0605.log
 
-why-trade ts '2026/06/04 00:26' -s BUY -l /tmp/audit_0604.log --after 60m
+why-trade ts '2026/06/05 21:20' -s BUY -l /tmp/audit_0605.log --after 60m
 
 =====================================
+
+## Use the below to get the time then use why-trade to forensic:
+
+zgrep 'blocked=ai_FLAT_logicOpinion=BUY' /tmp/audit_0605.log \
+| awk '
+match($0,/pUp=([0-9.]+)/,a) {
+    if (a[1] >= 0.484) print
+}' \
+| head -20 \
+| GREP_COLORS='mt=01;31' grep --color=always -E 'pUp=[0-9.]+|$'
+
+## then:
+
+why-trade ts '2026/06/05 14:29' \
+-l /tmp/audit_0605.log \
+--after 60m

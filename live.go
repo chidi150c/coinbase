@@ -33,7 +33,7 @@ import (
 // runLive executes the real-time loop with cadence intervalSec (seconds).
 func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 
-	var history []Candle       // keep as 1m/tick execution history
+	var execHistory []Candle       // keep as 1m/tick execution history
 	var signalHistory []Candle // new 5m decision history
 
 	if intervalSec <= 0 {
@@ -122,16 +122,20 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 	}
 	log.Printf("[SIGNAL] signalTF=%s signalGateTF=%s gateTF=%s", signalTF, signalGateTF, trader.cfg.GateTF)
 
+
+	//-------------------------------------------------------------------------------------
+	// Warmup execHistory candles separately: history remains the execution history (1m/tick)
+	//-------------------------------------------------------------------------------------
 	if trader.cfg.BridgeURL != "" {
 		log.Printf("TRACE WARMUP using bridge paged fetch tries=10 pageLimit=300 target=%d", target)
 		const tries = 10
-		for i := 0; i < tries && len(history) == 0; i++ {
+		for i := 0; i < tries && len(execHistory) == 0; i++ {
 			log.Printf("TRACE WARMUP attempt=%d (bridge paged)", i+1)
 			if hs, err := fetchHistoryPaged(trader.cfg.BridgeURL, trader.cfg.ProductID, trader.cfg.GateTF, 300, target); err == nil && len(hs) > 0 {
-				history = hs
-				log.Printf("[BOOT] history=%d (paged to %d target)", len(history), target)
+				execHistory = hs
+				log.Printf("[BOOT] execHistory=%d (paged to %d target)", len(execHistory), target)
 				// TODO: remove TRACE
-				log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
+				log.Printf("TRACE execHistory readiness len=%d need=%d", len(execHistory), trader.cfg.MaxHistoryCandles)
 				break
 			} else if err != nil {
 				log.Printf("[BOOT] paged warmup error: %v", err)
@@ -142,25 +146,25 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 			}
 		}
 	}
-	if len(history) == 0 {
+	if len(execHistory) == 0 {
 		limitTry := target
 		if limitTry < 200 {
 			limitTry = 200
 		}
 		log.Printf("TRACE WARMUP broker large batch path limitTry=%d product=%s GateTF=%s", limitTry, trader.cfg.ProductID, trader.cfg.GateTF)
 		if cs, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.GateTF, limitTry); err == nil && len(cs) > 0 {
-			history = cs
-			log.Printf("[BOOT] history=%d (broker large batch, limit=%d)", len(history), limitTry)
+			execHistory = cs
+			log.Printf("[BOOT] execHistory=%d (broker large batch, limit=%d)", len(execHistory), limitTry)
 			// TODO: remove TRACE
-			log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
+			log.Printf("TRACE execHistory readiness len=%d need=%d", len(execHistory), trader.cfg.MaxHistoryCandles)
 		} else if err != nil {
 			log.Printf("TRACE WARMUP broker large batch error: %v", err)
 			log.Printf("TRACE WARMUP broker fallback limit=350")
 			if cs2, err2 := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.GateTF, 350); err2 == nil && len(cs2) > 0 {
-				history = cs2
-				log.Printf("[BOOT] history=%d (broker fallback, limit=350)", len(history))
+				execHistory = cs2
+				log.Printf("[BOOT] execHistory=%d (broker fallback, limit=350)", len(execHistory))
 				// TODO: remove TRACE
-				log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
+				log.Printf("TRACE execHistory readiness len=%d need=%d", len(execHistory), trader.cfg.MaxHistoryCandles)
 			} else {
 				log.Printf("warmup GetRecentCandles error: %v", err)
 				if err2 != nil {
@@ -173,10 +177,10 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 			log.Printf("TRACE WARMUP broker large batch returned 0 rows (limitTry=%d)", limitTry)
 			log.Printf("TRACE WARMUP broker fallback limit=350")
 			if cs2, err2 := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.GateTF, 350); err2 == nil && len(cs2) > 0 {
-				history = cs2
-				log.Printf("[BOOT] history=%d (broker fallback, limit=350)", len(history))
+				execHistory = cs2
+				log.Printf("[BOOT] execHistory=%d (broker fallback, limit=350)", len(execHistory))
 				// TODO: remove TRACE
-				log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
+				log.Printf("TRACE execHistory readiness len=%d need=%d", len(execHistory), trader.cfg.MaxHistoryCandles)
 			} else if err2 != nil {
 				log.Printf("TRACE WARMUP broker fallback error: %v", err2)
 			} else {
@@ -184,13 +188,15 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 			}
 		}
 	}
-	if len(history) == 0 {
+	if len(execHistory) == 0 {
 		log.Printf("TRACE WARMUP giving up: no candles after bridge-paged and broker-large/fallback")
 		log.Fatalf("warmup failed: no candles returned")
 	}
 
-	// Warmup signal candles separately.
-	// history remains the execution history (1m/tick); signalHistory is used only for ML direction.
+
+	//-------------------------------------------------------------------------------------
+	// // Warmup signal candles separately: signalHistory is used only for ML direction
+	//-------------------------------------------------------------------------------------
 	if trader.cfg.BridgeURL != "" {
 		log.Printf("TRACE SIGNAL_WARMUP using bridge paged fetch tries=10 pageLimit=300 target=%d tf=%s GateTF=%s", target, signalTF, signalGateTF)
 		const tries = 10
@@ -296,9 +302,9 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 		ctxInit, cancelInit := context.WithTimeout(context.Background(), 5*time.Second)
 		var attempt bool
 		if trader.cfg.BridgeURL != "" {
-			attempt = attemptLiveEquityRebase(ctxInit, trader.cfg, trader, history[len(history)-1].Close)
+			attempt = attemptLiveEquityRebase(ctxInit, trader.cfg, trader, execHistory[len(execHistory)-1].Close)
 		} else {
-			attempt = attemptLiveEquityRebaseBroker(ctxInit, trader, history[len(history)-1].Close)
+			attempt = attemptLiveEquityRebaseBroker(ctxInit, trader, execHistory[len(execHistory)-1].Close)
 		}
 		if attempt {
 			eqReady = true
@@ -326,18 +332,27 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				log.Println("shutdown")
 				return
 			default:
+
 				// Periodic candle resync from the broker (use getter for hot-ish reload)
+
+				//-----------------------------------------------------------------
+				//fetch lates candle for execHistory and signalHistory
+				//-----------------------------------------------------------------
 				if time.Since(lastCandleSync) >= time.Duration(trader.cfg.CandleResync())*time.Second {
+					
+					//-------------------------------------------
+					//fetch candles for execHistory: output latest candle becomes current candle in execHistory
+					//----------------------------------------------
 					if latestSlice, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.GateTF, 1); err == nil && len(latestSlice) > 0 {
 						latest := latestSlice[len(latestSlice)-1]
 						if latest.Time.IsZero() {
 							latest.Time = time.Now().UTC()
 						}
 
-						beforePUp := debugPUp(history, model, trader.cfg.MACDLineEPS, trader.cfg.AIFeatureDim)
+						beforePUp := debugPUp(execHistory, model, trader.cfg.MACDLineEPS, trader.cfg.AIFeatureDim)
 						var beforeLast Candle
-						if len(history) > 0 {
-							beforeLast = history[len(history)-1]
+						if len(execHistory) > 0 {
+							beforeLast = execHistory[len(execHistory)-1]
 						}
 
 						log.Printf(
@@ -357,17 +372,17 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 							latest.Volume,
 						)
 
-						if len(history) == 0 || latest.Time.After(history[len(history)-1].Time) {
-							history = append(history, latest)
+						if len(execHistory) == 0 || latest.Time.After(execHistory[len(execHistory)-1].Time) {
+							execHistory = append(execHistory, latest)
 						} else {
-							history[len(history)-1] = latest
+							execHistory[len(execHistory)-1] = latest
 						}
-						if len(history) > trader.cfg.MaxHistoryCandles {
-							history = history[len(history)-trader.cfg.MaxHistoryCandles:]
+						if len(execHistory) > trader.cfg.MaxHistoryCandles {
+							execHistory = execHistory[len(execHistory)-trader.cfg.MaxHistoryCandles:]
 						}
 
-						afterPUp := debugPUp(history, model, trader.cfg.MACDLineEPS, trader.cfg.AIFeatureDim)
-						afterLast := history[len(history)-1]
+						afterPUp := debugPUp(execHistory, model, trader.cfg.MACDLineEPS, trader.cfg.AIFeatureDim)
+						afterLast := execHistory[len(execHistory)-1]
 
 						log.Printf(
 							"[SYNC_DIAG after] pUp=%.5f lastTime=%s O=%.2f H=%.2f L=%.2f C=%.2f V=%.4f deltaPUp=%.5f",
@@ -383,31 +398,34 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 
 						lastCandleSync = time.Now().UTC()
 						// TODO: remove TRACE
-						log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
-						log.Printf("[SYNC] latest=%s history_last=%s len=%d", latest.Time, history[len(history)-1].Time, len(history))
-
-						if sigSlice, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, signalGateTF, 1); err == nil && len(sigSlice) > 0 {
-							sigLatest := sigSlice[len(sigSlice)-1]
-							if sigLatest.Time.IsZero() {
-								sigLatest.Time = time.Now().UTC()
-							}
-							beforeSignalPUp := debugPUp(signalHistory, model, trader.cfg.MACDLineEPS, trader.cfg.AIFeatureDim)
-							if len(signalHistory) == 0 || sigLatest.Time.After(signalHistory[len(signalHistory)-1].Time) {
-								signalHistory = append(signalHistory, sigLatest)
-							} else {
-								signalHistory[len(signalHistory)-1] = sigLatest
-							}
-							if len(signalHistory) > trader.cfg.MaxHistoryCandles {
-								signalHistory = signalHistory[len(signalHistory)-trader.cfg.MaxHistoryCandles:]
-							}
-							afterSignalPUp := debugPUp(signalHistory, model, trader.cfg.MACDLineEPS, trader.cfg.AIFeatureDim)
-							log.Printf("[SIGNAL_SYNC] tf=%s GateTF=%s latest=%s signal_last=%s len=%d pUpBefore=%.5f pUpAfter=%.5f deltaPUp=%.5f",
-								signalTF, signalGateTF, sigLatest.Time, signalHistory[len(signalHistory)-1].Time, len(signalHistory), beforeSignalPUp, afterSignalPUp, afterSignalPUp-beforeSignalPUp)
-						} else if err != nil {
-							log.Fatalf("[SIGNAL_SYNC] signal candle update failed tf=%s GateTF=%s error=%v", signalTF, signalGateTF, err)
-						}
+						log.Printf("TRACE execHistory readiness len=%d need=%d", len(execHistory), trader.cfg.MaxHistoryCandles)
+						log.Printf("[SYNC] latest=%s execHistory_last=%s len=%d", latest.Time, execHistory[len(execHistory)-1].Time, len(execHistory))
 					} else if err != nil {
 						log.Fatalf("[SYNC] Candle update failed: error: %v", err)
+					}
+					
+					//-------------------------------------------
+					//fetch candles for signalHistory: output sigLatest candle becomes current candle in signalHistory
+					//----------------------------------------------
+					if sigSlice, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, signalGateTF, 1); err == nil && len(sigSlice) > 0 {
+						sigLatest := sigSlice[len(sigSlice)-1]
+						if sigLatest.Time.IsZero() {
+							sigLatest.Time = time.Now().UTC()
+						}
+						beforeSignalPUp := debugPUp(signalHistory, model, trader.cfg.MACDLineEPS, trader.cfg.AIFeatureDim)
+						if len(signalHistory) == 0 || sigLatest.Time.After(signalHistory[len(signalHistory)-1].Time) {
+							signalHistory = append(signalHistory, sigLatest)
+						} else {
+							signalHistory[len(signalHistory)-1] = sigLatest
+						}
+						if len(signalHistory) > trader.cfg.MaxHistoryCandles {
+							signalHistory = signalHistory[len(signalHistory)-trader.cfg.MaxHistoryCandles:]
+						}
+						afterSignalPUp := debugPUp(signalHistory, model, trader.cfg.MACDLineEPS, trader.cfg.AIFeatureDim)
+						log.Printf("[SIGNAL_SYNC] tf=%s GateTF=%s latest=%s signal_last=%s len=%d pUpBefore=%.5f pUpAfter=%.5f deltaPUp=%.5f",
+							signalTF, signalGateTF, sigLatest.Time, signalHistory[len(signalHistory)-1].Time, len(signalHistory), beforeSignalPUp, afterSignalPUp, afterSignalPUp-beforeSignalPUp)
+					} else if err != nil {
+						log.Fatalf("[SIGNAL_SYNC] signal candle update failed tf=%s GateTF=%s error=%v", signalTF, signalGateTF, err)
 					}
 				}
 
@@ -437,21 +455,10 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 					log.Printf("TRACE gate:px<=0 px=%.8f", px)
 				}
 
-				if err == nil && !stale && px > 0 {
-					// Defensive: ensure history non-empty before tick mutate
-					if len(history) == 0 {
-						// TODO: remove TRACE
-						log.Printf("TRACE gate:history_empty before applyTick")
-						cancelPx()
-						// Skip this iteration safely
-						time.Sleep(time.Duration(trader.cfg.TickInterval()) * time.Second)
-						continue
-					}
-					applyTickToLastCandle(history, px)
-					log.Printf("[TICK] px=%.2f lastClose(before-step)=%.2f", px, history[len(history)-1].Close)
-					// TODO: remove TRACE
-					log.Printf("TRACE TARGET [TICK] px=%.2f lastClose(before-step)=%.2f", px, history[len(history)-1].Close)
+				if err != nil || stale || px <= 0 {
+					px = execHistory[len(execHistory)-1].Close
 				}
+
 				cancelPx()
 
 				prevLastFit := trader.lastFit
@@ -476,7 +483,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				}
 
 				// Step trader
-				msg, err := trader.step(ctx, history, signalHistory)
+				msg, err := trader.step(ctx, execHistory, signalHistory, px)
 				if err != nil {
 					log.Printf("step err: %v", err)
 					time.Sleep(time.Duration(trader.cfg.TickInterval()) * time.Second)
@@ -502,7 +509,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 					}
 					if err == nil {
 						base, quote := splitProductID(trader.cfg.ProductID)
-						px := history[len(history)-1].Close
+						px := execHistory[len(execHistory)-1].Close
 						if traceOn() {
 							// print a compact map snapshot for base/quote/USDC/USB
 							lb := bal[strings.ToUpper(base)]
@@ -526,7 +533,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 							// TRACE: break down balances and price to see why eq<=0
 							lb := bal[strings.ToUpper(base)]
 							lq := bal[strings.ToUpper(quote)]
-							lp := history[len(history)-1].Close // or latest.Close in candle loop
+							lp := execHistory[len(execHistory)-1].Close // or latest.Close in candle loop
 							log.Printf("TRACE equity_breakdown path=%s base=%s quote=%s bal_base=%.8f bal_quote=%.8f lastPrice=%.8f eq=%.8f",
 								func() string {
 									if trader.cfg.BridgeURL != "" {
@@ -564,19 +571,20 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				log.Println("shutdown")
 				return
 			case <-ticker.C:
+				//fetch candles for execHistory
 				latestSlice, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.GateTF, 1)
 				if err != nil || len(latestSlice) == 0 {
 					log.Printf("poll err: %v", err)
 					continue
 				}
 				latest := latestSlice[0]
-				if len(history) == 0 || latest.Time.After(history[len(history)-1].Time) {
-					history = append(history, latest)
+				if len(execHistory) == 0 || latest.Time.After(execHistory[len(execHistory)-1].Time) {
+					execHistory = append(execHistory, latest)
 				} else {
-					history[len(history)-1] = latest
+					execHistory[len(execHistory)-1] = latest
 				}
-				if len(history) > trader.cfg.MaxHistoryCandles {
-					history = history[len(history)-trader.cfg.MaxHistoryCandles:]
+				if len(execHistory) > trader.cfg.MaxHistoryCandles {
+					execHistory = execHistory[len(execHistory)-trader.cfg.MaxHistoryCandles:]
 				}
 
 				if sigSlice, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, signalGateTF, 1); err == nil && len(sigSlice) > 0 {
@@ -598,7 +606,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				}
 
 				// TODO: remove TRACE
-				log.Printf("TRACE history readiness len=%d need=%d signal_len=%d", len(history), trader.cfg.MaxHistoryCandles, len(signalHistory))
+				log.Printf("TRACE execHistory readiness len=%d need=%d signal_len=%d", len(execHistory), trader.cfg.MaxHistoryCandles, len(signalHistory))
 
 				prevLastFit := trader.lastFit
 
@@ -620,7 +628,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 					trader.mu.Unlock()
 				}
 
-				msg, err := trader.step(ctx, history, signalHistory)
+				msg, err := trader.step(ctx, execHistory, signalHistory, execHistory[len(execHistory)-1].Close)
 				if err != nil {
 					log.Printf("step err: %v", err)
 					continue
@@ -653,7 +661,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 							// TRACE: break down balances and price to see why eq<=0
 							lb := bal[strings.ToUpper(base)]
 							lq := bal[strings.ToUpper(quote)]
-							lp := history[len(history)-1].Close // or latest.Close in candle loop
+							lp := execHistory[len(execHistory)-1].Close // or latest.Close in candle loop
 							log.Printf("TRACE equity_breakdown path=%s base=%s quote=%s bal_base=%.8f bal_quote=%.8f lastPrice=%.8f eq=%.8f",
 								func() string {
 									if trader.cfg.BridgeURL != "" {
@@ -967,22 +975,6 @@ func fetchBridgePrice(ctx context.Context, bridgeURL, productID string) (float64
 	}
 
 	return payload.Price, stale, nil
-}
-
-func applyTickToLastCandle(history []Candle, lastPrice float64) {
-	if len(history) == 0 || lastPrice <= 0 {
-		return
-	}
-	i := len(history) - 1
-	c := history[i]
-	if lastPrice > c.High {
-		c.High = lastPrice
-	}
-	if lastPrice < c.Low || c.Low == 0 {
-		c.Low = lastPrice
-	}
-	c.Close = lastPrice
-	history[i] = c
 }
 
 // ---- Paged history bootstrap (bridge /candles) ----

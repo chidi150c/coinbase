@@ -355,7 +355,7 @@ func (t *Trader) maybeRepriceOnce(
 
 // step consumes the current candle history and may place/close a position.
 // It returns a human-readable status string for logging.
-func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory []Candle) (string, error) {
+func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory []Candle, livePrice float64) (string, error) {
 	c := execHistory
 
 	if len(c) == 0 {
@@ -712,7 +712,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		now.Format(time.RFC3339), c[len(c)-1].Close, lsb, lss,
 		t.lastAddBuy.Format(time.RFC3339), t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell)
 
-	price := c[len(c)-1].Close
+	price := livePrice
 
 	// --- Effective min-notional for this tick: prefer cfg.MinNotional, fallback to cfg.OrderMinUSD ---
 	minNotional := t.cfg.MinNotional
