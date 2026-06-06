@@ -113,11 +113,11 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 		base.Signal = Buy
 		base.Raw = Buy
 		base.Confidence = pUp
-	}else if pUp < t.cfg.SellThreshold {
+	} else if pUp < t.cfg.SellThreshold {
 		base.Signal = Sell
 		base.Raw = Sell
 		base.Confidence = 1 - pUp
-	}else{
+	} else {
 		base.Signal = Flat
 		base.Raw = Flat
 	}
@@ -164,7 +164,7 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 }
 
 func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
-	
+
 	reason := ""
 
 	if !t.cfg.UseMACDSlopeGate {
@@ -192,11 +192,11 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		return d
 	}
 
+	logicOpinion := Flat
+
 	// Gate remains execution-timeframe based. Do not feed signalHistory here.
 	emaSellPattern := snap.EMAHighPeak || snap.EMAPriceUpGoingDown
 	emaBuyPattern := snap.EMALowBottom || snap.EMAPriceDownGoingUp
-
-	logicOpinion := Flat
 
 	if snap.MACDStrongNegative && snap.MACDMomentumUp && emaBuyPattern {
 		logicOpinion = Buy
@@ -205,8 +205,8 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	}
 
 	logicDisagreement :=
-	(d.Raw == Buy && logicOpinion == Sell) ||
-	(d.Raw == Sell && logicOpinion == Buy)
+		(d.Raw == Buy && logicOpinion == Sell) ||
+			(d.Raw == Sell && logicOpinion == Buy)
 
 	if logicDisagreement {
 		d.Signal = Flat
@@ -258,7 +258,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		}
 	default:
 		reason = appendReason(reason,
-				fmt.Sprintf("ai_%s_logicOpinion=%s", d.Raw, logicOpinion))
+			fmt.Sprintf("ai_%s_logicOpinion=%s", d.Raw, logicOpinion))
 	}
 
 	reason = fmt.Sprintf(
@@ -271,7 +271,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		t.cfg.GateTF,
 		d.Raw,
 		logicOpinion,
-		logicDisagreement,	
+		logicDisagreement,
 		d.Signal,
 
 		snap.MACDLine,
@@ -311,4 +311,41 @@ func appendReason(base, reason string) string {
 		return reason
 	}
 	return base + " | " + reason
+}
+
+func confidenceRiskMultiplier(sig Signal, pUp float64) float64 {
+	switch sig {
+
+	case Buy:
+		switch {
+		case pUp >= 0.57:
+			return 1.00
+		case pUp >= 0.55:
+			return 0.80
+		case pUp >= 0.53:
+			return 0.50
+		}
+
+	case Sell:
+		switch {
+		case pUp <= 0.30:
+			return 1.00
+		case pUp <= 0.32:
+			return 0.80
+		case pUp <= 0.34:
+			return 0.50
+		}
+	}
+
+	return 0.00
+}
+
+func shouldExitByAILogic(lot *Position, d Decision) bool {
+	if lot.Side == SideBuy {
+		return d.Signal == Sell
+	}
+	if lot.Side == SideSell {
+		return d.Signal == Buy
+	}
+	return false
 }

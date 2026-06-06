@@ -82,9 +82,7 @@ type Config struct {
 
 	// USD trailing / profit gates
 	TrailActivateUSDRunner float64
-	TrailActivateUSDScalp  float64
 	TrailDistancePctRunner float64
-	TrailDistancePctScalp  float64
 	ProfitGateUSD          float64
 	TPMakerOffsetBps       float64 // maker offset for fixed-TP exits
 
@@ -200,9 +198,7 @@ func loadConfigFromEnv() Config {
 
 		// USD trailing / profit gates
 		TrailActivateUSDRunner: getEnvFloat("TRAIL_ACTIVATE_USD_RUNNER", 1.00),
-		TrailActivateUSDScalp:  getEnvFloat("TRAIL_ACTIVATE_USD_SCALP", 0.50),
 		TrailDistancePctRunner: getEnvFloat("TRAIL_DISTANCE_PCT_RUNNER", 0.40),
-		TrailDistancePctScalp:  getEnvFloat("TRAIL_DISTANCE_PCT_SCALP", 0.25),
 		ProfitGateUSD:          getEnvFloat("PROFIT_GATE_USD", 0.50),
 		TPMakerOffsetBps:       getEnvFloat("TP_MAKER_OFFSET_BPS", 0.0),
 
@@ -274,9 +270,6 @@ func loadConfigFromEnv() Config {
 	// dependency defaults
 	if cfg.TrailActivateUSDRunner == 0 {
 		cfg.TrailActivateUSDRunner = 8.0 * cfg.ProfitGateUSD
-	}
-	if cfg.TrailActivateUSDScalp == 0 {
-		cfg.TrailActivateUSDScalp = 4.0 * cfg.ProfitGateUSD
 	}
 
 	// Historical carry-over: if someone still sets BROKER=X, we may still

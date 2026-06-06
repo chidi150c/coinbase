@@ -486,16 +486,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					newLot.RefundPortionUSD = t.pendingBuy.RefundPortionUSD
 					newLot.Take = t.pendingBuy.Take
 				}
-				idx := len(book.Lots) // the new lot’s index after append
-				if idx >= 2 {
-					if !strings.Contains(newLot.Reason, "mode=choppy") {
-						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=choppy")
-					}
-				} else if idx >= 1 && idx < 2 {
-					if !strings.Contains(newLot.Reason, "mode=strict") {
-						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=strict")
-					}
-				}
 				book.Lots = append(book.Lots, newLot)
 				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
 				t.didConsolidateStartup = false
@@ -658,17 +648,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					newLot.Take = t.pendingSell.Take
 					newLot.RefundPortionUSD = t.pendingSell.RefundPortionUSD
 				}
-
-				idx := len(book.Lots) // the new lot’s index after append
-				if idx >= 2 {
-					if !strings.Contains(newLot.Reason, "mode=choppy") {
-						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=choppy")
-					}
-				} else if idx >= 1 && idx < 2 {
-					if !strings.Contains(newLot.Reason, "mode=strict") {
-						newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=strict")
-					}
-				}
 				book.Lots = append(book.Lots, newLot)
 				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
 				t.didConsolidateStartup = false
@@ -754,6 +733,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// 	log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
 	// }
 
+	//AI-LOGIC
+	d := t.decide(signalHistory)
+	d = t.applyLogicGate(d, c)
+
 	// --------------------------------------------------------------------------------------------------------
 	// --- EXIT path: evaluate profit gate and trailing/TP logic per lot (side-aware) and close at most one.
 	// --------------------------------------------------------------------------------------------------------
@@ -771,8 +754,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			switch m {
 			case ExitModeRunnerTrailing:
 				return "RunnerTrailing"
-			case ExitModeScalpTrailing:
-				return "ScalpTrailing"
 			case ExitModeScalpFixedTP:
 				return "ScalpFixedTP"
 			default:
@@ -841,24 +822,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				}
 				return
 			}
-			// 0 → trailing (scalp); 1.. → fixed TP
-			if idx == 0 {
-				lot.ExitMode = ExitModeScalpTrailing
-				lot.TrailDistancePct = t.cfg.TrailDistancePctScalp
-				lot.TrailActivateGateUSD = t.cfg.TrailActivateUSDScalp
-				lot.Take = activationPrice(lot, lot.TrailActivateGateUSD, feeRatePct)
-				if lot.TrailPeak == 0 {
-					lot.TrailPeak = lot.OpenPrice
-				}
-				return
-			} else {
-				// ScalpFixedTP: Take = fee-aware profit-gate price (preview);
-				// when gate passes you’ll arm FixedTPWorking and use this for post-only exits.
-				lot.ExitMode = ExitModeScalpFixedTP
-				lot.TrailDistancePct = 0
-				lot.TrailActivateGateUSD = t.cfg.ProfitGateUSD
-				lot.Take = activationPrice(lot, lot.TrailActivateGateUSD, feeRatePct)
-			}
+			// ScalpFixedTP: Take = fee-aware profit-gate price (preview);
+			// when gate passes you’ll arm FixedTPWorking and use this for post-only exits.
+			lot.ExitMode = ExitModeScalpFixedTP
+			lot.TrailDistancePct = 0
+			lot.TrailActivateGateUSD = t.cfg.ProfitGateUSD
+			lot.Take = activationPrice(lot, lot.TrailActivateGateUSD, feeRatePct)
 		}
 
 		// Helper to scan a side book
@@ -876,38 +845,26 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// gather nearest TAKE/mode/net while we're already here (no extra loops later)
 				updateNearest(book, side, i, lot, net, price)
 
-				// Override gating for FixedTP buckets:
-				// - idx == 1 → stricter 25× gate (gate = 0.02 now)
-				// - idx ≥ 2  → normal 1× gate (ScalpChoppyTP semantics)
 				if lot.ExitMode == ExitModeScalpFixedTP {
-					if i == 1 {
-						pass = net >= t.cfg.TrailActivateUSDScalp
-						lot.TrailActivateGateUSD = t.cfg.TrailActivateUSDScalp // preview consistency
-					} else if i >= 2 {
-						pass = net >= t.cfg.ProfitGateUSD
-						lot.TrailActivateGateUSD = t.cfg.ProfitGateUSD
-					}
+					pass = net >= t.cfg.ProfitGateUSD
+					lot.TrailActivateGateUSD = t.cfg.ProfitGateUSD
 				}
 
-				// reset arming when gate not passed
+				// Must be profitable first
 				if !pass {
-					// strict gating: no exit arms
 					lot.TrailActive = false
 					lot.TrailPeak = 0
 					lot.TrailStop = 0
 					lot.FixedTPWorking = false
 					i++
 					continue
-				} else {
-					// first pass breadcrumb
-					if lot.Take == 0 && !lot.TrailActive && !lot.FixedTPWorking {
-						log.Printf("TRACE GATE_PASS !!!!!!! side=%s net=%.6f gate=%.6f", lot.Side, net, t.cfg.ProfitGateUSD)
-					}
 				}
+
+				aiExit := shouldExitByAILogic(lot, d)
 
 				// --- EXIT arming when profit gate passed ---
 				switch lot.ExitMode {
-				case ExitModeRunnerTrailing, ExitModeScalpTrailing:
+				case ExitModeRunnerTrailing:
 					// trailing path (USD activate)
 					if trigger, _ := t.updateRunnerTrail(lot, price); trigger {
 						// --- MINIMAL CHANGE: skip trailing-stop close if notional < ORDER_MIN_USD and CONTINUE ---
@@ -931,6 +888,33 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					}
 
 				case ExitModeScalpFixedTP:
+
+					//Apply AI - LOGIC Gates on Exit
+
+					// Profit exists but AI/logic still supports the trade.
+					// HOLD the winner.
+					if !aiExit {
+						log.Printf(
+							"TRACE ai.exit.hold side=%s idx=%d signal=%s net=%.4f",
+							lot.Side,
+							i,
+							d.Signal,
+							net,
+						)
+						i++
+						continue
+					}
+
+					// Profit exists AND opposite AI/logic reversal appeared.
+					// Allow exit.
+					log.Printf(
+						"TRACE ai.exit.allow side=%s idx=%d signal=%s net=%.4f",
+						lot.Side,
+						i,
+						d.Signal,
+						net,
+					)
+
 					// emulate a maker-friendly TP "post" at/near mark
 					offBps := t.cfg.TPMakerOffsetBps
 					tp := price
@@ -955,14 +939,18 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				exitReason := ""
 				if lot.ExitMode == ExitModeScalpFixedTP {
 					exitReason = "take_profit"
-				} else if lot.ExitMode == ExitModeRunnerTrailing || lot.ExitMode == ExitModeScalpTrailing {
+				} else if lot.ExitMode == ExitModeRunnerTrailing {
 					exitReason = "trailing_stop"
 				}
 				if lot.Side == SideBuy && (lot.Take > 0 && price >= lot.Take) {
-					trigger = true
+					if lot.ExitMode == ExitModeScalpFixedTP && aiExit {
+						trigger = true
+					}
 				}
 				if lot.Side == SideSell && (lot.Take > 0 && price <= lot.Take) {
-					trigger = true
+					if lot.ExitMode == ExitModeScalpFixedTP && aiExit {
+						trigger = true
+					}
 				}
 				// ⬇️ ADD THIS dust guard for Fixed-TP before calling closeLot:
 				if trigger && lot.ExitMode == ExitModeScalpFixedTP {
@@ -1057,8 +1045,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// --------------------------------------------------------------------------------------------------------
 	//---ADD path continues-----
 	// --------------------------------------------------------------------------------------------------------
-	d := t.decide(signalHistory)
-	d = t.applyLogicGate(d, c)
+
 	totalLots := lsb + lss
 
 	log.Printf(
@@ -1200,25 +1187,25 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		return fmt.Sprintf("FLAT (long-only) [%s]", d.Reason), nil
 	}
 	if d.Signal == Flat && !equityTriggerSell && !equityTriggerBuy {
-			log.Printf(
-				"[TRADE_GATE] lastAddBuy=%s lastAddSell=%s "+
-					"winLowBuy=%.2f winHighSell=%.2f "+
-					"latchedBuy=%.2f latchedSell=%.2f "+
-					"nearestBuy{take=%.2f net=%.2f idx=%d} "+
-					"nearestSell{take=%.2f net=%.2f idx=%d} ",
-				t.lastAddBuy.Format(time.RFC3339),
-				t.lastAddSell.Format(time.RFC3339),
-				t.winLowBuy,
-				t.winHighSell,
-				t.latchedGateBuy,
-				t.latchedGateSell,
-				t.nearestTakeBuy,
-				t.nearestNetBuy,
-				t.nearestIdxBuy,
-				t.nearestTakeSell,
-				t.nearestNetSell,
-				t.nearestIdxSell,
-			)
+		log.Printf(
+			"[TRADE_GATE] lastAddBuy=%s lastAddSell=%s "+
+				"winLowBuy=%.2f winHighSell=%.2f "+
+				"latchedBuy=%.2f latchedSell=%.2f "+
+				"nearestBuy{take=%.2f net=%.2f idx=%d} "+
+				"nearestSell{take=%.2f net=%.2f idx=%d} ",
+			t.lastAddBuy.Format(time.RFC3339),
+			t.lastAddSell.Format(time.RFC3339),
+			t.winLowBuy,
+			t.winHighSell,
+			t.latchedGateBuy,
+			t.latchedGateSell,
+			t.nearestTakeBuy,
+			t.nearestNetBuy,
+			t.nearestIdxBuy,
+			t.nearestTakeSell,
+			t.nearestNetSell,
+			t.nearestIdxSell,
+		)
 		t.mu.Unlock()
 		return "FLAT", nil
 	}
@@ -1259,11 +1246,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		reasonElapsedHr float64
 	)
 
-	// --- MIRROR-PROFIT GATE (choppy scalp override):
-	// If the opposite side's nearest net ≥ ProfitGateUSD and this side is in choppy tier (idx≥2),
-	// bypass Gate2 (spacing + adverse) for THIS SIDE ONLY.
-	// Toggle: cfg.MirrorProfitGateEnabled
-	mirrorProfitOverride := false
+// --- MIRROR-PROFIT ADD OVERRIDE:
+// If the opposite side has enough unrealized profit, allow this-side add
+// to bypass Gate2 spacing/adverse checks.
+// This is no longer tied to "choppy" exit classification.
+mirrorProfitOverride := false
 	// GATE2 Gating for pyramiding adds — spacing + adverse move (with optional time-decay), side-aware.
 	if isAdd && !skipPyramidGates {
 		dynamicGate := t.mirrorEffectiveGate(side) // ramped by nearest idx
@@ -1532,16 +1519,17 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 	}
 
+	confMult := confidenceRiskMultiplier(d.Signal, d.PUp)
+	if confMult <= 0 {
+		confMult = 1.0
+	}
 	if !(equityTriggerSell || equityTriggerBuy) {
-		confMult := confidenceRiskMultiplier(d.Signal, d.PUp)
-		if confMult > 0 {
-			oldQuote := quote
-			quote *= confMult
-			log.Printf(
-				"TRACE sizing.confidence side=%s pUp=%.5f mult=%.2f quote_before=%.2f quote_after=%.2f",
-				side, d.PUp, confMult, oldQuote, quote,
-			)
-		}
+		oldQuote := quote
+		quote *= confMult
+		log.Printf(
+			"TRACE sizing.confidence side=%s pUp=%.5f mult=%.2f quote_before=%.2f quote_after=%.2f",
+			side, d.PUp, confMult, oldQuote, quote,
+		)
 	}
 
 	// Ensure we respect the exchange minimum notional
@@ -1559,6 +1547,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		var targetBase float64
 		for s := startStage; s < len(stagesSell); s++ {
 			tb := equitySpareBase * stagesSell[s]
+			oldBase := tb
+			tb *= confMult
+			log.Printf(
+				"TRACE sizing.equity.confidence side=%s pUp=%.5f mult=%.2f quote_before=%.2f quote_after=%.2f",
+				side, d.PUp, confMult, oldBase, tb,
+			)
 			tb = snapToStep(tb, baseStep)
 			if tb <= 0 || tb > equitySpareBase {
 				continue
@@ -1585,6 +1579,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		var targetQuote float64
 		for s := startStage; s < len(stagesBuy); s++ {
 			tq := equitySpareQuote * stagesBuy[s]
+			oldQuote := tq
+			tq *= confMult
+			log.Printf(
+				"TRACE sizing.equity.confidence side=%s pUp=%.5f mult=%.2f quote_before=%.2f quote_after=%.2f",
+				side, d.PUp, confMult, oldQuote, tq,
+			)
 			tq = snapToStep(tq, quoteStep)
 			if tq <= 0 || tq > equitySpareQuote {
 				continue
@@ -2753,49 +2753,4 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 	if len(book.Lots) == 1 {
 		padSingleLot(book.Lots[0])
 	}
-}
-
-func confidenceRiskMultiplier(sig Signal, pUp float64) float64 {
-	switch sig {
-
-	case Buy:
-		switch {
-		// Strong BUY only
-		case pUp >= 0.62:
-			return 1.00
-
-		// Good BUY
-		case pUp >= 0.60:
-			return 0.80
-
-		// Borderline but acceptable
-		case pUp >= 0.58:
-			return 0.50
-
-		// Weak = effectively ignore
-		case pUp >= 0.52:
-			return 0.00
-		}
-
-	case Sell:
-		switch {
-		// Strong SELL only
-		case pUp <= 0.38:
-			return 1.00
-
-		// Good SELL
-		case pUp <= 0.40:
-			return 0.80
-
-		// Borderline but acceptable
-		case pUp <= 0.42:
-			return 0.50
-
-		// Weak = effectively ignore
-		case pUp <= 0.47:
-			return 0.00
-		}
-	}
-
-	return 0.00
 }

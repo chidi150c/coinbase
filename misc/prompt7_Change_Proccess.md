@@ -677,8 +677,6 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 			switch m {
 			case ExitModeRunnerTrailing:
 				return "RunnerTrailing"
-			case ExitModeScalpTrailing:
-				return "ScalpTrailing"
 			case ExitModeScalpFixedTP:
 				return "ScalpFixedTP"
 			default:
@@ -739,24 +737,14 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				}
 				return
 			}
-			// 0 → trailing (scalp); 1.. → fixed TP
-			if idx == 0 {
-				lot.ExitMode = ExitModeScalpTrailing
-				lot.TrailDistancePct = t.cfg.TrailDistancePctScalp
-				lot.TrailActivateGateUSD = t.cfg.TrailActivateUSDScalp
-				lot.Take = activationPrice(lot, lot.TrailActivateGateUSD, feeRatePct)
-				if lot.TrailPeak == 0 {
-					lot.TrailPeak = lot.OpenPrice
-				}
-				return
-			} else {
-				// ScalpFixedTP: Take = fee-aware profit-gate price (preview);
-				// when gate passes you’ll arm FixedTPWorking and use this for post-only exits.
-				lot.ExitMode = ExitModeScalpFixedTP
-				lot.TrailDistancePct = 0
-				lot.TrailActivateGateUSD = t.cfg.ProfitGateUSD
-				lot.Take = activationPrice(lot, lot.TrailActivateGateUSD, feeRatePct)
-			}
+			
+			// ScalpFixedTP: Take = fee-aware profit-gate price (preview);
+			// when gate passes you’ll arm FixedTPWorking and use this for post-only exits.
+			lot.ExitMode = ExitModeScalpFixedTP
+			lot.TrailDistancePct = 0
+			lot.TrailActivateGateUSD = t.cfg.ProfitGateUSD
+			lot.Take = activationPrice(lot, lot.TrailActivateGateUSD, feeRatePct)
+			
 		}
 
 		// Helper to scan a side book
@@ -805,7 +793,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 
 				// --- EXIT arming when profit gate passed ---
 				switch lot.ExitMode {
-				case ExitModeRunnerTrailing, ExitModeScalpTrailing:
+				case ExitModeRunnerTrailing:
 					// trailing path (USD activate)
 					if trigger, _ := t.updateRunnerTrail(lot, price); trigger {
 						// --- MINIMAL CHANGE: skip trailing-stop close if notional < ORDER_MIN_USD and CONTINUE ---
@@ -853,7 +841,7 @@ func (t *Trader) step(ctx context.Context, c []Candle) (string, error) {
 				exitReason := ""
 				if lot.ExitMode == ExitModeScalpFixedTP {
 					exitReason = "take_profit"
-				} else if lot.ExitMode == ExitModeRunnerTrailing || lot.ExitMode == ExitModeScalpTrailing {
+				} else if lot.ExitMode == ExitModeRunnerTrailing{
 					exitReason = "trailing_stop"
 				}
 				if lot.Side == SideBuy && (lot.Take > 0 && price >= lot.Take) {

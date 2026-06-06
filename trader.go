@@ -41,7 +41,6 @@ type ExitMode string
 
 const (
 	ExitModeRunnerTrailing ExitMode = "RunnerTrailing"
-	ExitModeScalpTrailing  ExitMode = "ScalpTrailing"
 	ExitModeScalpFixedTP   ExitMode = "ScalpFixedTP"
 )
 
@@ -65,7 +64,7 @@ type Position struct {
 	// --- NEW (profit-gate data model) ---
 	EstExitFeeUSD    float64  `json:"est_exit_fee_usd,omitempty"` // recomputed each tick from mark
 	UnrealizedPnLUSD float64  `json:"unrealized_pnl_usd"`         // NET = gross - entry - estExit
-	ExitMode         ExitMode `json:"exit_mode,omitempty"`        // RunnerTrailing | ScalpTrailing | ScalpFixedTP
+	ExitMode         ExitMode `json:"exit_mode,omitempty"`        // RunnerTrailing | ScalpFixedTP
 	Version          int      `json:"version"`
 	FixedTPWorking   bool     `json:"-"` // internal flag: emulate a posted TP (re-post each tick while gate holds)
 
@@ -444,9 +443,6 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 	actUSD := t.cfg.TrailActivateUSDRunner
 	distPct := t.cfg.TrailDistancePctRunner
 	switch lot.ExitMode {
-	case ExitModeScalpTrailing:
-		actUSD = t.cfg.TrailActivateUSDScalp
-		distPct = t.cfg.TrailDistancePctScalp
 	case ExitModeRunnerTrailing:
 		// default as set
 	default:
@@ -1319,23 +1315,8 @@ func (t *Trader) loadState() error {
 					lot.ExitMode = ExitModeRunnerTrailing
 				}
 			} else {
-				n := i + 1 // 1-based scalp index
-				if n >= 1 && n <= 4 {
-					// Scalp 1..4 → trailing (scalp params)
-					if lot.TrailDistancePct == 0 {
-						lot.TrailDistancePct = t.cfg.TrailDistancePctScalp
-					}
-					if lot.TrailActivateGateUSD == 0 {
-						lot.TrailActivateGateUSD = t.cfg.TrailActivateUSDScalp
-					}
-					if lot.ExitMode == "" {
-						lot.ExitMode = ExitModeScalpTrailing
-					}
-				} else {
-					// Scalp >4 → fixed TP
-					if lot.ExitMode == "" {
-						lot.ExitMode = ExitModeScalpFixedTP
-					}
+				if lot.ExitMode == "" {
+					lot.ExitMode = ExitModeScalpFixedTP
 				}
 			}
 		}

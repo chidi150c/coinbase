@@ -305,3 +305,14 @@ why-trade answers:
 why-trade --after 60m answers:
 
   "Was it actually the correct decision?"
+
+
+======================================
+
+how to use zip file with ts:
+
+gunzip -c /opt/coinbase/logs/audit/binance_audit.log-20260604.gz > /tmp/audit_0604.log
+
+why-trade ts '2026/06/04 00:26' -s BUY -l /tmp/audit_0604.log --after 60m
+
+=====================================
