@@ -181,7 +181,7 @@ type Trader struct {
 	// NEW: index of the designated runner lot in legacy aggregate (-1 if none). Derived from books.
 	// runnerIdx int
 
-	// --- NEW: side-aware pyramiding state (kept in-memory; mirrored to legacy fields for logs) ---
+	// --- NEW: side-aware pyramiding state (kept in-memory; copied to legacy fields for logs) ---
 	lastAddBuy      time.Time
 	lastAddSell     time.Time
 	winLowBuy       float64
@@ -734,30 +734,6 @@ func (t *Trader) consolidateRunners(book *SideBook, px float64) {
 	// NOTE:
 	// - we did NOT touch t.lastAddEquityBuy / t.lastAddEquitySell / t.equityStage*
 	// - only per-lot fields on this side's book were rewritten
-}
-
-// mirrorEffectiveGate returns the dynamic (ramped) mirror gate based on nearest lot index.
-func (t *Trader) mirrorEffectiveGate(side OrderSide) float64 {
-	base := t.cfg.MirrorGateUSD
-	slope := t.cfg.MirrorGateSlopeUSD
-	start := t.cfg.MirrorGateStartIdx
-	cap := t.cfg.MirrorGateMaxUSD
-
-	var idx int
-	if side == SideBuy {
-		idx = t.nearestIdxBuy
-	} else {
-		idx = t.nearestIdxSell
-	}
-	steps := idx - start
-	if steps < 0 {
-		steps = 0
-	}
-	gate := base + float64(steps)*slope
-	if cap > 0 && gate > cap {
-		gate = cap
-	}
-	return gate
 }
 
 // --- NEW: side-aware lot closing (no global index) ---

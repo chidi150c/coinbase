@@ -1246,50 +1246,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		reasonElapsedHr float64
 	)
 
-// --- MIRROR-PROFIT ADD OVERRIDE:
-// If the opposite side has enough unrealized profit, allow this-side add
-// to bypass Gate2 spacing/adverse checks.
-// This is no longer tied to "choppy" exit classification.
-mirrorProfitOverride := false
 	// GATE2 Gating for pyramiding adds — spacing + adverse move (with optional time-decay), side-aware.
 	if isAdd && !skipPyramidGates {
-		dynamicGate := t.mirrorEffectiveGate(side) // ramped by nearest idx
-		if side == SideBuy {
-			if t.nearestNetSell >= dynamicGate {
-				mirrorProfitOverride = true
-			}
-		} else {
-			if t.nearestNetBuy >= dynamicGate {
-				mirrorProfitOverride = true
-			}
-		}
 
-		if mirrorProfitOverride {
-			log.Printf("[DEBUG] GATE2 override (mirror-profit choppy): side=%s net=%.4f ≥ gate=%.4f idx=%d",
-				side,
-				func() float64 {
-					if side == SideBuy {
-						return t.nearestNetSell
-					}
-					return t.nearestNetBuy
-				}(),
-				dynamicGate,
-				func() int {
-					if side == SideBuy {
-						return t.nearestIdxBuy
-					}
-					return t.nearestIdxSell
-				}(),
-			)
-			// Bypass spacing & adverse; continue with sizing/entry path
+		// Choose side-aware anchor set
+		var lastAddSide time.Time
+		if side == SideBuy {
+			lastAddSide = t.lastAddBuy
 		} else {
-			// Choose side-aware anchor set
-			var lastAddSide time.Time
-			if side == SideBuy {
-				lastAddSide = t.lastAddBuy
-			} else {
-				lastAddSide = t.lastAddSell
-			}
+			lastAddSide = t.lastAddSell
+		}
 
 			// 1) Spacing
 			psb := t.cfg.PyramidMinSecondsBetween
@@ -1370,7 +1336,7 @@ mirrorProfitOverride := false
 						gatePrice = clampP
 					}
 
-					// mirror for reason/log fields
+					// Copy for reason/log fields
 					reasonGatePrice = gatePrice
 					reasonLatched = t.latchedGateBuy
 
@@ -1416,7 +1382,7 @@ mirrorProfitOverride := false
 						gatePrice = clampP
 					}
 
-					// mirror for legacy reason/log fields
+					// copy for legacy reason/log fields
 					reasonGatePrice = gatePrice
 					reasonLatched = t.latchedGateSell
 
@@ -1436,7 +1402,6 @@ mirrorProfitOverride := false
 				}
 			}
 
-		}
 
 	}
 
@@ -1862,13 +1827,13 @@ mirrorProfitOverride := false
 		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquityBuy=%.2f pct_diff_buy=%.6f equitySpareQuote=%.2f", t.equityUSD, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, equitySpareQuote)
 	} else if side == SideBuy {
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|mirror=%v",
-			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, mirrorProfitOverride,
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f",
+			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr,
 		)
 	} else { // SideSell
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|mirror=%v",
-			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, mirrorProfitOverride,
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f",
+			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr,
 		)
 	}
 	if d.Reason != "" {
@@ -2516,16 +2481,6 @@ mirrorProfitOverride := false
 		LotID:            len(book.Lots),
 		EntryOrderID:     "", // market path has no known order id here
 		RefundPortionUSD: refundFromOpposite,
-	}
-	idx := len(book.Lots) // the new lot’s index after append
-	if idx >= 2 {
-		if !strings.Contains(newLot.Reason, "mode=choppy") {
-			newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=choppy")
-		}
-	} else if idx >= 1 && idx < 2 {
-		if !strings.Contains(newLot.Reason, "mode=strict") {
-			newLot.Reason = strings.TrimSpace(newLot.Reason + " mode=strict")
-		}
 	}
 	book.Lots = append(book.Lots, newLot)
 	t.consolidateDust(book, priceToUse, minNotional)
