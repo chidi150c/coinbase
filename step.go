@@ -374,17 +374,36 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	}
 	t.updateDaily(now)
 
-	// --- NEW (Phase 4): drain async maker-first results per-side (non-blocking) ---
+	// -------------------------------------------------------------------------------------------------
+	// Drain completed BUY maker-first order result, if any.
+	//
+	// This block handles the asynchronous post-only BUY lifecycle. The maker order is submitted earlier
+	// and polled in the background. On each step(), we non-blockingly check whether that goroutine sent
+	// a result.
+	//
+	// Important:
+	// - This block must not block the trading loop.
+	// - A result is accepted only if it matches the current pending order or one of its repriced history IDs.
+	// - If a fill arrives but pending state is missing, we still accept it to avoid orphaning a real broker fill.
+	// - On timeout/error/non-fill, we set pendingRecheckBuy=true so the normal entry path can optionally retry.
+	// - The pending object is cleared at the end regardless of fill/non-fill.
+	// -------------------------------------------------------------------------------------------------
 	if t.pendingBuyCh != nil {
 		select {
 		case res := <-t.pendingBuyCh:
-			log.Printf("TRACE postonly.drain.recv side=%s order_id=%s filled=%v placed_nil=%v", SideBuy, res.OrderID, res.Filled, res.Placed == nil)
-			// Decide whether to accept this fill
+			log.Printf("TRACE postonly.drain.recv side=%s order_id=%s filled=%v placed_nil=%v",
+				SideBuy, res.OrderID, res.Filled, res.Placed == nil)
+
+			// Decide whether this async result is safe to apply to state.
+			// Repricing can create multiple order IDs, so we accept:
+			// 1) the current pending order ID, or
+			// 2) any historical replaced order ID recorded in PendingOpen.History.
 			accept := false
 			if res.Filled && res.Placed != nil {
-				log.Printf("TRACE postonly.drain.placed side=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f", SideBuy, res.OrderID, res.Placed.Price, res.Placed.BaseSize, res.Placed.QuoteSpent, res.Placed.CommissionUSD)
+				log.Printf("TRACE postonly.drain.placed side=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f",
+					SideBuy, res.OrderID, res.Placed.Price, res.Placed.BaseSize, res.Placed.QuoteSpent, res.Placed.CommissionUSD)
+
 				if t.pendingBuy != nil {
-					// Accept if it matches current or any historical order id
 					if res.OrderID == t.pendingBuy.OrderID {
 						accept = true
 					} else {
@@ -396,14 +415,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						}
 					}
 				} else {
-					// No pending in memory, but we received a fill → accept to avoid orphaning
+					// A real fill without in-memory pending state is safer to accept than ignore.
+					// This can happen after restart/state mismatch/channel timing.
 					accept = true
 					log.Printf("[WARN] postonly.fill.without_pending side=%s order_id=%s", SideBuy, res.OrderID)
 				}
 			}
 
 			if accept {
-				// Append lot using res.Placed (price/base/fee), set a safe Reason
+				// Convert the broker fill into a BUY lot using actual execution data.
+				// Prefer broker-reported commission; if unavailable, estimate from FeeRatePct.
 				side := SideBuy
 				book := t.book(side)
 				priceToUse := res.Placed.Price
@@ -414,7 +435,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					entryFee = quoteSpent * (t.cfg.FeeRatePct / 100.0)
 				}
 
-				// Compute history match explicitly (clearer than inline func)
+				// Diagnostic: was the fill accepted by current ID or repriced-history ID?
 				matchHistory := false
 				if t.pendingBuy != nil {
 					for _, id := range t.pendingBuy.History {
@@ -432,124 +453,181 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					t.pendingBuy == nil,
 				)
 
-				if t.pendingBuy != nil {
-					if t.pendingBuy.RefundPortionUSD > 0 {
-						origBase := baseToUse
-						origQuote := quoteSpent
-						origFee := entryFee
+				// Refund-service adjustment:
+				// If part of the fill was intended to restore opposite-side inventory/spare,
+				// remove that portion from the open lot and credit it to the appropriate spare bucket.
+				if t.pendingBuy != nil && t.pendingBuy.RefundPortionUSD > 0 {
+					origBase := baseToUse
+					origQuote := quoteSpent
+					origFee := entryFee
 
-						refundBase := t.pendingBuy.RefundPortionUSD / priceToUse
-						if refundBase > baseToUse {
-							refundBase = baseToUse
-						}
-
-						keptBase := baseToUse - refundBase
-						if keptBase < 0 {
-							keptBase = 0
-						}
-
-						keptQuote := quoteSpent
-						keptFee := entryFee
-						refundQuote := t.pendingBuy.RefundPortionUSD
-						refundFee := refundQuote * (t.cfg.FeeRatePct / 100.0)
-
-						if origBase > 0 {
-							keptQuote = origQuote * (keptBase / origBase)
-							keptFee = origFee * (keptBase / origBase)
-							refundQuote = origQuote * (refundBase / origBase)
-							refundFee = origFee * (refundBase / origBase)
-						}
-
-						t.creditRefundService(SideBuy, refundQuote, refundFee)
-
-						baseToUse = keptBase
-						quoteSpent = keptQuote
-						entryFee = keptFee
+					refundBase := t.pendingBuy.RefundPortionUSD / priceToUse
+					if refundBase > baseToUse {
+						refundBase = baseToUse
 					}
+
+					keptBase := baseToUse - refundBase
+					if keptBase < 0 {
+						keptBase = 0
+					}
+
+					keptQuote := quoteSpent
+					keptFee := entryFee
+					refundQuote := t.pendingBuy.RefundPortionUSD
+					refundFee := refundQuote * (t.cfg.FeeRatePct / 100.0)
+
+					if origBase > 0 {
+						keptQuote = origQuote * (keptBase / origBase)
+						keptFee = origFee * (keptBase / origBase)
+						refundQuote = origQuote * (refundBase / origBase)
+						refundFee = origFee * (refundBase / origBase)
+					}
+
+					t.creditRefundService(SideBuy, refundQuote, refundFee)
+
+					baseToUse = keptBase
+					quoteSpent = keptQuote
+					entryFee = keptFee
 				}
 
+				// Build the open BUY lot.
+				//
+				// ConfidenceMult / EntryAIMode / ProfitGateUSD should come from PendingOpen,
+				// because this fill may occur many ticks after the decision that created it.
+				// Do not rely on current d/confMult here unless this block is guaranteed to run
+				// in the same tick as placement.
 				newLot := &Position{
 					OpenPrice:       priceToUse,
 					Side:            side,
 					SizeBase:        baseToUse,
 					OpenTime:        now,
 					EntryFee:        entryFee,
-					OpenNotionalUSD: quoteSpent, // <<< USD PERSISTENCE: notional in USD at open
+					OpenNotionalUSD: quoteSpent,
 					Reason:          "async postonly filled",
-					Take:            0, // or carry from pending if available
+					Take:            0,
 					Version:         1,
 					LotID:           len(book.Lots),
 					EntryOrderID:    res.OrderID,
 				}
+
+				// Restore decision-time metadata from pending state.
 				if t.pendingBuy != nil {
 					newLot.Reason = t.pendingBuy.Reason
 					newLot.RefundPortionUSD = t.pendingBuy.RefundPortionUSD
 					newLot.Take = t.pendingBuy.Take
+					newLot.ConfidenceMult = t.pendingBuy.ConfidenceMult
+					newLot.EntryAIMode = t.pendingBuy.EntryAIMode
+					newLot.ProfitGateUSD = t.pendingBuy.ProfitGateUSD
 				}
+				if newLot.ConfidenceMult <= 0 {
+					newLot.ConfidenceMult = 0.0
+				}
+				if newLot.EntryAIMode == "" {
+					newLot.EntryAIMode = "UNKNOWN"
+				}
+				if newLot.ProfitGateUSD <= 0 {
+					newLot.ProfitGateUSD = t.cfg.ProfitGateUSD
+				}
+
+				log.Printf(
+					"[KPI] lot.created side=%s mode=%s conf=%.2f gate=%.2f",
+					newLot.Side,
+					newLot.EntryAIMode,
+					newLot.ConfidenceMult,
+					newLot.ProfitGateUSD,
+				)
+
 				book.Lots = append(book.Lots, newLot)
+
+				// Clean up any dust created by partial fills/refund service.
 				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
 				t.didConsolidateStartup = false
+
+				// Deduct quote actually kept as open BUY exposure.
 				t.SpareBuyUSD -= quoteSpent
 				if t.SpareBuyUSD < 0 {
 					t.SpareBuyUSD = 0
 				}
+
+				// Equity-triggered BUY fills are promoted to runner status.
 				if t.pendingBuy != nil && t.pendingBuy.EquityBuy {
-					newIdx := len(book.Lots) - 1 // the newly appended lot
+					newIdx := len(book.Lots) - 1
 					addRunner(book, newIdx)
+
 					r := book.Lots[newIdx]
 					r.TrailActive = false
 					r.TrailPeak = r.OpenPrice
 					r.TrailStop = 0
 					t.applyRunnerTargets(r)
-					log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
+
+					log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f",
+						newIdx, side, r.OpenPrice, r.Take)
 				}
-				// side-specific resets...
+
+				// Reset BUY-side add anchors after accepted fill.
 				t.lastAddBuy = wallNow
 				t.winLowBuy = priceToUse
 				t.latchedGateBuy = 0
+
 				old := t.lastAddEquityBuy
 				t.lastAddEquityBuy = t.equityUSD
-				log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquityBuy)
+				log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f",
+					side, old, t.lastAddEquityBuy)
 
 				msg := fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
 					side, quoteSpent, newLot.Take, entryFee, newLot.Reason, "async postonly filled")
+
 				if t.cfg.UseDirectSlack {
 					postSlack(msg)
 				}
-				// save
+
 				if err := t.saveStateNoLock(); err != nil {
 					log.Printf("[WARN] saveState (filled BUY): %v", err)
 				}
 			} else {
-				// Non-fill (timeout/error) → enable one market fallback
+				// Non-fill result: allow the normal entry path to re-check and possibly fallback.
 				t.pendingRecheckBuy = true
-				log.Printf("TRACE postonly.recheck side=%s set=true reason=timeout_or_error order_id=%s", SideBuy, res.OrderID)
+				log.Printf("TRACE postonly.recheck side=%s set=true reason=timeout_or_error order_id=%s",
+					SideBuy, res.OrderID)
 			}
 
-			// Cancel & clear pending either way
+			// Pending lifecycle is finished for this result, whether filled or not.
+			// Cancel context, clear pointers, and persist so restart state is clean.
 			if t.pendingBuyCancel != nil {
 				t.pendingBuyCancel()
 			}
 			t.pendingBuy = nil
 			t.pendingBuyCtx = nil
 			t.pendingBuyCancel = nil
+
 			if err := t.saveStateNoLock(); err != nil {
 				log.Printf("[WARN] saveState (drain BUY): %v", err)
 			}
+
 		default:
+			// No async BUY result this tick.
 		}
 	}
 
+	// -------------------------------------------------------------------------------------------------
+	// Drain completed SELL maker-first order result, if any.
+	//
+	// Same lifecycle as BUY drain, but for SELL-side post-only orders.
+	// Accept fills that match the current pending order ID or any repriced historical ID.
+	// If accepted, convert the broker fill into a SELL lot using actual fill price/base/fee.
+	// -------------------------------------------------------------------------------------------------
 	if t.pendingSellCh != nil {
 		select {
 		case res := <-t.pendingSellCh:
-			log.Printf("TRACE postonly.drain.recv side=%s order_id=%s filled=%v placed_nil=%v", SideSell, res.OrderID, res.Filled, res.Placed == nil)
-			// Decide whether to accept this fill
+			log.Printf("TRACE postonly.drain.recv side=%s order_id=%s filled=%v placed_nil=%v",
+				SideSell, res.OrderID, res.Filled, res.Placed == nil)
+
 			accept := false
 			if res.Filled && res.Placed != nil {
-				log.Printf("TRACE postonly.drain.placed side=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f", SideSell, res.OrderID, res.Placed.Price, res.Placed.BaseSize, res.Placed.QuoteSpent, res.Placed.CommissionUSD)
+				log.Printf("TRACE postonly.drain.placed side=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f",
+					SideSell, res.OrderID, res.Placed.Price, res.Placed.BaseSize, res.Placed.QuoteSpent, res.Placed.CommissionUSD)
+
 				if t.pendingSell != nil {
-					// Accept if it matches current or any historical order id
 					if res.OrderID == t.pendingSell.OrderID {
 						accept = true
 					} else {
@@ -561,14 +639,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						}
 					}
 				} else {
-					// No pending in memory, but we received a fill → accept to avoid orphaning
 					accept = true
 					log.Printf("[WARN] postonly.fill.without_pending side=%s order_id=%s", SideSell, res.OrderID)
 				}
 			}
 
 			if accept {
-				// Append lot using res.Placed (price/base/fee), set a safe Reason
 				side := SideSell
 				book := t.book(side)
 				priceToUse := res.Placed.Price
@@ -595,110 +671,145 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					matchHistory,
 					t.pendingSell == nil,
 				)
-				if t.pendingSell != nil {
-					if t.pendingSell.RefundPortionUSD > 0 {
-						origBase := baseToUse
-						origQuote := quoteSpent
-						origFee := entryFee
 
-						refundBase := t.pendingSell.RefundPortionUSD / priceToUse
-						if refundBase > baseToUse {
-							refundBase = baseToUse
-						}
+				// Refund-service adjustment.
+				if t.pendingSell != nil && t.pendingSell.RefundPortionUSD > 0 {
+					origBase := baseToUse
+					origQuote := quoteSpent
+					origFee := entryFee
 
-						keptBase := baseToUse - refundBase
-						if keptBase < 0 {
-							keptBase = 0
-						}
-
-						keptQuote := quoteSpent
-						keptFee := entryFee
-						refundQuote := t.pendingSell.RefundPortionUSD
-						refundFee := refundQuote * (t.cfg.FeeRatePct / 100.0)
-
-						if origBase > 0 {
-							keptQuote = origQuote * (keptBase / origBase)
-							keptFee = origFee * (keptBase / origBase)
-							refundQuote = origQuote * (refundBase / origBase)
-							refundFee = origFee * (refundBase / origBase)
-						}
-
-						t.creditRefundService(SideSell, refundQuote, refundFee)
-
-						baseToUse = keptBase
-						quoteSpent = keptQuote
-						entryFee = keptFee
+					refundBase := t.pendingSell.RefundPortionUSD / priceToUse
+					if refundBase > baseToUse {
+						refundBase = baseToUse
 					}
+
+					keptBase := baseToUse - refundBase
+					if keptBase < 0 {
+						keptBase = 0
+					}
+
+					keptQuote := quoteSpent
+					keptFee := entryFee
+					refundQuote := t.pendingSell.RefundPortionUSD
+					refundFee := refundQuote * (t.cfg.FeeRatePct / 100.0)
+
+					if origBase > 0 {
+						keptQuote = origQuote * (keptBase / origBase)
+						keptFee = origFee * (keptBase / origBase)
+						refundQuote = origQuote * (refundBase / origBase)
+						refundFee = origFee * (refundBase / origBase)
+					}
+
+					t.creditRefundService(SideSell, refundQuote, refundFee)
+
+					baseToUse = keptBase
+					quoteSpent = keptQuote
+					entryFee = keptFee
 				}
+
 				newLot := &Position{
 					OpenPrice:       priceToUse,
 					Side:            side,
 					SizeBase:        baseToUse,
 					OpenTime:        now,
 					EntryFee:        entryFee,
-					OpenNotionalUSD: quoteSpent, // <<< USD PERSISTENCE
+					OpenNotionalUSD: quoteSpent,
 					Reason:          "async postonly filled",
-					Take:            0, // or carry from pending if available
+					Take:            0,
 					Version:         1,
 					LotID:           len(book.Lots),
 					EntryOrderID:    res.OrderID,
 				}
+
 				if t.pendingSell != nil {
 					newLot.Reason = t.pendingSell.Reason
 					newLot.Take = t.pendingSell.Take
 					newLot.RefundPortionUSD = t.pendingSell.RefundPortionUSD
+					newLot.ConfidenceMult = t.pendingSell.ConfidenceMult
+					newLot.EntryAIMode = t.pendingSell.EntryAIMode
+					newLot.ProfitGateUSD = t.pendingSell.ProfitGateUSD
 				}
+
+				if newLot.ConfidenceMult <= 0 {
+					newLot.ConfidenceMult = 0.0
+				}
+				if newLot.EntryAIMode == "" {
+					newLot.EntryAIMode = "UNKNOWN"
+				}
+				if newLot.ProfitGateUSD <= 0 {
+					newLot.ProfitGateUSD = t.cfg.ProfitGateUSD
+				}
+
+				log.Printf(
+					"[KPI] lot.created side=%s mode=%s conf=%.2f gate=%.2f",
+					newLot.Side,
+					newLot.EntryAIMode,
+					newLot.ConfidenceMult,
+					newLot.ProfitGateUSD,
+				)
+
 				book.Lots = append(book.Lots, newLot)
+
 				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
 				t.didConsolidateStartup = false
+
 				t.SpareSellUSD -= quoteSpent
 				if t.SpareSellUSD < 0 {
 					t.SpareSellUSD = 0
 				}
+
 				if t.pendingSell != nil && t.pendingSell.EquitySell {
-					newIdx := len(book.Lots) - 1 // the newly appended lot
+					newIdx := len(book.Lots) - 1
 					addRunner(book, newIdx)
+
 					r := book.Lots[newIdx]
 					r.TrailActive = false
 					r.TrailPeak = r.OpenPrice
 					r.TrailStop = 0
 					t.applyRunnerTargets(r)
-					log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
+
+					log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f",
+						newIdx, side, r.OpenPrice, r.Take)
 				}
-				// side-specific resets...
+
 				t.lastAddSell = wallNow
 				t.winHighSell = priceToUse
 				t.latchedGateSell = 0
+
 				old := t.lastAddEquitySell
 				t.lastAddEquitySell = t.equityUSD
-				log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquitySell)
+				log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f",
+					side, old, t.lastAddEquitySell)
 
 				msg := fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
 					side, quoteSpent, newLot.Take, entryFee, newLot.Reason, "async postonly filled")
+
 				if t.cfg.UseDirectSlack {
 					postSlack(msg)
 				}
-				// save
+
 				if err := t.saveStateNoLock(); err != nil {
 					log.Printf("[WARN] saveState (filled SELL): %v", err)
 				}
 			} else {
-				// Non-fill (timeout/error) → enable one market fallback
 				t.pendingRecheckSell = true
-				log.Printf("TRACE postonly.recheck side=%s set=true reason=timeout_or_error order_id=%s", SideSell, res.OrderID)
+				log.Printf("TRACE postonly.recheck side=%s set=true reason=timeout_or_error order_id=%s",
+					SideSell, res.OrderID)
 			}
 
-			// Cancel & clear pending either way
 			if t.pendingSellCancel != nil {
 				t.pendingSellCancel()
 			}
 			t.pendingSell = nil
 			t.pendingSellCtx = nil
 			t.pendingSellCancel = nil
+
 			if err := t.saveStateNoLock(); err != nil {
 				log.Printf("[WARN] saveState (drain SELL): %v", err)
 			}
+
 		default:
+			// No async SELL result this tick.
 		}
 	}
 
@@ -738,7 +849,17 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	d = t.applyLogicGate(d, c)
 
 	// --------------------------------------------------------------------------------------------------------
-	// --- EXIT path: evaluate profit gate and trailing/TP logic per lot (side-aware) and close at most one.
+	// EXIT path: fee-aware per-lot exit management.
+	//
+	// This block scans existing BUY and SELL lots before any new entry is considered.
+	// It computes each lot's current net PnL, applies its correct per-lot profit gate,
+	// manages runner/scalp exit behavior, and closes at most ONE lot per step.
+	//
+	// Important:
+	// - Profit gate is per-lot. AI-FLAT entries may have a reduced ProfitGateUSD.
+	// - ScalpFixedTP exits require profit gate + AI/logic exit approval.
+	// - RunnerTrailing uses runner activation/trailing rules.
+	// - nearestTakeBuy/Sell are diagnostic/Gate2 snapshots, not separate exit orders.
 	// --------------------------------------------------------------------------------------------------------
 	if (lsb > 0) || (lss > 0) {
 
@@ -749,7 +870,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		buyNet, sellNet := 0.0, 0.0
 		feeRatePct := t.cfg.FeeRatePct
 
-		// Label exit mode
+		// Human-readable label for the lot's current exit mode.
+		// Used only for logs/Gate2 snapshots.
 		modeLabel := func(m ExitMode) string {
 			switch m {
 			case ExitModeRunnerTrailing:
@@ -761,7 +883,15 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 		}
 
-		// Update nearest TAKE for a side using already computed fields in-loop
+		// Track nearest fee-aware exit/activation price per side.
+		//
+		// BUY side:
+		//   lowest Take is nearest (price rises to reach it).
+		//
+		// SELL side:
+		//   highest Take is nearest (price falls to reach it).
+		//
+		// Used for diagnostics/Gate2 context only.
 		updateNearest := func(book *SideBook, side OrderSide, idx int, lot *Position, net float64, price float64) {
 			cand := lot.Take
 			if cand <= 0 {
@@ -792,7 +922,27 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 		}
 
-		// Helper: compute net PnL and gate state for one lot, update EstExitFeeUSD/UnrealizedPnLUSD
+		// Return this lot's effective profit gate.
+		//
+		// Normal AI-confirmed lots use cfg.ProfitGateUSD.
+		// Reduced-confidence AI-FLAT lots may carry a smaller ProfitGateUSD.
+		// Older lots fall back to cfg.ProfitGateUSD.
+		lotProfitGateUSD := func(lot *Position) float64 {
+			gate := lot.ProfitGateUSD
+			if gate <= 0 {
+				gate = t.cfg.ProfitGateUSD
+			}
+			return gate
+		}
+
+		// Compute fee-aware unrealized net PnL and gate pass/fail.
+		//
+		// Net PnL includes:
+		// - gross move
+		// - entry fee
+		// - estimated exit fee
+		//
+		// Exit gate uses the lot's effective ProfitGateUSD
 		computeGate := func(lot *Position) (netPnL float64, gate bool) {
 			feeRate := t.cfg.FeeRatePct
 			estExit := (lot.SizeBase * price) * (feeRate / 100.0)
@@ -804,10 +954,18 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 			net := gross - lot.EntryFee - estExit
 			lot.UnrealizedPnLUSD = net
-			return net, net >= t.cfg.ProfitGateUSD
+			gateUSD := lotProfitGateUSD(lot)
+			return net, net >= gateUSD
 		}
 
-		// Helper to classify ExitMode (idempotent) and set a preview Take
+		// Classify exit mode and refresh fee-aware Take preview.
+		//
+		// Runner:
+		//   trailing activation + runner trail distance.
+		//
+		// ScalpFixedTP:
+		//   fee-aware Take derived from this lot's ProfitGateUSD.
+		//   Supports confidence-scaled exits for AI-FLAT entries.
 		setExitMode := func(book *SideBook, idx int, lot *Position) {
 			feeRatePct := t.cfg.FeeRatePct
 
@@ -824,13 +982,22 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 			// ScalpFixedTP: Take = fee-aware profit-gate price (preview);
 			// when gate passes you’ll arm FixedTPWorking and use this for post-only exits.
+			gateUSD := lotProfitGateUSD(lot)
 			lot.ExitMode = ExitModeScalpFixedTP
 			lot.TrailDistancePct = 0
-			lot.TrailActivateGateUSD = t.cfg.ProfitGateUSD
-			lot.Take = activationPrice(lot, lot.TrailActivateGateUSD, feeRatePct)
+			lot.TrailActivateGateUSD = gateUSD
+			lot.Take = activationPrice(lot, gateUSD, feeRatePct)
 		}
 
-		// Helper to scan a side book
+		// Scan one side book and close at most one lot.
+		//
+		// Flow:
+		// 1. Refresh exit mode and Take
+		// 2. Compute fee-aware net PnL
+		// 3. Update nearest snapshot
+		// 4. Skip non-profitable lots
+		// 5. Require AI/logic exit approval
+		// 6. Trigger side-aware exit
 		scanSide := func(side OrderSide) (string, bool, error) {
 			book := t.book(side)
 			for i := 0; i < len(book.Lots); {
@@ -846,11 +1013,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				updateNearest(book, side, i, lot, net, price)
 
 				if lot.ExitMode == ExitModeScalpFixedTP {
-					pass = net >= t.cfg.ProfitGateUSD
-					lot.TrailActivateGateUSD = t.cfg.ProfitGateUSD
+					gateUSD := lotProfitGateUSD(lot)
+					pass = net >= gateUSD
+					lot.TrailActivateGateUSD = gateUSD
 				}
 
 				// Must be profitable first
+				// Profit gate must pass before any exit action.
+				// If profit disappears, clear transient trailing/TP state.
 				if !pass {
 					lot.TrailActive = false
 					lot.TrailPeak = 0
@@ -860,12 +1030,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					continue
 				}
 
+				// AI/logic exit approval.
+				// Winning trades are held while AI/logic still supports them.
 				aiExit := shouldExitByAILogic(lot, d)
 
-				// --- EXIT arming when profit gate passed ---
+				// Profit gate passed.
+				// Apply exit-mode-specific behavior.
 				switch lot.ExitMode {
 				case ExitModeRunnerTrailing:
-					// trailing path (USD activate)
+					// Runner path.
+					// Managed by trailing activation/stop behavior.
 					if trigger, _ := t.updateRunnerTrail(lot, price); trigger {
 						// --- MINIMAL CHANGE: skip trailing-stop close if notional < ORDER_MIN_USD and CONTINUE ---
 						closeSide := SideSell
@@ -888,11 +1062,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					}
 
 				case ExitModeScalpFixedTP:
+					// Scalp path.
+					// ProfitGate passed
+					// Does AI/logic still supports this profitable trade.
 
-					//Apply AI - LOGIC Gates on Exit
-
-					// Profit exists but AI/logic still supports the trade.
-					// HOLD the winner.
+					// Hold winner; do not exit yet.
 					if !aiExit {
 						log.Printf(
 							"TRACE ai.exit.hold side=%s idx=%d signal=%s net=%.4f",
@@ -905,8 +1079,17 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						continue
 					}
 
-					// Profit exists AND opposite AI/logic reversal appeared.
-					// Allow exit.
+					//-------flow reminder-----------------------------
+					// ProfitGate passed
+					// AI exit approved
+					// arm Take as maker-friendly limit
+					// call closeLot()
+					// closeLot tries post-only at Take
+					// if not filled by timeout, fallback market
+					//-------------------------------------------------------
+
+					// Opposite AI/logic appeared while profitable.
+					// Allow maker-friendly exit.
 					log.Printf(
 						"TRACE ai.exit.allow side=%s idx=%d signal=%s net=%.4f",
 						lot.Side,
@@ -915,18 +1098,18 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						net,
 					)
 
-					// emulate a maker-friendly TP "post" at/near mark
+					// Arm/update maker-friendly exit limit price to be near current mark price.
 					offBps := t.cfg.TPMakerOffsetBps
-					tp := price
+					makerExitPx := price
 					if lot.Side == SideBuy && offBps > 0 {
-						tp = price * (1.0 + offBps/10000.0)
+						makerExitPx = price * (1.0 + offBps/10000.0)
 					}
 					if lot.Side == SideSell && offBps > 0 {
-						tp = price * (1.0 - offBps/10000.0)
+						makerExitPx = price * (1.0 - offBps/10000.0)
 					}
 					// place/re-post every tick while gate holds (minimal emulation)
-					if !lot.FixedTPWorking || (lot.Side == SideBuy && tp < lot.Take) || (lot.Side == SideSell && tp > lot.Take) {
-						lot.Take = tp
+					if !lot.FixedTPWorking || (lot.Side == SideBuy && makerExitPx < lot.Take) || (lot.Side == SideSell && makerExitPx > lot.Take) {
+						lot.Take = makerExitPx
 						lot.FixedTPWorking = true
 						log.Printf("TRACE tp.post side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
 					} else {
@@ -934,7 +1117,15 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					}
 				}
 
-				// --- Legacy trigger block (now governed by our gated Stop/Take) ---
+				// Final trigger check.
+				// Scalp exits require:
+				// - ProfitGate already passed
+				// - AI/logic exit approval
+				// - maker exit armed with lot.Take
+				// - valid notional
+				//
+				// We do NOT wait for price to cross Take here.
+				// closeLot() uses lot.Take as the post-only limit price.
 				trigger := false
 				exitReason := ""
 				if lot.ExitMode == ExitModeScalpFixedTP {
@@ -942,16 +1133,20 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				} else if lot.ExitMode == ExitModeRunnerTrailing {
 					exitReason = "trailing_stop"
 				}
-				if lot.Side == SideBuy && (lot.Take > 0 && price >= lot.Take) {
-					if lot.ExitMode == ExitModeScalpFixedTP && aiExit {
-						trigger = true
-					}
+
+				//--------------------information----------------------------
+				// Take = post-only exit price
+				// FixedTPWorking = maker exit armed
+				// trigger = send maker exit attempt now
+				//----------------------------------------------------------
+
+				// FixedTPWorking means the lot has passed ProfitGate + AI/logic exit approval,
+				// and lot.Take has been set as the intended post-only exit limit.
+				// We call closeLot immediately so the maker order is placed before price crosses it.
+				if lot.ExitMode == ExitModeScalpFixedTP && lot.FixedTPWorking && aiExit {
+					trigger = true
 				}
-				if lot.Side == SideSell && (lot.Take > 0 && price <= lot.Take) {
-					if lot.ExitMode == ExitModeScalpFixedTP && aiExit {
-						trigger = true
-					}
-				}
+
 				// ⬇️ ADD THIS dust guard for Fixed-TP before calling closeLot:
 				if trigger && lot.ExitMode == ExitModeScalpFixedTP {
 					notional := lot.SizeBase * price
@@ -1146,7 +1341,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// --- NEW (minimal): equity strategy trigger detection (SELL runner add of entire spare base)
 	equityTriggerSell := false
 	var equitySpareBase float64
-	if t.lastAddEquitySell > 0 && t.equityUSD >= t.lastAddEquitySell*1.05 && d.Signal == Sell {
+	if t.lastAddEquitySell > 0 && t.equityUSD >= t.lastAddEquitySell*t.cfg.SellEquityTriggerMult && d.Signal == Sell {
 		// Only proceed if not long-only; respect existing guard
 		if t.cfg.LongOnly {
 			t.mu.Unlock()
@@ -1167,7 +1362,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// --- NEW (minimal): BUY equity-trigger flag ---(Buy runner of entire spare quote on dip)
 	equityTriggerBuy := false
 	var equitySpareQuote float64
-	if t.lastAddEquityBuy > 0 && t.equityUSD <= t.lastAddEquityBuy*0.95 && d.Signal == Buy {
+	if t.lastAddEquityBuy > 0 && t.equityUSD <= t.lastAddEquityBuy*t.cfg.BuyEquityTriggerMult && d.Signal == Buy {
 		if spare < 0 {
 			spare = 0
 		}
@@ -1186,6 +1381,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		t.mu.Unlock()
 		return fmt.Sprintf("FLAT (long-only) [%s]", d.Reason), nil
 	}
+
+	//this block might be going out =========
 	if d.Signal == Flat && !equityTriggerSell && !equityTriggerBuy {
 		log.Printf(
 			"[TRADE_GATE] lastAddBuy=%s lastAddSell=%s "+
@@ -1257,152 +1454,150 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			lastAddSide = t.lastAddSell
 		}
 
-			// 1) Spacing
-			psb := t.cfg.PyramidMinSecondsBetween
-			// TODO: remove TRACE
-			log.Printf("TRACE pyramid.spacing since_last=%.1fs need>=%ds", time.Since(lastAddSide).Seconds(), psb)
-			if time.Since(lastAddSide) < time.Duration(psb)*time.Second {
-				t.mu.Unlock()
-				hrs := time.Since(lastAddSide).Hours()
-				log.Printf("[DEBUG] GATE2 pyramid: blocked by spacing; since_last=%vHours need>=%ds", fmt.Sprintf("%.1f", hrs), psb)
-				return "HOLD", nil
-			}
+		// 1) Spacing
+		psb := t.cfg.PyramidMinSecondsBetween
+		// TODO: remove TRACE
+		log.Printf("TRACE pyramid.spacing since_last=%.1fs need>=%ds", time.Since(lastAddSide).Seconds(), psb)
+		if time.Since(lastAddSide) < time.Duration(psb)*time.Second {
+			t.mu.Unlock()
+			hrs := time.Since(lastAddSide).Hours()
+			log.Printf("[DEBUG] GATE2 pyramid: blocked by spacing; since_last=%vHours need>=%ds", fmt.Sprintf("%.1f", hrs), psb)
+			return "HOLD", nil
+		}
 
-			// 2) Adverse move gate with optional time-based exponential decay.
-			basePct := t.cfg.PyramidMinAdversePct
-			effPct := basePct
-			lambda := t.cfg.PyramidDecayLambda
-			floor := t.cfg.PyramidDecayMinPct
-			elapsedMin := 0.0
-			if lambda > 0 {
-				if !lastAddSide.IsZero() {
-					elapsedMin = time.Since(lastAddSide).Minutes()
+		// 2) Adverse move gate with optional time-based exponential decay.
+		basePct := t.cfg.PyramidMinAdversePct
+		effPct := basePct
+		lambda := t.cfg.PyramidDecayLambda
+		floor := t.cfg.PyramidDecayMinPct
+		elapsedMin := 0.0
+		if lambda > 0 {
+			if !lastAddSide.IsZero() {
+				elapsedMin = time.Since(lastAddSide).Minutes()
+			} else {
+				elapsedMin = 0.0
+			}
+			decayed := basePct * math.Exp(-lambda*elapsedMin)
+			if decayed < floor {
+				decayed = floor
+			}
+			effPct = decayed
+		}
+
+		// Capture for reason string
+		reasonBasePct = basePct
+		reasonEffPct = effPct
+		reasonElapsedHr = elapsedMin / 60.0
+
+		// Time (in minutes) to hit the floor once (t_floor_min)
+		tFloorMin := 0.0
+		if lambda > 0 && basePct > floor {
+			tFloorMin = math.Log(basePct/floor) / lambda
+		}
+
+		// TODO: remove TRACE
+		log.Printf("TRACE pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
+			side, elapsedMin, basePct, effPct, lambda, floor, tFloorMin)
+
+		// Use side-aware latest entry for adverse gate anchoring
+		last := t.latestEntryBySide(side)
+
+		if last > 0 {
+			if side == SideBuy {
+				// BUY adverse tracker (side-aware)
+				if elapsedMin >= tFloorMin {
+					if t.winLowBuy == 0 || price < t.winLowBuy {
+						t.winLowBuy = price
+					}
 				} else {
-					elapsedMin = 0.0
+					t.winLowBuy = 0
 				}
-				decayed := basePct * math.Exp(-lambda*elapsedMin)
-				if decayed < floor {
-					decayed = floor
+				// latch at 2*t_floor_min
+				if t.latchedGateBuy == 0 && elapsedMin >= 2.0*tFloorMin && t.winLowBuy > 0 {
+					t.latchedGateBuy = t.winLowBuy
+					// --- breadcrumb ---
+					log.Printf("[DEBUG] LATCH SET BUY: latchedGate=%.2f winLow=%.2f elapsedMin=%.1f tFloorMin=%.2f",
+						t.latchedGateBuy, t.winLowBuy, elapsedMin, tFloorMin)
 				}
-				effPct = decayed
-			}
+				// baseline gate: last * (1.0 - effPct); latched replaces baseline
+				gatePrice := last * (1.0 - effPct/100.0)
+				if t.latchedGateBuy > 0 {
+					gatePrice = t.latchedGateBuy
+				}
+				// clamp to min(winLowBuy, last BUY open)
+				clampP := last
+				if t.winLowBuy > 0 && t.winLowBuy < clampP {
+					clampP = t.winLowBuy
+				}
+				if gatePrice > clampP {
+					gatePrice = clampP
+				}
 
-			// Capture for reason string
-			reasonBasePct = basePct
-			reasonEffPct = effPct
-			reasonElapsedHr = elapsedMin / 60.0
+				// Copy for reason/log fields
+				reasonGatePrice = gatePrice
+				reasonLatched = t.latchedGateBuy
 
-			// Time (in minutes) to hit the floor once (t_floor_min)
-			tFloorMin := 0.0
-			if lambda > 0 && basePct > floor {
-				tFloorMin = math.Log(basePct/floor) / lambda
-			}
+				// --- breadcrumb when baseline condition met ---
+				if price <= gatePrice {
+					log.Printf("[DEBUG] pyramid: BUY baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
+						price, gatePrice, last, effPct, elapsedMin)
+				}
 
-			// TODO: remove TRACE
-			log.Printf("TRACE pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
-				side, elapsedMin, basePct, effPct, lambda, floor, tFloorMin)
+				if !(price <= gatePrice) {
+					t.mu.Unlock()
+					log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
+						price, gatePrice, t.winLowBuy, effPct, basePct, reasonElapsedHr)
+					log.Printf("TRACE pyramid.block.buy price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateBuy)
+					return "HOLD", nil
+				}
+			} else { // SELL
+				// SELL adverse tracker (side-aware)
+				if elapsedMin >= tFloorMin {
+					if t.winHighSell == 0 || price > t.winHighSell {
+						t.winHighSell = price
+					}
+				} else {
+					t.winHighSell = 0
+				}
+				if t.latchedGateSell == 0 && elapsedMin >= 2.0*tFloorMin && t.winHighSell > 0 {
+					t.latchedGateSell = t.winHighSell
+					// --- breadcrumb ---
+					log.Printf("[DEBUG] LATCH SET SELL: latchedGate=%.2f winHigh=%.2f elapsedMin=%.1f tFloorMin=%.2f",
+						t.latchedGateSell, t.winHighSell, elapsedMin, tFloorMin)
+				}
+				// baseline gate: last * (1.0 + effPct); latched replaces baseline
+				gatePrice := last * (1.0 + effPct/100.0)
+				if t.latchedGateSell > 0 {
+					gatePrice = t.latchedGateSell
+				}
+				// clamp to max(winHighSell, last SELL open)
+				clampP := last
+				if t.winHighSell > 0 && t.winHighSell > clampP {
+					clampP = t.winHighSell
+				}
+				if gatePrice < clampP {
+					gatePrice = clampP
+				}
 
-			// Use side-aware latest entry for adverse gate anchoring
-			last := t.latestEntryBySide(side)
+				// copy for legacy reason/log fields
+				reasonGatePrice = gatePrice
+				reasonLatched = t.latchedGateSell
 
-			if last > 0 {
-				if side == SideBuy {
-					// BUY adverse tracker (side-aware)
-					if elapsedMin >= tFloorMin {
-						if t.winLowBuy == 0 || price < t.winLowBuy {
-							t.winLowBuy = price
-						}
-					} else {
-						t.winLowBuy = 0
-					}
-					// latch at 2*t_floor_min
-					if t.latchedGateBuy == 0 && elapsedMin >= 2.0*tFloorMin && t.winLowBuy > 0 {
-						t.latchedGateBuy = t.winLowBuy
-						// --- breadcrumb ---
-						log.Printf("[DEBUG] LATCH SET BUY: latchedGate=%.2f winLow=%.2f elapsedMin=%.1f tFloorMin=%.2f",
-							t.latchedGateBuy, t.winLowBuy, elapsedMin, tFloorMin)
-					}
-					// baseline gate: last * (1.0 - effPct); latched replaces baseline
-					gatePrice := last * (1.0 - effPct/100.0)
-					if t.latchedGateBuy > 0 {
-						gatePrice = t.latchedGateBuy
-					}
-					// clamp to min(winLowBuy, last BUY open)
-					clampP := last
-					if t.winLowBuy > 0 && t.winLowBuy < clampP {
-						clampP = t.winLowBuy
-					}
-					if gatePrice > clampP {
-						gatePrice = clampP
-					}
+				// --- breadcrumb when baseline condition met ---
+				if price >= gatePrice {
+					log.Printf("[DEBUG] pyramid: SELL baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
+						price, gatePrice, last, effPct, elapsedMin)
+				}
 
-					// Copy for reason/log fields
-					reasonGatePrice = gatePrice
-					reasonLatched = t.latchedGateBuy
-
-					// --- breadcrumb when baseline condition met ---
-					if price <= gatePrice {
-						log.Printf("[DEBUG] pyramid: BUY baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
-							price, gatePrice, last, effPct, elapsedMin)
-					}
-
-					if !(price <= gatePrice) {
-						t.mu.Unlock()
-						log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
-							price, gatePrice, t.winLowBuy, effPct, basePct, reasonElapsedHr)
-						log.Printf("TRACE pyramid.block.buy price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateBuy)
-						return "HOLD", nil
-					}
-				} else { // SELL
-					// SELL adverse tracker (side-aware)
-					if elapsedMin >= tFloorMin {
-						if t.winHighSell == 0 || price > t.winHighSell {
-							t.winHighSell = price
-						}
-					} else {
-						t.winHighSell = 0
-					}
-					if t.latchedGateSell == 0 && elapsedMin >= 2.0*tFloorMin && t.winHighSell > 0 {
-						t.latchedGateSell = t.winHighSell
-						// --- breadcrumb ---
-						log.Printf("[DEBUG] LATCH SET SELL: latchedGate=%.2f winHigh=%.2f elapsedMin=%.1f tFloorMin=%.2f",
-							t.latchedGateSell, t.winHighSell, elapsedMin, tFloorMin)
-					}
-					// baseline gate: last * (1.0 + effPct); latched replaces baseline
-					gatePrice := last * (1.0 + effPct/100.0)
-					if t.latchedGateSell > 0 {
-						gatePrice = t.latchedGateSell
-					}
-					// clamp to max(winHighSell, last SELL open)
-					clampP := last
-					if t.winHighSell > 0 && t.winHighSell > clampP {
-						clampP = t.winHighSell
-					}
-					if gatePrice < clampP {
-						gatePrice = clampP
-					}
-
-					// copy for legacy reason/log fields
-					reasonGatePrice = gatePrice
-					reasonLatched = t.latchedGateSell
-
-					// --- breadcrumb when baseline condition met ---
-					if price >= gatePrice {
-						log.Printf("[DEBUG] pyramid: SELL baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
-							price, gatePrice, last, effPct, elapsedMin)
-					}
-
-					if !(price >= gatePrice) {
-						t.mu.Unlock()
-						log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
-							price, gatePrice, t.winHighSell, effPct, basePct, reasonElapsedHr)
-						log.Printf("TRACE pyramid.block.sell price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateSell)
-						return "HOLD", nil
-					}
+				if !(price >= gatePrice) {
+					t.mu.Unlock()
+					log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
+						price, gatePrice, t.winHighSell, effPct, basePct, reasonElapsedHr)
+					log.Printf("TRACE pyramid.block.sell price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateSell)
+					return "HOLD", nil
 				}
 			}
-
-
+		}
 	}
 
 	// --- Fixed-USD risk sizing & ramping (no equity dependency) ---
@@ -1486,8 +1681,39 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	confMult := confidenceRiskMultiplier(d.Signal, d.PUp)
 	if confMult <= 0 {
-		confMult = 1.0
+		log.Printf(
+			"[TRADE_GATE] confidence=%.2f lastAddBuy=%s lastAddSell=%s "+
+				"winLowBuy=%.2f winHighSell=%.2f "+
+				"latchedBuy=%.2f latchedSell=%.2f "+
+				"nearestBuy{take=%.2f net=%.2f idx=%d} "+
+				"nearestSell{take=%.2f net=%.2f idx=%d} ",
+			confMult,
+			t.lastAddBuy.Format(time.RFC3339),
+			t.lastAddSell.Format(time.RFC3339),
+			t.winLowBuy,
+			t.winHighSell,
+			t.latchedGateBuy,
+			t.latchedGateSell,
+			t.nearestTakeBuy,
+			t.nearestNetBuy,
+			t.nearestIdxBuy,
+			t.nearestTakeSell,
+			t.nearestNetSell,
+			t.nearestIdxSell,
+		)
+		t.mu.Unlock()
+		return "HOLD", nil // or continue / hold
 	}
+
+	entryAIMode := "AI_MATCH"
+	entryProfitGateUSD := t.cfg.ProfitGateUSD
+
+	if d.Raw == Flat {
+		entryAIMode = "AI_FLAT"
+		entryProfitGateUSD = t.cfg.ProfitGateUSD * confMult
+	}
+
+	//Applying confidence multiplier to scalp, that of equity comes later
 	if !(equityTriggerSell || equityTriggerBuy) {
 		oldQuote := quote
 		quote *= confMult
@@ -1503,8 +1729,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	}
 	base := quote / price
 
-	// --- NEW: staged sizing for EQUITY triggers (SELL in BASE, BUY in QUOTE) ---
-	// --- NEW: override sizing for normal Sell using stage function of spare base as the order size (SELL only) ---
+	// Staged sizing for EQUITY triggers (SELL in BASE, BUY in QUOTE) ---
+	// Override sizing for normal Sell using stage function of spare base as the order size (SELL only) ---
 	if equityTriggerSell && side == SideSell && equitySpareBase > 0 {
 		stagesSell := equityStagesSell()
 		startStage := clampStage(t.equityStageSell, len(stagesSell))
@@ -1822,23 +2048,24 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// --- NEW: side-biased Lot reason (without winLow) ---
 	var gatesReason string
 	if equityTriggerSell && side == SideSell && equitySpareBase > 0 {
-		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquitySell=%.2f pct_diff_sell=%.6f equitySpareBase=%.8f ", t.equityUSD, t.lastAddEquitySell, t.equityUSD/t.lastAddEquitySell, equitySpareBase)
+		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquitySell=%.2f sellEquityMultiplier=%.6f(triggerAt:>=%.2f) equitySpareBase=%.8f confidenceMult=%.2f", t.equityUSD, t.lastAddEquitySell, t.equityUSD/t.lastAddEquitySell, t.cfg.SellEquityTriggerMult, equitySpareBase, confMult)
 	} else if equityTriggerBuy && side == SideBuy && equitySpareQuote > 0 {
-		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquityBuy=%.2f pct_diff_buy=%.6f equitySpareQuote=%.2f", t.equityUSD, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, equitySpareQuote)
+		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquityBuy=%.2f buyEquityMultiplier=%.6f(triggerAt:>=%.2f) equitySpareQuote=%.2f confidenceMult=%.2f", t.equityUSD, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, t.cfg.BuyEquityTriggerMult, equitySpareQuote, confMult)
 	} else if side == SideBuy {
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f",
-			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr,
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f confidenceMult=%.2f",
+			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, confMult,
 		)
 	} else { // SideSell
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f",
-			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr,
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f confidenceMult=%.2f",
+			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, confMult,
 		)
 	}
 	if d.Reason != "" {
 		gatesReason = appendReason(gatesReason, "decision{"+d.Reason+"}")
 	}
+
 	refundFromOpposite := 0.0
 	if t.refundBuyUSD > 0 && side == SideSell {
 		// turn refund USD into extra base at current price
@@ -1990,9 +2217,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			if t.cfg.BaseStep > 0 {
 				baseAtLimit = math.Floor(baseAtLimit/t.cfg.BaseStep) * t.cfg.BaseStep
 			}
-			if baseAtLimit <= 0 || baseAtLimit*limitPx < minNotional {
-				// If we cannot satisfy min-notional with snapped values, skip maker path; fall through to market path below.
-			} else {
+
+			if baseAtLimit > 0 && baseAtLimit*limitPx >= minNotional {
 				log.Printf("TRACE postonly.place side=%s limit=%.8f baseReq=%.8f timeout_sec=%d", side, limitPx, baseAtLimit, limitWait)
 				orderID, err := t.broker.PlaceLimitPostOnly(ctx, t.cfg.ProductID, side, limitPx, baseAtLimit)
 				if err == nil && strings.TrimSpace(orderID) != "" {
@@ -2004,7 +2230,33 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						t.pendingSellCh = make(chan OpenResult, 1)
 					}
 
-					// Create per-side pending & ctx
+					// -------------------------------------------------------------------------------------------------
+					// Create per-side PendingOpen ("lot-in-waiting") and cancellation context.
+					//
+					// Mental model:
+					// PendingOpen = proposed future lot
+					// Position    = confirmed live lot
+					//
+					// Lifecycle:
+					// Decision → maker order submitted → PendingOpen → repricing/polling
+					// → fill confirmed → Position (real lot) → PendingOpen cleared
+					//
+					// Why:
+					// Maker/post-only fills are asynchronous and may complete several ticks later.
+					// PendingOpen preserves decision-time state until execution is finalized.
+					//
+					// Stores:
+					// - Order lifecycle (order id, repricing history, deadline)
+					// - Intended trade (quote, base-at-limit, take)
+					// - Decision metadata (confidence multiplier, AI mode, profit gate)
+					// - Refund-service bookkeeping
+					// - Equity-trigger runner flags
+					//
+					// Important:
+					// Final execution price/base/fee are unknown here.
+					// At fill time, PendingOpen matures into a real Position (lot),
+					// carrying forward the original decision metadata.
+					// -------------------------------------------------------------------------------------------------
 					pctx, cancel := context.WithCancel(ctx)
 					t.mu.Lock()
 					if side == SideBuy {
@@ -2025,6 +2277,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							EquitySell:       equityTriggerSell,
 							OrderID:          orderID,
 							History:          make([]string, 0, 5), // NEW
+							ConfidenceMult:   confMult,
+							EntryAIMode:      entryAIMode,
+							ProfitGateUSD:    entryProfitGateUSD,
 						}
 						if side == SideBuy && t.pendingBuy != nil {
 							log.Printf("TRACE postonly.pending.set side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f dl=%s eqFlags[buy=%v sell=%v]",
@@ -2049,6 +2304,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							EquitySell:       equityTriggerSell,
 							OrderID:          orderID,
 							History:          make([]string, 0, 5), // NEW
+							ConfidenceMult:   confMult,
+							EntryAIMode:      entryAIMode,
+							ProfitGateUSD:    entryProfitGateUSD,
 						}
 						if side == SideSell && t.pendingSell != nil {
 							log.Printf("TRACE postonly.pending.set side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f dl=%s eqFlags[buy=%v sell=%v]",
@@ -2056,7 +2314,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 								t.pendingSell.Deadline.Format(time.RFC3339), t.pendingSell.EquityBuy, t.pendingSell.EquitySell)
 						}
 					}
-					// Capture immutable copy for poller
+
+					// Capture immutable references for the async poller.
+					// The poller manages repricing, partial fills, timeout handling,
+					// and eventually emits a finalized OpenResult back to step().
 					var pend *PendingOpen
 					var ch chan OpenResult
 					var pctxUse context.Context
@@ -2071,7 +2332,19 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					}
 					t.mu.Unlock()
 
-					// Spawn poller (Phase 4: smart reprice loop) with environment guardrails
+					// Spawn async maker-first poller.
+					//
+					// Responsibilities:
+					// - Poll broker order state
+					// - Track partial fills across reprices
+					// - Reprice resting maker orders when allowed
+					// - Aggregate session VWAP/base/fees
+					// - Emit a finalized OpenResult (filled or non-filled)
+					//
+					// Important:
+					// The poller NEVER mutates lots directly.
+					// step() drain path remains the single synchronous authority that
+					// converts PendingOpen → Position and persists state.
 					go func(initOrderID string, side OrderSide, deadline time.Time, initLimitPx, initBaseAtLimit float64, pend *PendingOpen, ch chan OpenResult, pctx context.Context) {
 						log.Printf("TRACE postonly.poll.start side=%s init_id=%s init_limit=%.8f init_base=%.8f deadline=%s offset_bps=%.3f",
 							side, initOrderID, initLimitPx, initBaseAtLimit, deadline.Format(time.RFC3339), offsetBps)
@@ -2303,10 +2576,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						// Do not clear pending here; step() drain will clear & persist synchronously
 					}(orderID, side, time.Now().Add(time.Duration(limitWait)*time.Second), limitPx, baseAtLimit, pend, ch, pctxUse)
 
-					// Build reason string now that all gates are known
-					// (We set it after spawning to minimize time outside the lock.)
+					// Persist PendingOpen after poller launch.
+					// Pending state is intentionally cleared later by the synchronous
+					// drain path, not by the poller goroutine.
 					t.mu.Lock()
-					// persist pending state
 					_ = t.saveStateNoLock()
 					t.mu.Unlock()
 					return fmt.Sprintf("OPEN-PENDING side=%s", side), nil
@@ -2481,7 +2754,19 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		LotID:            len(book.Lots),
 		EntryOrderID:     "", // market path has no known order id here
 		RefundPortionUSD: refundFromOpposite,
+		ConfidenceMult:   confMult,
+		EntryAIMode:      entryAIMode,
+		ProfitGateUSD:    entryProfitGateUSD,
 	}
+
+	log.Printf(
+		"[KPI] lot.created side=%s mode=%s conf=%.2f gate=%.2f",
+		newLot.Side,
+		newLot.EntryAIMode,
+		newLot.ConfidenceMult,
+		newLot.ProfitGateUSD,
+	)
+
 	book.Lots = append(book.Lots, newLot)
 	t.consolidateDust(book, priceToUse, minNotional)
 	t.didConsolidateStartup = false

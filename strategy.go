@@ -18,6 +18,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -208,65 +209,56 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		(d.Raw == Buy && logicOpinion == Sell) ||
 			(d.Raw == Sell && logicOpinion == Buy)
 
+	// Final entry signal policy:
+	//
+	// AI BUY + logic BUY   → BUY
+	// AI FLAT + logic BUY  → BUY
+	// AI SELL + logic BUY  → FLAT
+	//
+	// AI SELL + logic SELL → SELL
+	// AI FLAT + logic SELL → SELL
+	// AI BUY + logic SELL  → FLAT
+	//
+	// logicOpinion already represents the MACD/EMA reversal logic,
+	// so we no longer hard-block d.Signal separately below.
+	final := finalSignalFromAILogic(d.Raw, logicOpinion)
+
 	if logicDisagreement {
-		d.Signal = Flat
 		reason = appendReason(reason, "logic_disagreement")
 	}
 
-	switch d.Signal {
-	case Sell:
-		// 1. Must have strong MACD turn-origin evidence
-		if !snap.MACDStrongPositive {
-			d.Signal = Flat
-			reason = appendReason(reason, "macd_not_strong_positive_for_sell")
-		}
-
-		// 2. Must have weakening momentum
-		if !snap.MACDMomentumDown {
-			d.Signal = Flat
-			reason = appendReason(reason, "macd_not_momentum_down_for_sell")
-		}
-
-		// 3. Need at least ONE EMA exhaustion pattern
-		if !emaSellPattern {
-			d.Signal = Flat
-			reason = appendReason(reason,
-				"ema_no_sell_exhaustion_pattern")
-		}
-
-	case Buy:
-		// Must have strong MACD negative turn-origin
-		if !snap.MACDStrongNegative {
-			d.Signal = Flat
-			reason = appendReason(reason,
-				"macd_not_strong_negative_for_buy")
-		}
-
-		// Must have improving momentum
-		if !snap.MACDMomentumUp {
-			d.Signal = Flat
-			reason = appendReason(reason,
-				"macd_not_momentum_up_for_buy")
-		}
-
-		// Need at least one EMA recovery pattern
-		if !emaBuyPattern {
-
-			d.Signal = Flat
-			reason = appendReason(reason,
-				"ema_no_buy_recovery_pattern")
-		}
-	default:
+	if d.Raw == Flat && logicOpinion != Flat {
 		reason = appendReason(reason,
-			fmt.Sprintf("ai_%s_logicOpinion=%s", d.Raw, logicOpinion))
+			fmt.Sprintf("ai_FLAT_logicOpinion=%s_allowed", logicOpinion))
 	}
+
+	if d.Raw == logicOpinion && logicOpinion != Flat {
+		reason = appendReason(reason,
+			fmt.Sprintf("ai_%s_logicOpinion=%s_match",
+				d.Raw, logicOpinion))
+	}
+
+	if logicOpinion == Flat {
+		reason = appendReason(reason,
+			fmt.Sprintf("ai_%s_logicOpinion=FLAT", d.Raw))
+	}
+
+	d.Signal = final
+
+	log.Printf(
+		"[KPI] logic.route ai=%s logic=%s final=%s pUp=%.5f",
+		d.Raw,
+		logicOpinion,
+		d.Signal,
+		d.PUp,
+	)
 
 	reason = fmt.Sprintf(
 		"[LOGIC_GATE] gateTF=%s aiRaw=%s logicOpinion=%s logicDisagreement=%v final=%s | "+
 			"MACD{line=%.5f turn=%.5f hist=%.5f dHist=%.5f dSmooth=%.5f} | "+
 			"EMA{spread=%.6f ema2050=%.6f} | "+
 			"Pattern{emaHighPeak=%v emaLowBottom=%v emaPriceDownGoingUp=%v emaPriceUpGoingDown=%v emaSellPattern=%v emaBuyPattern=%v macdMomentumDown=%v macdMomentumUp=%v macdStrongPositive=%v macdStrongNegative=%v} | "+
-			"Gate{eps=%.5f blocked=%v}",
+			"Gate{eps=%.5f note=%v}",
 
 		t.cfg.GateTF,
 		d.Raw,
@@ -303,6 +295,22 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	return d
 }
 
+func finalSignalFromAILogic(aiRaw Signal, logicOpinion Signal) Signal {
+	if logicOpinion == Flat {
+		return Flat
+	}
+
+	if aiRaw == Flat {
+		return logicOpinion
+	}
+
+	if aiRaw == logicOpinion {
+		return logicOpinion
+	}
+
+	return Flat
+}
+
 func appendReason(base, reason string) string {
 	if reason == "" {
 		return base
@@ -315,25 +323,28 @@ func appendReason(base, reason string) string {
 
 func confidenceRiskMultiplier(sig Signal, pUp float64) float64 {
 	switch sig {
-
 	case Buy:
 		switch {
-		case pUp >= 0.57:
+		case pUp >= 0.60:
 			return 1.00
-		case pUp >= 0.55:
+		case pUp >= 0.574:
 			return 0.80
 		case pUp >= 0.53:
-			return 0.50
+			return 0.55
+		case pUp >= 0.484:
+			return 0.30
 		}
 
 	case Sell:
 		switch {
-		case pUp <= 0.30:
+		case pUp <= 0.28:
 			return 1.00
 		case pUp <= 0.32:
 			return 0.80
 		case pUp <= 0.34:
-			return 0.50
+			return 0.55
+		case pUp <= 0.43:
+			return 0.30
 		}
 	}
 

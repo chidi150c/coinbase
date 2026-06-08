@@ -95,6 +95,7 @@ func loadBotEnv() {
 		"RISK_PER_TRADE_USD": {}, "USD_EQUITY": {}, "TAKE_PROFIT_PCT": {},
 		"STOP_LOSS_PCT": {}, "ORDER_MIN_USD": {}, "LONG_ONLY": {}, "PORT": {}, "BRIDGE_URL": {},
 		"BUY_THRESHOLD": {}, "SELL_THRESHOLD": {}, "USE_MA_FILTER": {}, "BACKTEST_SLEEP_MS": {},
+		"SELL_EQUITY_TRIGGER_MULT": {}, "BUY_EQUITY_TRIGGER_MULT": {},
 
 		// unified AI / fee-aware labels
 		"AI_LABEL_HORIZON": {},

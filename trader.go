@@ -67,6 +67,9 @@ type Position struct {
 	ExitMode         ExitMode `json:"exit_mode,omitempty"`        // RunnerTrailing | ScalpFixedTP
 	Version          int      `json:"version"`
 	FixedTPWorking   bool     `json:"-"` // internal flag: emulate a posted TP (re-post each tick while gate holds)
+	ConfidenceMult   float64  `json:"confidence_mult,omitempty"`
+	ProfitGateUSD    float64  `json:"profit_gate_usd,omitempty"`
+	EntryAIMode      string   `json:"entry_ai_mode,omitempty"` // AI_MATCH or AI_FLAT
 
 	TrailActivateGateUSD float64 `json:"activate_gate_usd"` // from TRAIL_ACTIVATE_USD (runner/scalp)
 	TrailDistancePct     float64 `json:"distance_pct"`      // from TRAIL_DISTANCE_PCT (runner/scalp)
@@ -147,9 +150,12 @@ type PendingOpen struct {
 	// NEW: keep last few order IDs so we accept late fills after a cancel/reprice.
 	History []string `json:"history,omitempty"` // capped (e.g., last 5)
 	// NEW: accumulate fills across reprices
-	AccumBase   float64 // sum of executed base over all prior order IDs
-	AccumQuote  float64 // sum of executed quote
-	AccumFeeUSD float64 // sum of fees (if provided)
+	AccumBase      float64 // sum of executed base over all prior order IDs
+	AccumQuote     float64 // sum of executed quote
+	AccumFeeUSD    float64 // sum of fees (if provided)
+	ConfidenceMult float64 `json:"confidence_mult,omitempty"`
+	ProfitGateUSD  float64 `json:"profit_gate_usd,omitempty"`
+	EntryAIMode    string  `json:"entry_ai_mode,omitempty"` // AI_MATCH or AI_FLAT
 }
 
 type OpenResult struct {

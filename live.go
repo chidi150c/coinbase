@@ -33,7 +33,7 @@ import (
 // runLive executes the real-time loop with cadence intervalSec (seconds).
 func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 
-	var execHistory []Candle       // keep as 1m/tick execution history
+	var execHistory []Candle   // keep as 1m/tick execution history
 	var signalHistory []Candle // new 5m decision history
 
 	if intervalSec <= 0 {
@@ -122,7 +122,6 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 	}
 	log.Printf("[SIGNAL] signalTF=%s signalGateTF=%s gateTF=%s", signalTF, signalGateTF, trader.cfg.GateTF)
 
-
 	//-------------------------------------------------------------------------------------
 	// Warmup execHistory candles separately: history remains the execution history (1m/tick)
 	//-------------------------------------------------------------------------------------
@@ -192,7 +191,6 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 		log.Printf("TRACE WARMUP giving up: no candles after bridge-paged and broker-large/fallback")
 		log.Fatalf("warmup failed: no candles returned")
 	}
-
 
 	//-------------------------------------------------------------------------------------
 	// // Warmup signal candles separately: signalHistory is used only for ML direction
@@ -339,7 +337,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				//fetch lates candle for execHistory and signalHistory
 				//-----------------------------------------------------------------
 				if time.Since(lastCandleSync) >= time.Duration(trader.cfg.CandleResync())*time.Second {
-					
+
 					//-------------------------------------------
 					//fetch candles for execHistory: output latest candle becomes current candle in execHistory
 					//----------------------------------------------
@@ -403,7 +401,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 					} else if err != nil {
 						log.Fatalf("[SYNC] Candle update failed: error: %v", err)
 					}
-					
+
 					//-------------------------------------------
 					//fetch candles for signalHistory: output sigLatest candle becomes current candle in signalHistory
 					//----------------------------------------------

@@ -27,17 +27,19 @@ type Config struct {
 	GateTF    string // e.g., "ONE_MINUTE"
 
 	// Safety & sizing
-	DryRun              bool
-	MaxDailyLossPct     float64
-	RiskPerTradeUSD     float64
-	USDEquity           float64
-	TakeProfitPct       float64
-	StopLossPct         float64
-	OrderMinUSD         float64 // legacy floor; still honored if MinNotional <= 0
-	MinNotional         float64 // preferred exchange min notional (QUOTE); if >0, use this instead of OrderMinUSD
-	LongOnly            bool    // prevent SELL entries when flat on spot
-	RequireBaseForShort bool    // spot safety: require base inventory to short (default true)
-	FeeRatePct          float64 // % fee applied on entry/exit trades
+	DryRun                bool
+	MaxDailyLossPct       float64
+	RiskPerTradeUSD       float64
+	USDEquity             float64
+	SellEquityTriggerMult float64
+	BuyEquityTriggerMult  float64
+	TakeProfitPct         float64
+	StopLossPct           float64
+	OrderMinUSD           float64 // legacy floor; still honored if MinNotional <= 0
+	MinNotional           float64 // preferred exchange min notional (QUOTE); if >0, use this instead of OrderMinUSD
+	LongOnly              bool    // prevent SELL entries when flat on spot
+	RequireBaseForShort   bool    // spot safety: require base inventory to short (default true)
+	FeeRatePct            float64 // % fee applied on entry/exit trades
 
 	// Normalized venue filters (optionally populated via env or bridge)
 	PriceTick float64 // price tick size (QUOTE)
@@ -145,17 +147,19 @@ func loadConfigFromEnv() Config {
 		GateTF:    getEnv("GATE_TF", "ONE_MINUTE"),
 
 		// Universal, unprefixed knobs
-		DryRun:              getEnvBool("DRY_RUN", true),
-		MaxDailyLossPct:     getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
-		RiskPerTradeUSD:     getEnvFloat("RISK_PER_TRADE_USD", 80.0),
-		USDEquity:           getEnvFloat("USD_EQUITY", 1000.0),
-		TakeProfitPct:       getEnvFloat("TAKE_PROFIT_PCT", 0.8),
-		StopLossPct:         getEnvFloat("STOP_LOSS_PCT", 0.4),
-		OrderMinUSD:         getEnvFloat("ORDER_MIN_USD", 5.00),
-		MinNotional:         getEnvFloat("MIN_NOTIONAL", 10.0), // preferred when > 0
-		LongOnly:            getEnvBool("LONG_ONLY", true),
-		RequireBaseForShort: getEnvBool("REQUIRE_BASE_FOR_SHORT", true),
-		FeeRatePct:          getEnvFloat("FEE_RATE_PCT", 0.10),
+		DryRun:                getEnvBool("DRY_RUN", true),
+		MaxDailyLossPct:       getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
+		RiskPerTradeUSD:       getEnvFloat("RISK_PER_TRADE_USD", 80.0),
+		USDEquity:             getEnvFloat("USD_EQUITY", 1000.0),
+		SellEquityTriggerMult: getEnvFloat("SELL_EQUITY_TRIGGER_MULT", 1.05),
+		BuyEquityTriggerMult:  getEnvFloat("BUY_EQUITY_TRIGGER_MULT", 0.95),
+		TakeProfitPct:         getEnvFloat("TAKE_PROFIT_PCT", 0.8),
+		StopLossPct:           getEnvFloat("STOP_LOSS_PCT", 0.4),
+		OrderMinUSD:           getEnvFloat("ORDER_MIN_USD", 5.00),
+		MinNotional:           getEnvFloat("MIN_NOTIONAL", 10.0), // preferred when > 0
+		LongOnly:              getEnvBool("LONG_ONLY", true),
+		RequireBaseForShort:   getEnvBool("REQUIRE_BASE_FOR_SHORT", true),
+		FeeRatePct:            getEnvFloat("FEE_RATE_PCT", 0.10),
 
 		// Venue filters (can be hydrated by bridge and/or env file)
 		PriceTick: getEnvFloat("PRICE_TICK", 0.01),

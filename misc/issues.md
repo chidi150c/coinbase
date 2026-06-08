@@ -670,3 +670,13 @@ cp /tmp/test1_raw_6h.log ~/coinbase/test1_raw_6h.log
 wc -l /tmp/test1_raw_6h.log
 ls -lh /tmp/test1_raw_6h.log
 ______
+
+==================================================
+
+ok i want to move on to something else. I want to:
+1) move buy threshold up from 0.53 to 0.574: why: because it delays AI in reaching buy exhaustion
+2) I will then BUY/SELL at logic BUY/SELL when AI is FLAT or both matches as well. only block disagreement
+3) Then I will expand confidence multiplier beyond thresholds starting at the models up/down avg of 0.484/0.43 (how did we even come across these figures?)
+4) This will cause a lot of tiny trade amount LOTs in the state file, so exit should not be first come first save but first profitable first Exit. And the same AI-Logic is applicable to both Entry and Exit
+5) monitor how pyramid adverse will be blocking 
+6) trades made on AI FLAT should have target Net of their confidence multiplier value 
