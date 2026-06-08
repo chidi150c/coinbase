@@ -51,6 +51,7 @@ const (
 	Flat Signal = iota
 	Buy
 	Sell
+	Hold
 )
 
 // Decision captures what to do and why.
@@ -182,7 +183,19 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		return d
 	}
 
-	snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1, t.cfg.MACDLineEPS, t.cfg.AIFeatureDim)
+	eps := t.cfg.MACDLineEPS
+	routeRaw := d.Raw
+	if (routeRaw == d.Signal && routeRaw == Flat) {
+		logicSig, logicConfMult := logicGateConfidenceMultiplier(d.PUp, 0.484, 0.43)
+		if logicSig == Hold {
+			routeRaw = Hold
+		} else {
+			eps *= logicConfMult
+			if eps < 10 { eps = 10 }
+		}
+	}
+
+	snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1, eps, t.cfg.AIFeatureDim)
 	if !ok {
 		reason = fmt.Sprintf(
 			"[LOGIC_GATE] skip no_feature_snapshot len=%d gateTF=%s",
@@ -205,10 +218,8 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		logicOpinion = Sell
 	}
 
-	logicDisagreement :=
-		(d.Raw == Buy && logicOpinion == Sell) ||
-			(d.Raw == Sell && logicOpinion == Buy)
-
+	logicDisagreement := (routeRaw == Buy && logicOpinion == Sell) || (routeRaw == Sell && logicOpinion == Buy)
+	
 	// Final entry signal policy:
 	//
 	// AI BUY + logic BUY   → BUY
@@ -221,40 +232,40 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	//
 	// logicOpinion already represents the MACD/EMA reversal logic,
 	// so we no longer hard-block d.Signal separately below.
-	final := finalSignalFromAILogic(d.Raw, logicOpinion)
+	final := finalSignalFromAILogic(routeRaw, logicOpinion)
+	d.Signal = final
 
 	if logicDisagreement {
 		reason = appendReason(reason, "logic_disagreement")
 	}
 
-	if d.Raw == Flat && logicOpinion != Flat {
-		reason = appendReason(reason,
-			fmt.Sprintf("ai_FLAT_logicOpinion=%s_allowed", logicOpinion))
+	if routeRaw == Flat && logicOpinion != Flat {
+		reason = appendReason(reason, fmt.Sprintf("ai_FLAT_logicOpinion=%s_allowed", logicOpinion))
 	}
 
-	if d.Raw == logicOpinion && logicOpinion != Flat {
-		reason = appendReason(reason,
-			fmt.Sprintf("ai_%s_logicOpinion=%s_match",
-				d.Raw, logicOpinion))
+	if routeRaw == Hold && logicOpinion != Flat {
+		reason = appendReason(reason, fmt.Sprintf("ai_HOLD_neutral_band_logicOpinion=%s_blocked", logicOpinion))
+	}
+
+	if routeRaw == logicOpinion && logicOpinion != Flat {
+		reason = appendReason(reason, fmt.Sprintf("ai_%s_logicOpinion=%s_match", routeRaw, logicOpinion))
 	}
 
 	if logicOpinion == Flat {
-		reason = appendReason(reason,
-			fmt.Sprintf("ai_%s_logicOpinion=FLAT", d.Raw))
+		reason = appendReason(reason, fmt.Sprintf("ai_%s_logicOpinion=FLAT", routeRaw))
 	}
 
-	d.Signal = final
-
 	log.Printf(
-		"[KPI] logic.route ai=%s logic=%s final=%s pUp=%.5f",
+		"[KPI] logic.route ai=%s route=%s logic=%s final=%s pUp=%.5f", 
 		d.Raw,
+		routeRaw,
 		logicOpinion,
 		d.Signal,
 		d.PUp,
 	)
 
 	reason = fmt.Sprintf(
-		"[LOGIC_GATE] gateTF=%s aiRaw=%s logicOpinion=%s logicDisagreement=%v final=%s | "+
+		"[LOGIC_GATE] gateTF=%s aiRaw=%s route=%s logicOpinion=%s logicDisagreement=%v final=%s | "+
 			"MACD{line=%.5f turn=%.5f hist=%.5f dHist=%.5f dSmooth=%.5f} | "+
 			"EMA{spread=%.6f ema2050=%.6f} | "+
 			"Pattern{emaHighPeak=%v emaLowBottom=%v emaPriceDownGoingUp=%v emaPriceUpGoingDown=%v emaSellPattern=%v emaBuyPattern=%v macdMomentumDown=%v macdMomentumUp=%v macdStrongPositive=%v macdStrongNegative=%v} | "+
@@ -262,6 +273,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 
 		t.cfg.GateTF,
 		d.Raw,
+		routeRaw,
 		logicOpinion,
 		logicDisagreement,
 		d.Signal,
@@ -286,7 +298,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		snap.MACDStrongPositive,
 		snap.MACDStrongNegative,
 
-		t.cfg.MACDLineEPS,
+		eps,
 		reason,
 	)
 
@@ -359,4 +371,15 @@ func shouldExitByAILogic(lot *Position, d Decision) bool {
 		return d.Signal == Buy
 	}
 	return false
+}
+
+func logicGateConfidenceMultiplier(pUp, modelUpAvg, modelDownAvg float64) (Signal, float64) {
+	switch {
+	case pUp >= modelUpAvg:
+		return Buy, 0.55
+	case pUp <= modelDownAvg:
+		return Sell, 0.55
+	default:
+		return Hold, 0.00
+	}
 }
