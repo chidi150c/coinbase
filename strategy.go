@@ -42,6 +42,8 @@ func (s Signal) String() string {
 		return "BUY"
 	case Sell:
 		return "SELL"
+	case Hold:
+		return "HOLD"
 	default:
 		return "FLAT"
 	}
@@ -111,11 +113,22 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 		PUp:        pUp,
 	}
 
-	if pUp > t.cfg.BuyThreshold {
+	buyThreshold := t.cfg.BuyThreshold
+	sellThreshold := t.cfg.SellThreshold
+	if t.model != nil {
+		if t.model.BuyThreshold > 0 {
+			buyThreshold = t.model.BuyThreshold
+		}
+		if t.model.SellThreshold > 0 {
+			sellThreshold = t.model.SellThreshold
+		}
+	}
+
+	if pUp > buyThreshold {
 		base.Signal = Buy
 		base.Raw = Buy
 		base.Confidence = pUp
-	} else if pUp < t.cfg.SellThreshold {
+	} else if pUp < sellThreshold {
 		base.Signal = Sell
 		base.Raw = Sell
 		base.Confidence = 1 - pUp
@@ -343,29 +356,32 @@ func appendReason(base, reason string) string {
 	return base + " | " + reason
 }
 
-func confidenceRiskMultiplier(sig Signal, pUp float64) float64 {
+func confidenceRiskMultiplier(sig Signal, pUp, modelUpAvg, modelDownAvg, buyThreshold, sellThreshold float64) float64 {
+	midBuy := (modelUpAvg + buyThreshold) / 2
+	midSell := (modelDownAvg + sellThreshold) / 2
+
 	switch sig {
 	case Buy:
 		switch {
-		case pUp >= 0.60:
+		case pUp >= buyThreshold+0.05:
 			return 1.00
-		case pUp >= 0.574:
+		case pUp >= buyThreshold:
 			return 0.80
-		case pUp >= 0.53:
+		case pUp >= midBuy:
 			return 0.55
-		case pUp >= 0.484:
+		case pUp >= modelUpAvg:
 			return 0.30
 		}
 
 	case Sell:
 		switch {
-		case pUp <= 0.28:
+		case pUp <= sellThreshold-0.05:
 			return 1.00
-		case pUp <= 0.32:
+		case pUp <= sellThreshold:
 			return 0.80
-		case pUp <= 0.34:
+		case pUp <= midSell:
 			return 0.55
-		case pUp <= 0.43:
+		case pUp <= modelDownAvg:
 			return 0.30
 		}
 	}
