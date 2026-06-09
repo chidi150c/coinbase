@@ -183,15 +183,25 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		return d
 	}
 
+	modelUpAvg := t.model.AvgUp
+	modelDownAvg := t.model.AvgDown
+	if modelUpAvg <= 0 {
+		modelUpAvg = 0.484
+	}
+	if modelDownAvg <= 0 {
+		modelDownAvg = 0.43
+	}
 	eps := t.cfg.MACDLineEPS
 	routeRaw := d.Raw
-	if (routeRaw == d.Signal && routeRaw == Flat) {
-		logicSig, logicConfMult := logicGateConfidenceMultiplier(d.PUp, 0.484, 0.43)
+	if routeRaw == d.Signal && routeRaw == Flat {
+		logicSig, logicConfMult := logicGateConfidenceMultiplier(d.PUp, modelUpAvg, modelDownAvg)
 		if logicSig == Hold {
 			routeRaw = Hold
 		} else {
 			eps *= logicConfMult
-			if eps < 10 { eps = 10 }
+			if eps < 10 {
+				eps = 10
+			}
 		}
 	}
 
@@ -219,7 +229,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	}
 
 	logicDisagreement := (routeRaw == Buy && logicOpinion == Sell) || (routeRaw == Sell && logicOpinion == Buy)
-	
+
 	// Final entry signal policy:
 	//
 	// AI BUY + logic BUY   → BUY
@@ -256,7 +266,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	}
 
 	log.Printf(
-		"[KPI] logic.route ai=%s route=%s logic=%s final=%s pUp=%.5f", 
+		"[KPI] logic.route ai=%s route=%s logic=%s final=%s pUp=%.5f",
 		d.Raw,
 		routeRaw,
 		logicOpinion,

@@ -5,6 +5,7 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"sort"
 )
 
 type LogisticModel struct {
@@ -14,6 +15,11 @@ type LogisticModel struct {
 	FeatDim     int       `json:"FeatDim"`
 	FeatureMean []float64 `json:"FeatureMean,omitempty"`
 	FeatureStd  []float64 `json:"FeatureStd,omitempty"`
+
+	AvgUp         float64 `json:"AvgUp,omitempty"`
+	AvgDown       float64 `json:"AvgDown,omitempty"`
+	BuyThreshold  float64 `json:"BuyThreshold,omitempty"`
+	SellThreshold float64 `json:"SellThreshold,omitempty"`
 }
 
 func newModel(featureDim int) *LogisticModel {
@@ -343,7 +349,7 @@ func (m *LogisticModel) logFitReport(feats [][]float64, labels []float64) {
 	var correct, tp, tn, fp, fn int
 	var upSum, downSum float64
 	var upN, downN int
-
+	pUps := make([]float64, 0, len(feats))
 	for i := range feats {
 		p := m.Predict(feats[i])
 
@@ -376,8 +382,10 @@ func (m *LogisticModel) logFitReport(feats [][]float64, labels []float64) {
 			downSum += p
 			downN++
 		}
+		pUps = append(pUps, p)
 	}
-
+	m.BuyThreshold = percentile(pUps, 0.75)
+	m.SellThreshold = percentile(pUps, 0.25)
 	acc := float64(correct) / float64(len(labels))
 
 	precision := 0.0
@@ -400,8 +408,11 @@ func (m *LogisticModel) logFitReport(feats [][]float64, labels []float64) {
 		avgDown = downSum / float64(downN)
 	}
 
+	m.AvgUp = avgUp
+	m.AvgDown = avgDown
+
 	log.Printf(
-		"[MODEL_FIT] rows=%d feat_dim=%d acc=%.4f precision=%.4f recall=%.4f tp=%d tn=%d fp=%d fn=%d avg_up=%.5f avg_down=%.5f separation=%.5f",
+		"[MODEL_FIT] rows=%d feat_dim=%d acc=%.4f precision=%.4f recall=%.4f tp=%d tn=%d fp=%d fn=%d avg_up=%.5f avg_down=%.5f separation=%.5f buy_q75=%.5f sell_q25=%.5f",
 		len(labels),
 		m.FeatDim,
 		acc,
@@ -414,6 +425,8 @@ func (m *LogisticModel) logFitReport(feats [][]float64, labels []float64) {
 		avgUp,
 		avgDown,
 		avgUp-avgDown,
+		m.BuyThreshold,
+		m.SellThreshold,
 	)
 }
 
@@ -443,4 +456,25 @@ func (m *LogisticModel) loss(feats [][]float64, labels []float64) float64 {
 	}
 
 	return loss + reg
+}
+
+func percentile(vals []float64, p float64) float64 {
+	if len(vals) == 0 {
+		return 0.5
+	}
+
+	cp := append([]float64(nil), vals...) // copy
+	sort.Float64s(cp)
+
+	idx := p * float64(len(cp)-1)
+
+	lo := int(math.Floor(idx))
+	hi := int(math.Ceil(idx))
+
+	if lo == hi {
+		return cp[lo]
+	}
+
+	w := idx - float64(lo)
+	return cp[lo]*(1-w) + cp[hi]*w
 }
