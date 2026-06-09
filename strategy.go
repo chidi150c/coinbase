@@ -19,6 +19,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"time"
 )
 
@@ -64,7 +65,8 @@ type Decision struct {
 	Reason     string
 
 	// Carry raw pUp and selected soft-gate flags for downstream gate-audit strings.
-	PUp float64
+	PUp          float64
+	DecisionPath string
 }
 
 // SignalToSide converts the intent into a broker side.
@@ -196,13 +198,24 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		return d
 	}
 
-	modelUpAvg := t.model.AvgUp
-	modelDownAvg := t.model.AvgDown
-	if modelUpAvg <= 0 {
-		modelUpAvg = 0.484
-	}
-	if modelDownAvg <= 0 {
-		modelDownAvg = 0.43
+	buyThreshold := t.cfg.BuyThreshold
+	sellThreshold := t.cfg.SellThreshold
+	modelUpAvg := 0.484
+	modelDownAvg := 0.43
+
+	if t.model != nil {
+		if t.model.AvgUp > 0 {
+			modelUpAvg = t.model.AvgUp
+		}
+		if t.model.AvgDown > 0 {
+			modelDownAvg = t.model.AvgDown
+		}
+		if t.model.BuyThreshold > 0 {
+			buyThreshold = t.model.BuyThreshold
+		}
+		if t.model.SellThreshold > 0 {
+			sellThreshold = t.model.SellThreshold
+		}
 	}
 	eps := t.cfg.MACDLineEPS
 	routeRaw := d.Raw
@@ -227,6 +240,48 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		)
 		d.Reason = appendReason(d.Reason, reason)
 		return d
+	}
+
+	thresholdBuffer := 0.005
+
+	if routeRaw == Sell && math.Abs(d.PUp-sellThreshold) < thresholdBuffer {
+		effectiveEPS := t.cfg.MACDLineEPS * 0.55
+		if effectiveEPS < 10 {
+			effectiveEPS = 10
+		}
+
+		macdWouldClear := math.Abs(snap.MACDLine) >= effectiveEPS
+
+		if snap.EMALowBottom &&
+			snap.MACDMomentumUp &&
+			macdWouldClear {
+
+			routeRaw = Flat
+			eps = effectiveEPS
+			snap.MACDStrongNegative = true
+
+			reason = appendReason(reason, "weak_AI_SELL_softened_for_trough_BUY")
+		}
+	}
+
+	if routeRaw == Buy && math.Abs(d.PUp-buyThreshold) < thresholdBuffer {
+		effectiveEPS := t.cfg.MACDLineEPS * 0.55
+		if effectiveEPS < 10 {
+			effectiveEPS = 10
+		}
+
+		macdWouldClear := math.Abs(snap.MACDLine) >= effectiveEPS
+
+		if snap.EMAHighPeak &&
+			snap.MACDMomentumDown &&
+			macdWouldClear {
+
+			routeRaw = Flat
+			eps = effectiveEPS
+			snap.MACDStrongPositive = true
+
+			reason = appendReason(reason, "weak_AI_BUY_softened_for_peak_SELL")
+		}
 	}
 
 	logicOpinion := Flat
@@ -257,6 +312,14 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	// so we no longer hard-block d.Signal separately below.
 	final := finalSignalFromAILogic(routeRaw, logicOpinion)
 	d.Signal = final
+
+	d.DecisionPath = fmt.Sprintf(
+		"raw_%s_route_%s_logic_%s_final_%s",
+		d.Raw,
+		routeRaw,
+		logicOpinion,
+		d.Signal,
+	)
 
 	if logicDisagreement {
 		reason = appendReason(reason, "logic_disagreement")
@@ -292,7 +355,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 			"MACD{line=%.5f turn=%.5f hist=%.5f dHist=%.5f dSmooth=%.5f} | "+
 			"EMA{spread=%.6f ema2050=%.6f} | "+
 			"Pattern{emaHighPeak=%v emaLowBottom=%v emaPriceDownGoingUp=%v emaPriceUpGoingDown=%v emaSellPattern=%v emaBuyPattern=%v macdMomentumDown=%v macdMomentumUp=%v macdStrongPositive=%v macdStrongNegative=%v} | "+
-			"Gate{eps=%.5f note=%v}",
+			"Gate{eps=%.5f note=%v decisionPath=%s} modelUpAvg=%.5f modelDownAvg=%.5f",
 
 		t.cfg.GateTF,
 		d.Raw,
@@ -323,6 +386,9 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 
 		eps,
 		reason,
+		d.DecisionPath,
+		modelUpAvg,
+		modelDownAvg,
 	)
 
 	d.Reason = appendReason(d.Reason, reason)
@@ -354,6 +420,27 @@ func appendReason(base, reason string) string {
 		return reason
 	}
 	return base + " | " + reason
+}
+
+func riskMultiplier(decisionPath string,sig Signal,pUp, modelUpAvg, modelDownAvg,buyThreshold, sellThreshold float64,) float64 {
+	switch decisionPath {
+
+	case "raw_BUY_route_FLAT_logic_SELL_final_SELL":
+		return 0.30
+
+	case "raw_SELL_route_FLAT_logic_BUY_final_BUY":
+		return 0.30
+
+	default:
+		return confidenceRiskMultiplier(
+			sig,
+			pUp,
+			modelUpAvg,
+			modelDownAvg,
+			buyThreshold,
+			sellThreshold,
+		)
+	}
 }
 
 func confidenceRiskMultiplier(sig Signal, pUp, modelUpAvg, modelDownAvg, buyThreshold, sellThreshold float64) float64 {

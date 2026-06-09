@@ -1244,7 +1244,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-61",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-62",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1701,7 +1701,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 	}
 
-	confMult := confidenceRiskMultiplier(d.Signal, d.PUp, modelUpAvg, modelDownAvg, buyThreshold, sellThreshold)
+	confMult := riskMultiplier(d.DecisionPath, d.Signal, d.PUp, modelUpAvg, modelDownAvg, buyThreshold, sellThreshold)
 	if confMult <= 0 {
 		log.Printf(
 			"[TRADE_GATE] confidence=%.2f lastAddBuy=%s lastAddSell=%s "+
