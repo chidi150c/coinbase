@@ -1244,7 +1244,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-62",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-63",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1376,7 +1376,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 	}
 
-	log.Printf("[DEBUG] EQUITY Trading: equityUSD=%.2f lastAddEquitySell=%.2f pct_diff_sell=%.6f lastAddEquityBuy=%.2f pct_diff_buy=%.6f", t.equityUSD, t.lastAddEquitySell, t.equityUSD/t.lastAddEquitySell, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy)
+	log.Printf("[DEBUG] EQUITY Trading: equityUSD=%.2f lastAddEquitySell=%.2f sellEquityMultiplier=%.6f(triggerAt:>=%.2f) lastAddEquityBuy=%.2f buyEquityMultiplier=%.6f(triggerAt:>=%.2f) ", t.equityUSD, t.lastAddEquitySell, t.equityUSD/t.lastAddEquitySell, t.cfg.SellEquityTriggerMult, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, t.cfg.BuyEquityTriggerMult)
 
 	// Long-only veto for SELL when flat; unchanged behavior.
 	if d.Signal == Sell && t.cfg.LongOnly {
@@ -1521,11 +1521,67 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					log.Printf("[DEBUG] LATCH SET BUY: latchedGate=%.2f winLow=%.2f elapsedMin=%.1f tFloorMin=%.2f",
 						t.latchedGateBuy, t.winLowBuy, elapsedMin, tFloorMin)
 				}
-				// baseline gate: last * (1.0 - effPct); latched replaces baseline
+
+				// baseline gate: last * (1.0 - effPct)
 				gatePrice := last * (1.0 - effPct/100.0)
+
+				// -------------------------------------------------------------------------------------------------
+				// Stale BUY latch reset
+				//
+				// Why:
+				// BUY latch is created only after enough time has passed:
+				//
+				// With current config:
+				//
+				//	PYRAMID_MIN_ADVERSE_PCT = 1.5
+				//	PYRAMID_DECAY_MIN_PCT   = 0.4
+				//	PYRAMID_DECAY_LAMBDA    = 0.02
+				//
+				// tFloorMin ≈ 66 minutes
+				//
+				// Timeline:
+				//
+				//	0h   → BUY add occurs
+				//	1.1h → winLow tracking starts (tFloorMin)
+				//	2.2h → latchedGateBuy created (2 * tFloorMin)
+				//	4.0h → eligible for reset
+				//
+				// Meaning:
+				// A 4h reset window effectively gives the latch ~1.8 hours to do its job
+				// after it exists, before allowing a stale reset.
+				//
+				// Safety:
+				// We DO NOT reset by time alone.
+				// Reset only when:
+				//  1. enough time has passed since last BUY add, AND
+				//  2. logic has flipped opposite (SELL)
+				//
+				// -------------------------------------------------------------------------------------------------
+				buyLatchAgeHr := time.Since(t.lastAddBuy).Hours()
+				latchResetHours := t.cfg.PyramidLatchResetHours
+
+				if t.latchedGateBuy > 0 &&
+					buyLatchAgeHr >= latchResetHours &&
+					d.Signal == Sell {
+
+					log.Printf(
+						"[DEBUG] LATCH RESET BUY: ageHr=%.2f logic=%s old_latched=%.2f price=%.2f last=%.2f",
+						buyLatchAgeHr,
+						d.Signal,
+						t.latchedGateBuy,
+						price,
+						last,
+					)
+
+					t.latchedGateBuy = 0
+					t.winLowBuy = 0
+				}
+
+				// latched replaces baseline
 				if t.latchedGateBuy > 0 {
 					gatePrice = t.latchedGateBuy
 				}
+
 				// clamp to min(winLowBuy, last BUY open)
 				clampP := last
 				if t.winLowBuy > 0 && t.winLowBuy < clampP {
@@ -1567,11 +1623,69 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					log.Printf("[DEBUG] LATCH SET SELL: latchedGate=%.2f winHigh=%.2f elapsedMin=%.1f tFloorMin=%.2f",
 						t.latchedGateSell, t.winHighSell, elapsedMin, tFloorMin)
 				}
-				// baseline gate: last * (1.0 + effPct); latched replaces baseline
+
+				// baseline gate: last * (1.0 + effPct/100.0)
 				gatePrice := last * (1.0 + effPct/100.0)
+
+				// -------------------------------------------------------------------------------------------------
+				// Stale SELL latch reset
+				//
+				// Why:
+				// SELL latch is created only after enough time has passed:
+				//
+				// With current config:
+				//
+				//	PYRAMID_MIN_ADVERSE_PCT = 1.5
+				//	PYRAMID_DECAY_MIN_PCT   = 0.4
+				//	PYRAMID_DECAY_LAMBDA    = 0.02
+				//
+				// tFloorMin ≈ 66 minutes
+				//
+				// Timeline:
+				//
+				//	0h   → SELL add occurs
+				//	1.1h → winHigh tracking starts (tFloorMin)
+				//	2.2h → latchedGateSell created (2 * tFloorMin)
+				//	4.0h → eligible for reset
+				//
+				// Meaning:
+				// A 4h reset window effectively gives the latch ~1.8 hours to do its job
+				// after it exists, before allowing a stale reset.
+				//
+				// Safety:
+				// We DO NOT reset by time alone.
+				// Reset only when:
+				//  1. enough time has passed since last SELL add, AND
+				//  2. logic has flipped opposite (BUY)
+				//
+				// This prevents a stale high from permanently freezing SELL adds while
+				// still preserving adverse-move protection.
+				// -------------------------------------------------------------------------------------------------
+				sellLatchAgeHr := time.Since(t.lastAddSell).Hours()
+				latchResetHours := t.cfg.PyramidLatchResetHours
+
+				if t.latchedGateSell > 0 &&
+					sellLatchAgeHr >= latchResetHours &&
+					d.Signal == Buy {
+
+					log.Printf(
+						"[DEBUG] LATCH RESET SELL: ageHr=%.2f logic=%s old_latched=%.2f price=%.2f last=%.2f",
+						sellLatchAgeHr,
+						d.Signal,
+						t.latchedGateSell,
+						price,
+						last,
+					)
+
+					t.latchedGateSell = 0
+					t.winHighSell = 0
+				}
+
+				// latched replaces baseline
 				if t.latchedGateSell > 0 {
 					gatePrice = t.latchedGateSell
 				}
+
 				// clamp to max(winHighSell, last SELL open)
 				clampP := last
 				if t.winHighSell > 0 && t.winHighSell > clampP {

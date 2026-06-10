@@ -242,7 +242,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		return d
 	}
 
-	thresholdBuffer := 0.005
+	thresholdBuffer := t.cfg.AIThresholdBuffer
 
 	if routeRaw == Sell && math.Abs(d.PUp-sellThreshold) < thresholdBuffer {
 		effectiveEPS := t.cfg.MACDLineEPS * 0.55
@@ -422,7 +422,7 @@ func appendReason(base, reason string) string {
 	return base + " | " + reason
 }
 
-func riskMultiplier(decisionPath string,sig Signal,pUp, modelUpAvg, modelDownAvg,buyThreshold, sellThreshold float64,) float64 {
+func riskMultiplier(decisionPath string, sig Signal, pUp, modelUpAvg, modelDownAvg, buyThreshold, sellThreshold float64) float64 {
 	switch decisionPath {
 
 	case "raw_BUY_route_FLAT_logic_SELL_final_SELL":

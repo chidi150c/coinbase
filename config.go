@@ -74,6 +74,7 @@ type Config struct {
 	PyramidMinAdversePct     float64
 	PyramidDecayLambda       float64 // per-minute
 	PyramidDecayMinPct       float64
+	PyramidLatchResetHours   float64
 
 	// TP-decay
 	ScalpTPDecayEnable bool
@@ -123,8 +124,9 @@ type Config struct {
 	AIFeatureDim     int
 
 	// Unified AI — fee-aware horizon labels
-	AILabelHorizon int
-	AIMinEdgePct   float64
+	AILabelHorizon    int
+	AIMinEdgePct      float64
+	AIThresholdBuffer float64
 
 	// Runtime optional toggles retained from the old Extended() holder, but no model mode.
 	WalkForwardMin int  // minutes between live refits; 0 disables
@@ -192,6 +194,7 @@ func loadConfigFromEnv() Config {
 		PyramidMinAdversePct:     getEnvFloat("PYRAMID_MIN_ADVERSE_PCT", 0.0),
 		PyramidDecayLambda:       getEnvFloat("PYRAMID_DECAY_LAMBDA", 0.0),
 		PyramidDecayMinPct:       getEnvFloat("PYRAMID_DECAY_MIN_PCT", 0.0),
+		PyramidLatchResetHours:   getEnvFloat("PYRAMID_LATCH_RESET_HOURS", 4.0),
 
 		// TP-decay
 		ScalpTPDecayEnable: getEnvBool("SCALP_TP_DECAY_ENABLE", false),
@@ -241,8 +244,9 @@ func loadConfigFromEnv() Config {
 		AIFeatureDim:     getEnvInt("AI_FEATURE_DIM", 18),
 
 		// Unified AI — fee-aware labels
-		AILabelHorizon: getEnvInt("AI_LABEL_HORIZON", 15),
-		AIMinEdgePct:   getEnvFloat("AI_MIN_EDGE_PCT", 0.05),
+		AILabelHorizon:    getEnvInt("AI_LABEL_HORIZON", 15),
+		AIMinEdgePct:      getEnvFloat("AI_MIN_EDGE_PCT", 0.05),
+		AIThresholdBuffer: getEnvFloat("AI_THRESHOLD_BUFFER", 0.005),
 
 		// Runtime optional toggles
 		WalkForwardMin: getEnvInt("WALK_FORWARD_MIN", 0),

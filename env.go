@@ -107,14 +107,16 @@ func loadBotEnv() {
 		"AI_SIGNAL_TF":         {},
 		"USE_MACD_SLOPE_GATE":  {},
 		"MACD_LINE_EPS":        {},
+		"AI_THRESHOLD_BUFFER":  {},
 
 		// ---- pyramiding/env-driven knobs ----
 		"ALLOW_PYRAMIDING":            {},
 		"PYRAMID_MIN_SECONDS_BETWEEN": {},
 		"PYRAMID_MIN_ADVERSE_PCT":     {},
 		// time-based exponential decay
-		"PYRAMID_DECAY_LAMBDA":  {},
-		"PYRAMID_DECAY_MIN_PCT": {},
+		"PYRAMID_DECAY_LAMBDA":      {},
+		"PYRAMID_DECAY_MIN_PCT":     {},
+		"PYRAMID_LATCH_RESET_HOURS": {},
 
 		// tick/candle sync & risk
 		"USE_TICK_PRICE":               {},
