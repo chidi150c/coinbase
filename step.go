@@ -1244,7 +1244,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-63",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-64",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1560,21 +1560,25 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				buyLatchAgeHr := time.Since(t.lastAddBuy).Hours()
 				latchResetHours := t.cfg.PyramidLatchResetHours
 
-				if t.latchedGateBuy > 0 &&
-					buyLatchAgeHr >= latchResetHours &&
-					d.Signal == Sell {
+				if t.latchedGateBuy > 0 && buyLatchAgeHr >= latchResetHours && d.Signal == Sell && t.RecentLow > t.latchedGateBuy {
+
+					oldLatch := t.latchedGateBuy
+					oldWin := t.winLowBuy
+
+					t.latchedGateBuy = t.RecentLow
+					t.winLowBuy = t.RecentLow
 
 					log.Printf(
-						"[DEBUG] LATCH RESET BUY: ageHr=%.2f logic=%s old_latched=%.2f price=%.2f last=%.2f",
+						"[DEBUG] LATCH RESET BUY: ageHr=%.2f logic=%s old_latched=%.2f old_winLow=%.2f new_latched=%.2f new_winLow=%.2f price=%.2f last=%.2f",
 						buyLatchAgeHr,
 						d.Signal,
+						oldLatch,
+						oldWin,
 						t.latchedGateBuy,
+						t.winLowBuy,
 						price,
 						last,
 					)
-
-					t.latchedGateBuy = 0
-					t.winLowBuy = 0
 				}
 
 				// latched replaces baseline
@@ -1664,21 +1668,24 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				sellLatchAgeHr := time.Since(t.lastAddSell).Hours()
 				latchResetHours := t.cfg.PyramidLatchResetHours
 
-				if t.latchedGateSell > 0 &&
-					sellLatchAgeHr >= latchResetHours &&
-					d.Signal == Buy {
+				if t.latchedGateSell > 0 && sellLatchAgeHr >= latchResetHours && d.Signal == Buy && t.RecentHigh < t.latchedGateSell {
+
+					oldLatch := t.latchedGateSell
+					oldWin := t.winHighSell
+					t.latchedGateSell = t.RecentHigh
+					t.winHighSell = t.RecentHigh
 
 					log.Printf(
-						"[DEBUG] LATCH RESET SELL: ageHr=%.2f logic=%s old_latched=%.2f price=%.2f last=%.2f",
+						"[DEBUG] LATCH RESET SELL: ageHr=%.2f logic=%s old_latched=%.2f old_winHigh=%.2f new_latched=%.2f new_winHigh=%.2f price=%.2f last=%.2f",
 						sellLatchAgeHr,
 						d.Signal,
+						oldLatch,
+						oldWin,
 						t.latchedGateSell,
+						t.winHighSell,
 						price,
 						last,
 					)
-
-					t.latchedGateSell = 0
-					t.winHighSell = 0
 				}
 
 				// latched replaces baseline

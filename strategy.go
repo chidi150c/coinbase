@@ -496,3 +496,84 @@ func logicGateConfidenceMultiplier(pUp, modelUpAvg, modelDownAvg float64) (Signa
 		return Hold, 0.00
 	}
 }
+// lowestLow returns the lowest candle low within the rolling lookback window.
+// If no candle falls inside the window, returns 0.
+//
+// Example:
+//   lowestLow(execHistory, 4*time.Hour)
+func lowestLow(candles []Candle, lookback time.Duration) float64 {
+	if len(candles) == 0 || lookback <= 0 {
+		return 0
+	}
+
+	latest := candles[len(candles)-1].Time
+	if latest.IsZero() {
+		latest = time.Now().UTC()
+	}
+
+	cutoff := latest.Add(-lookback)
+
+	lowest := 0.0
+	found := false
+
+	for i := len(candles) - 1; i >= 0; i-- {
+		c := candles[i]
+
+		// stop once outside window
+		if !c.Time.IsZero() && c.Time.Before(cutoff) {
+			break
+		}
+
+		if !found || c.Low < lowest {
+			lowest = c.Low
+			found = true
+		}
+	}
+
+	if !found {
+		return 0
+	}
+
+	return lowest
+}
+
+// highestHigh returns the highest candle high within the rolling lookback window.
+// If no candle falls inside the window, returns 0.
+//
+// Example:
+//   highestHigh(execHistory, 4*time.Hour)
+func highestHigh(candles []Candle, lookback time.Duration) float64 {
+	if len(candles) == 0 || lookback <= 0 {
+		return 0
+	}
+
+	latest := candles[len(candles)-1].Time
+	if latest.IsZero() {
+		latest = time.Now().UTC()
+	}
+
+	cutoff := latest.Add(-lookback)
+
+	highest := 0.0
+	found := false
+
+	for i := len(candles) - 1; i >= 0; i-- {
+		c := candles[i]
+
+		// stop once outside window
+		if !c.Time.IsZero() && c.Time.Before(cutoff) {
+			break
+		}
+
+		if !found || c.High > highest {
+			highest = c.High
+			found = true
+		}
+	}
+
+	if !found {
+		return 0
+	}
+
+	return highest
+}

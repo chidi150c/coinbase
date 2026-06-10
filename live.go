@@ -334,7 +334,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				// Periodic candle resync from the broker (use getter for hot-ish reload)
 
 				//-----------------------------------------------------------------
-				//fetch lates candle for execHistory and signalHistory
+				//fetch lates candles for execHistory and signalHistory
 				//-----------------------------------------------------------------
 				if time.Since(lastCandleSync) >= time.Duration(trader.cfg.CandleResync())*time.Second {
 
@@ -427,7 +427,85 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 					}
 				}
 
+				// -------------------------------------------------------------------------------------------------
+				// Walk-forward model refit (optional)
+				//
+				// Purpose:
+				// Periodically retrain/update the live model using the latest signalHistory
+				// so predictions adapt to newer market behavior without restarting the bot.
+				//
+				// Important execution order:
+				// This runs BEFORE fetching the per-tick live price and before step().
+				// Reason:
+				// We do not want to fetch a fresh market price and then delay acting on it
+				// while model retraining occurs. By refitting first, step() receives the
+				// freshest possible price after any model update.
+				//
+				// Safety:
+				// - maybeWalkForwardRefit() decides internally whether a refit is actually due.
+				// - We only swap the live model if:
+				//     1. a newer refit timestamp exists, and
+				//     2. the returned model is valid (non-nil).
+				// - Model swap is protected by trader.mu.
+				// - Updated model state is persisted immediately so restart recovery uses
+				//   the latest fit timestamp and weights.
+				//
+				// Persistence:
+				// Saves:
+				//   - trader.model
+				//   - trader.lastFit
+				//
+				// Diagnostics:
+				// Logs:
+				//   - save failures
+				//   - model fit timestamp
+				//   - feature dimension
+				//   - number of trained weights
+				// -------------------------------------------------------------------------------------------------
+				prevLastFit := trader.lastFit
+
+				// Walk-forward refit (optional)
+				lastRefit, model = maybeWalkForwardRefit(trader.cfg, model, signalHistory, lastRefit)
+
+				if lastRefit != nil && lastRefit.After(prevLastFit) && model != nil {
+					trader.mu.Lock()
+					trader.model = model
+					trader.lastFit = *lastRefit
+
+					if err := trader.saveStateNoLock(); err != nil {
+						log.Printf("[WARN] saveState after walk-forward refit: %v", err)
+					} else {
+						log.Printf("[MODEL_STATE] saved lastFit=%s feat_dim=%d weights=%d",
+							trader.lastFit.Format(time.RFC3339),
+							trader.model.FeatDim,
+							len(trader.model.W),
+						)
+					}
+
+					trader.mu.Unlock()
+				}
+
+				// -----------------------------------------------------------------
+				// Refresh rolling recent extremes used for stale pyramid latch
+				// rebase logic.
+				//
+				// Why here:
+				// - Computed once per tick (cheap O(window))
+				// - Avoids recomputing inside step() hot path
+				// - Uses freshly synced candle history
+				// - Available for next-tick latch maintenance
+				//
+				// Window:
+				// Last 4 hours of candles.
+				// BUY side uses RecentLow.
+				// SELL side uses RecentHigh.
+				// -----------------------------------------------------------------
+				trader.RecentHigh = highestHigh(execHistory, 4*time.Hour)
+				trader.RecentLow = lowestLow(execHistory, 4*time.Hour)
+
+				//-------------------------------------------------------------
 				// Per-tick price updates (bridge or broker)
+				//---------------------------------------------------
 				ctxPx, cancelPx := context.WithTimeout(ctx, 2*time.Second)
 				var px float64
 				var stale bool
@@ -458,27 +536,6 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				}
 
 				cancelPx()
-
-				prevLastFit := trader.lastFit
-
-				// Walk-forward refit (optional)
-				lastRefit, model = maybeWalkForwardRefit(trader.cfg, model, signalHistory, lastRefit)
-
-				if lastRefit != nil && lastRefit.After(prevLastFit) && model != nil {
-					trader.mu.Lock()
-					trader.model = model
-					trader.lastFit = *lastRefit
-					if err := trader.saveStateNoLock(); err != nil {
-						log.Printf("[WARN] saveState after walk-forward refit: %v", err)
-					} else {
-						log.Printf("[MODEL_STATE] saved lastFit=%s feat_dim=%d weights=%d",
-							trader.lastFit.Format(time.RFC3339),
-							trader.model.FeatDim,
-							len(trader.model.W),
-						)
-					}
-					trader.mu.Unlock()
-				}
 
 				// Step trader
 				msg, err := trader.step(ctx, execHistory, signalHistory, px)
