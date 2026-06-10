@@ -496,11 +496,13 @@ func logicGateConfidenceMultiplier(pUp, modelUpAvg, modelDownAvg float64) (Signa
 		return Hold, 0.00
 	}
 }
+
 // lowestLow returns the lowest candle low within the rolling lookback window.
 // If no candle falls inside the window, returns 0.
 //
 // Example:
-//   lowestLow(execHistory, 4*time.Hour)
+//
+//	lowestLow(execHistory, 4*time.Hour)
 func lowestLow(candles []Candle, lookback time.Duration) float64 {
 	if len(candles) == 0 || lookback <= 0 {
 		return 0
@@ -541,7 +543,8 @@ func lowestLow(candles []Candle, lookback time.Duration) float64 {
 // If no candle falls inside the window, returns 0.
 //
 // Example:
-//   highestHigh(execHistory, 4*time.Hour)
+//
+//	highestHigh(execHistory, 4*time.Hour)
 func highestHigh(candles []Candle, lookback time.Duration) float64 {
 	if len(candles) == 0 || lookback <= 0 {
 		return 0

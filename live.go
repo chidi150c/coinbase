@@ -502,6 +502,11 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				// -----------------------------------------------------------------
 				trader.RecentHigh = highestHigh(execHistory, 4*time.Hour)
 				trader.RecentLow = lowestLow(execHistory, 4*time.Hour)
+				log.Printf(
+					"TRACE recent.window high=%.2f low=%.2f",
+					trader.RecentHigh,
+					trader.RecentLow,
+				)
 
 				//-------------------------------------------------------------
 				// Per-tick price updates (bridge or broker)
