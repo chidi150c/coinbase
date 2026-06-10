@@ -819,9 +819,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// TODO: remove TRACE
 	lsb := len(t.book(SideBuy).Lots)
 	lss := len(t.book(SideSell).Lots)
-	log.Printf("TRACE step.start ts=%s price=%.8f lotsBuy=%d lotsSell=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f",
+	log.Printf("TRACE step.start ts=%s price=%.8f lotsBuy=%d lotsSell=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f recentLow=%.8f recentHigh=%.8f",
 		now.Format(time.RFC3339), c[len(c)-1].Close, lsb, lss,
-		t.lastAddBuy.Format(time.RFC3339), t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell)
+		t.lastAddBuy.Format(time.RFC3339), t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell, t.RecentLow, t.RecentHigh)
 
 	price := livePrice
 
@@ -1588,11 +1588,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				// clamp to min(winLowBuy, last BUY open)
 				clampP := last
-				if t.winLowBuy > 0 && t.winLowBuy < clampP {
+
+				// Before latch: winLowBuy can tighten the gate.
+				// After latch: latchedGateBuy freezes the adverse gate.
+				if t.latchedGateBuy == 0 && t.winLowBuy > 0 && t.winLowBuy < clampP {
 					clampP = t.winLowBuy
-				}
-				if gatePrice > clampP {
-					gatePrice = clampP
+					if gatePrice > clampP {
+						gatePrice = clampP
+					}
 				}
 
 				// Copy for reason/log fields
@@ -1693,13 +1696,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					gatePrice = t.latchedGateSell
 				}
 
-				// clamp to max(winHighSell, last SELL open)
+				// Before latch: winHighSell can tighten the gate.
+				// After latch: latchedGateSell freezes the adverse gate.
 				clampP := last
-				if t.winHighSell > 0 && t.winHighSell > clampP {
+				if t.latchedGateSell == 0 && t.winHighSell > 0 && t.winHighSell > clampP {
 					clampP = t.winHighSell
-				}
-				if gatePrice < clampP {
-					gatePrice = clampP
+					if gatePrice < clampP {
+						gatePrice = clampP
+					}
 				}
 
 				// copy for legacy reason/log fields
