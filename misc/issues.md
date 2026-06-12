@@ -680,3 +680,53 @@ ok i want to move on to something else. I want to:
 4) This will cause a lot of tiny trade amount LOTs in the state file, so exit should not be first come first save but first profitable first Exit. And the same AI-Logic is applicable to both Entry and Exit
 5) monitor how pyramid adverse will be blocking 
 6) trades made on AI FLAT should have target Net of their confidence multiplier value 
+
+==================================================================================
+
+Case 1: AI 5m and Logic 1m have no overlap.
+Case 2: Logic itself is always FLAT.
+Case 2.1: AI_BUY/AI_SELL weak-AI path fails.
+Case 2.1A: threshold-window condition not entered.
+Case 2.1B: macdWouldClear fails.
+Case 2.2: AI_FLAT route produces no logic BUY/SELL.
+
+======================================================
+
+When AI_FLAT_LOGIC_BUY/SEL what was Final Decision?
+
+chidi@localhost:~$
+chidi@localhost:~$ grep "aiRaw=FLAT" /opt/coinbase/logs/audit/binance_audit.log | \
+awk -v cutoff="$(date -u -d '24 hours ago' '+%Y/%m/%d %H:%M:%S')" '
+{
+  ts=$3" "$4
+  if (ts < cutoff) next
+
+  if ($0 ~ /logicOpinion=BUY/) {
+    lb++
+    if ($0 ~ /final=BUY/ || $0 ~ /Decision=BUY/) fb++
+    else blockedBuy++
+  }
+
+  if ($0 ~ /logicOpinion=SELL/) {
+    ls++
+    if ($0 ~ /final=SELL/ || $0 ~ /Decision=SELL/) fs++
+    else blockedSell++
+  }
+}
+END {
+  print "AI_FLAT_LOGIC_BUY =", lb+0
+  print "AI_FLAT_FINAL_BUY =", fb+0
+  print "AI_FLAT_LOGIC_BUY_NOT_FINAL =", blockedBuy+0
+  print "AI_FLAT_LOGIC_SELL =", ls+0
+  print "AI_FLAT_FINAL_SELL =", fs+0
+  print "AI_FLAT_LOGIC_SELL_NOT_FINAL =", blockedSell+0
+}'
+
+----------output------------------------
+AI_FLAT_LOGIC_BUY = 670
+AI_FLAT_FINAL_BUY = 670
+AI_FLAT_LOGIC_BUY_NOT_FINAL = 0
+AI_FLAT_LOGIC_SELL = 154
+AI_FLAT_FINAL_SELL = 154
+AI_FLAT_LOGIC_SELL_NOT_FINAL = 0
+

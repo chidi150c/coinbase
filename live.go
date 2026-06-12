@@ -502,10 +502,27 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				// -----------------------------------------------------------------
 				trader.RecentHigh = highestHigh(execHistory, 4*time.Hour)
 				trader.RecentLow = lowestLow(execHistory, 4*time.Hour)
+
+				buyLots := 0
+				sellLots := 0
+
+				for range trader.book(SideBuy).Lots {
+					buyLots++
+				}
+				for range trader.book(SideSell).Lots {
+					sellLots++
+				}
+
 				log.Printf(
-					"TRACE recent.window high=%.2f low=%.2f",
+					"TRACE recent.window high=%.2f low=%.2f latchedBuy=%.2f latchedSell=%.2f winLowBuy=%.2f winHighSell=%.2f buyLots=%d sellLots=%d",
 					trader.RecentHigh,
 					trader.RecentLow,
+					trader.latchedGateBuy,
+					trader.latchedGateSell,
+					trader.winLowBuy,
+					trader.winHighSell,
+					buyLots,
+					sellLots,
 				)
 
 				//-------------------------------------------------------------
