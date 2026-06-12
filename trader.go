@@ -196,6 +196,8 @@ type Trader struct {
 	latchedGateSell float64
 	RecentHigh      float64
 	RecentLow       float64
+	SellGateTouchedAt time.Time
+	BuyGateTouchedAt time.Time
 
 	// --- NEW: equity-at-last-add snapshots for equity strategy trading ---
 	lastAddEquitySell float64 // replaces legacy lastAddEquity (SELL path)

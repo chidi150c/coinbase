@@ -243,89 +243,98 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	}
 
 	if t.latchedGateBuy > 0 && t.RecentLow > t.latchedGateBuy {
-		t.buyGateTouchedAt = time.Time{}
+		t.BuyGateTouchedAt = time.Time{}
 	}
 	if t.latchedGateSell > 0 && t.RecentHigh < t.latchedGateSell {
-		t.sellGateTouchedAt = time.Time{}
+		t.SellGateTouchedAt = time.Time{}
 	}
 
 	buyGateTouched := t.RecentLow > 0 && t.latchedGateBuy > 0 && t.RecentLow <= t.latchedGateBuy
 	sellGateTouched := t.RecentHigh > 0 && t.latchedGateSell > 0 && t.RecentHigh >= t.latchedGateSell
 
-	thresholdBuffer := t.cfg.AIThresholdBuffer
-	epsFactor := 0.55
-	if (buyGateTouched && t.buyGateTouchedAt.IsZero()) || (sellGateTouched && t.sellGateTouchedAt.IsZero()) {
-		t.buyGateTouchedAt = time.Now()
-		thresholdBuffer = t.cfg.AIThresholdLoosenBuffer
-		epsFactor = 0.40
-	} else if buyGateTouched || sellGateTouched {
-		thresholdBuffer = t.cfg.AIThresholdLoosenBuffer
-		epsFactor = 0.55
+	if buyGateTouched && t.BuyGateTouchedAt.IsZero() {
+		t.BuyGateTouchedAt = time.Now()
+	}
+	if sellGateTouched && t.SellGateTouchedAt.IsZero() {
+		t.SellGateTouchedAt = time.Now()
 	}
 
+	thresholdBuffer := t.cfg.AIThresholdBuffer
+	if buyGateTouched || sellGateTouched {
+		thresholdBuffer = t.cfg.AIThresholdLoosenBuffer
+	}
+
+	emaSellPattern := snap.EMAHighPeak || snap.EMAPriceUpGoingDown
+	emaBuyPattern := snap.EMALowBottom || snap.EMAPriceDownGoingUp
+
 	if routeRaw == Sell && d.PUp < sellThreshold && (sellThreshold-d.PUp) <= thresholdBuffer {
-		effectiveEPS := t.cfg.MACDLineEPS * epsFactor
+		effectiveEPS := t.cfg.MACDLineEPS * 0.55
+		if buyGateTouched {
+			effectiveEPS = t.cfg.MACDLineEPS * 0.40
+		}
 		if effectiveEPS < 10 {
 			effectiveEPS = 10
 		}
 
 		macdWouldClear := math.Abs(snap.MACDLine) >= effectiveEPS
 
-		if snap.EMALowBottom &&
-			snap.MACDMomentumUp &&
-			macdWouldClear {
-
+		if emaBuyPattern && snap.MACDMomentumUp && macdWouldClear {
 			routeRaw = Flat
 			eps = effectiveEPS
 			snap.MACDStrongNegative = true
-
-			reason = appendReason(reason, "weak_AI_SELL_softened_for_trough_BUY")
+			reason = appendReason(reason, "near_threshold_AI_SELL_softened_for_BUY")
 		}
 	}
 
 	if routeRaw == Buy && d.PUp > buyThreshold && (d.PUp-buyThreshold) <= thresholdBuffer {
-		effectiveEPS := t.cfg.MACDLineEPS * epsFactor
+		effectiveEPS := t.cfg.MACDLineEPS * 0.55
+		if sellGateTouched {
+			effectiveEPS = t.cfg.MACDLineEPS * 0.40
+		}
 		if effectiveEPS < 10 {
 			effectiveEPS = 10
 		}
 
 		macdWouldClear := math.Abs(snap.MACDLine) >= effectiveEPS
 
-		if snap.EMAHighPeak &&
-			snap.MACDMomentumDown &&
-			macdWouldClear {
-
+		if emaSellPattern && snap.MACDMomentumDown && macdWouldClear {
 			routeRaw = Flat
 			eps = effectiveEPS
 			snap.MACDStrongPositive = true
-
-			reason = appendReason(reason, "weak_AI_BUY_softened_for_peak_SELL")
+			reason = appendReason(reason, "near_threshold_AI_BUY_softened_for_SELL")
 		}
-		log.Printf("TRACE weak_ai_gate side=BUY pUp=%.5f buyThreshold=%.5f diff=%.5f buffer=%.5f macdLine=%.5f effectiveEPS=%.5f emaHighPeak=%v macdMomentumDown=%v macdWouldClear=%v",
-			d.PUp, buyThreshold, math.Abs(d.PUp-buyThreshold), thresholdBuffer,
-			snap.MACDLine, effectiveEPS, snap.EMAHighPeak, snap.MACDMomentumDown, macdWouldClear)
 	}
 
-	logicOpinion := Flat
+	buyTouchAge := time.Duration(0)
+	if !t.BuyGateTouchedAt.IsZero() {
+		buyTouchAge = time.Since(t.BuyGateTouchedAt)
+	}
 
-	// Gate remains execution-timeframe based. Do not feed signalHistory here.
-	emaSellPattern := snap.EMAHighPeak || snap.EMAPriceUpGoingDown
-	emaBuyPattern := snap.EMALowBottom || snap.EMAPriceDownGoingUp
+	sellTouchAge := time.Duration(0)
+	if !t.SellGateTouchedAt.IsZero() {
+		sellTouchAge = time.Since(t.SellGateTouchedAt)
+	}
 
-	buyTouchAge := time.Since(t.buyGateTouchedAt)
-	sellTouchAge := time.Since(t.sellGateTouchedAt)
+	softEPS := t.cfg.MACDLineEPS * 0.40
+	if softEPS < 10 {
+		softEPS = 10
+	}
+
+	softMACDNeg := snap.MACDLine <= -softEPS
+	softMACDPos := snap.MACDLine >= softEPS
 
 	normalBuy := snap.MACDStrongNegative && snap.MACDMomentumUp && emaBuyPattern
-	softenedPostTouchBuy := buyGateTouched && buyTouchAge >= time.Hour && buyTouchAge < time.Hour*2 && normalBuy
+	softenedPostTouchBuy := buyGateTouched && buyTouchAge >= time.Hour && buyTouchAge < time.Hour*2 && softMACDNeg && snap.MACDMomentumUp && emaBuyPattern
 	loosePostTouchBuy := buyGateTouched && buyTouchAge >= time.Hour*2 && snap.MACDMomentumUp && emaBuyPattern
 
 	normalSell := snap.MACDStrongPositive && snap.MACDMomentumDown && emaSellPattern
-	softenedPostTouchSell := sellGateTouched && sellTouchAge >= time.Hour && sellTouchAge < time.Hour*2 && normalSell
+	softenedPostTouchSell := sellGateTouched && sellTouchAge >= time.Hour && sellTouchAge < time.Hour*2 && softMACDPos && snap.MACDMomentumDown && emaSellPattern
 	loosePostTouchSell := sellGateTouched && sellTouchAge >= time.Hour*2 && snap.MACDMomentumDown && emaSellPattern
 
+	logicOpinion := Flat
 	if normalBuy || softenedPostTouchBuy || loosePostTouchBuy {
 		logicOpinion = Buy
-	} else if normalSell || softenedPostTouchSell || loosePostTouchSell{
+	} else if normalSell || softenedPostTouchSell || loosePostTouchSell {
 		logicOpinion = Sell
 	}
 
