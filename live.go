@@ -502,6 +502,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				// -----------------------------------------------------------------
 				trader.RecentHigh = highestHigh(execHistory, 4*time.Hour)
 				trader.RecentLow = lowestLow(execHistory, 4*time.Hour)
+				trader.latchedGateSell = trader.RecentHigh
 
 				buyLots := 0
 				sellLots := 0

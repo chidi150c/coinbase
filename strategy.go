@@ -336,7 +336,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 			modelDownAvg = t.model.AvgDown
 		}
 	}
-	
+
 	reason = appendReason(reason, fmt.Sprintf("softStrongBuy=%v softStrongSell=%v", softAboveStrongBuy, softAboveStrongSell))
 
 	reason = fmt.Sprintf(

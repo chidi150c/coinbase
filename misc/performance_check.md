@@ -354,3 +354,11 @@ awk '
 | 21:50    | 64506.24 | 0.65872 | BUY   | BUY   | FLAT  | FLAT  | 63.43 / 25.71 / 2.02 / 3.92           | 71.17 / 4.58 / -5.33 / -5.94             | emaSell=true, momentumDown=true                      |
 | 21:52    | 64454.01 | 0.59844 | BUY   | BUY   | FLAT  | FLAT  | 59.27 / 22.37 / -1.32 / 2.26          | 57.75 / -6.90 / -6.05 / -5.74            | momentumDown=true                                    |
 | 21:54    | 64494.08 | 0.64489 | BUY   | BUY   | FLAT  | FLAT  | 62.47 / 24.93 / 1.24 / 3.54           | 51.60 / -8.94 / -1.41 / -1.02            | momentumDown=true                                    |
+==============================================
+| pUp       | Meaning                                     |
+| --------- | ------------------------------------------- |
+| ≤ 0.20    | extremely strong BUY / very oversold region |
+| 0.20–0.27 | strong BUY                                  |
+| 0.27–0.32 | medium BUY                                  |
+| 0.32–0.34 | weak BUY edge                               |
+| > 0.34    | no BUY                                      |
