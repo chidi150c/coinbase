@@ -247,8 +247,8 @@ func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim i
 	// ---------------------------------------------------------------------
 
 	// Momentum direction
-	macdMomentumDown := histDeltaNow < 0
-	macdMomentumUp := histDeltaNow > 0
+	macdMomentumDown := histDeltaNow < 0 && histNow > 0
+	macdMomentumUp := histDeltaNow > 0 && histNow < 0
 
 	// Strength / turning evidence
 	macdStrongPositive := macdTurningPoint >= macdLineEPS

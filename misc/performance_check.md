@@ -2,7 +2,7 @@
 
 1) trade attempts
 
-awk -v start="$(date -u -d '6 hours ago' '+%Y/%m/%d %H:%M:%S')" '
+awk -v start="$(date -u -d '1 hours ago' '+%Y/%m/%d %H:%M:%S')" '
 $0 ~ /\[DEBUG\]/ &&
 $0 ~ /Decision=/ {
 
@@ -52,7 +52,11 @@ END {
 ' /opt/coinbase/logs/audit/binance_audit.log
 
 =========================================================================
+) Run this first to identify the latest trade/order and the 60 lines before it:
 
+grep -nE "LIVE ORDER|FILLED|filled|ORDER|Decision=(BUY|SELL)|pyramid:|OPEN-PENDING" \
+/opt/coinbase/logs/audit/binance_audit.log | tail -120
+======================================================================================
 2) what blocked them
 
 awk -v start="$(date -u -d '3 hours ago' '+%Y/%m/%d %H:%M:%S')" '
@@ -328,3 +332,25 @@ awk '
   print $0
 }
 ' | tail -100
+===============================================================================
+
+| Time UTC |    Price |     pUp | aiRaw | Route | Logic | Final | AI MACD line / hist / dHist / dSmooth | Logic MACD line / hist / dHist / dSmooth | EMA / Pattern raw materials                          |
+| -------- | -------: | ------: | ----- | ----- | ----- | ----- | ------------------------------------- | ---------------------------------------- | ---------------------------------------------------- |
+| 21:26    | 64248.17 | 0.44625 | FLAT  | FLAT  | FLAT  | FLAT  | 14.68 / -7.21 / -0.36 / -1.11         | -8.58 / -1.75 / 0.995 / 1.13             | emaBuy=true, momentumUp=true, strongNeg=false        |
+| 21:28    | 64260.39 | 0.47124 | FLAT  | HOLD  | FLAT  | FLAT  | 15.66 / -6.43 / 0.42 / -0.72          | -6.43 / 0.49 / 1.32 / 1.12               | emaBuy=false, momentumUp=true                        |
+| 21:30    | 64260.40 | 0.47146 | FLAT  | HOLD  | FLAT  | FLAT  | 14.55 / -6.03 / 0.40 / 0.41           | -4.21 / 1.89 / 0.53 / 0.70               | emaBuy=false, momentumUp=true                        |
+| 21:32    | 64275.39 | 0.55453 | BUY   | BUY   | FLAT  | FLAT  | 15.75 / -5.07 / 1.36 / 0.89           | -0.53 / 3.82 / 0.65 / 0.97               | emaBuy=false, momentumUp=true                        |
+| 21:34    | 64291.77 | 0.58600 | BUY   | BUY   | FLAT  | FLAT  | 17.06 / -4.03 / 2.40 / 1.41           | 3.02 / 5.09 / 1.02 / 0.63                | emaBuy=false, momentumUp=true                        |
+| 21:36    | 64297.10 | 0.59186 | BUY   | BUY   | FLAT  | FLAT  | 18.38 / -2.16 / 1.87 / 2.13           | 5.72 / 5.30 / 0.66 / 0.11                | emaSell=true, momentumUp=true                        |
+| 21:38    | 64317.45 | 0.59014 | BUY   | BUY   | FLAT  | FLAT  | 20.00 / -0.86 / 3.16 / 2.78           | 10.72 / 6.99 / 0.73 / 0.84               | no EMA pattern, momentumUp=true                      |
+| 21:40    | 64326.93 | 0.60524 | BUY   | BUY   | FLAT  | FLAT  | 23.03 / 1.69 / 2.36 / 2.86            | 14.75 / 7.37 / 0.14 / 0.19               | no EMA pattern, momentumUp=true                      |
+| 21:41    | 64629.86 | 0.75432 | BUY   | BUY   | FLAT  | FLAT  | 47.19 / 21.02 / 21.69 / 12.52         | 40.31 / 26.34 / 18.97 / 9.55             | no EMA pattern, momentumUp=true                      |
+| 21:42    | 64724.01 | 0.76199 | BUY   | BUY   | FLAT  | FLAT  | 54.70 / 27.03 / 27.70 / 15.53         | 67.38 / 42.73 / 16.39 / 17.68            | no EMA pattern, momentumUp=true                      |
+| 21:43    | 64615.09 | 0.74003 | BUY   | BUY   | FLAT  | FLAT  | 46.01 / 20.08 / 20.75 / 12.05         | 79.13 / 43.58 / 0.86 / 8.62              | no EMA pattern, momentumUp=true                      |
+| 21:44    | 64580.30 | 0.73032 | BUY   | BUY   | FLAT  | FLAT  | 43.24 / 17.86 / 18.53 / 10.94         | 84.66 / 39.29 / -4.29 / -1.72            | emaSell=true, momentumDown=true                      |
+| 21:45    | 64540.00 | 0.69153 | BUY   | BUY   | FLAT  | FLAT  | 57.55 / 25.73 / 7.88 / 13.20          | 84.81 / 31.55 / -7.74 / -6.01            | emaSell=true, momentumDown=true                      |
+| 21:46    | 64505.99 | 0.64750 | BUY   | BUY   | FLAT  | FLAT  | 54.83 / 23.56 / 5.70 / 12.12          | 81.25 / 22.40 / -9.16 / -8.45            | strongPositive=true, momentumDown=true               |
+| 21:48    | 64507.98 | 0.65005 | BUY   | BUY   | SELL  | FLAT  | 54.99 / 23.69 / 5.83 / 12.18          | 75.36 / 9.91 / -6.54 / -6.24             | emaSell=true, momentumDown=true, strongPositive=true |
+| 21:50    | 64506.24 | 0.65872 | BUY   | BUY   | FLAT  | FLAT  | 63.43 / 25.71 / 2.02 / 3.92           | 71.17 / 4.58 / -5.33 / -5.94             | emaSell=true, momentumDown=true                      |
+| 21:52    | 64454.01 | 0.59844 | BUY   | BUY   | FLAT  | FLAT  | 59.27 / 22.37 / -1.32 / 2.26          | 57.75 / -6.90 / -6.05 / -5.74            | momentumDown=true                                    |
+| 21:54    | 64494.08 | 0.64489 | BUY   | BUY   | FLAT  | FLAT  | 62.47 / 24.93 / 1.24 / 3.54           | 51.60 / -8.94 / -1.41 / -1.02            | momentumDown=true                                    |

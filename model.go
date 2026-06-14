@@ -384,8 +384,8 @@ func (m *LogisticModel) logFitReport(feats [][]float64, labels []float64) {
 		}
 		pUps = append(pUps, p)
 	}
-	m.BuyThreshold = percentile(pUps, 0.75)
-	m.SellThreshold = percentile(pUps, 0.25)
+	m.SellThreshold = percentile(pUps, 0.75)
+	m.BuyThreshold = percentile(pUps, 0.25)
 	acc := float64(correct) / float64(len(labels))
 
 	precision := 0.0

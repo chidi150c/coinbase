@@ -124,10 +124,8 @@ type Config struct {
 	AIFeatureDim     int
 
 	// Unified AI — fee-aware horizon labels
-	AILabelHorizon          int
-	AIMinEdgePct            float64
-	AIThresholdBuffer       float64
-	AIThresholdLoosenBuffer float64
+	AILabelHorizon int
+	AIMinEdgePct   float64
 
 	// Runtime optional toggles retained from the old Extended() holder, but no model mode.
 	WalkForwardMin int  // minutes between live refits; 0 disables
@@ -237,18 +235,16 @@ func loadConfigFromEnv() Config {
 		RepriceMaxCount:       getEnvInt("REPRICE_MAX_COUNT", 0),
 
 		// Strategy thresholds
-		BuyThreshold:     getEnvFloat("BUY_THRESHOLD", 0.55),
-		SellThreshold:    getEnvFloat("SELL_THRESHOLD", 0.45),
+		BuyThreshold:     getEnvFloat("BUY_THRESHOLD", 0.34),
+		SellThreshold:    getEnvFloat("SELL_THRESHOLD", 0.574),
 		UseMAFilter:      getEnvBool("USE_MA_FILTER", true),
 		UseMACDSlopeGate: getEnvBool("USE_MACD_SLOPE_GATE", false),
 		MACDLineEPS:      getEnvFloat("MACD_LINE_EPS", 0.0),
 		AIFeatureDim:     getEnvInt("AI_FEATURE_DIM", 18),
 
 		// Unified AI — fee-aware labels
-		AILabelHorizon:          getEnvInt("AI_LABEL_HORIZON", 15),
-		AIMinEdgePct:            getEnvFloat("AI_MIN_EDGE_PCT", 0.05),
-		AIThresholdBuffer:       getEnvFloat("AI_THRESHOLD_BUFFER", 0.005),
-		AIThresholdLoosenBuffer: getEnvFloat("AI_THRESHOLD_LOOSEN_BUFFER", 0.033),
+		AILabelHorizon: getEnvInt("AI_LABEL_HORIZON", 15),
+		AIMinEdgePct:   getEnvFloat("AI_MIN_EDGE_PCT", 0.05),
 
 		// Runtime optional toggles
 		WalkForwardMin: getEnvInt("WALK_FORWARD_MIN", 0),

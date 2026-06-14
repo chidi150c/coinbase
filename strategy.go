@@ -19,7 +19,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"math"
 	"time"
 )
 
@@ -43,8 +42,6 @@ func (s Signal) String() string {
 		return "BUY"
 	case Sell:
 		return "SELL"
-	case Hold:
-		return "HOLD"
 	default:
 		return "FLAT"
 	}
@@ -54,7 +51,6 @@ const (
 	Flat Signal = iota
 	Buy
 	Sell
-	Hold
 )
 
 // Decision captures what to do and why.
@@ -65,8 +61,7 @@ type Decision struct {
 	Reason     string
 
 	// Carry raw pUp and selected soft-gate flags for downstream gate-audit strings.
-	PUp          float64
-	DecisionPath string
+	PUp float64
 }
 
 // SignalToSide converts the intent into a broker side.
@@ -126,27 +121,35 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 		}
 	}
 
-	if pUp > buyThreshold {
+	if pUp <= buyThreshold {
 		base.Signal = Buy
 		base.Raw = Buy
-		base.Confidence = pUp
-	} else if pUp < sellThreshold {
+		base.Confidence = confidenceRiskMultiplier(
+			Buy,
+			pUp,
+			buyThreshold,
+			sellThreshold,
+		)
+
+	} else if pUp >= sellThreshold {
 		base.Signal = Sell
 		base.Raw = Sell
-		base.Confidence = 1 - pUp
+		base.Confidence = confidenceRiskMultiplier(
+			Sell,
+			pUp,
+			buyThreshold,
+			sellThreshold,
+		)
+
 	} else {
 		base.Signal = Flat
 		base.Raw = Flat
-	}
-
-	lateSellExhaustion := false
-	if base.Raw == Sell && snap.MACDTurningPoint <= -120 && snap.DistLowPct <= 0.002 {
-		lateSellExhaustion = true
+		base.Confidence = 0
 	}
 
 	signalTF := t.cfg.SignalTF()
 	reason := fmt.Sprintf(
-		"[AI_GATE] signalTF=%s pUp=%.5f exhaustion{lateSell=%v} "+
+		"[AI_GATE] signalTF=%s pUp=%.5f "+
 			"range{high=%.4f low=%.4f} "+
 			"macd{line=%.2f turn=%.5f hist=%.2f dHist=%.2f dSmooth=%.2f} "+
 			"ema{spread=%.5f ema2050=%.5f slope20=%.5f slope50=%.5f} "+
@@ -154,7 +157,6 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 
 		signalTF,
 		pUp,
-		lateSellExhaustion,
 		snap.DistHighPct,
 		snap.DistLowPct,
 
@@ -198,37 +200,20 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		return d
 	}
 
-	buyThreshold := t.cfg.BuyThreshold
-	sellThreshold := t.cfg.SellThreshold
-	modelUpAvg := 0.484
-	modelDownAvg := 0.43
+	confidence := d.Confidence
 
-	if t.model != nil {
-		if t.model.AvgUp > 0 {
-			modelUpAvg = t.model.AvgUp
-		}
-		if t.model.AvgDown > 0 {
-			modelDownAvg = t.model.AvgDown
-		}
-		if t.model.BuyThreshold > 0 {
-			buyThreshold = t.model.BuyThreshold
-		}
-		if t.model.SellThreshold > 0 {
-			sellThreshold = t.model.SellThreshold
-		}
+	if confidence < 0.20 {
+		confidence = 0.20
 	}
-	eps := t.cfg.MACDLineEPS
-	routeRaw := d.Raw
-	if routeRaw == d.Signal && routeRaw == Flat {
-		logicSig, logicConfMult := logicGateConfidenceMultiplier(d.PUp, modelUpAvg, modelDownAvg)
-		if logicSig == Hold {
-			routeRaw = Hold
-		} else {
-			eps *= logicConfMult
-			if eps < 10 {
-				eps = 10
-			}
-		}
+	if confidence > 1.00 {
+		confidence = 1.00
+	}
+
+	epsFactor := 1.20 - confidence
+	eps := t.cfg.MACDLineEPS * epsFactor
+
+	if eps < 10 {
+		eps = 10
 	}
 
 	snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1, eps, t.cfg.AIFeatureDim)
@@ -259,51 +244,8 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		t.SellGateTouchedAt = time.Now()
 	}
 
-	thresholdBuffer := t.cfg.AIThresholdBuffer
-	if buyGateTouched || sellGateTouched {
-		thresholdBuffer = t.cfg.AIThresholdLoosenBuffer
-	}
-
 	emaSellPattern := snap.EMAHighPeak || snap.EMAPriceUpGoingDown
 	emaBuyPattern := snap.EMALowBottom || snap.EMAPriceDownGoingUp
-
-	if routeRaw == Sell && d.PUp < sellThreshold && (sellThreshold-d.PUp) <= thresholdBuffer {
-		effectiveEPS := t.cfg.MACDLineEPS * 0.55
-		if buyGateTouched {
-			effectiveEPS = t.cfg.MACDLineEPS * 0.40
-		}
-		if effectiveEPS < 10 {
-			effectiveEPS = 10
-		}
-
-		macdWouldClear := math.Abs(snap.MACDLine) >= effectiveEPS
-
-		if emaBuyPattern && snap.MACDMomentumUp && macdWouldClear {
-			routeRaw = Flat
-			eps = effectiveEPS
-			snap.MACDStrongNegative = true
-			reason = appendReason(reason, "near_threshold_AI_SELL_softened_for_BUY")
-		}
-	}
-
-	if routeRaw == Buy && d.PUp > buyThreshold && (d.PUp-buyThreshold) <= thresholdBuffer {
-		effectiveEPS := t.cfg.MACDLineEPS * 0.55
-		if sellGateTouched {
-			effectiveEPS = t.cfg.MACDLineEPS * 0.40
-		}
-		if effectiveEPS < 10 {
-			effectiveEPS = 10
-		}
-
-		macdWouldClear := math.Abs(snap.MACDLine) >= effectiveEPS
-
-		if emaSellPattern && snap.MACDMomentumDown && macdWouldClear {
-			routeRaw = Flat
-			eps = effectiveEPS
-			snap.MACDStrongPositive = true
-			reason = appendReason(reason, "near_threshold_AI_BUY_softened_for_SELL")
-		}
-	}
 
 	buyTouchAge := time.Duration(0)
 	if !t.BuyGateTouchedAt.IsZero() {
@@ -315,7 +257,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		sellTouchAge = time.Since(t.SellGateTouchedAt)
 	}
 
-	softEPS := t.cfg.MACDLineEPS * 0.40
+	softEPS := eps * 0.40
 	if softEPS < 10 {
 		softEPS = 10
 	}
@@ -325,83 +267,83 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 
 	normalBuy := snap.MACDStrongNegative && snap.MACDMomentumUp && emaBuyPattern
 	softenedPostTouchBuy := buyGateTouched && buyTouchAge >= time.Hour && buyTouchAge < time.Hour*2 && softMACDNeg && snap.MACDMomentumUp && emaBuyPattern
-	loosePostTouchBuy := buyGateTouched && buyTouchAge >= time.Hour*2 && snap.MACDMomentumUp && emaBuyPattern
+	loosePostTouchBuy := buyGateTouched && buyTouchAge >= time.Hour*2 && snap.MACDMomentumUp && snap.EMALowBottom
+	loosestPostTouchBuy := buyGateTouched && buyTouchAge >= time.Hour*2 && snap.MACDMomentumUp && emaBuyPattern
 
 	normalSell := snap.MACDStrongPositive && snap.MACDMomentumDown && emaSellPattern
 	softenedPostTouchSell := sellGateTouched && sellTouchAge >= time.Hour && sellTouchAge < time.Hour*2 && softMACDPos && snap.MACDMomentumDown && emaSellPattern
-	loosePostTouchSell := sellGateTouched && sellTouchAge >= time.Hour*2 && snap.MACDMomentumDown && emaSellPattern
+	loosePostTouchSell := sellGateTouched && sellTouchAge >= time.Hour*2 && snap.MACDMomentumDown && snap.EMAHighPeak
+	loosestPostTouchSell := sellGateTouched && sellTouchAge >= time.Hour*3 && snap.MACDMomentumDown && emaSellPattern
 
 	logicOpinion := Flat
-	if normalBuy || softenedPostTouchBuy || loosePostTouchBuy {
+	if normalBuy || softenedPostTouchBuy || loosePostTouchBuy || loosestPostTouchBuy {
 		logicOpinion = Buy
-	} else if normalSell || softenedPostTouchSell || loosePostTouchSell {
+	} else if normalSell || softenedPostTouchSell || loosePostTouchSell || loosestPostTouchSell {
 		logicOpinion = Sell
 	}
 
-	logicDisagreement := (routeRaw == Buy && logicOpinion == Sell) || (routeRaw == Sell && logicOpinion == Buy)
+	logicDisagreement := (d.Raw == Buy && logicOpinion == Sell) || (d.Raw == Sell && logicOpinion == Buy)
 
 	// Final entry signal policy:
 	//
 	// AI BUY + logic BUY   → BUY
-	// AI FLAT + logic BUY  → BUY
+	// AI FLAT + logic BUY  → FLAT
 	// AI SELL + logic BUY  → FLAT
 	//
 	// AI SELL + logic SELL → SELL
-	// AI FLAT + logic SELL → SELL
+	// AI FLAT + logic SELL → FLAT
 	// AI BUY + logic SELL  → FLAT
 	//
 	// logicOpinion already represents the MACD/EMA reversal logic,
 	// so we no longer hard-block d.Signal separately below.
-	final := finalSignalFromAILogic(routeRaw, logicOpinion)
+	final := finalSignalFromAILogic(d.Raw, logicOpinion)
 	d.Signal = final
-
-	d.DecisionPath = fmt.Sprintf(
-		"raw_%s_route_%s_logic_%s_final_%s",
-		d.Raw,
-		routeRaw,
-		logicOpinion,
-		d.Signal,
-	)
 
 	if logicDisagreement {
 		reason = appendReason(reason, "logic_disagreement")
 	}
 
-	if routeRaw == Flat && logicOpinion != Flat {
-		reason = appendReason(reason, fmt.Sprintf("ai_FLAT_logicOpinion=%s_allowed", logicOpinion))
+	if d.Raw == Flat && logicOpinion != Flat {
+		reason = appendReason(reason, fmt.Sprintf("ai_FLAT_logicOpinion=%s_blocked", logicOpinion))
 	}
 
-	if routeRaw == Hold && logicOpinion != Flat {
-		reason = appendReason(reason, fmt.Sprintf("ai_HOLD_neutral_band_logicOpinion=%s_blocked", logicOpinion))
-	}
-
-	if routeRaw == logicOpinion && logicOpinion != Flat {
-		reason = appendReason(reason, fmt.Sprintf("ai_%s_logicOpinion=%s_match", routeRaw, logicOpinion))
+	if d.Raw == logicOpinion && logicOpinion != Flat {
+		reason = appendReason(reason, fmt.Sprintf("ai_%s_logicOpinion=%s_match", d.Raw, logicOpinion))
 	}
 
 	if logicOpinion == Flat {
-		reason = appendReason(reason, fmt.Sprintf("ai_%s_logicOpinion=FLAT", routeRaw))
+		reason = appendReason(reason, fmt.Sprintf("ai_%s_logicOpinion=FLAT", d.Raw))
 	}
 
 	log.Printf(
-		"[KPI] logic.route ai=%s route=%s logic=%s final=%s pUp=%.5f",
+		"[KPI] logic ai=%s logic=%s final=%s pUp=%.5f",
 		d.Raw,
-		routeRaw,
 		logicOpinion,
 		d.Signal,
 		d.PUp,
 	)
 
+	modelUpAvg := 0.0
+	modelDownAvg := 0.0
+
+	if t.model != nil {
+		if t.model.AvgUp > 0 {
+			modelUpAvg = t.model.AvgUp
+		}
+		if t.model.AvgDown > 0 {
+			modelDownAvg = t.model.AvgDown
+		}
+	}
+
 	reason = fmt.Sprintf(
-		"[LOGIC_GATE] gateTF=%s aiRaw=%s route=%s logicOpinion=%s logicDisagreement=%v final=%s | "+
+		"[LOGIC_GATE] gateTF=%s aiRaw=%s logicOpinion=%s logicDisagreement=%v final=%s | "+
 			"MACD{line=%.5f turn=%.5f hist=%.5f dHist=%.5f dSmooth=%.5f} | "+
 			"EMA{spread=%.6f ema2050=%.6f} | "+
 			"Pattern{emaHighPeak=%v emaLowBottom=%v emaPriceDownGoingUp=%v emaPriceUpGoingDown=%v emaSellPattern=%v emaBuyPattern=%v macdMomentumDown=%v macdMomentumUp=%v macdStrongPositive=%v macdStrongNegative=%v} | "+
-			"Gate{eps=%.5f note=%v decisionPath=%s} modelUpAvg=%.5f modelDownAvg=%.5f",
+			"Gate{confidence=%.2f epsFactor=%.2f eps=%.5f note=%v} modelUpAvg=%.5f modelDownAvg=%.5f",
 
 		t.cfg.GateTF,
 		d.Raw,
-		routeRaw,
 		logicOpinion,
 		logicDisagreement,
 		d.Signal,
@@ -425,10 +367,10 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		snap.MACDMomentumUp,
 		snap.MACDStrongPositive,
 		snap.MACDStrongNegative,
-
+		confidence,
+		epsFactor,
 		eps,
 		reason,
-		d.DecisionPath,
 		modelUpAvg,
 		modelDownAvg,
 	)
@@ -444,7 +386,7 @@ func finalSignalFromAILogic(aiRaw Signal, logicOpinion Signal) Signal {
 	}
 
 	if aiRaw == Flat {
-		return logicOpinion
+		return Flat
 	}
 
 	if aiRaw == logicOpinion {
@@ -464,55 +406,49 @@ func appendReason(base, reason string) string {
 	return base + " | " + reason
 }
 
-func riskMultiplier(decisionPath string, sig Signal, pUp, modelUpAvg, modelDownAvg, buyThreshold, sellThreshold float64) float64 {
-	switch decisionPath {
+func confidenceRiskMultiplier(sig Signal, pUp, buyThreshold, sellThreshold float64) float64 {
 
-	case "raw_BUY_route_FLAT_logic_SELL_final_SELL":
-		return 0.30
+	sellStrong := 0.70
 
-	case "raw_SELL_route_FLAT_logic_BUY_final_BUY":
-		return 0.30
+	sellMid2 := (sellThreshold + sellStrong) / 2.0
+	sellMid3 := (sellMid2 + sellStrong) / 2.0
+	sellMid1 := (sellThreshold + sellMid2) / 2.0
 
-	default:
-		return confidenceRiskMultiplier(
-			sig,
-			pUp,
-			modelUpAvg,
-			modelDownAvg,
-			buyThreshold,
-			sellThreshold,
-		)
-	}
-}
+	buyStrong := 0.20
 
-func confidenceRiskMultiplier(sig Signal, pUp, modelUpAvg, modelDownAvg, buyThreshold, sellThreshold float64) float64 {
-	midBuy := (modelUpAvg + buyThreshold) / 2
-	midSell := (modelDownAvg + sellThreshold) / 2
+	buyMid2 := (buyThreshold + buyStrong) / 2.0
+	buyMid3 := (buyMid2 + buyStrong) / 2.0
+	buyMid1 := (buyThreshold + buyMid2) / 2.0
 
 	switch sig {
 	case Buy:
 		switch {
-		case pUp >= buyThreshold+0.05:
+		case pUp <= buyStrong:
 			return 1.00
-		case pUp >= buyThreshold:
+		case pUp <= buyMid3:
 			return 0.80
-		case pUp >= midBuy:
-			return 0.55
-		case pUp >= modelUpAvg:
-			return 0.30
+		case pUp <= buyMid2:
+			return 0.60
+		case pUp <= buyMid1:
+			return 0.40
+		case pUp <= buyThreshold:
+			return 0.20
 		}
 
 	case Sell:
 		switch {
-		case pUp <= sellThreshold-0.05:
+		case pUp >= sellStrong:
 			return 1.00
-		case pUp <= sellThreshold:
+		case pUp >= sellMid3:
 			return 0.80
-		case pUp <= midSell:
-			return 0.55
-		case pUp <= modelDownAvg:
-			return 0.30
+		case pUp >= sellMid2:
+			return 0.60
+		case pUp >= sellMid1:
+			return 0.40
+		case pUp >= sellThreshold:
+			return 0.20
 		}
+
 	}
 
 	return 0.00
@@ -526,17 +462,6 @@ func shouldExitByAILogic(lot *Position, d Decision) bool {
 		return d.Signal == Buy
 	}
 	return false
-}
-
-func logicGateConfidenceMultiplier(pUp, modelUpAvg, modelDownAvg float64) (Signal, float64) {
-	switch {
-	case pUp >= modelUpAvg:
-		return Buy, 0.55
-	case pUp <= modelDownAvg:
-		return Sell, 0.55
-	default:
-		return Hold, 0.00
-	}
 }
 
 // lowestLow returns the lowest candle low within the rolling lookback window.
