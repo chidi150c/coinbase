@@ -266,19 +266,21 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	softMACDPos := snap.MACDLine >= softEPS
 
 	normalBuy := snap.MACDStrongNegative && snap.MACDMomentumUp && emaBuyPattern
+	softAboveStrongBuy := d.Confidence >= 0.60 && softMACDNeg && snap.MACDMomentumUp && emaBuyPattern
 	softenedPostTouchBuy := buyGateTouched && buyTouchAge >= time.Hour && buyTouchAge < time.Hour*2 && softMACDNeg && snap.MACDMomentumUp && emaBuyPattern
 	loosePostTouchBuy := buyGateTouched && buyTouchAge >= time.Hour*2 && snap.MACDMomentumUp && snap.EMALowBottom
 	loosestPostTouchBuy := buyGateTouched && buyTouchAge >= time.Hour*2 && snap.MACDMomentumUp && emaBuyPattern
 
 	normalSell := snap.MACDStrongPositive && snap.MACDMomentumDown && emaSellPattern
+	softAboveStrongSell := d.Confidence >= 0.60 && softMACDPos && snap.MACDMomentumDown && emaSellPattern
 	softenedPostTouchSell := sellGateTouched && sellTouchAge >= time.Hour && sellTouchAge < time.Hour*2 && softMACDPos && snap.MACDMomentumDown && emaSellPattern
 	loosePostTouchSell := sellGateTouched && sellTouchAge >= time.Hour*2 && snap.MACDMomentumDown && snap.EMAHighPeak
 	loosestPostTouchSell := sellGateTouched && sellTouchAge >= time.Hour*3 && snap.MACDMomentumDown && emaSellPattern
 
 	logicOpinion := Flat
-	if normalBuy || softenedPostTouchBuy || loosePostTouchBuy || loosestPostTouchBuy {
+	if normalBuy || softAboveStrongBuy || softenedPostTouchBuy || loosePostTouchBuy || loosestPostTouchBuy {
 		logicOpinion = Buy
-	} else if normalSell || softenedPostTouchSell || loosePostTouchSell || loosestPostTouchSell {
+	} else if normalSell || softAboveStrongSell || softenedPostTouchSell || loosePostTouchSell || loosestPostTouchSell {
 		logicOpinion = Sell
 	}
 
@@ -334,6 +336,8 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 			modelDownAvg = t.model.AvgDown
 		}
 	}
+	
+	reason = appendReason(reason, fmt.Sprintf("softStrongBuy=%v softStrongSell=%v", softAboveStrongBuy, softAboveStrongSell))
 
 	reason = fmt.Sprintf(
 		"[LOGIC_GATE] gateTF=%s aiRaw=%s logicOpinion=%s logicDisagreement=%v final=%s | "+
