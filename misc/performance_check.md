@@ -81,6 +81,11 @@ END {
 }
 ' /opt/coinbase/logs/audit/binance_audit.log
 
+====================================================================
+2.2)what blocked them
+
+grep -nE "00:00:|00:02:|sizing|sell.gate|FUNDS|HOLD|LIVE ORDER|OPEN-PENDING|FILLED|filled|pyramid:" /opt/coinbase/logs/audit/binance_audit.log | tail -200
+
 ==============================================================
 
 3) Next check should be why pyramid blocked:

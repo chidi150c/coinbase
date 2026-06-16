@@ -385,7 +385,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// - This block must not block the trading loop.
 	// - A result is accepted only if it matches the current pending order or one of its repriced history IDs.
 	// - If a fill arrives but pending state is missing, we still accept it to avoid orphaning a real broker fill.
-	// - On timeout/error/non-fill, we set pendingRecheckBuy=true so the normal entry path can optionally retry.
+	// On timeout/error/non-fill, set pendingRecheckBuy=true only if the order was not
+	// canceled because the signal changed. Signal-change cancels must not allow market fallback.
 	// - The pending object is cleared at the end regardless of fill/non-fill.
 	// -------------------------------------------------------------------------------------------------
 	if t.pendingBuyCh != nil {
@@ -586,9 +587,23 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				}
 			} else {
 				// Non-fill result: allow the normal entry path to re-check and possibly fallback.
-				t.pendingRecheckBuy = true
-				log.Printf("TRACE postonly.recheck side=%s set=true reason=timeout_or_error order_id=%s",
-					SideBuy, res.OrderID)
+				cancelRequested := t.pendingBuy != nil && t.pendingBuy.CancelRequested
+
+				if cancelRequested {
+					t.pendingRecheckBuy = false
+					log.Printf(
+						"TRACE postonly.cancel.ack side=%s order_id=%s fallback=false reason=signal_changed",
+						SideBuy,
+						res.OrderID,
+					)
+				} else {
+					t.pendingRecheckBuy = true
+					log.Printf(
+						"TRACE postonly.recheck side=%s set=true reason=timeout_or_error order_id=%s",
+						SideBuy,
+						res.OrderID,
+					)
+				}
 			}
 
 			// Pending lifecycle is finished for this result, whether filled or not.
@@ -792,9 +807,24 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					log.Printf("[WARN] saveState (filled SELL): %v", err)
 				}
 			} else {
-				t.pendingRecheckSell = true
-				log.Printf("TRACE postonly.recheck side=%s set=true reason=timeout_or_error order_id=%s",
-					SideSell, res.OrderID)
+				cancelRequested := t.pendingSell != nil && t.pendingSell.CancelRequested
+
+				if cancelRequested {
+					t.pendingRecheckSell = false
+					log.Printf(
+						"TRACE postonly.cancel.ack side=%s order_id=%s fallback=false reason=signal_changed",
+						SideSell,
+						res.OrderID,
+					)
+				} else {
+					t.pendingRecheckSell = true
+					log.Printf(
+						"TRACE postonly.recheck side=%s set=true reason=timeout_or_error order_id=%s",
+						SideSell,
+						res.OrderID,
+					)
+				}
+
 			}
 
 			if t.pendingSellCancel != nil {
@@ -848,6 +878,37 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	d := t.decide(signalHistory)
 	d = t.applyLogicGate(d, c)
 
+	// Cancel stale pending opens if the current decision no longer supports them.
+	// Do NOT clear pending here.
+	// Do NOT cancel pending context here.
+	// Let the async poller observe CANCELED/PARTIALLY_FILLED/FILLED and emit OpenResult.
+	if t.pendingBuy != nil && d.Signal != Buy {
+		orderID := t.pendingBuy.OrderID
+		t.pendingBuy.CancelRequested = true
+		t.pendingRecheckBuy = false
+
+		t.mu.Unlock()
+		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, orderID)
+		t.mu.Lock()
+
+		_ = t.saveStateNoLock()
+		t.mu.Unlock()
+		return "HOLD pending BUY cancel requested: signal changed", nil
+	}
+
+	if t.pendingSell != nil && d.Signal != Sell {
+		orderID := t.pendingSell.OrderID
+		t.pendingSell.CancelRequested = true
+		t.pendingRecheckSell = false
+
+		t.mu.Unlock()
+		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, orderID)
+		t.mu.Lock()
+
+		_ = t.saveStateNoLock()
+		t.mu.Unlock()
+		return "HOLD pending SELL cancel requested: signal changed", nil
+	}
 	// --------------------------------------------------------------------------------------------------------
 	// EXIT path: fee-aware per-lot exit management.
 	//
@@ -1244,7 +1305,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-72",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-74",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1259,11 +1320,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
 
-	// Determine the side and its boo
+	// Determine the side and its book
 	side := d.SignalToSide()
 	book := t.book(side)
 
-	// --- NEW (Phase 4): prevent duplicate opens while pending on this side (exits already ran) ---
+	// Prevent duplicate opens while pending on this side (exits already ran) ---
 	// Extra belt-and-suspenders: if a pending exists and we haven't hit its Deadline, keep waiting.
 	if side == SideBuy && t.pendingBuy != nil && time.Now().Before(t.pendingBuy.Deadline) {
 		t.mu.Unlock()
@@ -1503,7 +1564,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			if decayed < floor {
 				decayed = floor
 			}
-			effPct = decayed
+			gateMult := confidenceEffPctMultiplier(d.Confidence)
+			effPct = decayed * gateMult
+
+			log.Printf(
+				"TRACE pyramid.conf_gate side=%s confidence=%.4f gateMult=%.4f decayedPct=%.4f effPct=%.4f",
+				side, d.Confidence, gateMult, decayed, effPct,
+			)
 		}
 
 		// Capture for reason string
@@ -1527,13 +1594,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		if last > 0 {
 			if side == SideBuy {
 				// BUY adverse tracker (side-aware)
-				if elapsedMin >= tFloorMin {
+				if elapsedMin >= tFloorMin && t.latchedGateBuy == 0 {
 					if t.winLowBuy == 0 || price < t.winLowBuy {
 						t.winLowBuy = price
 					}
-				} else {
+				} else if elapsedMin < tFloorMin {
 					t.winLowBuy = 0
 				}
+
 				// latch at 2*t_floor_min
 				if t.latchedGateBuy == 0 && elapsedMin >= 2.0*tFloorMin && t.winLowBuy > 0 {
 					t.latchedGateBuy = t.winLowBuy
@@ -1581,13 +1649,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				}
 			} else { // SELL
 				// SELL adverse tracker (side-aware)
-				if elapsedMin >= tFloorMin {
+				if elapsedMin >= tFloorMin && t.latchedGateSell == 0 {
 					if t.winHighSell == 0 || price > t.winHighSell {
 						t.winHighSell = price
 					}
-				} else {
+				} else if elapsedMin < tFloorMin {
 					t.winHighSell = 0
 				}
+
 				if t.latchedGateSell == 0 && elapsedMin >= 2.0*tFloorMin && t.winHighSell > 0 {
 					t.latchedGateSell = t.winHighSell
 					// --- breadcrumb ---
@@ -2101,7 +2170,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	}
 
 	refundFromOpposite := 0.0
-	if t.refundBuyUSD > 0 && side == SideSell {
+	refundMinConf := 0.60
+	if t.refundBuyUSD > 0 && side == SideSell && confMult >= refundMinConf {
 		// turn refund USD into extra base at current price
 		extraBase := t.refundBuyUSD / price
 
@@ -2138,9 +2208,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				gatesReason = strings.TrimSpace(gatesReason + "|refund=buy-partial")
 			}
 		}
+	} else if t.refundBuyUSD > 0 && side == SideSell && confMult < refundMinConf {
+		log.Printf("TRACE refund.block side=%s conf=%.2f need>=%.2f refundBuyUSD=%.2f",
+			side, confMult, refundMinConf, t.refundBuyUSD)
 	}
 
-	if t.refundSellUSD > 0 && side == SideBuy {
+	if t.refundSellUSD > 0 && side == SideBuy && confMult >= refundMinConf {
 		extraQuote := t.refundSellUSD
 
 		// how much room do we actually have (in quote)?
@@ -2175,6 +2248,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				gatesReason = strings.TrimSpace(gatesReason + "|refund=sell-partial")
 			}
 		}
+	} else if t.refundSellUSD > 0 && side == SideBuy && confMult < refundMinConf {
+		log.Printf("TRACE refund.block side=%s conf=%.2f need>=%.2f refundSellUSD=%.2f",
+			side, confMult, refundMinConf, t.refundSellUSD)
 	}
 
 	if side == SideBuy {
@@ -2459,6 +2535,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 									return
 
 								case "PARTIALLY_FILLED":
+									if t.pendingCancelRequested(side) {
+										log.Printf("TRACE postonly.reprice.skip.cancel_requested side=%s order_id=%s", side, orderID)
+										lastReprice = time.Now()
+										break
+									}
 									// still open; allow reprice path (throttled)
 									if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
 										log.Printf("TRACE postonly.reprice.try.partially side=%s order_id=%s last_limit=%.8f reprice_count=%d",
@@ -2492,6 +2573,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 									}
 
 								case "NEW", "PENDING_CANCEL":
+									if t.pendingCancelRequested(side) {
+										log.Printf("TRACE postonly.reprice.skip.cancel_requested side=%s order_id=%s", side, orderID)
+										lastReprice = time.Now()
+										break
+									}
 									// resting or in cancel transition; keep polling
 									if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
 										log.Printf("TRACE postonly.reprice.try.new side=%s order_id=%s last_limit=%.8f reprice_count=%d",

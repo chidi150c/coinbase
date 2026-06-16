@@ -150,12 +150,13 @@ type PendingOpen struct {
 	// NEW: keep last few order IDs so we accept late fills after a cancel/reprice.
 	History []string `json:"history,omitempty"` // capped (e.g., last 5)
 	// NEW: accumulate fills across reprices
-	AccumBase      float64 // sum of executed base over all prior order IDs
-	AccumQuote     float64 // sum of executed quote
-	AccumFeeUSD    float64 // sum of fees (if provided)
-	ConfidenceMult float64 `json:"confidence_mult,omitempty"`
-	ProfitGateUSD  float64 `json:"profit_gate_usd,omitempty"`
-	EntryAIMode    string  `json:"entry_ai_mode,omitempty"` // AI_MATCH or AI_FLAT
+	AccumBase       float64 // sum of executed base over all prior order IDs
+	AccumQuote      float64 // sum of executed quote
+	AccumFeeUSD     float64 // sum of fees (if provided)
+	ConfidenceMult  float64 `json:"confidence_mult,omitempty"`
+	ProfitGateUSD   float64 `json:"profit_gate_usd,omitempty"`
+	EntryAIMode     string  `json:"entry_ai_mode,omitempty"` // AI_MATCH or AI_FLAT
+	CancelRequested bool    `json:"cancel_requested,omitempty"`
 }
 
 type OpenResult struct {
@@ -1446,6 +1447,19 @@ type RehydrateMode int
 const (
 	RehydrateModeResume RehydrateMode = iota
 )
+
+func (t *Trader) pendingCancelRequested(side OrderSide) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if side == SideBuy && t.pendingBuy != nil {
+		return t.pendingBuy.CancelRequested
+	}
+	if side == SideSell && t.pendingSell != nil {
+		return t.pendingSell.CancelRequested
+	}
+	return false
+}
 
 // RehydratePending resumes any persisted post-only pending opens by restoring channels/contexts
 // and restarting the poller using the saved OrderID and remaining deadline if the order is still open.

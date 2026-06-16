@@ -500,8 +500,8 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				// BUY side uses RecentLow.
 				// SELL side uses RecentHigh.
 				// -----------------------------------------------------------------
-				trader.RecentHigh = highestHigh(execHistory, 4*time.Hour)
-				trader.RecentLow = lowestLow(execHistory, 4*time.Hour)
+				trader.RecentHigh = highestHigh(execHistory, 6*time.Hour)
+				trader.RecentLow = lowestLow(execHistory, 6*time.Hour)
 
 				buyLots := 0
 				sellLots := 0

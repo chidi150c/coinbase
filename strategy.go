@@ -19,6 +19,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"time"
 )
 
@@ -411,51 +412,51 @@ func appendReason(base, reason string) string {
 }
 
 func confidenceRiskMultiplier(sig Signal, pUp, buyThreshold, sellThreshold float64) float64 {
-
-	sellStrong := 0.70
-
-	sellMid2 := (sellThreshold + sellStrong) / 2.0
-	sellMid3 := (sellMid2 + sellStrong) / 2.0
-	sellMid1 := (sellThreshold + sellMid2) / 2.0
-
-	buyStrong := 0.20
-
-	buyMid2 := (buyThreshold + buyStrong) / 2.0
-	buyMid3 := (buyMid2 + buyStrong) / 2.0
-	buyMid1 := (buyThreshold + buyMid2) / 2.0
+	const (
+		minConf    = 0.20
+		maxConf    = 1.00
+		sellStrong = 0.70
+		buyStrong  = 0.20
+		curve      = 1.50 // >1 = stricter near threshold, stronger only when farther away
+	)
 
 	switch sig {
 	case Buy:
-		switch {
-		case pUp <= buyStrong:
-			return 1.00
-		case pUp <= buyMid3:
-			return 0.80
-		case pUp <= buyMid2:
-			return 0.60
-		case pUp <= buyMid1:
-			return 0.40
-		case pUp <= buyThreshold:
-			return 0.20
+		if pUp > buyThreshold {
+			return 0.00
 		}
+		if pUp <= buyStrong {
+			return maxConf
+		}
+
+		x := (buyThreshold - pUp) / (buyThreshold - buyStrong)
+		x = math.Pow(clamp01(x), curve)
+		return minConf + x*(maxConf-minConf)
 
 	case Sell:
-		switch {
-		case pUp >= sellStrong:
-			return 1.00
-		case pUp >= sellMid3:
-			return 0.80
-		case pUp >= sellMid2:
-			return 0.60
-		case pUp >= sellMid1:
-			return 0.40
-		case pUp >= sellThreshold:
-			return 0.20
+		if pUp < sellThreshold {
+			return 0.00
+		}
+		if pUp >= sellStrong {
+			return maxConf
 		}
 
+		x := (pUp - sellThreshold) / (sellStrong - sellThreshold)
+		x = math.Pow(clamp01(x), curve)
+		return minConf + x*(maxConf-minConf)
 	}
 
 	return 0.00
+}
+
+func clamp01(x float64) float64 {
+	if x < 0 {
+		return 0
+	}
+	if x > 1 {
+		return 1
+	}
+	return x
 }
 
 func shouldExitByAILogic(lot *Position, d Decision) bool {
@@ -550,4 +551,22 @@ func highestHigh(candles []Candle, lookback time.Duration) float64 {
 	}
 
 	return highest
+}
+
+func confidenceEffPctMultiplier(confidence float64) float64 {
+	const (
+		minGateMult = 0.20 // strongest confidence
+		maxGateMult = 1.00 // weakest confidence
+		curve       = 1.50 // smoothness
+	)
+
+	// confidence expected in [0.20, 1.00]
+	x := (confidence - 0.20) / 0.80
+	x = clamp01(x)
+
+	// optional curve
+	x = math.Pow(x, curve)
+
+	// invert: stronger confidence => smaller multiplier
+	return maxGateMult - x*(maxGateMult-minGateMult)
 }
