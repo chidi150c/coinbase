@@ -1609,7 +1609,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			baseTFloorMin = math.Log(basePct/floor) / lambda
 		}
 		tFloorMin := baseTFloorMin * gateMult
-		reasonTFloorHr  = tFloorMin / 60.0
+		reasonTFloorHr = tFloorMin / 60.0
 		// TODO: remove TRACE
 		log.Printf("TRACE pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
 			side, elapsedMin, basePct, effPct, lambda, floor, tFloorMin)
@@ -1813,11 +1813,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	}
 
 	entryAIMode := "AI_MATCH"
-	entryProfitGateUSD := t.cfg.ProfitGateUSD
-
 	if d.Raw == Flat {
 		entryAIMode = "AI_FLAT"
-		entryProfitGateUSD = t.cfg.ProfitGateUSD * confMult
+	}
+
+	entryProfitGateUSD := t.cfg.ProfitGateUSD * confMult
+	if entryProfitGateUSD < 0.30 {
+		entryProfitGateUSD = 0.30
 	}
 
 	//Applying confidence multiplier to scalp, that of equity comes later

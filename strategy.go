@@ -385,32 +385,12 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	return d
 }
 
-func finalSignalFromAILogic(aiRaw Signal, logicOpinion Signal) Signal {
-	if logicOpinion == Flat {
-		return Flat
-	}
-
-	if aiRaw == Flat {
-		return Flat
-	}
-
-	if aiRaw == logicOpinion {
-		return logicOpinion
-	}
-
-	return Flat
-}
-
-func appendReason(base, reason string) string {
-	if reason == "" {
-		return base
-	}
-	if base == "" {
-		return reason
-	}
-	return base + " | " + reason
-}
-
+// Confidence scaling.
+//
+//	direct relationship with confidence.
+//	Higher confidence => larger confidence_mult.
+//	Used for AI_FLAT net-profit activation/exit gates
+//	(ProfitGateUSD / ActivateGateUSD) EPS logic gates and position sizing.
 func confidenceRiskMultiplier(sig Signal, pUp, buyThreshold, sellThreshold float64) float64 {
 	const (
 		minConf    = 0.20
@@ -447,6 +427,56 @@ func confidenceRiskMultiplier(sig Signal, pUp, buyThreshold, sellThreshold float
 	}
 
 	return 0.00
+}
+
+// Confidence scaling.
+//
+//	inverse relationship with confidence.
+//	Higher confidence => smaller effPct and shorter tFloor.
+//	Used for pyramid adverse gating, winLow/winHigh collection,
+//	latch timing, and latched-gate activation.
+func confidenceEffPctMultiplier(confidence float64) float64 {
+	const (
+		minGateMult = 0.20 // lowest confidence
+		maxGateMult = 1.00 // highest confidence
+		curve       = 1.50 // smoothness
+	)
+
+	// confidence expected in [0.20, 1.00]
+	x := (confidence - 0.20) / 0.80
+	x = clamp01(x)
+
+	// optional curve
+	x = math.Pow(x, curve)
+
+	// invert: stronger confidence => smaller multiplier
+	return maxGateMult - x*(maxGateMult-minGateMult)
+}
+
+func finalSignalFromAILogic(aiRaw Signal, logicOpinion Signal) Signal {
+	if logicOpinion == Flat {
+		return Flat
+	}
+
+	if aiRaw == Flat {
+		return Flat
+	}
+
+	if aiRaw == logicOpinion {
+		return logicOpinion
+	}
+
+	return Flat
+}
+
+func appendReason(base, reason string) string {
+	if reason == "" {
+		return base
+	}
+	if base == "" {
+		return reason
+	}
+	return base + " | " + reason
 }
 
 func clamp01(x float64) float64 {
@@ -551,22 +581,4 @@ func highestHigh(candles []Candle, lookback time.Duration) float64 {
 	}
 
 	return highest
-}
-
-func confidenceEffPctMultiplier(confidence float64) float64 {
-	const (
-		minGateMult = 0.20 // lowest confidence
-		maxGateMult = 1.00 // highest confidence
-		curve       = 1.50 // smoothness
-	)
-
-	// confidence expected in [0.20, 1.00]
-	x := (confidence - 0.20) / 0.80
-	x = clamp01(x)
-
-	// optional curve
-	x = math.Pow(x, curve)
-
-	// invert: stronger confidence => smaller multiplier
-	return maxGateMult - x*(maxGateMult-minGateMult)
 }
