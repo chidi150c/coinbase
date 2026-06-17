@@ -555,8 +555,8 @@ func highestHigh(candles []Candle, lookback time.Duration) float64 {
 
 func confidenceEffPctMultiplier(confidence float64) float64 {
 	const (
-		minGateMult = 0.20 // strongest confidence
-		maxGateMult = 1.00 // weakest confidence
+		minGateMult = 0.20 // lowest confidence
+		maxGateMult = 1.00 // highest confidence
 		curve       = 1.50 // smoothness
 	)
 

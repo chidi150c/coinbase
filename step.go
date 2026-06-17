@@ -1305,7 +1305,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-74",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-75",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1554,6 +1554,31 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		lambda := t.cfg.PyramidDecayLambda
 		floor := t.cfg.PyramidDecayMinPct
 		elapsedMin := 0.0
+
+		// Confidence here represents reversal tenderness, not trade certainty.
+		// Higher confidence means the setup is more tender/sensitive, so the bot
+		// requires a smaller adverse move before allowing a pyramid add.
+		//
+		// gateMult scales both:
+		//   1) effPct: the adverse % gate
+		//   2) tFloorMin: the time spent in baseline-effPct regime before recording
+		//      winLow/winHigh for future latch.
+		//
+		// Low confidence  -> larger gateMult -> deeper adverse gate, longer wait.
+		// High confidence -> smaller gateMult -> shallower adverse gate, shorter wait.
+		//
+		// Design:
+		// Phase 1: 0 → tFloorMin
+		//   Use only the baseline/decayed effPct gate.
+		//   If price crosses this gate, the add is valid immediately.
+		//
+		// Phase 2: tFloorMin → 2*tFloorMin
+		//   If baseline gate was not crossed earlier, start observing winLow/winHigh
+		//   while still using the baseline/decayed effPct gate.
+		//
+		// Phase 3: >= 2*tFloorMin
+		//   Latch the observed extreme and use the latched gate going forward.
+		gateMult := confidenceEffPctMultiplier(d.Confidence)
 		if lambda > 0 {
 			if !lastAddSide.IsZero() {
 				elapsedMin = time.Since(lastAddSide).Minutes()
@@ -1564,7 +1589,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			if decayed < floor {
 				decayed = floor
 			}
-			gateMult := confidenceEffPctMultiplier(d.Confidence)
 			effPct = decayed * gateMult
 
 			log.Printf(
@@ -1579,11 +1603,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		reasonElapsedHr = elapsedMin / 60.0
 
 		// Time (in minutes) to hit the floor once (t_floor_min)
-		tFloorMin := 0.0
+		baseTFloorMin := 0.0
 		if lambda > 0 && basePct > floor {
-			tFloorMin = math.Log(basePct/floor) / lambda
+			baseTFloorMin = math.Log(basePct/floor) / lambda
 		}
-
+		tFloorMin := baseTFloorMin * gateMult
 		// TODO: remove TRACE
 		log.Printf("TRACE pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
 			side, elapsedMin, basePct, effPct, lambda, floor, tFloorMin)
@@ -1616,18 +1640,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// latched replaces baseline
 				if t.latchedGateBuy > 0 {
 					gatePrice = t.latchedGateBuy
-				}
-
-				// clamp to min(winLowBuy, last BUY open)
-				clampP := last
-
-				// Before latch: winLowBuy can tighten the gate.
-				// After latch: latchedGateBuy freezes the adverse gate.
-				if t.latchedGateBuy == 0 && t.winLowBuy > 0 && t.winLowBuy < clampP {
-					clampP = t.winLowBuy
-					if gatePrice > clampP {
-						gatePrice = clampP
-					}
 				}
 
 				// Copy for reason/log fields
@@ -1670,16 +1682,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// latched replaces baseline
 				if t.latchedGateSell > 0 {
 					gatePrice = t.latchedGateSell
-				}
-
-				// Before latch: winHighSell can tighten the gate.
-				// After latch: latchedGateSell freezes the adverse gate.
-				clampP := last
-				if t.latchedGateSell == 0 && t.winHighSell > 0 && t.winHighSell > clampP {
-					clampP = t.winHighSell
-					if gatePrice < clampP {
-						gatePrice = clampP
-					}
 				}
 
 				// copy for legacy reason/log fields
