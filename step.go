@@ -1524,8 +1524,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		reasonEffPct    float64
 		reasonBasePct   float64
 		reasonElapsedHr float64
+		// reasonElapsedHr = elapsedMin / 60.0
+		reasonTFloorHr float64
 	)
-
 	// GATE2 Gating for pyramiding adds — spacing + adverse move (with optional time-decay), side-aware.
 	if isAdd && !skipPyramidGates {
 
@@ -1608,6 +1609,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			baseTFloorMin = math.Log(basePct/floor) / lambda
 		}
 		tFloorMin := baseTFloorMin * gateMult
+		reasonTFloorHr  = tFloorMin / 60.0
 		// TODO: remove TRACE
 		log.Printf("TRACE pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
 			side, elapsedMin, basePct, effPct, lambda, floor, tFloorMin)
@@ -1654,8 +1656,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				if !(price <= gatePrice) {
 					t.mu.Unlock()
-					log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
-						price, gatePrice, t.winLowBuy, effPct, basePct, reasonElapsedHr)
+					log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f latch_target_Hr>=%.2fHr confidence=%.2f",
+						price, gatePrice, t.winLowBuy, effPct, basePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence)
 					log.Printf("TRACE pyramid.block.buy price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateBuy)
 					return "HOLD", nil
 				}
@@ -1696,8 +1698,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				if !(price >= gatePrice) {
 					t.mu.Unlock()
-					log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f",
-						price, gatePrice, t.winHighSell, effPct, basePct, reasonElapsedHr)
+					log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f, latch_target_Hr>=%.2fHr confidence=%.2f",
+						price, gatePrice, t.winHighSell, effPct, basePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence)
 					log.Printf("TRACE pyramid.block.sell price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateSell)
 					return "HOLD", nil
 				}
@@ -2158,13 +2160,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquityBuy=%.2f buyEquityMultiplier=%.6f(triggerAt:>=%.2f) equitySpareQuote=%.2f confidenceMult=%.2f", t.equityUSD, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, t.cfg.BuyEquityTriggerMult, equitySpareQuote, confMult)
 	} else if side == SideBuy {
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f confidenceMult=%.2f",
-			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, confMult,
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|latchTargetHr>=%.2fHr|confidence=%.2f",
+			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence,
 		)
 	} else { // SideSell
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f confidenceMult=%.2f",
-			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, confMult,
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|latchTargetHr>=%.2fHr|confidence=%.2f",
+			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence,
 		)
 	}
 	if d.Reason != "" {
