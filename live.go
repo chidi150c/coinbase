@@ -559,7 +559,11 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 
 				cancelPx()
 
+				//=====================================================================
+				//=====================================================================
 				// Step trader
+				//=====================================================================
+				//=====================================================================
 				msg, err := trader.step(ctx, execHistory, signalHistory, px)
 				if err != nil {
 					log.Printf("step err: %v", err)
