@@ -1305,7 +1305,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-75",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-79",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -2710,7 +2710,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					t.mu.Unlock()
 					return fmt.Sprintf("OPEN-PENDING side=%s", side), nil
 				} else if err != nil {
-					log.Printf("TRACE postonly.error fallback=market err=%v", err)
+					log.Printf("TRACE postonly.error hold_for_recheck err=%v", err)
 				}
 			}
 		}
