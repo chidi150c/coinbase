@@ -1093,6 +1093,20 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 					lossLimit := -math.Abs(t.cfg.StopLossPnLUSD)
 					if t.cfg.EnableThresholdStopLoss && net <= lossLimit {
+
+						log.Printf(
+							"TRACE threshold_stoploss_check side=%s pUp=%.5f buyTh=%.5f sellTh=%.5f prevRaw=%s raw=%s signal=%s pnl=%.2f lossLimit=%.2f",
+							lot.Side,
+							d.PUp,
+							t.model.BuyThreshold,
+							t.model.SellThreshold,
+							t.prevRaw,
+							d.Raw,
+							d.Signal,
+							net,
+							lossLimit,
+						)
+
 						if lot.Side == SideBuy {
 							stopLossExit =
 								t.prevRaw == Flat &&
@@ -1342,7 +1356,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-80",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-81",
 		totalLots,
 		d.Raw,
 		d.Signal,
