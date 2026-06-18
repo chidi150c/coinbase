@@ -377,3 +377,136 @@ awk '
 | 0.60       | 0.60     | 40 min    | 80 min  |
 | 0.80       | 0.36     | 24 min    | 48 min  |
 | 1.00       | 0.20     | 13 min    | 26 min  |
+
+====================================================================
+
+ awk -v since="$(date -u -d '48 hours ago' +%s)" '
+function ts_epoch(line, a) {
+  if (match(line, /[0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+    split(substr(line,RSTART,19), a, /[\/ :]/)
+    return mktime(a[1]" "a[2]" "a[3]" "a[4]" "a[5]" "a[6])
+  }
+  return 0
+}
+BEGIN {
+  printf "%-20s %-20s %-12s %-8s %-10s %-10s %-10s\n", "prev_time", "curr_time", "transition", "pUp", "buyTh", "sellTh", "dist"
+}
+{
+  e = ts_epoch($0)
+  if (e && e < since) next
+
+  aiRaw = ""; pUp = ""; buyTh = ""; sellTh = ""; t = ""
+
+  if (match($0, /aiRaw=(BUY|SELL|FLAT)/))
+    aiRaw = substr($0, RSTART+6, RLENGTH-6)
+
+  if (match($0, /pUp=[0-9.]+/))
+    pUp = substr($0, RSTART+4, RLENGTH-4)
+
+  if (match($0, /modelBuyThresh=[0-9.]+/))
+    buyTh = substr($0, RSTART+15, RLENGTH-15)
+
+  if (match($0, /modelSellThresh=[0-9.]+/))
+    sellTh = substr($0, RSTART+16, RLENGTH-16)
+
+  if (match($0, /[0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/))
+    t = substr($0, RSTART, RLENGTH)
+
+  if (prevRaw == "FLAT" && (aiRaw == "BUY" || aiRaw == "SELL")) {
+    dist = ""
+    if (aiRaw == "BUY" && buyTh != "" && pUp != "")
+      dist = sprintf("%.5f", pUp - buyTh)
+    else if (aiRaw == "SELL" && sellTh != "" && pUp != "")
+      dist = sprintf("%.5f", pUp - sellTh)
+
+    printf "%-20s %-20s %-12s %-8s %-10s %-10s %-10s\n", prevTime, t, "FLAT->" aiRaw, pUp, buyTh, sellTh, dist
+  }
+
+  if (aiRaw != "") {
+    prevRaw = aiRaw
+    prevTime = t
+  }
+}' /opt/coinbase/logs/audit/binance_audit.log | head -80
+
+------- output --------------------
+prev_time            curr_time            transition   pUp      buyTh      sellTh     dist
+2026/06/18 06:12:32  2026/06/18 06:12:34  FLAT->BUY    0.35826  0.380      0.553      -0.02174
+2026/06/18 06:17:36  2026/06/18 06:17:37  FLAT->BUY    0.36752  0.380      0.553      -0.01248
+2026/06/18 06:19:38  2026/06/18 06:19:40  FLAT->BUY    0.33317  0.380      0.553      -0.04683
+2026/06/18 06:31:47  2026/06/18 06:31:49  FLAT->SELL   0.56544  0.390      0.547      0.01844
+2026/06/18 06:55:53  2026/06/18 06:56:32  FLAT->SELL   0.56871  0.367      0.554      0.01471
+2026/06/18 07:01:48  2026/06/18 07:01:50  FLAT->SELL   0.59318  0.367      0.554      0.03918
+2026/06/18 07:05:51  2026/06/18 07:05:53  FLAT->SELL   0.61867  0.367      0.554      0.06467
+2026/06/18 07:15:36  2026/06/18 07:15:38  FLAT->SELL   0.58591  0.377      0.549      0.03691
+2026/06/18 09:00:54  2026/06/18 09:00:56  FLAT->BUY    0.35517  0.371      0.555      -0.01583
+2026/06/18 09:04:57  2026/06/18 09:04:59  FLAT->BUY    0.36987  0.371      0.555      -0.00113
+2026/06/18 09:25:51  2026/06/18 09:25:53  FLAT->BUY    0.34931  0.378      0.537      -0.02869
+2026/06/18 09:34:59  2026/06/18 09:35:01  FLAT->BUY    0.35185  0.389      0.544      -0.03715
+2026/06/18 09:55:58  2026/06/18 09:56:00  FLAT->BUY    0.31772  0.373      0.560      -0.05528
+2026/06/18 11:15:47  2026/06/18 11:15:49  FLAT->BUY    0.33619  0.383      0.544      -0.04681
+2026/06/18 11:39:10  2026/06/18 11:39:13  FLAT->BUY    0.37262  0.378      0.549      -0.00538
+2026/06/18 11:41:05  2026/06/18 11:41:46  FLAT->BUY    0.37102  0.383      0.547      -0.01198
+2026/06/18 12:04:05  2026/06/18 12:04:07  FLAT->BUY    0.37153  0.380      0.537      -0.00847
+2026/06/18 12:06:06  2026/06/18 12:06:08  FLAT->BUY    0.34710  0.380      0.537      -0.03290
+2026/06/18 12:26:00  2026/06/18 12:26:01  FLAT->SELL   0.56122  0.373      0.554      0.00722
+2026/06/18 12:29:01  2026/06/18 12:29:03  FLAT->SELL   0.54142  0.389      0.538      0.00342
+2026/06/18 13:35:15  2026/06/18 13:35:17  FLAT->BUY    0.34656  0.374      0.540      -0.02744
+2026/06/18 13:43:53  2026/06/18 13:43:55  FLAT->BUY    0.37229  0.383      0.552      -0.01071
+2026/06/18 13:59:07  2026/06/18 13:59:08  FLAT->BUY    0.39530  0.396      0.551      -0.00070
+2026/06/18 14:10:16  2026/06/18 14:10:17  FLAT->BUY    0.37490  0.396      0.551      -0.02110
+2026/06/18 14:20:03  2026/06/18 14:20:05  FLAT->BUY    0.36829  0.375      0.554      -0.00671
+
+===================================================================================
+
+new version of above:
+
+awk -v since="$(date -u -d '48 hours ago' +%s)" '
+function ts_epoch(line, a) {
+  if (match(line, /[0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+    split(substr(line,RSTART,19), a, /[\/ :]/)
+    return mktime(a[1]" "a[2]" "a[3]" "a[4]" "a[5]" "a[6])
+  }
+  return 0
+}
+function dist(raw, p, b, s) {
+  if (raw == "BUY" && p != "" && b != "") return sprintf("%.5f", p - b)
+  if (raw == "SELL" && p != "" && s != "") return sprintf("%.5f", p - s)
+  return ""
+}
+BEGIN {
+  printf "%-20s %-20s %-12s %-9s %-9s %-10s %-10s %-10s %-10s %-10s %-10s\n", \
+    "prev_time","curr_time","transition","prev_pUp","curr_pUp","prev_buyTh","curr_buyTh","prev_sellTh","curr_sellTh","prev_dist","curr_dist"
+}
+{
+  e = ts_epoch($0)
+  if (e && e < since) next
+
+  aiRaw = pUp = buyTh = sellTh = t = ""
+
+  if (match($0, /aiRaw=(BUY|SELL|FLAT)/)) aiRaw = substr($0, RSTART+6, RLENGTH-6)
+  if (match($0, /pUp=[0-9.]+/)) pUp = substr($0, RSTART+4, RLENGTH-4)
+  if (match($0, /modelBuyThresh=[0-9.]+/)) buyTh = substr($0, RSTART+15, RLENGTH-15)
+  if (match($0, /modelSellThresh=[0-9.]+/)) sellTh = substr($0, RSTART+16, RLENGTH-16)
+  if (match($0, /[0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/)) t = substr($0, RSTART, RLENGTH)
+
+  if (aiRaw != "" && prevRaw != "" && aiRaw != prevRaw &&
+      ((prevRaw == "FLAT" && (aiRaw == "BUY" || aiRaw == "SELL")) ||
+       ((prevRaw == "BUY" || prevRaw == "SELL") && aiRaw == "FLAT"))) {
+
+    pd = dist(prevRaw, prevPUp, prevBuyTh, prevSellTh)
+    cd = dist(aiRaw, pUp, buyTh, sellTh)
+
+    printf "%-20s %-20s %-12s %-9s %-9s %-10s %-10s %-10s %-10s %-10s %-10s\n", \
+      prevTime, t, prevRaw "->" aiRaw, prevPUp, pUp, prevBuyTh, buyTh, prevSellTh, sellTh, pd, cd
+  }
+
+  if (aiRaw != "") {
+    prevRaw = aiRaw
+    prevTime = t
+    prevPUp = pUp
+    prevBuyTh = buyTh
+    prevSellTh = sellTh
+  }
+}' /opt/coinbase/logs/audit/binance_audit.log | head -80
+
+------------ output ---------------------------------

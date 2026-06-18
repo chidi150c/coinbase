@@ -175,6 +175,7 @@ type Trader struct {
 	// lots      []*Position // legacy aggregate view (derived from books; do not mutate directly)
 	mu        sync.RWMutex
 	equityUSD float64
+	prevRaw   Signal
 
 	// NEW: path to persisted state file
 	stateFile string
@@ -748,9 +749,9 @@ func (t *Trader) consolidateRunners(book *SideBook, px float64) {
 }
 
 // --- NEW: side-aware lot closing (no global index) ---
-func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, localIdx int, exitReason string) (string, error) {
+func (t *Trader) closeLot(ctx context.Context, c []Candle, livePrice float64, side OrderSide, localIdx int, exitReason string) (string, error) {
 	book := t.book(side)
-	price := c[len(c)-1].Close
+	price := livePrice
 	lot := book.Lots[localIdx]
 	closeSide := SideSell
 	if lot.Side == SideSell {
@@ -776,7 +777,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	}
 
 	// --- NEW: maker-first post-only limit attempt for ScalpFixedTP exits ---
-	wantLimitExit := (lot.ExitMode == ExitModeScalpFixedTP && t.cfg.LimitTimeoutSec > 0 && lot.Take > 0)
+	wantLimitExit := (lot.ExitMode == ExitModeScalpFixedTP && exitReason != "threshold_stop_loss" && t.cfg.LimitTimeoutSec > 0 && lot.Take > 0)
 
 	// unlock for I/O
 	t.mu.Unlock()
@@ -864,7 +865,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	wasNewest := (localIdx == len(book.Lots)-1)
 
 	// --- MINIMAL CHANGE: use actual filled size/price if available ---
-	priceExec := c[len(c)-1].Close
+	priceExec := livePrice
 	baseFilled := baseRequested
 	if placed != nil {
 		if placed.Price > 0 {
@@ -884,7 +885,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, side OrderSide, local
 	}
 	// refresh price snapshot (best-effort) if no execution price was available
 	if placed == nil || placed.Price <= 0 {
-		priceExec = c[len(c)-1].Close
+		priceExec = livePrice
 	}
 
 	// --- Phase 3: pro-rate entry fee for the exited portion ---

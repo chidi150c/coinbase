@@ -849,8 +849,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// TODO: remove TRACE
 	lsb := len(t.book(SideBuy).Lots)
 	lss := len(t.book(SideSell).Lots)
-	log.Printf("TRACE step.start ts=%s price=%.8f lotsBuy=%d lotsSell=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f recentLow=%.8f recentHigh=%.8f",
-		now.Format(time.RFC3339), c[len(c)-1].Close, lsb, lss,
+	log.Printf("TRACE step.start ts=%s livePrice=%.8f candleClose=%.8f lotsBuy=%d lotsSell=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f recentLow=%.8f recentHigh=%.8f",
+		now.Format(time.RFC3339), livePrice, c[len(c)-1].Close, lsb, lss,
 		t.lastAddBuy.Format(time.RFC3339), t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell, t.RecentLow, t.RecentHigh)
 
 	price := livePrice
@@ -878,6 +878,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	d := t.decide(signalHistory)
 	d = t.applyLogicGate(d, c)
 
+	updatePrevRaw := func() {
+		t.prevRaw = d.Raw
+	}
+
 	// Cancel stale pending opens if the current decision no longer supports them.
 	// Do NOT clear pending here.
 	// Do NOT cancel pending context here.
@@ -892,6 +896,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		t.mu.Lock()
 
 		_ = t.saveStateNoLock()
+		updatePrevRaw()
 		t.mu.Unlock()
 		return "HOLD pending BUY cancel requested: signal changed", nil
 	}
@@ -906,6 +911,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		t.mu.Lock()
 
 		_ = t.saveStateNoLock()
+		updatePrevRaw()
 		t.mu.Unlock()
 		return "HOLD pending SELL cancel requested: signal changed", nil
 	}
@@ -1083,6 +1089,35 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// Profit gate must pass before any exit action.
 				// If profit disappears, clear transient trailing/TP state.
 				if !pass {
+					stopLossExit := false
+
+					lossLimit := -math.Abs(t.cfg.StopLossPnLUSD)
+					if t.cfg.EnableThresholdStopLoss && net <= lossLimit {
+						if lot.Side == SideBuy {
+							stopLossExit =
+								t.prevRaw == Flat &&
+									d.Raw == Buy &&
+									d.PUp > t.model.BuyThreshold-t.cfg.MinBuyDistance &&
+									d.PUp <= t.model.BuyThreshold
+						} else if lot.Side == SideSell {
+							stopLossExit =
+								t.prevRaw == Flat &&
+									d.Raw == Sell &&
+									d.PUp >= t.model.SellThreshold &&
+									d.PUp < t.model.SellThreshold+t.cfg.MinSellDistance
+						}
+					}
+
+					if stopLossExit {
+						msg, err := t.closeLot(ctx, c, livePrice, side, i, "threshold_stop_loss")
+						updatePrevRaw()
+						defer t.mu.Unlock()
+						if err != nil {
+							return "", true, err
+						}
+						return msg, true, nil
+					}
+
 					lot.TrailActive = false
 					lot.TrailPeak = 0
 					lot.TrailStop = 0
@@ -1114,7 +1149,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							i++
 							continue
 						}
-						msg, err := t.closeLot(ctx, c, side, i, "trailing_stop")
+						msg, err := t.closeLot(ctx, c, livePrice, side, i, "trailing_stop")
+						updatePrevRaw()
 						defer t.mu.Unlock()
 						if err != nil {
 							return "", true, err
@@ -1221,7 +1257,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					}
 				}
 				if trigger {
-					msg, err := t.closeLot(ctx, c, side, i, exitReason)
+					msg, err := t.closeLot(ctx, c, livePrice, side, i, exitReason)
+					updatePrevRaw()
 					defer t.mu.Unlock()
 					if err != nil {
 						return "", true, err
@@ -1305,11 +1342,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s pUp=%.5f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-79",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-79",
 		totalLots,
 		d.Raw,
 		d.Signal,
-		d.PUp,
+		price,
 		d.Reason,
 		t.cfg.BuyThreshold,
 		t.cfg.SellThreshold,
@@ -1327,10 +1364,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// Prevent duplicate opens while pending on this side (exits already ran) ---
 	// Extra belt-and-suspenders: if a pending exists and we haven't hit its Deadline, keep waiting.
 	if side == SideBuy && t.pendingBuy != nil && time.Now().Before(t.pendingBuy.Deadline) {
+		updatePrevRaw()
 		t.mu.Unlock()
 		return "OPEN-PENDING side=BUY", nil
 	}
 	if side == SideSell && t.pendingSell != nil && time.Now().Before(t.pendingSell.Deadline) {
+		updatePrevRaw()
 		t.mu.Unlock()
 		return "OPEN-PENDING side=SELL", nil
 	}
@@ -1395,6 +1434,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	if t.lastAddEquitySell > 0 && t.equityUSD >= t.lastAddEquitySell*t.cfg.SellEquityTriggerMult && d.Signal == Sell {
 		// Only proceed if not long-only; respect existing guard
 		if t.cfg.LongOnly {
+			updatePrevRaw()
 			t.mu.Unlock()
 			return "FLAT (long-only) [equity-scalp]", nil
 		}
@@ -1429,6 +1469,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	// Long-only veto for SELL when flat; unchanged behavior.
 	if d.Signal == Sell && t.cfg.LongOnly {
+		updatePrevRaw()
 		t.mu.Unlock()
 		return fmt.Sprintf("FLAT (long-only) [%s]", d.Reason), nil
 	}
@@ -1454,6 +1495,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			t.nearestNetSell,
 			t.nearestIdxSell,
 		)
+		updatePrevRaw()
 		t.mu.Unlock()
 		return "FLAT", nil
 	}
@@ -1475,6 +1517,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			t.didConsolidateStartup = true
 			log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
 		}
+		updatePrevRaw()
 		t.mu.Unlock()
 		log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", t.cfg.MaxConcurrentLots)
 		return "HOLD", nil
@@ -1543,6 +1586,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		// TODO: remove TRACE
 		log.Printf("TRACE pyramid.spacing since_last=%.1fs need>=%ds", time.Since(lastAddSide).Seconds(), psb)
 		if time.Since(lastAddSide) < time.Duration(psb)*time.Second {
+			updatePrevRaw()
 			t.mu.Unlock()
 			hrs := time.Since(lastAddSide).Hours()
 			log.Printf("[DEBUG] GATE2 pyramid: blocked by spacing; since_last=%vHours need>=%ds", fmt.Sprintf("%.1f", hrs), psb)
@@ -1655,6 +1699,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				}
 
 				if !(price <= gatePrice) {
+					updatePrevRaw()
 					t.mu.Unlock()
 					log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f latch_target_Hr>=%.2fHr confidence=%.2f",
 						price, gatePrice, t.winLowBuy, effPct, basePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence)
@@ -1697,6 +1742,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				}
 
 				if !(price >= gatePrice) {
+					updatePrevRaw()
 					t.mu.Unlock()
 					log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f, latch_target_Hr>=%.2fHr confidence=%.2f",
 						price, gatePrice, t.winHighSell, effPct, basePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence)
@@ -1808,6 +1854,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			t.nearestNetSell,
 			t.nearestIdxSell,
 		)
+		updatePrevRaw()
 		t.mu.Unlock()
 		return "HOLD", nil // or continue / hold
 	}
@@ -1954,6 +2001,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						// remember that a BUY was blocked by this amount
 						t.refundBuyUSD = short
 					}
+					updatePrevRaw()
 					t.mu.Unlock()
 					return "HOLD", nil
 				}
@@ -1990,7 +2038,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					// only now (true failure) remember that a BUY was blocked
 					t.refundBuyUSD = short
 				}
-
+				updatePrevRaw()
 				t.mu.Unlock()
 				return "HOLD", nil
 			}
@@ -2054,7 +2102,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					if shortUSD > 0 {
 						t.refundSellUSD = shortUSD
 					}
-
+					updatePrevRaw()
 					t.mu.Unlock()
 					return "HOLD", nil
 				}
@@ -2089,7 +2137,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				if shortUSD > 0 {
 					t.refundSellUSD = shortUSD
 				}
-
+				updatePrevRaw()
 				t.mu.Unlock()
 				return "HOLD", nil
 			}
@@ -2707,6 +2755,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					// drain path, not by the poller goroutine.
 					t.mu.Lock()
 					_ = t.saveStateNoLock()
+					updatePrevRaw()
 					t.mu.Unlock()
 					return fmt.Sprintf("OPEN-PENDING side=%s", side), nil
 				} else if err != nil {
@@ -2729,6 +2778,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		if placed == nil {
 			if !allowMarket {
 				log.Printf("TRACE postonly.market_fallback.blocked side=%s reason=recheck_flag_not_set", side)
+
+				t.mu.Lock()
+				updatePrevRaw()
+				t.mu.Unlock()
+
 				return "HOLD", nil
 			}
 			var err error
@@ -2754,6 +2808,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					if t.cfg.UseDirectSlack {
 						postSlack(fmt.Sprintf("ERR step: %v", err))
 					}
+
+					t.mu.Lock()
+					updatePrevRaw()
+					t.mu.Unlock()
+
 					return "", err
 				}
 			}
@@ -2972,6 +3031,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	}
 	log.Printf("[KPI] summary equity=%.2f daily_pnl=%.2f lots_buy=%d lots_sell=%d product=%s",
 		t.equityUSD, t.dailyPnL, len(t.book(SideBuy).Lots), len(t.book(SideSell).Lots), t.cfg.ProductID)
+	updatePrevRaw()
 	t.mu.Unlock()
 	return msg, nil
 }

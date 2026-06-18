@@ -109,6 +109,11 @@ func loadBotEnv() {
 		"MACD_LINE_EPS":        {},
 		"AI_THRESHOLD_BUFFER":  {},
 
+		"MIN_SELL_DISTANCE":         {},
+		"MIN_BUY_DISTANCE":          {},
+		"STOP_LOSS_PNL_USD":         {},
+		"ENABLE_THRESHOLD_STOPLOSS": {},
+
 		// ---- pyramiding/env-driven knobs ----
 		"ALLOW_PYRAMIDING":            {},
 		"PYRAMID_MIN_SECONDS_BETWEEN": {},

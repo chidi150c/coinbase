@@ -2,8 +2,9 @@
 // CLI to migrate legacy bot state (aggregate Lots) -> SideBooks (BookBuy/BookSell).
 //
 // Usage:
-//   go run tools/migrate_state.go -in <legacy.json> -out <new.json>
-//   go run tools/migrate_state.go -in <legacy.json> -inplace
+//
+//	go run tools/migrate_state.go -in <legacy.json> -out <new.json>
+//	go run tools/migrate_state.go -in <legacy.json> -inplace
 //
 // Notes:
 // - Preserves equity, model blobs, walk-forward, and side-aware pyramiding memory.
@@ -30,22 +31,22 @@ const (
 )
 
 type Position struct {
-	OpenPrice  float64    `json:"OpenPrice"`
-	Side       OrderSide  `json:"Side"`
-	SizeBase   float64    `json:"SizeBase"`
-	Stop       float64    `json:"Stop"`
-	Take       float64    `json:"Take"`
-	OpenTime   time.Time  `json:"OpenTime"`
-	EntryFee   float64    `json:"EntryFee"`
+	OpenPrice   float64   `json:"OpenPrice"`
+	Side        OrderSide `json:"Side"`
+	SizeBase    float64   `json:"SizeBase"`
+	Stop        float64   `json:"Stop"`
+	Take        float64   `json:"Take"`
+	OpenTime    time.Time `json:"OpenTime"`
+	EntryFee    float64   `json:"EntryFee"`
 	TrailActive bool      `json:"TrailActive"`
-	TrailPeak  float64    `json:"TrailPeak"`
-	TrailStop  float64    `json:"TrailStop"`
-	Reason     string     `json:"reason,omitempty"`
+	TrailPeak   float64   `json:"TrailPeak"`
+	TrailStop   float64   `json:"TrailStop"`
+	Reason      string    `json:"reason,omitempty"`
 }
 
 type SideBook struct {
-	RunnerID int          `json:"runner_id"`
-	Lots     []*Position  `json:"lots"`
+	RunnerID int         `json:"runner_id"`
+	Lots     []*Position `json:"lots"`
 }
 
 // Old (legacy) persisted state. Lots was global aggregate; runnerIdx was NOT persisted.
@@ -53,9 +54,9 @@ type OldBotState struct {
 	EquityUSD      float64         `json:"EquityUSD"`
 	DailyStart     time.Time       `json:"DailyStart"`
 	DailyPnL       float64         `json:"DailyPnL"`
-	Lots           []*Position     `json:"Lots"`          // legacy aggregate
-	Model          json.RawMessage `json:"Model"`         // keep opaque
-	MdlExt         json.RawMessage `json:"MdlExt"`        // keep opaque
+	Lots           []*Position     `json:"Lots"`   // legacy aggregate
+	Model          json.RawMessage `json:"Model"`  // keep opaque
+	MdlExt         json.RawMessage `json:"MdlExt"` // keep opaque
 	WalkForwardMin int             `json:"WalkForwardMin"`
 	LastFit        time.Time       `json:"LastFit"`
 

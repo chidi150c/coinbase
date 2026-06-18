@@ -35,11 +35,17 @@ type Config struct {
 	BuyEquityTriggerMult  float64
 	TakeProfitPct         float64
 	StopLossPct           float64
-	OrderMinUSD           float64 // legacy floor; still honored if MinNotional <= 0
-	MinNotional           float64 // preferred exchange min notional (QUOTE); if >0, use this instead of OrderMinUSD
-	LongOnly              bool    // prevent SELL entries when flat on spot
-	RequireBaseForShort   bool    // spot safety: require base inventory to short (default true)
-	FeeRatePct            float64 // % fee applied on entry/exit trades
+
+	MinSellDistance         float64
+	MinBuyDistance          float64
+	StopLossPnLUSD          float64
+	EnableThresholdStopLoss bool
+
+	OrderMinUSD         float64 // legacy floor; still honored if MinNotional <= 0
+	MinNotional         float64 // preferred exchange min notional (QUOTE); if >0, use this instead of OrderMinUSD
+	LongOnly            bool    // prevent SELL entries when flat on spot
+	RequireBaseForShort bool    // spot safety: require base inventory to short (default true)
+	FeeRatePct          float64 // % fee applied on entry/exit trades
 
 	// Normalized venue filters (optionally populated via env or bridge)
 	PriceTick float64 // price tick size (QUOTE)
@@ -156,11 +162,17 @@ func loadConfigFromEnv() Config {
 		BuyEquityTriggerMult:  getEnvFloat("BUY_EQUITY_TRIGGER_MULT", 0.95),
 		TakeProfitPct:         getEnvFloat("TAKE_PROFIT_PCT", 0.8),
 		StopLossPct:           getEnvFloat("STOP_LOSS_PCT", 0.4),
-		OrderMinUSD:           getEnvFloat("ORDER_MIN_USD", 5.00),
-		MinNotional:           getEnvFloat("MIN_NOTIONAL", 10.0), // preferred when > 0
-		LongOnly:              getEnvBool("LONG_ONLY", true),
-		RequireBaseForShort:   getEnvBool("REQUIRE_BASE_FOR_SHORT", true),
-		FeeRatePct:            getEnvFloat("FEE_RATE_PCT", 0.10),
+
+		MinSellDistance:         getEnvFloat("MIN_SELL_DISTANCE", 0.01),
+		MinBuyDistance:          getEnvFloat("MIN_BUY_DISTANCE", 0.01),
+		StopLossPnLUSD:          getEnvFloat("STOP_LOSS_PNL_USD", 0.25),
+		EnableThresholdStopLoss: getEnvBool("ENABLE_THRESHOLD_STOPLOSS", true),
+
+		OrderMinUSD:         getEnvFloat("ORDER_MIN_USD", 5.00),
+		MinNotional:         getEnvFloat("MIN_NOTIONAL", 10.0), // preferred when > 0
+		LongOnly:            getEnvBool("LONG_ONLY", true),
+		RequireBaseForShort: getEnvBool("REQUIRE_BASE_FOR_SHORT", true),
+		FeeRatePct:          getEnvFloat("FEE_RATE_PCT", 0.10),
 
 		// Venue filters (can be hydrated by bridge and/or env file)
 		PriceTick: getEnvFloat("PRICE_TICK", 0.01),
