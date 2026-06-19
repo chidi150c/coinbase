@@ -412,7 +412,7 @@ BEGIN {
   if (match($0, /[0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/))
     t = substr($0, RSTART, RLENGTH)
 
-  if (prevRaw == "FLAT" && (aiRaw == "BUY" || aiRaw == "SELL")) {
+  if (previousAIRaw == "FLAT" && (aiRaw == "BUY" || aiRaw == "SELL")) {
     dist = ""
     if (aiRaw == "BUY" && buyTh != "" && pUp != "")
       dist = sprintf("%.5f", pUp - buyTh)
@@ -423,7 +423,7 @@ BEGIN {
   }
 
   if (aiRaw != "") {
-    prevRaw = aiRaw
+    previousAIRaw = aiRaw
     prevTime = t
   }
 }' /opt/coinbase/logs/audit/binance_audit.log | head -80
@@ -489,19 +489,19 @@ BEGIN {
   if (match($0, /modelSellThresh=[0-9.]+/)) sellTh = substr($0, RSTART+16, RLENGTH-16)
   if (match($0, /[0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/)) t = substr($0, RSTART, RLENGTH)
 
-  if (aiRaw != "" && prevRaw != "" && aiRaw != prevRaw &&
-      ((prevRaw == "FLAT" && (aiRaw == "BUY" || aiRaw == "SELL")) ||
-       ((prevRaw == "BUY" || prevRaw == "SELL") && aiRaw == "FLAT"))) {
+  if (aiRaw != "" && previousAIRaw != "" && aiRaw != previousAIRaw &&
+      ((previousAIRaw == "FLAT" && (aiRaw == "BUY" || aiRaw == "SELL")) ||
+       ((previousAIRaw == "BUY" || previousAIRaw == "SELL") && aiRaw == "FLAT"))) {
 
-    pd = dist(prevRaw, prevPUp, prevBuyTh, prevSellTh)
+    pd = dist(previousAIRaw, prevPUp, prevBuyTh, prevSellTh)
     cd = dist(aiRaw, pUp, buyTh, sellTh)
 
     printf "%-20s %-20s %-12s %-9s %-9s %-10s %-10s %-10s %-10s %-10s %-10s\n", \
-      prevTime, t, prevRaw "->" aiRaw, prevPUp, pUp, prevBuyTh, buyTh, prevSellTh, sellTh, pd, cd
+      prevTime, t, previousAIRaw "->" aiRaw, prevPUp, pUp, prevBuyTh, buyTh, prevSellTh, sellTh, pd, cd
   }
 
   if (aiRaw != "") {
-    prevRaw = aiRaw
+    previousAIRaw = aiRaw
     prevTime = t
     prevPUp = pUp
     prevBuyTh = buyTh
@@ -565,7 +565,7 @@ BEGIN {
   if (match($0, /modelSellThresh=[0-9.]+/))
     sellTh = substr($0, RSTART+16, RLENGTH-16)
 
-  if (prevRaw == "FLAT" && (aiRaw == "BUY" || aiRaw == "SELL")) {
+  if (previousAIRaw == "FLAT" && (aiRaw == "BUY" || aiRaw == "SELL")) {
     dist = ""; pdiff = ""
 
     if (aiRaw == "BUY" && buyTh != "" && pUp != "")
@@ -582,7 +582,7 @@ BEGIN {
   }
 
   if (aiRaw != "") {
-    prevRaw = aiRaw
+    previousAIRaw = aiRaw
     prevTime = t
     prevStepPrice = lastStepPrice
   }

@@ -129,6 +129,7 @@ type BotState struct {
 	RefundSellUSD      float64
 	SpareBuyUSD        float64
 	SpareSellUSD       float64
+	PreviousAIRaw      Signal
 }
 
 // --- NEW (Phase 1): pending async maker-first open support ---
@@ -173,9 +174,9 @@ type Trader struct {
 	didConsolidateStartup bool
 	pos                   *Position // kept for backward compatibility with earlier logic (represents last lot in aggregate)
 	// lots      []*Position // legacy aggregate view (derived from books; do not mutate directly)
-	mu        sync.RWMutex
-	equityUSD float64
-	prevRaw   Signal
+	mu            sync.RWMutex
+	equityUSD     float64
+	previousAIRaw Signal
 
 	// NEW: path to persisted state file
 	stateFile string
@@ -1203,6 +1204,7 @@ func (t *Trader) snapshotStateLocked() BotState {
 		WinLowBuy:       t.winLowBuy,
 		WinHighSell:     t.winHighSell,
 		LatchedGateBuy:  t.latchedGateBuy,
+		PreviousAIRaw:   t.previousAIRaw,
 		LatchedGateSell: t.latchedGateSell,
 
 		// Persist SELL equity baseline; keep legacy field for older state compatibility.
@@ -1316,6 +1318,7 @@ func (t *Trader) loadState() error {
 	t.winLowBuy = st.WinLowBuy
 	t.winHighSell = st.WinHighSell
 	t.latchedGateBuy = st.LatchedGateBuy
+	t.previousAIRaw = st.PreviousAIRaw
 	t.latchedGateSell = st.LatchedGateSell
 	t.lastAddEquitySell = st.LastAddEquitySell
 	t.lastAddEquityBuy = st.LastAddEquityBuy
