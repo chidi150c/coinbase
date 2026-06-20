@@ -590,6 +590,6 @@ BEGIN {
 ' /opt/coinbase/logs/audit/binance_audit.log | head -80
 
 ===========================================================================
-./last_state_item.sh --buy  -f /opt/coinbase/state/bot_state.newbinance.json
-./last_state_item.sh --sell -f /opt/coinbase/state/bot_state.newbinance.json
-./last_state_item.sh --exit -f /opt/coinbase/state/bot_state.newbinance.json
+./last_state_item.sh --buy 
+./last_state_item.sh --sell
+./last_state_item.sh --exit 

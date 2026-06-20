@@ -1119,19 +1119,19 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						switch lot.Side {
 						case SideBuy:
 							stopLossExit =
-								previousAIRaw == Flat &&
+								(previousAIRaw == Flat &&
 									d.Raw == Buy &&
 									d.PUp > buyTh-minBuyDist &&
 									d.PUp <= buyTh &&
-									d.Signal != Buy
+									d.Signal != Buy) || d.Signal == Sell
 
 						case SideSell:
 							stopLossExit =
-								previousAIRaw == Flat &&
+								(previousAIRaw == Flat &&
 									d.Raw == Sell &&
 									d.PUp >= sellTh &&
 									d.PUp < sellTh+minSellDist &&
-									d.Signal != Sell
+									d.Signal != Sell) || d.Signal == Buy
 						}
 					}
 
@@ -1377,7 +1377,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-82",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-84",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1696,6 +1696,15 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		// Use side-aware latest entry for adverse gate anchoring
 		last := t.latestEntryBySide(side)
 
+		// Convert stop-loss USD risk into a price distance and use 20% as a
+		// latch buffer. Keeps BUY latches below recent entries and SELL latches
+		// above recent entries, preventing immediate re-adds near the last fill.
+		latchBufferPrice := 0.0
+		if t.cfg.RiskPerTradeUSD > 0 && price > 0 {
+			fullDistance := math.Abs(t.cfg.StopLossPnLUSD) * price / t.cfg.RiskPerTradeUSD
+			latchBufferPrice = fullDistance / 5.0
+		}
+
 		if last > 0 {
 			if side == SideBuy {
 				// BUY adverse tracker (side-aware)
@@ -1721,7 +1730,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// latched replaces baseline
 				if t.latchedGateBuy > 0 {
 					oldLatch := t.latchedGateBuy
-					t.latchedGateBuy = math.Min(last, t.latchedGateBuy)
+					t.latchedGateBuy = math.Min(last-latchBufferPrice, t.latchedGateBuy)
 					if t.latchedGateBuy != oldLatch {
 						log.Printf("TRACE pyramid.latch_clamp.buy old=%.8f last=%.8f new=%.8f", oldLatch, last, t.latchedGateBuy)
 					}
@@ -1769,7 +1778,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// latched replaces baseline
 				if t.latchedGateSell > 0 {
 					oldLatch := t.latchedGateSell
-					t.latchedGateSell = math.Max(last, t.latchedGateSell)
+					t.latchedGateSell = math.Max(last+latchBufferPrice, t.latchedGateSell)
 					if t.latchedGateSell != oldLatch {
 						log.Printf("TRACE pyramid.latch_clamp.sell old=%.8f last=%.8f new=%.8f", oldLatch, last, t.latchedGateSell)
 					}

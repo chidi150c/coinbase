@@ -338,49 +338,24 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		}
 	}
 
-	reason = appendReason(reason, fmt.Sprintf("softStrongBuy=%v softStrongSell=%v", softAboveStrongBuy, softAboveStrongSell))
+	logicNote := appendReason(reason, fmt.Sprintf("softStrongBuy=%v softStrongSell=%v", softAboveStrongBuy, softAboveStrongSell))
 
-	reason = fmt.Sprintf(
-		"[LOGIC_GATE] gateTF=%s aiRaw=%s logicOpinion=%s logicDisagreement=%v final=%s | "+
-			"MACD{line=%.5f turn=%.5f hist=%.5f dHist=%.5f dSmooth=%.5f} | "+
+	logicReason := fmt.Sprintf(
+		"[LOGIC_GATE] signalTF=1m | Gate{confidence=%.2f eps=%.5f note=%v} | aiRaw=%s logicOpinion=%s final=%s | "+
+			"MACD{line=%.5f turn=%.5f hist=%.5f dHist=%.5f dSmooth=%.5f macdStrongPositive=%v macdStrongNegative=%v macdMomentumDown=%v macdMomentumUp=%v} | "+
+			"Pattern{emaHighPeak=%v emaLowBottom=%v emaPriceDownGoingUp=%v emaPriceUpGoingDown=%v emaSellPattern=%v emaBuyPattern=%v} | "+
 			"EMA{spread=%.6f ema2050=%.6f} | "+
-			"Pattern{emaHighPeak=%v emaLowBottom=%v emaPriceDownGoingUp=%v emaPriceUpGoingDown=%v emaSellPattern=%v emaBuyPattern=%v macdMomentumDown=%v macdMomentumUp=%v macdStrongPositive=%v macdStrongNegative=%v} | "+
-			"Gate{confidence=%.2f epsFactor=%.2f eps=%.5f note=%v} modelUpAvg=%.5f modelDownAvg=%.5f",
-
-		t.cfg.GateTF,
-		d.Raw,
-		logicOpinion,
-		logicDisagreement,
-		d.Signal,
-
-		snap.MACDLine,
-		snap.MACDTurningPoint,
-		snap.MACDHist,
-		snap.MACDHistDelta,
-		snap.MACDHistDeltaSmooth,
-
-		snap.EMASpreadPct,
-		snap.EMA2050Spread,
-
-		snap.EMAHighPeak,
-		snap.EMALowBottom,
-		snap.EMAPriceDownGoingUp,
-		snap.EMAPriceUpGoingDown,
-		emaSellPattern,
-		emaBuyPattern,
-		snap.MACDMomentumDown,
-		snap.MACDMomentumUp,
-		snap.MACDStrongPositive,
-		snap.MACDStrongNegative,
-		confidence,
-		epsFactor,
-		eps,
-		reason,
-		modelUpAvg,
-		modelDownAvg,
+			"modelUpAvg=%.5f modelDownAvg=%.5f",
+		confidence, eps, logicNote,
+		d.Raw, logicOpinion, d.Signal,
+		snap.MACDLine, snap.MACDTurningPoint, snap.MACDHist, snap.MACDHistDelta, snap.MACDHistDeltaSmooth,
+		snap.MACDStrongPositive, snap.MACDStrongNegative, snap.MACDMomentumDown, snap.MACDMomentumUp,
+		snap.EMAHighPeak, snap.EMALowBottom, snap.EMAPriceDownGoingUp, snap.EMAPriceUpGoingDown, emaSellPattern, emaBuyPattern,
+		snap.EMASpreadPct, snap.EMA2050Spread,
+		modelUpAvg, modelDownAvg,
 	)
 
-	d.Reason = appendReason(d.Reason, reason)
+	d.Reason = appendReason(d.Reason, logicReason)
 
 	return d
 }

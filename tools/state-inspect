@@ -1,0 +1,122 @@
+cat > ~/coinbase/monitoring/last_state_item.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_FILE="${STATE_FILE:-/opt/coinbase/state/bot_state.newbinance.json}"
+MODE=""
+N=1
+COMPACT=false
+REASON=false
+
+usage() {
+  cat <<USAGE
+Usage:
+  last_state_item.sh --buy|--sell|--exit|--all [options]
+
+Options:
+  --buy             Show latest BUY lots
+  --sell            Show latest SELL lots
+  --exit            Show latest exits
+  --all             Show BUY, SELL, and EXIT
+  -n, --n NUM       Number of items to show, default: 1
+  --compact         Print one-line compact output
+  --reason          Print only key fields plus reason
+  -f, --file PATH   State file path
+  -h, --help        Show this help
+
+Examples:
+  last_state_item.sh --buy
+  last_state_item.sh --sell -n 3
+  last_state_item.sh --exit --compact
+  last_state_item.sh --all --reason
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --buy) MODE="buy"; shift ;;
+    --sell) MODE="sell"; shift ;;
+    --exit) MODE="exit"; shift ;;
+    --all) MODE="all"; shift ;;
+    -n|--n) N="${2:-}"; shift 2 ;;
+    --compact) COMPACT=true; shift ;;
+    --reason) REASON=true; shift ;;
+    -f|--file) STATE_FILE="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown arg: $1"; usage; exit 1 ;;
+  esac
+done
+
+[[ -n "$MODE" ]] || { usage; exit 1; }
+[[ "$N" =~ ^[0-9]+$ ]] || { echo "Invalid -n/--n: $N"; exit 1; }
+[[ -f "$STATE_FILE" ]] || { echo "State file not found: $STATE_FILE"; exit 1; }
+
+print_items() {
+  local path="$1"
+  local title="$2"
+
+  echo "=== $title last $N ==="
+
+  if [[ "$COMPACT" == true ]]; then
+    jq -r --argjson n "$N" --arg title "$title" '
+      def cdt:
+        if . == null then "n/a"
+        else
+          sub("\\.[0-9]+Z$"; "Z")
+          | fromdateiso8601
+          | . - (5*3600)
+          | strftime("%Y-%m-%d %H:%M:%S CDT")
+        end;
+
+      def pup:
+        ((.reason // .Reason // "") | capture("pUp=(?<x>[0-9.]+)")? | .x) // "n/a";
+
+      def conf:
+        ((.reason // .Reason // "") | capture("confidence=(?<x>[0-9.]+)")? | .x)
+        // (.confidence_mult // .ConfidenceMult // "n/a");
+
+      def reason_type:
+        ((.reason // .Reason // "") | split(" | ")[0] | split("|")[0]) // "n/a";
+
+      '"$path"' // []
+      | .[-$n:]
+      | reverse
+      | .[]
+      | if $title == "EXIT" then
+          "time=\(.time|cdt) side=\(.side // "n/a") lot_id=\(.lot_id // "n/a") open=\(.open_price // 0) close=\(.close_price // 0) pnl=\(.pnl_usd // 0) reason=\(reason_type) pUp=\(pup) conf=\(conf) entry_id=\(.entry_order_id // "n/a") exit_id=\(.exit_order_id // "n/a")"
+        else
+          "time=\(.OpenTime|cdt) side=\(.Side // "n/a") lot_id=\(.lot_id // .LotID // "n/a") open=\(.OpenPrice // 0) size=\(.SizeBase // 0) notional=\(.OpenNotionalUSD // 0) pUp=\(pup) conf=\(conf) gate=\(.profit_gate_usd // .ProfitGateUSD // "n/a") entry_id=\(.entry_order_id // .EntryOrderID // "n/a")"
+        end
+    ' "$STATE_FILE"
+
+  elif [[ "$REASON" == true ]]; then
+    jq --argjson n "$N" "$path // [] | .[-\$n:] | reverse | .[] | {
+      time:(.OpenTime // .time),
+      side:(.Side // .side),
+      lot_id:(.lot_id // .LotID),
+      open:(.OpenPrice // .open_price),
+      close:.close_price,
+      pnl:.pnl_usd,
+      entry_order_id:(.entry_order_id // .EntryOrderID),
+      exit_order_id:.exit_order_id,
+      reason:(.reason // .Reason)
+    }" "$STATE_FILE"
+
+  else
+    jq --argjson n "$N" "$path // [] | .[-\$n:] | reverse | .[]" "$STATE_FILE"
+  fi
+}
+
+case "$MODE" in
+  buy) print_items ".BookBuy.lots" "BUY" ;;
+  sell) print_items ".BookSell.lots" "SELL" ;;
+  exit) print_items ".Exits" "EXIT" ;;
+  all)
+    print_items ".BookBuy.lots" "BUY"
+    print_items ".BookSell.lots" "SELL"
+    print_items ".Exits" "EXIT"
+    ;;
+esac
+EOF
+
+chmod +x ~/coinbase/monitoring/last_state_item.sh
