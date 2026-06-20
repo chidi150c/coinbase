@@ -849,9 +849,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// TODO: remove TRACE
 	lsb := len(t.book(SideBuy).Lots)
 	lss := len(t.book(SideSell).Lots)
-	log.Printf("TRACE step.start ts=%s livePrice=%.8f candleClose=%.8f lotsBuy=%d lotsSell=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f recentLow=%.8f recentHigh=%.8f",
+	log.Printf("TRACE step.start ts=%s livePrice=%.8f candleClose=%.8f lotsBuy=%d lotsSell=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f recentLow=%.8f recentHigh=%.8f elapsed_Hours_Buy=%.1f elapsed_Hours_Sell=%.1f",
 		now.Format(time.RFC3339), livePrice, c[len(c)-1].Close, lsb, lss,
-		t.lastAddBuy.Format(time.RFC3339), t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell, t.RecentLow, t.RecentHigh)
+		t.lastAddBuy.Format(time.RFC3339), t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell, t.RecentLow, t.RecentHigh, time.Since(t.lastAddBuy).Hours(), time.Since(t.lastAddSell).Hours())
 
 	price := livePrice
 
@@ -1100,28 +1100,32 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				if !pass {
 					stopLossExit := false
 
-					if enableStopLoss && net <= lossLimit {
-						log.Printf(
-							"TRACE threshold_stoploss_check side=%s pUp=%.5f buyTh=%.5f sellTh=%.5f previousAIRaw=%s raw=%s signal=%s pnl=%.2f lossLimit=%.2f",
-							lot.Side,
-							d.PUp,
-							buyTh,
-							sellTh,
-							previousAIRaw,
-							d.Raw,
-							d.Signal,
-							net,
-							lossLimit,
-						)
+					stopReason := fmt.Sprintf(
+						"threshold_stoploss_check side=%s pUp=%.5f buyTh=%.5f sellTh=%.5f previousAIRaw=%s raw=%s signal=%s pnl=%.2f lossLimit=%.2f",
+						lot.Side,
+						d.PUp,
+						buyTh,
+						sellTh,
+						previousAIRaw,
+						d.Raw,
+						d.Signal,
+						net,
+						lossLimit,
+					)
 
-						if lot.Side == SideBuy {
+					if enableStopLoss && net <= lossLimit {
+						log.Printf("TRACE %s", stopReason)
+
+						switch lot.Side {
+						case SideBuy:
 							stopLossExit =
 								previousAIRaw == Flat &&
 									d.Raw == Buy &&
 									d.PUp > buyTh-minBuyDist &&
 									d.PUp <= buyTh &&
 									d.Signal != Buy
-						} else if lot.Side == SideSell {
+
+						case SideSell:
 							stopLossExit =
 								previousAIRaw == Flat &&
 									d.Raw == Sell &&
@@ -1132,7 +1136,17 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					}
 
 					if stopLossExit {
-						msg, err := t.closeLot(ctx, c, livePrice, side, i, "threshold_stop_loss")
+						exitDecision := appendReason(d.Reason, stopReason)
+
+						msg, err := t.closeLot(
+							ctx,
+							c,
+							livePrice,
+							side,
+							i,
+							"threshold_stop_loss",
+							exitDecision,
+						)
 						if err != nil {
 							return "", true, err
 						}
@@ -1170,7 +1184,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							i++
 							continue
 						}
-						msg, err := t.closeLot(ctx, c, livePrice, side, i, "trailing_stop")
+						msg, err := t.closeLot(ctx, c, livePrice, side, i, "trailing_stop", d.Reason)
 						if err != nil {
 							return "", true, err
 						}
@@ -1276,7 +1290,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					}
 				}
 				if trigger {
-					msg, err := t.closeLot(ctx, c, livePrice, side, i, exitReason)
+					msg, err := t.closeLot(ctx, c, livePrice, side, i, exitReason, d.Reason)
 					if err != nil {
 						return "", true, err
 					}
@@ -1706,6 +1720,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				// latched replaces baseline
 				if t.latchedGateBuy > 0 {
+					oldLatch := t.latchedGateBuy
+					t.latchedGateBuy = math.Min(last, t.latchedGateBuy)
+					if t.latchedGateBuy != oldLatch {
+						log.Printf("TRACE pyramid.latch_clamp.buy old=%.8f last=%.8f new=%.8f", oldLatch, last, t.latchedGateBuy)
+					}
 					gatePrice = t.latchedGateBuy
 				}
 
@@ -1749,6 +1768,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				// latched replaces baseline
 				if t.latchedGateSell > 0 {
+					oldLatch := t.latchedGateSell
+					t.latchedGateSell = math.Max(last, t.latchedGateSell)
+					if t.latchedGateSell != oldLatch {
+						log.Printf("TRACE pyramid.latch_clamp.sell old=%.8f last=%.8f new=%.8f", oldLatch, last, t.latchedGateSell)
+					}
 					gatePrice = t.latchedGateSell
 				}
 
@@ -2958,7 +2982,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		Take:             take,
 		Version:          1,
 		LotID:            len(book.Lots),
-		EntryOrderID:     "", // market path has no known order id here
+		EntryOrderID:     placedOrderID(placed),
 		RefundPortionUSD: refundFromOpposite,
 		ConfidenceMult:   confMult,
 		EntryAIMode:      entryAIMode,

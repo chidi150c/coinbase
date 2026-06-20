@@ -750,7 +750,7 @@ func (t *Trader) consolidateRunners(book *SideBook, px float64) {
 }
 
 // --- NEW: side-aware lot closing (no global index) ---
-func (t *Trader) closeLot(ctx context.Context, c []Candle, livePrice float64, side OrderSide, localIdx int, exitReason string) (string, error) {
+func (t *Trader) closeLot(ctx context.Context, c []Candle, livePrice float64, side OrderSide, localIdx int, exitReason string, exitDecision string) (string, error) {
 	book := t.book(side)
 	price := livePrice
 	lot := book.Lots[localIdx]
@@ -974,14 +974,19 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, livePrice float64, si
 		EntryFeeUSD:      entryPortion, // Phase 3: record proportional entry fee
 		ExitFeeUSD:       exitFee,
 		PNLUSD:           pl,
-		Reason:           exitReason + " | " + lot.Reason,
+		Reason:           exitReason + " | open{" + lot.Reason + "} | exit{" + exitDecision + "}",
 		ExitMode:         lot.ExitMode,
 		WasRunner:        removedWasRunner,
 		RefundPortionUSD: lot.RefundPortionUSD,
 		// NEW identifiers
 		LotID:        lot.LotID,
 		EntryOrderID: lot.EntryOrderID,
-		ExitOrderID:  exitOrderID,
+		ExitOrderID: func() string {
+			if strings.TrimSpace(exitOrderID) != "" {
+				return strings.TrimSpace(exitOrderID)
+			}
+			return placedOrderID(placed)
+		}(),
 	}
 
 	// Append with cap semantics (ring buffer behavior)
@@ -1121,6 +1126,13 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, livePrice float64, si
 
 	_ = removedWasRunner // kept to emphasize runner path; no extra logs.
 	return msg, nil
+}
+
+func placedOrderID(p *PlacedOrder) string {
+	if p == nil {
+		return ""
+	}
+	return strings.TrimSpace(p.ID)
 }
 
 // activationPrice returns the mark price that achieves a given NET USD gain (usdGate)
@@ -1512,7 +1524,6 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 					case (*ch) <- OpenResult{Filled: true, Placed: o, OrderID: p.OrderID}:
 					default:
 					}
-					*pend = nil
 					_ = t.saveStateNoLock()
 					return
 				}
@@ -1705,20 +1716,14 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 			default:
 			}
 
-			// Clear pending and persist on exit using centralized manager
+			// Do NOT clear pending here.
+			// step() drain must consume OpenResult first so it can copy pending Reason,
+			// ConfidenceMult, EntryAIMode, ProfitGateUSD, RefundPortionUSD, etc.
+			// Clearing pending here would create lots with missing entry metadata after restart.
 			t.apply(func(tt *Trader) {
-				if side == SideBuy {
-					tt.pendingBuy = nil
-					tt.pendingBuyCtx = nil
-					tt.pendingBuyCancel = nil
-				} else {
-					tt.pendingSell = nil
-					tt.pendingSellCtx = nil
-					tt.pendingSellCancel = nil
-				}
 				err := tt.saveStateFrom(tt.snapshotStateLocked())
 				if err != nil {
-					log.Fatalf("TRACE Unable to save state after order cancelling in RehydratePending!!! side=%s Error: %v", side, err)
+					log.Fatalf("TRACE Unable to save state after RehydratePending poller finish!!! side=%s Error: %v", side, err)
 				}
 			})
 		}(p, *ch, *pctx)
