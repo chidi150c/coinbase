@@ -474,30 +474,33 @@ function dist(raw, p, b, s) {
   return ""
 }
 BEGIN {
-  printf "%-20s %-20s %-12s %-9s %-9s %-10s %-10s %-10s %-10s %-10s %-10s\n", \
-    "prev_time","curr_time","transition","prev_pUp","curr_pUp","prev_buyTh","curr_buyTh","prev_sellTh","curr_sellTh","prev_dist","curr_dist"
+  printf "%-20s %-20s %-12s %-9s %-9s %-9s %-9s %-10s %-14s %-14s %-10s\n", \
+    "prev_time","curr_time","transition","prev_pUp","curr_pUp","buyTh","sellTh","dist","prev_price","curr_price","price_diff"
 }
 {
   e = ts_epoch($0)
   if (e && e < since) next
 
-  aiRaw = pUp = buyTh = sellTh = t = ""
+  aiRaw = pUp = buyTh = sellTh = price = t = ""
 
   if (match($0, /aiRaw=(BUY|SELL|FLAT)/)) aiRaw = substr($0, RSTART+6, RLENGTH-6)
   if (match($0, /pUp=[0-9.]+/)) pUp = substr($0, RSTART+4, RLENGTH-4)
   if (match($0, /modelBuyThresh=[0-9.]+/)) buyTh = substr($0, RSTART+15, RLENGTH-15)
   if (match($0, /modelSellThresh=[0-9.]+/)) sellTh = substr($0, RSTART+16, RLENGTH-16)
+  if (match($0, /price=[0-9.]+/)) price = substr($0, RSTART+6, RLENGTH-6)
   if (match($0, /[0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/)) t = substr($0, RSTART, RLENGTH)
 
-  if (aiRaw != "" && previousAIRaw != "" && aiRaw != previousAIRaw &&
-      ((previousAIRaw == "FLAT" && (aiRaw == "BUY" || aiRaw == "SELL")) ||
-       ((previousAIRaw == "BUY" || previousAIRaw == "SELL") && aiRaw == "FLAT"))) {
-
-    pd = dist(previousAIRaw, prevPUp, prevBuyTh, prevSellTh)
+  if (aiRaw != "" && previousAIRaw == "FLAT" && (aiRaw == "BUY" || aiRaw == "SELL")) {
     cd = dist(aiRaw, pUp, buyTh, sellTh)
 
-    printf "%-20s %-20s %-12s %-9s %-9s %-10s %-10s %-10s %-10s %-10s %-10s\n", \
-      prevTime, t, previousAIRaw "->" aiRaw, prevPUp, pUp, prevBuyTh, buyTh, prevSellTh, sellTh, pd, cd
+    if (prevPrice != "" && price != "") {
+      priceDiff = sprintf("%.2f", price - prevPrice)
+    } else {
+      priceDiff = ""
+    }
+
+    printf "%-20s %-20s %-12s %-9s %-9s %-9s %-9s %-10s %-14s %-14s %-10s\n", \
+      prevTime, t, previousAIRaw "->" aiRaw, prevPUp, pUp, buyTh, sellTh, cd, prevPrice, price, priceDiff
   }
 
   if (aiRaw != "") {
@@ -506,90 +509,14 @@ BEGIN {
     prevPUp = pUp
     prevBuyTh = buyTh
     prevSellTh = sellTh
+    prevPrice = price
   }
 }' /opt/coinbase/logs/audit/binance_audit.log | head -80
 
------------- output ---------------------------------
-
-
-
-=============================================================================
-This version with price:
-
-awk -v since="$(date -u -d '48 hours ago' +%s)" '
-function ts_epoch(line, a) {
-  if (match(line, /[0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
-    split(substr(line,RSTART,19), a, /[\/ :]/)
-    return mktime(a[1]" "a[2]" "a[3]" "a[4]" "a[5]" "a[6])
-  }
-  return 0
-}
-BEGIN {
-  printf "%-20s %-20s %-12s %-8s %-10s %-10s %-10s %-12s %-12s %-12s\n",
-         "prev_time","curr_time","transition","pUp","buyTh","sellTh","dist",
-         "prev_price","curr_price","price_diff"
-}
-{
-  e = ts_epoch($0)
-  if (e && e < since) next
-
-  t = ""
-  if (match($0, /[0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/))
-    t = substr($0, RSTART, RLENGTH)
-
-  # Capture price only from the latest TRACE step.start line
-  if ($0 ~ /TRACE step.start/) {
-    stepPrice = ""
-    if (match($0, /price=[0-9.]+/))
-      stepPrice = substr($0, RSTART+6, RLENGTH-6)
-    else if (match($0, /livePrice=[0-9.]+/))
-      stepPrice = substr($0, RSTART+10, RLENGTH-10)
-
-    if (stepPrice != "") {
-      lastStepPrice = stepPrice
-      lastStepTime = t
-    }
-  }
-
-  aiRaw = ""; pUp = ""; buyTh = ""; sellTh = ""
-
-  if (match($0, /aiRaw=(BUY|SELL|FLAT)/))
-    aiRaw = substr($0, RSTART+6, RLENGTH-6)
-
-  if (match($0, /pUp=[0-9.]+/))
-    pUp = substr($0, RSTART+4, RLENGTH-4)
-
-  if (match($0, /modelBuyThresh=[0-9.]+/))
-    buyTh = substr($0, RSTART+15, RLENGTH-15)
-
-  if (match($0, /modelSellThresh=[0-9.]+/))
-    sellTh = substr($0, RSTART+16, RLENGTH-16)
-
-  if (previousAIRaw == "FLAT" && (aiRaw == "BUY" || aiRaw == "SELL")) {
-    dist = ""; pdiff = ""
-
-    if (aiRaw == "BUY" && buyTh != "" && pUp != "")
-      dist = sprintf("%.5f", pUp - buyTh)
-    else if (aiRaw == "SELL" && sellTh != "" && pUp != "")
-      dist = sprintf("%.5f", pUp - sellTh)
-
-    if (prevStepPrice != "" && lastStepPrice != "")
-      pdiff = sprintf("%.2f", lastStepPrice - prevStepPrice)
-
-    printf "%-20s %-20s %-12s %-8s %-10s %-10s %-10s %-12s %-12s %-12s\n",
-           prevTime, t, "FLAT->" aiRaw, pUp, buyTh, sellTh, dist,
-           prevStepPrice, lastStepPrice, pdiff
-  }
-
-  if (aiRaw != "") {
-    previousAIRaw = aiRaw
-    prevTime = t
-    prevStepPrice = lastStepPrice
-  }
-}
-' /opt/coinbase/logs/audit/binance_audit.log | head -80
-
 ===========================================================================
+
 ./last_state_item.sh --buy 
 ./last_state_item.sh --sell
 ./last_state_item.sh --exit 
+
+==============================================================================

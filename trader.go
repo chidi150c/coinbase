@@ -974,7 +974,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, livePrice float64, si
 		EntryFeeUSD:      entryPortion, // Phase 3: record proportional entry fee
 		ExitFeeUSD:       exitFee,
 		PNLUSD:           pl,
-		Reason:           exitReason + " | exitReason{" + exitDecision + "} | openReason{" + lot.Reason + "}",
+		Reason:           exitReason + " | exitReason{" + exitDecision + "}  ||  openReason{" + lot.Reason + "}",
 		ExitMode:         lot.ExitMode,
 		WasRunner:        removedWasRunner,
 		RefundPortionUSD: lot.RefundPortionUSD,

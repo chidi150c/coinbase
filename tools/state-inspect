@@ -1,4 +1,4 @@
-cat > ~/coinbase/monitoring/last_state_item.sh <<'EOF'
+cat > ~/coinbase/monitoring/what-state <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -11,7 +11,7 @@ REASON=false
 usage() {
   cat <<USAGE
 Usage:
-  last_state_item.sh --buy|--sell|--exit|--all [options]
+  what-state --buy|--sell|--exit|--all [options]
 
 Options:
   --buy             Show latest BUY lots
@@ -25,10 +25,11 @@ Options:
   -h, --help        Show this help
 
 Examples:
-  last_state_item.sh --buy
-  last_state_item.sh --sell -n 3
-  last_state_item.sh --exit --compact
-  last_state_item.sh --all --reason
+  what-state --buy
+  what-state --sell -n 3
+  what-state --exit --compact
+  what-state --all --reason
+  what-state --all --compact --n 10
 USAGE
 }
 
@@ -68,24 +69,80 @@ print_items() {
           | strftime("%Y-%m-%d %H:%M:%S CDT")
         end;
 
+      def num:
+        if . == null then null else (try tonumber catch null) end;
+
+      def exit_part:
+        ((.reason // .Reason // "") | capture("exitReason\\{(?<x>.*)\\} \\| openReason\\{")? | .x)
+        // (.reason // .Reason // "");
+
+      def open_part:
+        ((.reason // .Reason // "") | capture("openReason\\{(?<x>.*)\\}$")? | .x)
+        // (.reason // .Reason // "");
+
       def pup:
-        ((.reason // .Reason // "") | capture("pUp=(?<x>[0-9.]+)")? | .x) // "n/a";
+        if $title == "EXIT" then
+          (exit_part | capture("pUp=(?<x>[0-9.]+)")? | .x) // "n/a"
+        else
+          (open_part | capture("pUp=(?<x>[0-9.]+)")? | .x) // "n/a"
+        end;
 
       def conf:
-        ((.reason // .Reason // "") | capture("confidence=(?<x>[0-9.]+)")? | .x)
-        // (.confidence_mult // .ConfidenceMult // "n/a");
+        if $title == "EXIT" then
+          (exit_part | capture("confidence=(?<x>[0-9.]+)")? | .x)
+          // (.confidence_mult // .ConfidenceMult // "n/a")
+        else
+          (open_part | capture("confidence=(?<x>[0-9.]+)")? | .x)
+          // (.confidence_mult // .ConfidenceMult // "n/a")
+        end;
+
+      def final_sig:
+        if $title == "EXIT" then
+          (exit_part | capture("final=(?<x>BUY|SELL|FLAT)")? | .x) // "n/a"
+        else
+          (open_part | capture("final=(?<x>BUY|SELL|FLAT)")? | .x) // "n/a"
+        end;
 
       def reason_type:
         ((.reason // .Reason // "") | split(" | ")[0] | split("|")[0]) // "n/a";
+
+      def open_notional:
+        (.OpenNotionalUSD // .open_notional_usd)
+        // (
+          ((.OpenPrice // .open_price) | num) as $open
+          | ((.SizeBase // .size_base // .size // .Size) | num) as $size
+          | if $open != null and $size != null then ($open * $size)
+            else null
+            end
+        )
+        // (
+          (.side // .Side // "") as $side
+          | (.open_price // .OpenPrice | num) as $open
+          | (.close_price // .ClosePrice | num) as $close
+          | (.pnl_usd // .PnLUSD | num) as $pnl
+          | if $open == null or $close == null or $pnl == null or $open == $close then null
+            elif $side == "BUY" then
+              ($pnl / ($close - $open)) as $size
+              | ($open * ($size | fabs))
+            elif $side == "SELL" then
+              ($pnl / ($open - $close)) as $size
+              | ($open * ($size | fabs))
+            else null
+            end
+        )
+        // "n/a";
+
+      def unrealized_pnl:
+        (.unrealized_pnl_usd // .UnrealizedPnLUSD // "n/a");
 
       '"$path"' // []
       | .[-$n:]
       | reverse
       | .[]
       | if $title == "EXIT" then
-          "time=\(.time|cdt) side=\(.side // "n/a") lot_id=\(.lot_id // "n/a") open=\(.open_price // 0) close=\(.close_price // 0) pnl=\(.pnl_usd // 0) reason=\(reason_type) pUp=\(pup) conf=\(conf) entry_id=\(.entry_order_id // "n/a") exit_id=\(.exit_order_id // "n/a")"
+          "time=\(.time|cdt) side=\(.side // "n/a") reason=\(reason_type) pUp=\(pup) conf=\(conf) d_signal=\(final_sig) pnl=\(.pnl_usd // 0) open_notional_usd=\(open_notional) size=\(.size_base // "n/a") open=\(.open_price // 0) close=\(.close_price // 0) exit_mode=\(.exit_mode // "n/a") entry_id=\(.entry_order_id // "n/a") exit_id=\(.exit_order_id // "n/a")"
         else
-          "time=\(.OpenTime|cdt) side=\(.Side // "n/a") lot_id=\(.lot_id // .LotID // "n/a") open=\(.OpenPrice // 0) size=\(.SizeBase // 0) notional=\(.OpenNotionalUSD // 0) pUp=\(pup) conf=\(conf) gate=\(.profit_gate_usd // .ProfitGateUSD // "n/a") entry_id=\(.entry_order_id // .EntryOrderID // "n/a")"
+          "time=\(.OpenTime|cdt) side=\(.Side // "n/a") lot_id=\(.lot_id // .LotID // "n/a") open=\(.OpenPrice // 0) size=\(.SizeBase // 0) open_notional_usd=\(open_notional) unrealized_pnl_usd=\(unrealized_pnl) pUp=\(pup) conf=\(conf) net_gate_usd=\(.profit_gate_usd // .ProfitGateUSD // "n/a") entry_id=\(.entry_order_id // .EntryOrderID // "n/a")"
         end
     ' "$STATE_FILE"
 
@@ -96,9 +153,13 @@ print_items() {
       lot_id:(.lot_id // .LotID),
       open:(.OpenPrice // .open_price),
       close:.close_price,
+      size_base:(.SizeBase // .size_base),
       pnl:.pnl_usd,
+      open_notional_usd:(.OpenNotionalUSD // .open_notional_usd),
+      unrealized_pnl_usd:(.unrealized_pnl_usd // .UnrealizedPnLUSD),
       entry_order_id:(.entry_order_id // .EntryOrderID),
       exit_order_id:.exit_order_id,
+      exit_mode:.exit_mode,
       reason:(.reason // .Reason)
     }" "$STATE_FILE"
 
@@ -119,4 +180,128 @@ case "$MODE" in
 esac
 EOF
 
-chmod +x ~/coinbase/monitoring/last_state_item.sh
+chmod +x ~/coinbase/monitoring/what-state
+sudo ln -sf ~/coinbase/monitoring/what-state /usr/local/bin/what-state
+
+======================================================================
+CSV Version:
+
+cat > ~/coinbase/monitoring/what-case <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_FILE="${LOG_FILE:-/opt/coinbase/logs/audit/binance_audit.log}"
+HOURS="${HOURS:-48}"
+CSV=false
+N=""
+
+usage() {
+  cat <<USAGE
+Usage:
+  what-case [options]
+
+Options:
+  --csv             Output CSV
+  -n, --n NUM       Limit output rows
+  --hours NUM       Lookback hours, default: 48
+  -f, --file PATH   Audit log path
+  -h, --help        Show help
+
+Examples:
+  what-case
+  what-case --csv > case1.csv
+  what-case --hours 24
+  what-case --csv --hours 48 > case1.csv
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --csv) CSV=true; shift ;;
+    -n|--n) N="${2:-}"; shift 2 ;;
+    --hours) HOURS="${2:-}"; shift 2 ;;
+    -f|--file) LOG_FILE="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown arg: $1"; usage; exit 1 ;;
+  esac
+done
+
+[[ -f "$LOG_FILE" ]] || { echo "Log file not found: $LOG_FILE"; exit 1; }
+[[ "$HOURS" =~ ^[0-9]+$ ]] || { echo "Invalid --hours: $HOURS"; exit 1; }
+[[ -z "$N" || "$N" =~ ^[0-9]+$ ]] || { echo "Invalid -n/--n: $N"; exit 1; }
+
+awk -v since="$(date -u -d "$HOURS hours ago" +%s)" -v csv="$CSV" -v limit="$N" '
+function ts_epoch(line, a) {
+  if (match(line, /[0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+    split(substr(line,RSTART,19), a, /[\/ :]/)
+    return mktime(a[1]" "a[2]" "a[3]" "a[4]" "a[5]" "a[6])
+  }
+  return 0
+}
+
+function dist(raw, p, b, s) {
+  if (raw == "BUY" && p != "" && b != "") return sprintf("%.5f", p - b)
+  if (raw == "SELL" && p != "" && s != "") return sprintf("%.5f", p - s)
+  return ""
+}
+
+BEGIN {
+  if (csv == "true") {
+    print "prev_time,curr_time,transition,prev_pUp,curr_pUp,buyTh,sellTh,dist,confidence,logicOpinion,final,prev_price,curr_price,price_diff"
+  } else {
+    printf "%-20s %-20s %-12s %-9s %-9s %-9s %-9s %-10s %-10s %-12s %-8s %-14s %-14s %-10s\n", \
+      "prev_time","curr_time","transition","prev_pUp","curr_pUp","buyTh","sellTh","dist","conf","logic","final","prev_price","curr_price","price_diff"
+  }
+}
+
+{
+  e = ts_epoch($0)
+  if (e && e < since) next
+
+  aiRaw = pUp = buyTh = sellTh = price = t = conf = logic = final = ""
+
+  if (match($0, /aiRaw=(BUY|SELL|FLAT)/)) aiRaw = substr($0, RSTART+6, RLENGTH-6)
+  if (match($0, /pUp=[0-9.]+/)) pUp = substr($0, RSTART+4, RLENGTH-4)
+  if (match($0, /modelBuyThresh=[0-9.]+/)) buyTh = substr($0, RSTART+15, RLENGTH-15)
+  if (match($0, /modelSellThresh=[0-9.]+/)) sellTh = substr($0, RSTART+16, RLENGTH-16)
+  if (match($0, /price=[0-9.]+/)) price = substr($0, RSTART+6, RLENGTH-6)
+  if (match($0, /confidence=[0-9.]+/)) conf = substr($0, RSTART+11, RLENGTH-11)
+  if (match($0, /logicOpinion=(BUY|SELL|FLAT)/)) logic = substr($0, RSTART+13, RLENGTH-13)
+  if (match($0, /final=(BUY|SELL|FLAT)/)) final = substr($0, RSTART+6, RLENGTH-6)
+  if (match($0, /[0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/)) t = substr($0, RSTART, RLENGTH)
+
+  if (aiRaw != "" && previousAIRaw == "FLAT" && (aiRaw == "BUY" || aiRaw == "SELL")) {
+    cd = dist(aiRaw, pUp, buyTh, sellTh)
+
+    if (prevPrice != "" && price != "") {
+      priceDiff = sprintf("%.2f", price - prevPrice)
+    } else {
+      priceDiff = ""
+    }
+
+    rows++
+
+    if (csv == "true") {
+      print prevTime "," t "," previousAIRaw "->" aiRaw "," prevPUp "," pUp "," buyTh "," sellTh "," cd "," conf "," logic "," final "," prevPrice "," price "," priceDiff
+    } else {
+      printf "%-20s %-20s %-12s %-9s %-9s %-9s %-9s %-10s %-10s %-12s %-8s %-14s %-14s %-10s\n", \
+        prevTime, t, previousAIRaw "->" aiRaw, prevPUp, pUp, buyTh, sellTh, cd, conf, logic, final, prevPrice, price, priceDiff
+    }
+
+    if (limit != "" && rows >= limit) exit
+  }
+
+  if (aiRaw != "") {
+    previousAIRaw = aiRaw
+    prevTime = t
+    prevPUp = pUp
+    prevBuyTh = buyTh
+    prevSellTh = sellTh
+    prevPrice = price
+  }
+}
+' "$LOG_FILE"
+EOF
+
+chmod +x ~/coinbase/monitoring/what-case
+sudo ln -sf ~/coinbase/monitoring/what-case /usr/local/bin/what-case

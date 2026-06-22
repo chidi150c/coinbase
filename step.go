@@ -1123,7 +1123,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 									d.Raw == Buy &&
 									d.PUp > buyTh-minBuyDist &&
 									d.PUp <= buyTh &&
-									d.Signal != Buy) || d.Signal == Sell
+									d.Signal != Buy) || (d.Signal == Sell && d.Confidence >= 0.60)
 
 						case SideSell:
 							stopLossExit =
@@ -1131,7 +1131,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 									d.Raw == Sell &&
 									d.PUp >= sellTh &&
 									d.PUp < sellTh+minSellDist &&
-									d.Signal != Sell) || d.Signal == Buy
+									d.Signal != Sell) || (d.Signal == Buy && d.Confidence >= 0.60)
 						}
 					}
 
@@ -1377,7 +1377,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-84",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-85",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1702,32 +1702,45 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		latchBufferPrice := 0.0
 		if t.cfg.RiskPerTradeUSD > 0 && price > 0 {
 			fullDistance := math.Abs(t.cfg.StopLossPnLUSD) * price / t.cfg.RiskPerTradeUSD
-			latchBufferPrice = fullDistance / 5.0
+			latchBufferPrice = fullDistance / 8.0
 		}
 
 		if last > 0 {
 			if side == SideBuy {
-				// BUY adverse tracker (side-aware)
+				// baseline gate: last * (1.0 - effPct)
+				gatePrice := last * (1.0 - effPct/100.0)
+
+				// BUY adverse tracker
 				if elapsedMin >= tFloorMin && t.latchedGateBuy == 0 {
 					if t.winLowBuy == 0 || price < t.winLowBuy {
 						t.winLowBuy = price
 					}
+
+					// Soft regime before hard latch.
+					// BUY triggers when price <= gatePrice, so max(recentLow, baseline)
+					// softens the gate.
+					if elapsedMin < 2.0*tFloorMin && t.RecentLow > 0 {
+						oldGate := gatePrice
+						gatePrice = math.Max(gatePrice, t.RecentLow)
+
+						if gatePrice != oldGate {
+							log.Printf("[DEBUG] SOFT GATE BUY: elapsedMin=%.1f tFloorMin=%.2f old_gate=%.2f recentLow=%.2f soft_gate=%.2f winLow=%.2f price=%.2f",
+								elapsedMin, tFloorMin, oldGate, t.RecentLow, gatePrice, t.winLowBuy, price)
+						}
+					}
+
 				} else if elapsedMin < tFloorMin {
 					t.winLowBuy = 0
 				}
 
-				// latch at 2*t_floor_min
+				// hard latch at 2*tFloorMin
 				if t.latchedGateBuy == 0 && elapsedMin >= 2.0*tFloorMin && t.winLowBuy > 0 {
 					t.latchedGateBuy = t.winLowBuy
-					// --- breadcrumb ---
 					log.Printf("[DEBUG] LATCH SET BUY: latchedGate=%.2f winLow=%.2f elapsedMin=%.1f tFloorMin=%.2f",
 						t.latchedGateBuy, t.winLowBuy, elapsedMin, tFloorMin)
 				}
 
-				// baseline gate: last * (1.0 - effPct)
-				gatePrice := last * (1.0 - effPct/100.0)
-
-				// latched replaces baseline
+				// latched replaces baseline after hard latch
 				if t.latchedGateBuy > 0 {
 					oldLatch := t.latchedGateBuy
 					t.latchedGateBuy = math.Min(last-latchBufferPrice, t.latchedGateBuy)
@@ -1737,7 +1750,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					gatePrice = t.latchedGateBuy
 				}
 
-				// Copy for reason/log fields
 				reasonGatePrice = gatePrice
 				reasonLatched = t.latchedGateBuy
 
@@ -1756,24 +1768,38 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					return "HOLD", nil
 				}
 			} else { // SELL
-				// SELL adverse tracker (side-aware)
+				// baseline gate: last * (1.0 + effPct/100.0)
+				gatePrice := last * (1.0 + effPct/100.0)
+
+				// SELL adverse tracker
 				if elapsedMin >= tFloorMin && t.latchedGateSell == 0 {
 					if t.winHighSell == 0 || price > t.winHighSell {
 						t.winHighSell = price
 					}
+
+					// Soft regime before hard latch.
+					// SELL triggers when price >= gatePrice, so min(recentHigh, baseline)
+					// softens the gate.
+					if elapsedMin < 2.0*tFloorMin && t.RecentHigh > 0 {
+						oldGate := gatePrice
+						gatePrice = math.Min(gatePrice, t.RecentHigh)
+
+						if gatePrice != oldGate {
+							log.Printf("[DEBUG] SOFT GATE SELL: elapsedMin=%.1f tFloorMin=%.2f old_gate=%.2f recentHigh=%.2f soft_gate=%.2f winHigh=%.2f price=%.2f",
+								elapsedMin, tFloorMin, oldGate, t.RecentHigh, gatePrice, t.winHighSell, price)
+						}
+					}
+
 				} else if elapsedMin < tFloorMin {
 					t.winHighSell = 0
 				}
 
+				// hard latch at 2*tFloorMin
 				if t.latchedGateSell == 0 && elapsedMin >= 2.0*tFloorMin && t.winHighSell > 0 {
 					t.latchedGateSell = t.winHighSell
-					// --- breadcrumb ---
 					log.Printf("[DEBUG] LATCH SET SELL: latchedGate=%.2f winHigh=%.2f elapsedMin=%.1f tFloorMin=%.2f",
 						t.latchedGateSell, t.winHighSell, elapsedMin, tFloorMin)
 				}
-
-				// baseline gate: last * (1.0 + effPct/100.0)
-				gatePrice := last * (1.0 + effPct/100.0)
 
 				// latched replaces baseline
 				if t.latchedGateSell > 0 {

@@ -163,9 +163,9 @@ func loadConfigFromEnv() Config {
 		TakeProfitPct:         getEnvFloat("TAKE_PROFIT_PCT", 0.8),
 		StopLossPct:           getEnvFloat("STOP_LOSS_PCT", 0.4),
 
-		MinSellDistance:         getEnvFloat("MIN_SELL_DISTANCE", 0.01),
-		MinBuyDistance:          getEnvFloat("MIN_BUY_DISTANCE", 0.01),
-		StopLossPnLUSD:          getEnvFloat("STOP_LOSS_PNL_USD", 0.25),
+		MinSellDistance:         getEnvFloat("MIN_SELL_DISTANCE", 0.0189),
+		MinBuyDistance:          getEnvFloat("MIN_BUY_DISTANCE", 0.0047),
+		StopLossPnLUSD:          getEnvFloat("STOP_LOSS_PNL_USD", 0.299),
 		EnableThresholdStopLoss: getEnvBool("ENABLE_THRESHOLD_STOPLOSS", true),
 
 		OrderMinUSD:         getEnvFloat("ORDER_MIN_USD", 5.00),
@@ -217,7 +217,7 @@ func loadConfigFromEnv() Config {
 		// USD trailing / profit gates
 		TrailActivateUSDRunner: getEnvFloat("TRAIL_ACTIVATE_USD_RUNNER", 1.00),
 		TrailDistancePctRunner: getEnvFloat("TRAIL_DISTANCE_PCT_RUNNER", 0.40),
-		ProfitGateUSD:          getEnvFloat("PROFIT_GATE_USD", 0.50),
+		ProfitGateUSD:          getEnvFloat("PROFIT_GATE_USD", 1.16),
 		TPMakerOffsetBps:       getEnvFloat("TP_MAKER_OFFSET_BPS", 0.0),
 
 		// Ramping
