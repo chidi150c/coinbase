@@ -22,6 +22,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -29,6 +30,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -991,14 +993,13 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, livePrice float64, si
 
 	// Append with cap semantics (ring buffer behavior)
 	t.lastExits = append(t.lastExits, rec)
-	if capN := func() int {
-		if t.cfg.ExitHistorySize > 0 {
-			return t.cfg.ExitHistorySize
-		}
-		return 8
-	}(); len(t.lastExits) > capN {
-		t.lastExits = t.lastExits[len(t.lastExits)-capN:]
+
+	capN := t.cfg.ExitHistorySize
+	if capN <= 0 {
+		capN = 8
 	}
+
+	archiveAndPruneExits(&t.lastExits, capN)
 
 	// --- NEW: increment win/loss trades ---
 	if pl >= 0 {
@@ -1126,6 +1127,264 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, livePrice float64, si
 
 	_ = removedWasRunner // kept to emphasize runner path; no extra logs.
 	return msg, nil
+}
+
+const exitsArchivePath = "/opt/coinbase/archive/exits.csv"
+
+func archiveAndPruneExits(exits *[]ExitRecord, keep int) {
+	if exits == nil {
+		return
+	}
+	if keep <= 0 {
+		keep = 8
+	}
+	if len(*exits) <= keep {
+		return
+	}
+
+	cut := len(*exits) - keep
+	old := (*exits)[:cut]
+
+	if err := appendExitsCSV(exitsArchivePath, old); err != nil {
+		log.Printf("[ERROR] exit archive failed; keeping unpruned exits to avoid data loss: %v", err)
+		return
+	}
+
+	*exits = (*exits)[cut:]
+	log.Printf("[INFO] exit archive ok path=%s archived=%d kept=%d", exitsArchivePath, len(old), len(*exits))
+}
+
+func appendExitsCSV(path string, exits []ExitRecord) error {
+	if len(exits) == 0 {
+		return nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+
+	_, statErr := os.Stat(path)
+	writeHeader := os.IsNotExist(statErr)
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	if writeHeader {
+		if err := w.Write(exitCSVHeader()); err != nil {
+			return err
+		}
+	}
+
+	for _, e := range exits {
+		if err := w.Write(exitCSVRow(e)); err != nil {
+			return err
+		}
+	}
+
+	return w.Error()
+}
+
+func exitCSVHeader() []string {
+	return []string{
+		"time",
+		"side",
+		"open_price",
+		"close_price",
+		"size_base",
+		"open_notional_usd",
+		"entry_fee_usd",
+		"exit_fee_usd",
+		"pnl_usd",
+		"exit_reason",
+		"exit_mode",
+		"was_runner",
+		"refund_portion_usd",
+		"lot_id",
+		"entry_order_id",
+		"exit_order_id",
+		"entry_pup",
+		"exit_pup",
+		"entry_confidence",
+		"exit_confidence",
+		"entry_signal",
+		"exit_signal",
+		"entry_buy_threshold",
+		"entry_sell_threshold",
+		"exit_buy_threshold",
+		"exit_sell_threshold",
+		"entry_price_discount_pct",
+		"entry_gate_price",
+		"entry_latched_price",
+		"entry_elapsed_hr",
+		"entry_effective_pct",
+		"entry_base_pct",
+		"entry_ai_raw",
+		"entry_logic_opinion",
+		"entry_final_signal",
+		"exit_ai_raw",
+		"exit_logic_opinion",
+		"exit_final_signal",
+	}
+}
+
+func exitCSVRow(e ExitRecord) []string {
+	exitPart := extractExitPart(e.Reason)
+	entryPart := extractEntryPart(e.Reason)
+
+	entryPUp := kv(entryPart, "pUp")
+	exitPUp := kv(exitPart, "pUp")
+
+	entryConf := kv(entryPart, "confidence")
+	exitConf := kv(exitPart, "confidence")
+
+	entryFinal := kv(entryPart, "final")
+	exitFinal := kv(exitPart, "final")
+
+	entryGate := kv(entryPart, "gatePrice")
+	entryLatched := kv(entryPart, "latched")
+	entryElapsed := kv(entryPart, "elapsedHr")
+	entryEffPct := kv(entryPart, "effPct")
+	entryBasePct := kv(entryPart, "basePct")
+
+	entryAIRaw := kv(entryPart, "aiRaw")
+	entryLogic := kv(entryPart, "logicOpinion")
+	exitAIRaw := kv(exitPart, "aiRaw")
+	exitLogic := kv(exitPart, "logicOpinion")
+
+	exitBuyTh := kv(exitPart, "buyTh")
+	exitSellTh := kv(exitPart, "sellTh")
+	entryBuyTh := kv(entryPart, "buyTh")
+	entrySellTh := kv(entryPart, "sellTh")
+
+	entryDiscountPct := computeEntryDiscountPct(e.Side, e.OpenPrice, entryGate)
+
+	return []string{
+		e.Time.Format(time.RFC3339),
+		string(e.Side),
+		ff(e.OpenPrice),
+		ff(e.ClosePrice),
+		ff(e.SizeBase),
+		ff(e.OpenNotionalUSD),
+		ff(e.EntryFeeUSD),
+		ff(e.ExitFeeUSD),
+		ff(e.PNLUSD),
+		exitReasonType(e.Reason),
+		fmt.Sprintf("%v", e.ExitMode),
+		fmt.Sprintf("%v", e.WasRunner),
+		ff(e.RefundPortionUSD),
+		strconv.Itoa(e.LotID),
+		e.EntryOrderID,
+		e.ExitOrderID,
+
+		entryPUp,
+		exitPUp,
+		entryConf,
+		exitConf,
+		entryFinal,
+		exitFinal,
+		entryBuyTh,
+		entrySellTh,
+		exitBuyTh,
+		exitSellTh,
+		entryDiscountPct,
+		entryGate,
+		entryLatched,
+		entryElapsed,
+		entryEffPct,
+		entryBasePct,
+		entryAIRaw,
+		entryLogic,
+		entryFinal,
+		exitAIRaw,
+		exitLogic,
+		exitFinal,
+	}
+}
+
+func ff(v float64) string {
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
+func extractExitPart(reason string) string {
+	start := strings.Index(reason, "exitReason{")
+	if start < 0 {
+		return reason
+	}
+	start += len("exitReason{")
+
+	end := strings.Index(reason[start:], "}  ||  openReason{")
+	if end >= 0 {
+		return reason[start : start+end]
+	}
+
+	end = strings.Index(reason[start:], "} | openReason{")
+	if end >= 0 {
+		return reason[start : start+end]
+	}
+
+	end = strings.Index(reason[start:], "} || openReason{")
+	if end >= 0 {
+		return reason[start : start+end]
+	}
+
+	return reason[start:]
+}
+
+func extractEntryPart(reason string) string {
+	start := strings.Index(reason, "openReason{")
+	if start < 0 {
+		return ""
+	}
+	start += len("openReason{")
+	entry := reason[start:]
+	entry = strings.TrimSuffix(entry, "}")
+	return entry
+}
+
+func exitReasonType(reason string) string {
+	if reason == "" {
+		return ""
+	}
+	parts := strings.Split(reason, " | ")
+	if len(parts) > 0 {
+		return strings.TrimSpace(parts[0])
+	}
+	return strings.TrimSpace(reason)
+}
+
+func kv(s, key string) string {
+	if s == "" || key == "" {
+		return ""
+	}
+
+	re := regexp.MustCompile(regexp.QuoteMeta(key) + `=([A-Za-z0-9_.+-]+)`)
+	m := re.FindStringSubmatch(s)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
+
+func computeEntryDiscountPct(side OrderSide, openPrice float64, gatePriceRaw string) string {
+	gatePrice, err := strconv.ParseFloat(gatePriceRaw, 64)
+	if err != nil || gatePrice <= 0 || openPrice <= 0 {
+		return ""
+	}
+
+	var pct float64
+	if side == SideBuy {
+		pct = ((gatePrice - openPrice) / gatePrice) * 100.0
+	} else {
+		pct = ((openPrice - gatePrice) / gatePrice) * 100.0
+	}
+
+	return ff(pct)
 }
 
 func placedOrderID(p *PlacedOrder) string {
