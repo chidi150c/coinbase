@@ -1343,7 +1343,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				}
 				i++
 			}
-
 			return "", false, nil
 		}
 
@@ -1481,7 +1480,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-89",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-90",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -2394,13 +2393,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquityBuy=%.2f buyEquityMultiplier=%.6f(triggerAt:>=%.2f) equitySpareQuote=%.2f confidenceMult=%.2f", t.equityUSD, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, t.cfg.BuyEquityTriggerMult, equitySpareQuote, confMult)
 	} else if side == SideBuy {
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|latchTargetHr>=%.2fHr|confidence=%.2f",
-			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence,
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|latchTargetHr>=%.2fHr|confidence=%.2f|targetNetUSD=%.2f",
+			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence, entryProfitGateUSD,
 		)
 	} else { // SideSell
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|latchTargetHr>=%.2fHr|confidence=%.2f",
-			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence,
+			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|latchTargetHr>=%.2fHr|confidence=%.2f|targetNetUSD=%.2f",
+			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence, entryProfitGateUSD,
 		)
 	}
 

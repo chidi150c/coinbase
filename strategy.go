@@ -202,17 +202,8 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	}
 
 	confidence := d.Confidence
-
-	if confidence < 0.20 {
-		confidence = 0.20
-	}
-	if confidence > 1.00 {
-		confidence = 1.00
-	}
-
-	epsFactor := 1.20 - confidence
-	eps := t.cfg.MACDLineEPS * epsFactor
-
+	epsMult := confidenceEffPctMultiplier(confidence)
+	eps := t.cfg.MACDLineEPS * epsMult
 	if eps < 10 {
 		eps = 10
 	}
@@ -228,60 +219,17 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		return d
 	}
 
-	if t.latchedGateBuy > 0 && t.RecentLow > t.latchedGateBuy {
-		t.BuyGateTouchedAt = time.Time{}
-	}
-	if t.latchedGateSell > 0 && t.RecentHigh < t.latchedGateSell {
-		t.SellGateTouchedAt = time.Time{}
-	}
-
-	buyGateTouched := t.RecentLow > 0 && t.latchedGateBuy > 0 && t.RecentLow <= t.latchedGateBuy
-	sellGateTouched := t.RecentHigh > 0 && t.latchedGateSell > 0 && t.RecentHigh >= t.latchedGateSell
-
-	if buyGateTouched && t.BuyGateTouchedAt.IsZero() {
-		t.BuyGateTouchedAt = time.Now()
-	}
-	if sellGateTouched && t.SellGateTouchedAt.IsZero() {
-		t.SellGateTouchedAt = time.Now()
-	}
-
 	emaSellPattern := snap.EMAHighPeak || snap.EMAPriceUpGoingDown
 	emaBuyPattern := snap.EMALowBottom || snap.EMAPriceDownGoingUp
 
-	buyTouchAge := time.Duration(0)
-	if !t.BuyGateTouchedAt.IsZero() {
-		buyTouchAge = time.Since(t.BuyGateTouchedAt)
-	}
-
-	sellTouchAge := time.Duration(0)
-	if !t.SellGateTouchedAt.IsZero() {
-		sellTouchAge = time.Since(t.SellGateTouchedAt)
-	}
-
-	softEPS := eps * 0.40
-	if softEPS < 10 {
-		softEPS = 10
-	}
-
-	softMACDNeg := snap.MACDLine <= -softEPS
-	softMACDPos := snap.MACDLine >= softEPS
-
 	normalBuy := snap.MACDStrongNegative && snap.MACDMomentumUp && emaBuyPattern
-	softAboveStrongBuy := d.Confidence >= 0.60 && softMACDNeg && snap.MACDMomentumUp && emaBuyPattern
-	softenedPostTouchBuy := buyGateTouched && buyTouchAge >= time.Hour && buyTouchAge < time.Hour*2 && softMACDNeg && snap.MACDMomentumUp && emaBuyPattern
-	loosePostTouchBuy := buyGateTouched && buyTouchAge >= time.Hour*2 && snap.MACDMomentumUp && snap.EMALowBottom
-	loosestPostTouchBuy := buyGateTouched && buyTouchAge >= time.Hour*2 && snap.MACDMomentumUp && emaBuyPattern
 
 	normalSell := snap.MACDStrongPositive && snap.MACDMomentumDown && emaSellPattern
-	softAboveStrongSell := d.Confidence >= 0.60 && softMACDPos && snap.MACDMomentumDown && emaSellPattern
-	softenedPostTouchSell := sellGateTouched && sellTouchAge >= time.Hour && sellTouchAge < time.Hour*2 && softMACDPos && snap.MACDMomentumDown && emaSellPattern
-	loosePostTouchSell := sellGateTouched && sellTouchAge >= time.Hour*2 && snap.MACDMomentumDown && snap.EMAHighPeak
-	loosestPostTouchSell := sellGateTouched && sellTouchAge >= time.Hour*3 && snap.MACDMomentumDown && emaSellPattern
 
 	logicOpinion := Flat
-	if normalBuy || softAboveStrongBuy || softenedPostTouchBuy || loosePostTouchBuy || loosestPostTouchBuy {
+	if normalBuy {
 		logicOpinion = Buy
-	} else if normalSell || softAboveStrongSell || softenedPostTouchSell || loosePostTouchSell || loosestPostTouchSell {
+	} else if normalSell {
 		logicOpinion = Sell
 	}
 
@@ -338,7 +286,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		}
 	}
 
-	logicNote := appendReason(reason, fmt.Sprintf("softStrongBuy=%v softStrongSell=%v", softAboveStrongBuy, softAboveStrongSell))
+	logicNote := reason
 
 	logicReason := fmt.Sprintf(
 		"[LOGIC_GATE] signalTF=1m | Gate{confidence=%.2f eps=%.5f note=%v} | aiRaw=%s logicOpinion=%s final=%s | "+
