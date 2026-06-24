@@ -1157,8 +1157,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						}
 
 						if deepLossExit {
+							cand.decision += " | EXIT_CLASS=L2_DEEP_LOSS"
 							stopL2 = append(stopL2, cand)
 						} else {
+							cand.decision += " | EXIT_CLASS=L1_THRESHOLD_WARNING"
 							stopL1 = append(stopL1, cand)
 						}
 
@@ -1316,8 +1318,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					strongProfitExit := net >= gateUSD*strongProfitMult
 
 					if lot.ExitMode == ExitModeScalpFixedTP && strongProfitExit {
+						cand.decision += " | EXIT_CLASS=L2_STRONG_PROFIT"
 						profitL2 = append(profitL2, cand)
 					} else if lot.ExitMode == ExitModeScalpFixedTP {
+						cand.decision += " | EXIT_CLASS=L1_AI_PROFIT"
 						profitL1 = append(profitL1, cand)
 					}
 
@@ -1477,7 +1481,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-87",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-88",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -2399,6 +2403,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence,
 		)
 	}
+
 	if d.Reason != "" {
 		gatesReason = appendReason(gatesReason, "decision{"+d.Reason+"}")
 	}
