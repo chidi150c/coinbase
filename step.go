@@ -1105,8 +1105,15 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// Profit gate must pass before any exit action.
 				// If profit disappears, clear transient trailing/TP state.
 				if !pass {
+					if lot.ExitMode == ExitModeRunnerTrailing {
+						lot.TrailActive = false
+						lot.TrailPeak = 0
+						lot.TrailStop = 0
+						lot.FixedTPWorking = false
+						i++
+						continue
+					}
 					stopLossExit := false
-
 					stopReason := fmt.Sprintf(
 						"threshold_stoploss_check side=%s pUp=%.5f buyTh=%.5f sellTh=%.5f previousAIRaw=%s raw=%s signal=%s pnl=%.2f lossLimit=%.2f",
 						lot.Side,
@@ -1167,13 +1174,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						i++
 						continue
 					}
-
-					lot.TrailActive = false
-					lot.TrailPeak = 0
-					lot.TrailStop = 0
-					lot.FixedTPWorking = false
-					i++
-					continue
 				}
 
 				// AI/logic exit approval.
@@ -1481,7 +1481,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-88",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-89",
 		totalLots,
 		d.Raw,
 		d.Signal,
