@@ -72,6 +72,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -356,9 +357,7 @@ func (t *Trader) maybeRepriceOnce(
 // step consumes the current candle history and may place/close a position.
 // It returns a human-readable status string for logging.
 func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory []Candle, livePrice float64) (string, error) {
-	c := execHistory
-
-	if len(c) == 0 {
+	if len(execHistory) == 0 {
 		return "NO_DATA", nil
 	}
 
@@ -368,7 +367,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// Use wall clock as authoritative "now" for pyramiding timings; fall back for zero candle time.
 	wallNow := time.Now().UTC()
 
-	now := c[len(c)-1].Time
+	now := execHistory[len(execHistory)-1].Time
 	if now.IsZero() {
 		now = wallNow
 	}
@@ -844,13 +843,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	}
 
 	// --- NEW: walk-forward (re)fit guard hook (no-op other than the guard) ---
-	_ = t.shouldRefit(len(c)) // intentionally unused here (guard only)
+	_ = t.shouldRefit(len(execHistory)) // intentionally unused here (guard only)
 
 	// TODO: remove TRACE
 	lsb := len(t.book(SideBuy).Lots)
 	lss := len(t.book(SideSell).Lots)
 	log.Printf("TRACE step.start ts=%s livePrice=%.8f candleClose=%.8f lotsBuy=%d lotsSell=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f recentLow=%.8f recentHigh=%.8f elapsed_Hours_Buy=%.1f elapsed_Hours_Sell=%.1f",
-		now.Format(time.RFC3339), livePrice, c[len(c)-1].Close, lsb, lss,
+		now.Format(time.RFC3339), livePrice, execHistory[len(execHistory)-1].Close, lsb, lss,
 		t.lastAddBuy.Format(time.RFC3339), t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell, t.RecentLow, t.RecentHigh, time.Since(t.lastAddBuy).Hours(), time.Since(t.lastAddSell).Hours())
 
 	price := livePrice
@@ -876,7 +875,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	//AI-LOGIC
 	d := t.decide(signalHistory)
-	d = t.applyLogicGate(d, c)
+	d = t.applyLogicGate(d, execHistory)
 
 	updatePreviousAIRaw := func() {
 		t.previousAIRaw = d.Raw
@@ -1056,6 +1055,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			lot.Take = activationPrice(lot, gateUSD, feeRatePct)
 		}
 
+		var stopL2 []exitCandidate
+		var stopL1 []exitCandidate
+		var profitL2 []exitCandidate
+		var profitL1 []exitCandidate
+
 		// Scan one side book and close at most one lot.
 		//
 		// Flow:
@@ -1075,6 +1079,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			minBuyDist := t.cfg.MinBuyDistance
 			minSellDist := t.cfg.MinSellDistance
 			previousAIRaw := t.previousAIRaw
+
+			deepLossMult := 2.0
+			strongProfitMult := 1.5
 
 			for i := 0; i < len(book.Lots); {
 				lot := book.Lots[i]
@@ -1113,13 +1120,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						lossLimit,
 					)
 
+					deepLossLimit := lossLimit * deepLossMult
+					deepLossExit := net <= deepLossLimit
+
 					if enableStopLoss && net <= lossLimit {
 						log.Printf("TRACE %s", stopReason)
 
 						switch lot.Side {
 						case SideBuy:
 							stopLossExit =
-								(previousAIRaw == Flat &&
+								deepLossExit || (previousAIRaw == Flat &&
 									d.Raw == Buy &&
 									d.PUp > buyTh-minBuyDist &&
 									d.PUp <= buyTh &&
@@ -1127,7 +1137,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 						case SideSell:
 							stopLossExit =
-								(previousAIRaw == Flat &&
+								deepLossExit || (previousAIRaw == Flat &&
 									d.Raw == Sell &&
 									d.PUp >= sellTh &&
 									d.PUp < sellTh+minSellDist &&
@@ -1138,19 +1148,22 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					if stopLossExit {
 						exitDecision := appendReason(d.Reason, stopReason)
 
-						msg, err := t.closeLot(
-							ctx,
-							c,
-							livePrice,
-							side,
-							i,
-							"threshold_stop_loss",
-							exitDecision,
-						)
-						if err != nil {
-							return "", true, err
+						cand := exitCandidate{
+							side:     side,
+							idx:      i,
+							reason:   "threshold_stop_loss",
+							decision: exitDecision,
+							net:      net,
 						}
-						return msg, true, nil
+
+						if deepLossExit {
+							stopL2 = append(stopL2, cand)
+						} else {
+							stopL1 = append(stopL1, cand)
+						}
+
+						i++
+						continue
 					}
 
 					lot.TrailActive = false
@@ -1184,7 +1197,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							i++
 							continue
 						}
-						msg, err := t.closeLot(ctx, c, livePrice, side, i, "trailing_stop", d.Reason)
+						msg, err := t.closeLot(ctx, execHistory, livePrice, side, i, "trailing_stop", d.Reason)
 						if err != nil {
 							return "", true, err
 						}
@@ -1289,15 +1302,27 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						continue
 					}
 				}
+
 				if trigger {
-					msg, err := t.closeLot(ctx, c, livePrice, side, i, exitReason, d.Reason)
-					if err != nil {
-						return "", true, err
+					cand := exitCandidate{
+						side:     side,
+						idx:      i,
+						reason:   exitReason,
+						decision: d.Reason,
+						net:      net,
 					}
-					if lot.ExitMode == ExitModeScalpFixedTP {
-						log.Printf("TRACE tp.filled side=%s idx=%d mark=%.8f take=%.8f", lot.Side, i, price, lot.Take)
+
+					gateUSD := lotProfitGateUSD(lot)
+					strongProfitExit := net >= gateUSD*strongProfitMult
+
+					if lot.ExitMode == ExitModeScalpFixedTP && strongProfitExit {
+						profitL2 = append(profitL2, cand)
+					} else if lot.ExitMode == ExitModeScalpFixedTP {
+						profitL1 = append(profitL1, cand)
 					}
-					return msg, true, nil
+
+					i++
+					continue
 				}
 
 				// nearest summary (unchanged)
@@ -1314,6 +1339,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				}
 				i++
 			}
+
 			return "", false, nil
 		}
 
@@ -1328,6 +1354,80 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			t.mu.Unlock()
 			return msg, err
 		}
+
+		closeAll := func(cands []exitCandidate) (string, bool, error) {
+			if len(cands) == 0 {
+				return "", false, nil
+			}
+
+			sort.Slice(cands, func(a, b int) bool {
+				if cands[a].side != cands[b].side {
+					return string(cands[a].side) < string(cands[b].side)
+				}
+				return cands[a].idx > cands[b].idx
+			})
+
+			var msgs []string
+			for _, cand := range cands {
+				msg, err := t.closeLot(ctx, execHistory, livePrice, cand.side, cand.idx, cand.reason, cand.decision)
+				if err != nil {
+					return strings.Join(msgs, "\n"), true, err
+				}
+				if strings.TrimSpace(msg) != "" {
+					msgs = append(msgs, msg)
+				}
+			}
+
+			return strings.Join(msgs, "\n"), true, nil
+		}
+		closeOne := func(cands []exitCandidate, worst bool) (string, bool, error) {
+			if len(cands) == 0 {
+				return "", false, nil
+			}
+
+			sort.Slice(cands, func(i, j int) bool {
+				if worst {
+					return cands[i].net < cands[j].net
+				}
+				return cands[i].net > cands[j].net
+			})
+
+			c := cands[0]
+
+			msg, err := t.closeLot(
+				ctx,
+				execHistory,
+				livePrice,
+				c.side,
+				c.idx,
+				c.reason,
+				c.decision,
+			)
+
+			return msg, true, err
+		}
+
+		if msg, done, err := closeAll(stopL2); done || err != nil {
+			updatePreviousAIRaw()
+			t.mu.Unlock()
+			return msg, err
+		}
+		if msg, done, err := closeAll(profitL2); done || err != nil {
+			updatePreviousAIRaw()
+			t.mu.Unlock()
+			return msg, err
+		}
+		if msg, done, err := closeOne(stopL1, true); done || err != nil {
+			updatePreviousAIRaw()
+			t.mu.Unlock()
+			return msg, err
+		}
+		if msg, done, err := closeOne(profitL1, false); done || err != nil {
+			updatePreviousAIRaw()
+			t.mu.Unlock()
+			return msg, err
+		}
+
 		// single-pass enriched summary (collected in-loop; no extra scans)
 		log.Printf("[DEBUG] Nearest Takes | CLOSE-BUY=%.2f (%s, net=%.2f, idx=%d) | CLOSE-SELL=%.2f (%s, net=%.2f, idx=%d) | Buy-Lots=%d Sell-Lots=%d",
 			nearestTakeBuy, buyModeLabel, buyNet, buyNearestIdx,
@@ -1377,7 +1477,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-86",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-87",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1702,7 +1802,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		latchBufferPrice := 0.0
 		if t.cfg.RiskPerTradeUSD > 0 && price > 0 {
 			fullDistance := math.Abs(t.cfg.StopLossPnLUSD) * price / t.cfg.RiskPerTradeUSD
-			latchBufferPrice = fullDistance / 8.0
+			latchBufferPrice = fullDistance / 3.0
 		}
 
 		if last > 0 {
@@ -1762,8 +1862,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				if !(price <= gatePrice) {
 					updatePreviousAIRaw()
 					t.mu.Unlock()
-					log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.2f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f latch_target_Hr>=%.2fHr confidence=%.2f",
-						price, gatePrice, t.winLowBuy, effPct, basePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence)
+					log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.8f latched=%.3f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f latch_target_Hr>=%.2fHr confidence=%.2f",
+						price, gatePrice, t.latchedGateBuy, t.winLowBuy, effPct, basePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence)
 					log.Printf("TRACE pyramid.block.buy price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateBuy)
 					return "HOLD", nil
 				}
@@ -1824,8 +1924,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				if !(price >= gatePrice) {
 					updatePreviousAIRaw()
 					t.mu.Unlock()
-					log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f, latch_target_Hr>=%.2fHr confidence=%.2f",
-						price, gatePrice, t.winHighSell, effPct, basePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence)
+					log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f latched=%.8f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f, latch_target_Hr>=%.2fHr confidence=%.2f",
+						price, gatePrice, t.latchedGateSell, t.winHighSell, effPct, basePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence)
 					log.Printf("TRACE pyramid.block.sell price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateSell)
 					return "HOLD", nil
 				}
@@ -1846,7 +1946,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	// Optional: volatility adjust as a multiplier on USD (not on equity)
 	if t.cfg.VolRiskAdjust {
-		f := volRiskFactor(c)
+		f := volRiskFactor(execHistory)
 		if f <= 0 {
 			f = 1.0
 		}
@@ -3114,6 +3214,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	updatePreviousAIRaw()
 	t.mu.Unlock()
 	return msg, nil
+}
+
+type exitCandidate struct {
+	side     OrderSide
+	idx      int
+	reason   string
+	decision string
+	net      float64
 }
 
 // consolidateDust collapses tiny (notional < minNotional) lots on a side.
