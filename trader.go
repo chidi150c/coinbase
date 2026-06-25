@@ -193,16 +193,18 @@ type Trader struct {
 	// runnerIdx int
 
 	// --- NEW: side-aware pyramiding state (kept in-memory; copied to legacy fields for logs) ---
-	lastAddBuy        time.Time
-	lastAddSell       time.Time
-	winLowBuy         float64
-	winHighSell       float64
-	latchedGateBuy    float64
-	latchedGateSell   float64
-	RecentHigh        float64
-	RecentLow         float64
-	SellGateTouchedAt time.Time
-	BuyGateTouchedAt  time.Time
+	lastAddBuy         time.Time
+	lastAddSell        time.Time
+	winLowBuy          float64
+	winHighSell        float64
+	latchedGateBuy     float64
+	latchedGateSell    float64
+	RecentHigh         float64
+	RecentLow          float64
+	PreviousRecentHigh float64
+	PreviousRecentLow  float64
+	SellGateTouchedAt  time.Time
+	BuyGateTouchedAt   time.Time
 
 	// --- NEW: equity-at-last-add snapshots for equity strategy trading ---
 	lastAddEquitySell float64 // replaces legacy lastAddEquity (SELL path)
