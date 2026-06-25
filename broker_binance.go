@@ -238,6 +238,89 @@ func (b *BinanceBridge) PlaceMarketQuote(ctx context.Context, product string, si
 	return ord, nil
 }
 
+// PlaceMarketBase submits a MARKET order using a BASE quantity instead of a
+// QUOTE amount.
+//
+// Why:
+// Closing positions by quote_size can create tiny dust because the exchange
+// rounds the resulting base quantity down to the nearest LOT_SIZE step.
+// By sending a step-snapped base_size, the exchange receives exactly the
+// quantity we intend to close, greatly reducing unnecessary partial fills.
+func (b *BinanceBridge) PlaceMarketBase(ctx context.Context, product string, side OrderSide, baseSize float64) (*PlacedOrder, error) {
+
+	// Obtain cached exchange filters (LOT_SIZE step, etc.).
+	// This is cache-only and does not perform a network request.
+	f := b.getExchangeFiltersCached(product)
+
+	// Snap the requested base quantity down to the exchange step size.
+	// Example:
+	//   requested = 0.00038110
+	//   step      = 0.00001000
+	//   sent      = 0.00038000
+	//
+	// This prevents the exchange from silently rounding it later.
+	if f.StepSize > 0 {
+		baseSize = snapDownBinance(baseSize, f.StepSize)
+	}
+
+	// Reject quantities that become zero after snapping.
+	if baseSize <= 0 {
+		return nil, fmt.Errorf("base size after exchange step snap is zero")
+	}
+
+	// Format using the correct number of decimals implied by the step size.
+	sizeStr := formatWithStepBinance(baseSize, f.StepSize, 12)
+
+	// MARKET order using BASE quantity.
+	body := map[string]any{
+		"product_id": product,
+		"side":       side, // BUY or SELL
+		"base_size":  sizeStr,
+	}
+
+	data, _ := json.Marshal(body)
+	u := fmt.Sprintf("%s/order/market_base", b.base)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := b.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		xb, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("bridge order/market_base %d: %s",
+			resp.StatusCode, string(xb))
+	}
+
+	// Decode the immediate response.
+	var ordJSON placedOrderJSON
+	if err := json.NewDecoder(resp.Body).Decode(&ordJSON); err != nil {
+		return nil, err
+	}
+	ord := toPlacedOrder(ordJSON)
+
+	// As with the other bridge methods, poll briefly for the final fill
+	// quantities because the immediate response may not yet contain them.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		o2, err := b.fetchOrder(ctx, product, ord.ID)
+		if err == nil && (o2.BaseSize > 0 || o2.QuoteSpent > 0) {
+			return o2, nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// Fall back to the initial response if enrichment times out.
+	return ord, nil
+}
+
 // --- NEW: Post-only limit (LIMIT_MAKER) with size/price snapping to exchange filters ---
 // Returns the created order ID (best-effort), or an error.
 func (b *BinanceBridge) PlaceLimitPostOnly(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64) (string, error) {

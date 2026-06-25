@@ -1093,6 +1093,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 			for i := 0; i < len(book.Lots); {
 				lot := book.Lots[i]
+
+				if lot.SizeBase*price < minNotional {
+					lot.FixedTPWorking = false
+					i++
+					continue
+				}
+
 				// classify per spec
 				setExitMode(book, i, lot)
 
@@ -1488,7 +1495,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-92",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-93",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -3270,11 +3277,10 @@ type exitCandidate struct {
 
 // consolidateDust collapses tiny (notional < minNotional) lots on a side.
 // Behavior:
-// - If there is exactly 1 lot and it's below minNotional → pad it up to minNotional.
+// - If there is exactly 1 lot leave it as is.
 // - If there are 2+ lots →
 //  1. collapse tail dust backward,
 //  2. sweep older dust forward into newest,
-//  3. if at the end there's 1 dust left → pad it.
 //
 // RunnerIDs are kept authoritative.
 func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64) {

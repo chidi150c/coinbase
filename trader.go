@@ -762,7 +762,23 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, livePrice float64, si
 	if lot.Side == SideSell {
 		closeSide = SideBuy
 	}
-	baseRequested := lot.SizeBase
+
+	baseRequestedRaw := lot.SizeBase
+	baseRequested := floorToStep(baseRequestedRaw, t.cfg.BaseStep)
+
+	if baseRequested <= 0 {
+		log.Printf(
+			"[CLOSE-SKIP] lotSide=%s closeSide=%s baseRaw=%.8f baseRounded=%.8f step=%.8f reason=%s",
+			lot.Side,
+			closeSide,
+			baseRequestedRaw,
+			baseRequested,
+			t.cfg.BaseStep,
+			exitReason,
+		)
+		return "", nil
+	}
+
 	quote := baseRequested * price
 
 	// --- Effective min-notional: prefer cfg.MinNotional, fallback to cfg.OrderMinUSD ---
@@ -1131,8 +1147,15 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, livePrice float64, si
 	return msg, nil
 }
 
+func floorToStep(x, step float64) float64 {
+	if step <= 0 {
+		return x
+	}
+	return math.Floor((x/step)+1e-12) * step
+}
+
 func archiveAndPruneExits(path string, exits *[]ExitRecord, keep int) {
-	
+
 	if exits == nil {
 		return
 	}
@@ -1147,9 +1170,9 @@ func archiveAndPruneExits(path string, exits *[]ExitRecord, keep int) {
 	old := (*exits)[:cut]
 
 	if err := appendExitsCSV(path, old); err != nil {
-	log.Printf("[ERROR] exit archive failed path=%s; keeping unpruned exits to avoid data loss: %v", path, err)
-	return
-}
+		log.Printf("[ERROR] exit archive failed path=%s; keeping unpruned exits to avoid data loss: %v", path, err)
+		return
+	}
 
 	*exits = (*exits)[cut:]
 	log.Printf("[INFO] exit archive ok path=%s archived=%d kept=%d", path, len(old), len(*exits))
