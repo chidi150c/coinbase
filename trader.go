@@ -1001,7 +1001,7 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, livePrice float64, si
 		capN = 8
 	}
 
-	archiveAndPruneExits(&t.lastExits, capN)
+	archiveAndPruneExits(t.exitsArchivePath(), &t.lastExits, capN)
 
 	// --- NEW: increment win/loss trades ---
 	if pl >= 0 {
@@ -1131,9 +1131,8 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, livePrice float64, si
 	return msg, nil
 }
 
-const exitsArchivePath = "/opt/coinbase/archive/exits.csv"
-
-func archiveAndPruneExits(exits *[]ExitRecord, keep int) {
+func archiveAndPruneExits(path string, exits *[]ExitRecord, keep int) {
+	
 	if exits == nil {
 		return
 	}
@@ -1147,13 +1146,21 @@ func archiveAndPruneExits(exits *[]ExitRecord, keep int) {
 	cut := len(*exits) - keep
 	old := (*exits)[:cut]
 
-	if err := appendExitsCSV(exitsArchivePath, old); err != nil {
-		log.Printf("[ERROR] exit archive failed; keeping unpruned exits to avoid data loss: %v", err)
-		return
-	}
+	if err := appendExitsCSV(path, old); err != nil {
+	log.Printf("[ERROR] exit archive failed path=%s; keeping unpruned exits to avoid data loss: %v", path, err)
+	return
+}
 
 	*exits = (*exits)[cut:]
-	log.Printf("[INFO] exit archive ok path=%s archived=%d kept=%d", exitsArchivePath, len(old), len(*exits))
+	log.Printf("[INFO] exit archive ok path=%s archived=%d kept=%d", path, len(old), len(*exits))
+}
+
+func (t *Trader) exitsArchivePath() string {
+	if strings.TrimSpace(t.stateFile) != "" {
+		return filepath.Join(filepath.Dir(t.stateFile), "exits.csv")
+	}
+
+	return "exits.csv"
 }
 
 func appendExitsCSV(path string, exits []ExitRecord) error {

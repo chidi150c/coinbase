@@ -1488,7 +1488,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-90",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-91",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1676,7 +1676,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	latchResetHours := t.cfg.PyramidLatchResetHours
 
-	// Extend latch timing only when latch is due AND a fresh favorable extreme appears.
+	// Extend latch timing when a fresh favorable extreme appears.
 	// BUY: lower RecentLow means market is still moving down toward better BUY price.
 	// SELL: higher RecentHigh means market is still moving up toward better SELL price.
 	var elapsedHr float64
