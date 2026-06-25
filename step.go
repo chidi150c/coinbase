@@ -1488,7 +1488,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-91",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-92",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -3278,21 +3278,6 @@ type exitCandidate struct {
 //
 // RunnerIDs are kept authoritative.
 func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64) {
-	// helper to pad a single lot to minNotional (synthetic size increase!)
-	padSingleLot := func(lot *Position) {
-		if lot == nil || px <= 0 {
-			return
-		}
-		curNotional := lot.SizeBase * px
-		if curNotional < minNotional {
-			requiredBase := minNotional / px
-			lot.SizeBase = requiredBase
-			// keep original entry price; recompute USD notional off entry
-			lot.OpenNotionalUSD = lot.SizeBase * lot.OpenPrice
-			lot.Reason = strings.TrimSpace(lot.Reason + " padded-to-min")
-		}
-	}
-
 	// 0 lots: nothing to do
 	if len(book.Lots) == 0 {
 		return
@@ -3300,7 +3285,6 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 
 	// 1 lot at start: pad and stop
 	if len(book.Lots) == 1 {
-		padSingleLot(book.Lots[0])
 		return
 	}
 
@@ -3387,7 +3371,6 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 
 	// if we now have only 1 lot, pad it (if dust) and stop
 	if len(book.Lots) == 1 {
-		padSingleLot(book.Lots[0])
 		return
 	}
 
@@ -3405,10 +3388,5 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 			continue
 		}
 		i++
-	}
-
-	// final safety: if after all merges we are left with 1 lot and it's dust, pad it
-	if len(book.Lots) == 1 {
-		padSingleLot(book.Lots[0])
 	}
 }
