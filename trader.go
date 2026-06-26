@@ -132,6 +132,7 @@ type BotState struct {
 	SpareBuyUSD        float64
 	SpareSellUSD       float64
 	PreviousAIRaw      Signal
+	PendingExits       map[string]*PendingExit
 }
 
 // --- NEW (Phase 1): pending async maker-first open support ---
@@ -1159,6 +1160,7 @@ func (t *Trader) snapshotStateLocked() BotState {
 		RefundSellUSD:      t.refundSellUSD,
 		SpareBuyUSD:        t.SpareBuyUSD,
 		SpareSellUSD:       t.SpareSellUSD,
+		PendingExits:       t.pendingExits,
 	}
 }
 
@@ -1267,6 +1269,11 @@ func (t *Trader) loadState() error {
 	t.pendingSell = st.PendingSell
 	t.pendingRecheckBuy = st.PendingRecheckBuy
 	t.pendingRecheckSell = st.PendingRecheckSell
+
+	t.pendingExits = st.PendingExits
+	if t.pendingExits == nil {
+		t.pendingExits = make(map[string]*PendingExit)
+	}
 
 	t.refundBuyUSD = st.RefundBuyUSD
 	t.refundSellUSD = st.RefundSellUSD
@@ -1723,88 +1730,54 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 	}
 
 	exitTime := time.Now().UTC()
-
 	baseRequestedRaw := lot.SizeBase
 	baseRequested := floorToStep(baseRequestedRaw, t.cfg.BaseStep)
 
 	if baseRequested <= 0 {
-		log.Printf(
-			"[CLOSE-SKIP] lotSide=%s closeSide=%s baseRaw=%.8f baseRounded=%.8f step=%.8f reason=%s",
-			lot.Side, closeSide, baseRequestedRaw, baseRequested, t.cfg.BaseStep, exitReason,
-		)
+		log.Printf("[CLOSE-SKIP] lotSide=%s closeSide=%s baseRaw=%.8f baseRounded=%.8f step=%.8f reason=%s", lot.Side, closeSide, baseRequestedRaw, baseRequested, t.cfg.BaseStep, exitReason)
 		return "", nil
 	}
 
 	quote := baseRequested * livePrice
-
 	minNotional := t.cfg.MinNotional
 	if minNotional <= 0 {
 		minNotional = t.cfg.OrderMinUSD
 	}
 
 	if quote < minNotional {
-		log.Printf("[CLOSE-SKIP] lotSide=%s closeSide=%s base=%.8f livePrice=%.2f notional=%.2f < min %.2f; deferring",
-			lot.Side, closeSide, baseRequested, livePrice, quote, minNotional)
-
-		return fmt.Sprintf(
-			"EXIT-SKIP %s side=%s→%s notional=%.2f < min=%.2f reason=%s",
-			exitTime.Format(time.RFC3339), lot.Side, closeSide, quote, minNotional, exitReason,
-		), nil
+		log.Printf("[CLOSE-SKIP] lotSide=%s closeSide=%s base=%.8f livePrice=%.2f notional=%.2f < min %.2f; deferring", lot.Side, closeSide, baseRequested, livePrice, quote, minNotional)
+		return fmt.Sprintf("EXIT-SKIP %s side=%s→%s notional=%.2f < min=%.2f reason=%s", exitTime.Format(time.RFC3339), lot.Side, closeSide, quote, minNotional, exitReason), nil
 	}
 
-	isL2DeepLoss := exitReason == "threshold_stop_loss" &&
-		strings.Contains(exitDecision, "EXIT_CLASS=L2_DEEP_LOSS")
+	isL2DeepLoss := exitReason == "threshold_stop_loss" && strings.Contains(exitDecision, "EXIT_CLASS=L2_DEEP_LOSS")
+	usePendingMakerExit := lot.ExitMode == ExitModeScalpFixedTP && !isL2DeepLoss && t.cfg.LimitTimeoutSec > 0
 
-	usePendingMakerExit :=
-		lot.ExitMode == ExitModeScalpFixedTP &&
-			!isL2DeepLoss &&
-			t.cfg.LimitTimeoutSec > 0
+	if usePendingMakerExit && strings.TrimSpace(lot.FixedTPOrderID) != "" {
+		return fmt.Sprintf("PENDING_EXIT_EXISTS %s side=%s lot_id=%d entry_id=%s order_id=%s reason=%s", exitTime.Format(time.RFC3339), lot.Side, lot.LotID, lot.EntryOrderID, lot.FixedTPOrderID, exitReason), nil
+	}
 
-	// Release lock for broker I/O.
 	t.mu.Unlock()
 
 	var placed *PlacedOrder
 
 	if !t.cfg.DryRun {
 		if usePendingMakerExit {
-			limitPx := livePrice
-			baseAtLimit := baseRequested
-
-			if strings.TrimSpace(lot.FixedTPOrderID) != "" {
-				return fmt.Sprintf("PENDING_EXIT_EXISTS lot_id=%d order_id=%s", lot.LotID, lot.FixedTPOrderID), nil
-			}
-
-			err := t.startPendingMakerExit(ctx, lot, side, exitReason, exitDecision, limitPx, baseAtLimit)
-
-			// Re-lock before every return because caller expects lock ownership restored.
+			err := t.startPendingMakerExit(ctx, lot.Side, lot.LotID, lot.EntryOrderID, side, exitReason, exitDecision, livePrice, baseRequested)
 			t.mu.Lock()
 
 			if err != nil {
-				log.Printf("TRACE pending_exit.start_failed side=%s lot_id=%d entry_id=%s err=%v",
-					lot.Side, lot.LotID, lot.EntryOrderID, err)
+				log.Printf("TRACE pending_exit.start_failed side=%s lot_id=%d entry_id=%s err=%v", lot.Side, lot.LotID, lot.EntryOrderID, err)
 				return "", nil
 			}
 
-			return fmt.Sprintf(
-				"PENDING_EXIT %s side=%s lot_id=%d entry_id=%s limit=%.2f base=%.8f reason=%s",
-				exitTime.Format(time.RFC3339),
-				lot.Side,
-				lot.LotID,
-				lot.EntryOrderID,
-				limitPx,
-				baseAtLimit,
-				exitReason,
-			), nil
+			return fmt.Sprintf("PENDING_EXIT %s side=%s lot_id=%d entry_id=%s limit=%.2f base=%.8f reason=%s", exitTime.Format(time.RFC3339), lot.Side, lot.LotID, lot.EntryOrderID, livePrice, baseRequested, exitReason), nil
 		}
 
-		// Immediate market exit path. Used for emergency exits such as L2_DEEP_LOSS.
 		var err error
 		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote)
 
-		log.Printf("TRACE order.close request side=%s baseReq=%.8f quoteEst=%.2f priceSnap=%.8f",
-			closeSide, baseRequested, quote, livePrice)
-		log.Printf("[KPI] taker.exit side=%s base=%.8f quote_est=%.2f reason=market_now",
-			closeSide, baseRequested, quote)
+		log.Printf("TRACE order.close request side=%s baseReq=%.8f quoteEst=%.2f priceSnap=%.8f", closeSide, baseRequested, quote, livePrice)
+		log.Printf("[KPI] taker.exit side=%s base=%.8f quote_est=%.2f reason=market_now", closeSide, baseRequested, quote)
 
 		if err != nil {
 			if t.cfg.UseDirectSlack {
@@ -1815,18 +1788,16 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		}
 
 		if placed != nil {
-			log.Printf("TRACE order.close placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
-				placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
+			log.Printf("TRACE order.close placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f", placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
 		}
 	}
 
-	// Re-lock after broker I/O.
 	t.mu.Lock()
 
 	wasNewest := localIdx == len(book.Lots)-1
-
 	priceExec := livePrice
 	baseFilled := baseRequested
+	commissionUSD := 0.0
 
 	if placed != nil {
 		if placed.Price > 0 {
@@ -1835,18 +1806,29 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		if placed.BaseSize > 0 {
 			baseFilled = placed.BaseSize
 		}
+		if placed.CommissionUSD > 0 {
+			commissionUSD = placed.CommissionUSD
+		}
 
 		const tol = 1e-9
 		if baseFilled+tol < baseRequested {
-			log.Printf("[WARN] partial fill (exit): requested_base=%.8f filled_base=%.8f (%.2f%%)",
-				baseRequested, baseFilled, 100.0*(baseFilled/baseRequested))
+			log.Printf("[WARN] partial fill (exit): requested_base=%.8f filled_base=%.8f (%.2f%%)", baseRequested, baseFilled, 100.0*(baseFilled/baseRequested))
 			log.Printf("TRACE fill.exit partial requested=%.8f filled=%.8f", baseRequested, baseFilled)
 		}
 	}
 
-	if placed == nil || placed.Price <= 0 {
-		priceExec = livePrice
+	return t.applyFilledExitLocked(livePrice, priceExec, baseRequested, baseFilled, side, localIdx, exitReason, exitDecision, exitTime, placedOrderID(placed), commissionUSD, minNotional, wasNewest)
+}
+
+func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, baseRequested float64, baseFilled float64, side OrderSide, localIdx int, exitReason string, exitDecision string, exitTime time.Time, exitOrderID string, commissionUSD float64, minNotional float64, wasNewest bool) (string, error) {
+	_ = livePrice
+
+	book := t.book(side)
+	if localIdx < 0 || localIdx >= len(book.Lots) {
+		return "", fmt.Errorf("applyFilledExitLocked: invalid localIdx=%d side=%s", localIdx, side)
 	}
+
+	lot := book.Lots[localIdx]
 
 	entryPortion := 0.0
 	if baseRequested > 0 {
@@ -1859,15 +1841,9 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 	}
 
 	quoteExec := baseFilled * priceExec
-	feeRate := t.cfg.FeeRatePct
-	exitFee := quoteExec * (feeRate / 100.0)
-
-	if placed != nil {
-		if placed.CommissionUSD > 0 {
-			exitFee = placed.CommissionUSD
-		} else {
-			log.Printf("[WARN] commission missing (exit); falling back to FEE_RATE_PCT=%.4f%%", feeRate)
-		}
+	exitFee := quoteExec * (t.cfg.FeeRatePct / 100.0)
+	if commissionUSD > 0 {
+		exitFee = commissionUSD
 	}
 
 	pl -= entryPortion
@@ -1880,16 +1856,17 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		return (lot.OpenPrice - priceExec) * baseFilled
 	}()
 
+	removedWasRunner := false
 	kind := "scalp"
 	for _, rid := range book.RunnerIDs {
 		if rid == localIdx {
+			removedWasRunner = true
 			kind = "runner"
 			break
 		}
 	}
 
-	log.Printf("TRACE exit.classify side=%s kind=%s reason=%s open=%.8f exec=%.8f baseFilled=%.8f rawPL=%.6f entryFee=%.6f exitFee=%.6f finalPL=%.6f",
-		lot.Side, kind, exitReason, lot.OpenPrice, priceExec, baseFilled, rawPL, entryPortion, exitFee, pl)
+	log.Printf("TRACE exit.classify side=%s kind=%s reason=%s open=%.8f exec=%.8f baseFilled=%.8f rawPL=%.6f entryFee=%.6f exitFee=%.6f finalPL=%.6f", lot.Side, kind, exitReason, lot.OpenPrice, priceExec, baseFilled, rawPL, entryPortion, exitFee, pl)
 
 	t.dailyPnL += pl
 	t.equityUSD += pl
@@ -1903,14 +1880,6 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		t.SpareSellUSD += quoteExec
 		if t.SpareSellUSD < 0 {
 			t.SpareSellUSD = 0
-		}
-	}
-
-	removedWasRunner := false
-	for _, rid := range book.RunnerIDs {
-		if rid == localIdx {
-			removedWasRunner = true
-			break
 		}
 	}
 
@@ -1930,7 +1899,7 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		RefundPortionUSD: lot.RefundPortionUSD,
 		LotID:            lot.LotID,
 		EntryOrderID:     lot.EntryOrderID,
-		ExitOrderID:      placedOrderID(placed),
+		ExitOrderID:      exitOrderID,
 	}
 
 	t.lastExits = append(t.lastExits, rec)
@@ -1951,21 +1920,15 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 			lot.EntryFee = 0
 		}
 		lot.OpenNotionalUSD = lot.SizeBase * lot.OpenPrice
-
 		if priceExec > 0 && minNotional > 0 {
 			t.consolidateDust(book, priceExec, minNotional)
 		}
 
-		msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
-			exitTime.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, entryPortion+exitFee)
-
+		msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)", exitTime.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, entryPortion+exitFee)
 		if t.cfg.UseDirectSlack {
 			postSlack(msg)
 		}
-		if err := t.saveStateNoLock(); err != nil {
-			log.Printf("[WARN] saveState: %v", err)
-			log.Printf("TRACE state.save error=%v", err)
-		}
+		_ = t.saveStateNoLock()
 		return msg, nil
 	}
 
@@ -2003,14 +1966,11 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 	}
 
 	if removedWasRunner {
-		if lot.Side == SideBuy {
-			if t.equityStageBuy > 0 {
-				t.equityStageBuy--
-			}
-		} else {
-			if t.equityStageSell > 0 {
-				t.equityStageSell--
-			}
+		if lot.Side == SideBuy && t.equityStageBuy > 0 {
+			t.equityStageBuy--
+		}
+		if lot.Side == SideSell && t.equityStageSell > 0 {
+			t.equityStageSell--
 		}
 	}
 
@@ -2022,24 +1982,19 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		}
 	}
 
-	msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
-		exitTime.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, entryPortion+exitFee)
-
+	msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)", exitTime.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, entryPortion+exitFee)
 	if t.cfg.UseDirectSlack {
 		postSlack(msg)
 	}
-	if err := t.saveStateNoLock(); err != nil {
-		log.Printf("[WARN] saveState: %v", err)
-		log.Printf("TRACE state.save error=%v", err)
-	}
-
-	_ = removedWasRunner
+	_ = t.saveStateNoLock()
 	return msg, nil
 }
 
-func (t *Trader) startPendingMakerExit(ctx context.Context, lot *Position, side OrderSide, exitReason string, exitDecision string, limitPx float64, baseRequested float64) error {
+func (t *Trader) startPendingMakerExit(ctx context.Context, lotSide OrderSide, lotID int, entryOrderID string, side OrderSide, exitReason string, exitDecision string, limitPx float64, baseRequested float64) error {
+	_ = side
+
 	closeSide := SideSell
-	if lot.Side == SideSell {
+	if lotSide == SideSell {
 		closeSide = SideBuy
 	}
 
@@ -2055,17 +2010,57 @@ func (t *Trader) startPendingMakerExit(ctx context.Context, lot *Position, side 
 		return fmt.Errorf("empty maker exit order id")
 	}
 
+	t.mu.Lock()
+
+	book := t.book(lotSide)
+	var lot *Position
+	for _, l := range book.Lots {
+		if l != nil && l.LotID == lotID && strings.TrimSpace(l.EntryOrderID) == strings.TrimSpace(entryOrderID) {
+			lot = l
+			break
+		}
+	}
+
+	if lot == nil {
+		t.mu.Unlock()
+		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, oid)
+		return fmt.Errorf("lot disappeared before pending exit registration lot_id=%d entry_id=%s", lotID, entryOrderID)
+	}
+
+	if strings.TrimSpace(lot.FixedTPOrderID) != "" {
+		existing := lot.FixedTPOrderID
+		t.mu.Unlock()
+		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, oid)
+		return fmt.Errorf("lot already has pending exit lot_id=%d order_id=%s", lotID, existing)
+	}
+
 	lot.FixedTPOrderID = oid
 
-	p := &PendingExit{Side: lot.Side, ProductID: t.cfg.ProductID, OrderID: oid, LotID: lot.LotID, EntryOrderID: lot.EntryOrderID, ExitReason: exitReason, ExitDecision: exitDecision, LimitPx: limitPx, BaseRequested: baseRequested, Deadline: time.Now().Add(time.Duration(t.cfg.LimitTimeoutSec) * time.Second)}
+	p := &PendingExit{
+		Side:          lot.Side,
+		ProductID:     t.cfg.ProductID,
+		OrderID:       oid,
+		LotID:         lot.LotID,
+		EntryOrderID:  lot.EntryOrderID,
+		ExitReason:    exitReason,
+		ExitDecision:  exitDecision,
+		LimitPx:       limitPx,
+		BaseRequested: baseRequested,
+		Deadline:      time.Now().Add(time.Duration(t.cfg.LimitTimeoutSec) * time.Second),
+	}
 
 	t.pendingExits[oid] = p
 
 	log.Printf("TRACE pending_exit.register order_id=%s pending=%d", oid, len(t.pendingExits))
 	log.Printf("TRACE pending_exit.start side=%s order_id=%s lot_id=%d entry_id=%s limit=%.8f base=%.8f reason=%s", p.Side, p.OrderID, p.LotID, p.EntryOrderID, p.LimitPx, p.BaseRequested, p.ExitReason)
 
-	go t.watchPendingExit(ctx, p)
+	if err := t.saveStateNoLock(); err != nil {
+		log.Printf("[WARN] saveState: %v", err)
+	}
 
+	t.mu.Unlock()
+
+	go t.watchPendingExit(ctx, p)
 	return nil
 }
 
@@ -2232,19 +2227,16 @@ func (t *Trader) applyPendingExitResult(ctx context.Context, candles []Candle, l
 
 	book := t.book(p.Side)
 
-	findLot := func() (*Position, int) {
-		for i, lot := range book.Lots {
-			if lot == nil {
-				continue
-			}
-			if lot.LotID == p.LotID && strings.TrimSpace(lot.EntryOrderID) == strings.TrimSpace(p.EntryOrderID) {
-				return lot, i
-			}
+	localIdx := -1
+	var lot *Position
+	for i, l := range book.Lots {
+		if l != nil && l.LotID == p.LotID && strings.TrimSpace(l.EntryOrderID) == strings.TrimSpace(p.EntryOrderID) {
+			lot = l
+			localIdx = i
+			break
 		}
-		return nil, -1
 	}
 
-	lot, localIdx := findLot()
 	if lot == nil || localIdx < 0 {
 		delete(t.pendingExits, orderID)
 		log.Printf("TRACE pending_exit.apply_skip reason=lot_not_found order_id=%s lot_id=%d entry_id=%s", orderID, p.LotID, p.EntryOrderID)
@@ -2299,140 +2291,22 @@ func (t *Trader) applyPendingExitResult(ctx context.Context, candles []Candle, l
 		log.Printf("TRACE pending_exit.partial order_id=%s requested=%.8f filled=%.8f", orderID, baseRequested, baseFilled)
 	}
 
-	entryPortion := 0.0
-	if baseRequested > 0 {
-		entryPortion = lot.EntryFee * (baseFilled / baseRequested)
-	}
-
-	pl := (priceExec - lot.OpenPrice) * baseFilled
-	if lot.Side == SideSell {
-		pl = (lot.OpenPrice - priceExec) * baseFilled
-	}
-
-	quoteExec := baseFilled * priceExec
-	exitFee := quoteExec * (t.cfg.FeeRatePct / 100.0)
+	commissionUSD := 0.0
 	if placed.CommissionUSD > 0 {
-		exitFee = placed.CommissionUSD
+		commissionUSD = placed.CommissionUSD
 	}
 
-	pl -= entryPortion
-	pl -= exitFee
+	wasNewest := localIdx == len(book.Lots)-1
 
-	removedWasRunner := false
-	for _, rid := range book.RunnerIDs {
-		if rid == localIdx {
-			removedWasRunner = true
-			break
-		}
-	}
-
-	rec := ExitRecord{
-		Time: exitTime, Side: lot.Side, OpenPrice: lot.OpenPrice, ClosePrice: priceExec, SizeBase: baseFilled, OpenNotionalUSD: lot.OpenNotionalUSD,
-		EntryFeeUSD: entryPortion, ExitFeeUSD: exitFee, PNLUSD: pl,
-		Reason:   p.ExitReason + " | exitReason{" + p.ExitDecision + "}  ||  openReason{" + lot.Reason + "}",
-		ExitMode: lot.ExitMode, WasRunner: removedWasRunner, RefundPortionUSD: lot.RefundPortionUSD,
-		LotID: lot.LotID, EntryOrderID: lot.EntryOrderID, ExitOrderID: orderID,
-	}
-
-	t.lastExits = append(t.lastExits, rec)
-	capN := t.cfg.ExitHistorySize
-	if capN <= 0 {
-		capN = 8
-	}
-	archiveAndPruneExits(t.exitsArchivePath(), &t.lastExits, capN)
-
-	t.dailyPnL += pl
-	t.equityUSD += pl
-
-	if lot.Side == SideBuy {
-		t.SpareBuyUSD += quoteExec
-		if t.SpareBuyUSD < 0 {
-			t.SpareBuyUSD = 0
-		}
-	} else if lot.Side == SideSell {
-		t.SpareSellUSD += quoteExec
-		if t.SpareSellUSD < 0 {
-			t.SpareSellUSD = 0
-		}
-	}
-
-	isPartial := baseFilled+tol < baseRequested
-	if isPartial {
-		lot.SizeBase = baseRequested - baseFilled
-		lot.EntryFee -= entryPortion
-		if lot.EntryFee < 0 {
-			lot.EntryFee = 0
-		}
-		lot.OpenNotionalUSD = lot.SizeBase * lot.OpenPrice
-		if priceExec > 0 && minNotional > 0 {
-			t.consolidateDust(book, priceExec, minNotional)
-		}
-		delete(t.pendingExits, orderID)
-		log.Printf("TRACE pending_exit.applied_partial order_id=%s lot_id=%d remaining=%.8f pnl=%.6f", orderID, p.LotID, lot.SizeBase, pl)
+	msg, err := t.applyFilledExitLocked(livePrice, priceExec, baseRequested, baseFilled, p.Side, localIdx, p.ExitReason, p.ExitDecision, exitTime, orderID, commissionUSD, minNotional, wasNewest)
+	if err != nil {
+		log.Printf("TRACE pending_exit.apply_error order_id=%s lot_id=%d err=%v", orderID, p.LotID, err)
 		_ = t.saveStateNoLock()
 		return
 	}
 
-	wasNewest := localIdx == len(book.Lots)-1
-	book.Lots = append(book.Lots[:localIdx], book.Lots[localIdx+1:]...)
-
-	if len(book.RunnerIDs) > 0 {
-		out := book.RunnerIDs[:0]
-		for _, rid := range book.RunnerIDs {
-			if rid == localIdx {
-				continue
-			}
-			if rid > localIdx {
-				rid--
-			}
-			out = append(out, rid)
-		}
-		book.RunnerIDs = append([]int(nil), out...)
-	}
-
-	if priceExec > 0 && minNotional > 0 {
-		t.consolidateDust(book, priceExec, minNotional)
-	}
-
-	if wasNewest {
-		now := time.Now().UTC()
-		if lot.Side == SideBuy {
-			t.lastAddBuy = now
-			t.winLowBuy = 0
-			t.latchedGateBuy = 0
-		} else {
-			t.lastAddSell = now
-			t.winHighSell = 0
-			t.latchedGateSell = 0
-		}
-	}
-
-	if removedWasRunner {
-		if lot.Side == SideBuy && t.equityStageBuy > 0 {
-			t.equityStageBuy--
-		}
-		if lot.Side == SideSell && t.equityStageSell > 0 {
-			t.equityStageSell--
-		}
-	}
-
-	if len(book.Lots) == 0 {
-		if lot.Side == SideBuy {
-			t.equityStageBuy = 0
-		} else {
-			t.equityStageSell = 0
-		}
-	}
-
 	delete(t.pendingExits, orderID)
-	log.Printf("TRACE pending_exit.applied_full order_id=%s lot_id=%d entry_id=%s pnl=%.6f", orderID, p.LotID, p.EntryOrderID, pl)
+	_ = t.saveStateNoLock()
 
-	if t.cfg.UseDirectSlack {
-		postSlack(fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)", exitTime.Format(time.RFC3339), priceExec, p.ExitReason, lot.Reason, pl, entryPortion+exitFee))
-	}
-
-	if err := t.saveStateNoLock(); err != nil {
-		log.Printf("[WARN] saveState: %v", err)
-		log.Printf("TRACE state.save error=%v", err)
-	}
+	log.Printf("TRACE pending_exit.applied order_id=%s lot_id=%d entry_id=%s msg=%s", orderID, p.LotID, p.EntryOrderID, msg)
 }
