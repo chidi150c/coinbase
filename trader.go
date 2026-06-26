@@ -318,7 +318,7 @@ func NewTrader(cfg Config, broker Broker) *Trader {
 			}
 		}
 	}
-	
+
 	// In NewTrader(), use larger buffer:
 	t.pendingExitCh = make(chan ExitResult, 64)
 	t.pendingExits = make(map[string]*PendingExit)
@@ -777,7 +777,6 @@ func (t *Trader) consolidateRunners(book *SideBook, px float64) {
 	// - we did NOT touch t.lastAddEquityBuy / t.lastAddEquitySell / t.equityStage*
 	// - only per-lot fields on this side's book were rewritten
 }
-
 
 func floorToStep(x, step float64) float64 {
 	if step <= 0 {
@@ -1771,15 +1770,11 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 			limitPx := livePrice
 			baseAtLimit := baseRequested
 
-			err := t.startPendingMakerExit(
-				ctx,
-				lot,
-				side,
-				exitReason,
-				exitDecision,
-				limitPx,
-				baseAtLimit,
-			)
+			if strings.TrimSpace(lot.FixedTPOrderID) != "" {
+				return fmt.Sprintf("PENDING_EXIT_EXISTS lot_id=%d order_id=%s", lot.LotID, lot.FixedTPOrderID), nil
+			}
+
+			err := t.startPendingMakerExit(ctx, lot, side, exitReason, exitDecision, limitPx, baseAtLimit)
 
 			// Re-lock before every return because caller expects lock ownership restored.
 			t.mu.Lock()
@@ -2042,11 +2037,14 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 	return msg, nil
 }
 
-
 func (t *Trader) startPendingMakerExit(ctx context.Context, lot *Position, side OrderSide, exitReason string, exitDecision string, limitPx float64, baseRequested float64) error {
 	closeSide := SideSell
 	if lot.Side == SideSell {
 		closeSide = SideBuy
+	}
+
+	if limitPx <= 0 || baseRequested <= 0 {
+		return fmt.Errorf("invalid pending maker exit limit=%.8f base=%.8f", limitPx, baseRequested)
 	}
 
 	oid, err := t.broker.PlaceLimitPostOnly(ctx, t.cfg.ProductID, closeSide, limitPx, baseRequested)
@@ -2057,33 +2055,41 @@ func (t *Trader) startPendingMakerExit(ctx context.Context, lot *Position, side 
 		return fmt.Errorf("empty maker exit order id")
 	}
 
-	p := &PendingExit{
-		Side:          lot.Side,
-		ProductID:     t.cfg.ProductID,
-		OrderID:       oid,
-		LotID:         lot.LotID,
-		EntryOrderID:  lot.EntryOrderID,
-		ExitReason:    exitReason,
-		ExitDecision:  exitDecision,
-		LimitPx:       limitPx,
-		BaseRequested: baseRequested,
-		Deadline:      time.Now().Add(time.Duration(t.cfg.LimitTimeoutSec) * time.Second),
-	}
+	lot.FixedTPOrderID = oid
+
+	p := &PendingExit{Side: lot.Side, ProductID: t.cfg.ProductID, OrderID: oid, LotID: lot.LotID, EntryOrderID: lot.EntryOrderID, ExitReason: exitReason, ExitDecision: exitDecision, LimitPx: limitPx, BaseRequested: baseRequested, Deadline: time.Now().Add(time.Duration(t.cfg.LimitTimeoutSec) * time.Second)}
 
 	t.pendingExits[oid] = p
 
-	go t.watchPendingExit(ctx, p)
+	log.Printf("TRACE pending_exit.register order_id=%s pending=%d", oid, len(t.pendingExits))
+	log.Printf("TRACE pending_exit.start side=%s order_id=%s lot_id=%d entry_id=%s limit=%.8f base=%.8f reason=%s", p.Side, p.OrderID, p.LotID, p.EntryOrderID, p.LimitPx, p.BaseRequested, p.ExitReason)
 
-	log.Printf(
-		"TRACE pending_exit.start side=%s order_id=%s lot_id=%d entry_id=%s limit=%.8f base=%.8f reason=%s",
-		p.Side, p.OrderID, p.LotID, p.EntryOrderID, p.LimitPx, p.BaseRequested, p.ExitReason,
-	)
+	go t.watchPendingExit(ctx, p)
 
 	return nil
 }
 
 func (t *Trader) watchPendingExit(ctx context.Context, p *PendingExit) {
 	var filled *PlacedOrder
+	orderID := p.OrderID
+	lastLimitPx := p.LimitPx
+	initLimit := lastLimitPx
+	lastReprice := time.Now()
+	repriceCount := 0
+
+	cfg := t.cfg
+	tick := cfg.PriceTick
+	baseStep := cfg.BaseStep
+	offsetBps := cfg.LimitPriceOffsetBps
+	minNotional := cfg.MinNotional
+	if minNotional <= 0 {
+		minNotional = cfg.OrderMinUSD
+	}
+
+	closeSide := SideSell
+	if p.Side == SideSell {
+		closeSide = SideBuy
+	}
 
 	for time.Now().Before(p.Deadline) {
 		select {
@@ -2092,29 +2098,109 @@ func (t *Trader) watchPendingExit(ctx context.Context, p *PendingExit) {
 		default:
 		}
 
-		ord, err := t.broker.GetOrder(ctx, p.ProductID, p.OrderID)
+		ord, err := t.broker.GetOrder(ctx, p.ProductID, orderID)
 		if err == nil && ord != nil && (ord.BaseSize > 0 || ord.QuoteSpent > 0) {
 			filled = ord
 			break
+		}
+
+		if cfg.RepriceEnable && cfg.RepriceIntervalMs > 0 && time.Since(lastReprice) >= time.Duration(cfg.RepriceIntervalMs)*time.Millisecond {
+			if cfg.RepriceMaxCount <= 0 || repriceCount < cfg.RepriceMaxCount {
+				px, gErr := t.broker.GetNowPrice(ctx, p.ProductID)
+				if gErr == nil && px > 0 {
+					newLimitPx := px
+					if closeSide == SideSell {
+						newLimitPx = px * (1.0 + offsetBps/10000.0)
+					} else {
+						newLimitPx = px * (1.0 - offsetBps/10000.0)
+					}
+					if tick > 0 {
+						newLimitPx = math.Floor(newLimitPx/tick) * tick
+					}
+
+					shouldReprice := (tick > 0 && math.Abs(newLimitPx-lastLimitPx) >= tick) || (tick <= 0 && newLimitPx != lastLimitPx)
+
+					if shouldReprice && cfg.RepriceMaxDriftBps > 0 && initLimit > 0 {
+						driftBps := math.Abs((newLimitPx-initLimit)/initLimit) * 10000.0
+						if driftBps > cfg.RepriceMaxDriftBps {
+							shouldReprice = false
+						}
+					}
+
+					if shouldReprice && tick > 0 && cfg.RepriceMinImprovTicks > 1 {
+						improveTicks := int(math.Abs(newLimitPx-lastLimitPx) / tick)
+						if closeSide == SideSell {
+							if !(newLimitPx > lastLimitPx && improveTicks >= cfg.RepriceMinImprovTicks) {
+								shouldReprice = false
+							}
+						} else {
+							if !(newLimitPx < lastLimitPx && improveTicks >= cfg.RepriceMinImprovTicks) {
+								shouldReprice = false
+							}
+						}
+					}
+
+					newBase := p.BaseRequested
+					if baseStep > 0 {
+						newBase = math.Floor((newBase/baseStep)+1e-12) * baseStep
+					}
+
+					if shouldReprice && cfg.RepriceMinEdgeUSD > 0 && newBase > 0 {
+						edgeUSD := math.Abs(newLimitPx-lastLimitPx) * newBase
+						if edgeUSD < cfg.RepriceMinEdgeUSD {
+							shouldReprice = false
+						}
+					}
+
+					if shouldReprice && !(newBase > 0 && newBase*newLimitPx >= minNotional) {
+						shouldReprice = false
+					}
+
+					if shouldReprice {
+						_ = t.broker.CancelOrder(ctx, p.ProductID, orderID)
+						newID, perr := t.broker.PlaceLimitPostOnly(ctx, p.ProductID, closeSide, newLimitPx, newBase)
+						if perr == nil && strings.TrimSpace(newID) != "" {
+							oldID := orderID
+							orderID = newID
+							lastLimitPx = newLimitPx
+							repriceCount++
+
+							t.apply(func(tt *Trader) {
+								delete(tt.pendingExits, oldID)
+								p.OrderID = newID
+								p.LimitPx = newLimitPx
+								p.BaseRequested = newBase
+								tt.pendingExits[newID] = p
+								book := tt.book(p.Side)
+								for _, lot := range book.Lots {
+									if lot != nil && lot.LotID == p.LotID && strings.TrimSpace(lot.EntryOrderID) == strings.TrimSpace(p.EntryOrderID) {
+										lot.FixedTPOrderID = newID
+										break
+									}
+								}
+								_ = tt.saveStateFrom(tt.snapshotStateLocked())
+							})
+
+							log.Printf("TRACE pending_exit.reprice side=%s old_id=%s new_id=%s limit=%.8f base=%.8f count=%d", p.Side, oldID, newID, newLimitPx, newBase, repriceCount)
+						}
+					}
+				}
+			}
+			lastReprice = time.Now()
 		}
 
 		time.Sleep(200 * time.Millisecond)
 	}
 
 	if filled == nil {
-		_ = t.broker.CancelOrder(ctx, p.ProductID, p.OrderID)
-		log.Printf("TRACE pending_exit.timeout_cancel order_id=%s lot_id=%d", p.OrderID, p.LotID)
+		_ = t.broker.CancelOrder(ctx, p.ProductID, orderID)
+		log.Printf("TRACE pending_exit.timeout_cancel order_id=%s lot_id=%d", orderID, p.LotID)
 	}
 
 	select {
-	case t.pendingExitCh <- ExitResult{
-		Filled:  filled != nil,
-		Placed:  filled,
-		OrderID: p.OrderID,
-		Pending: p,
-	}:
+	case t.pendingExitCh <- ExitResult{Filled: filled != nil, Placed: filled, OrderID: orderID, Pending: p}:
 	default:
-		log.Printf("TRACE pending_exit.channel_full order_id=%s", p.OrderID)
+		log.Printf("TRACE pending_exit.channel_full order_id=%s", orderID)
 	}
 }
 
@@ -2243,7 +2329,7 @@ func (t *Trader) applyPendingExitResult(ctx context.Context, candles []Candle, l
 	rec := ExitRecord{
 		Time: exitTime, Side: lot.Side, OpenPrice: lot.OpenPrice, ClosePrice: priceExec, SizeBase: baseFilled, OpenNotionalUSD: lot.OpenNotionalUSD,
 		EntryFeeUSD: entryPortion, ExitFeeUSD: exitFee, PNLUSD: pl,
-		Reason: p.ExitReason + " | exitReason{" + p.ExitDecision + "}  ||  openReason{" + lot.Reason + "}",
+		Reason:   p.ExitReason + " | exitReason{" + p.ExitDecision + "}  ||  openReason{" + lot.Reason + "}",
 		ExitMode: lot.ExitMode, WasRunner: removedWasRunner, RefundPortionUSD: lot.RefundPortionUSD,
 		LotID: lot.LotID, EntryOrderID: lot.EntryOrderID, ExitOrderID: orderID,
 	}

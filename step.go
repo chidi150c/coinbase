@@ -1423,7 +1423,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 			c := cands[0]
 
-			msg, err := t.closeLot(ctx,	livePrice,	c.side,	c.idx, c.reason, c.decision)
+			msg, err := t.closeLot(ctx, livePrice, c.side, c.idx, c.reason, c.decision)
 
 			return msg, true, err
 		}
