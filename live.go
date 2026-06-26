@@ -631,12 +631,6 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 					}
 					cancelEq()
 				}
-				// Metrics readiness gate for equity
-				if eqReady || trader.cfg.DryRun || !trader.cfg.UseLiveEquity() {
-					mtxPnL.Set(trader.EquityUSD())
-				} else {
-					log.Printf("[EQUITY] waiting for accounts (metric withheld)")
-				}
 
 				// Sleep before next iteration (use getter for hot-ish reload)
 				time.Sleep(time.Duration(trader.cfg.TickInterval()) * time.Second)
@@ -758,12 +752,6 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 						log.Printf("[EQUITY] waiting for accounts (error: %v)", err)
 					}
 					cancelEq()
-				}
-				// Metrics readiness gate for equity
-				if eqReady || trader.cfg.DryRun || !trader.cfg.UseLiveEquity() {
-					mtxPnL.Set(trader.EquityUSD())
-				} else {
-					log.Printf("[EQUITY] waiting for accounts (metric withheld)")
 				}
 			}
 		}
@@ -975,9 +963,6 @@ func maybeWalkForwardRefit(cfg Config, mdl *LogisticModel, history []Candle, las
 			mdl.FeatDim, len(mdl.W))
 		return lastRefit, nil
 	}
-
-	IncWalkForwardFits()
-
 	t := now
 	return &t, mdl
 }

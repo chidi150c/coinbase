@@ -334,8 +334,6 @@ func (t *Trader) SetEquityUSD(v float64) {
 	t.equityUSD = v
 	t.mu.Unlock()
 
-	// update the metric with same naming style
-	mtxPnL.Set(v)
 	// persist new state (no-op if disabled) — executed outside lock via RLock snapshot
 	if err := t.saveState(); err != nil {
 		log.Printf("[WARN] saveState: %v", err)
@@ -828,8 +826,6 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, livePrice float64, si
 							closeSide, placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD, exitOrderID, exitReason)
 						log.Printf("TRACE postonly.exit.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
 							oid, placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
-
-						mtxOrders.WithLabelValues("live", string(closeSide)).Inc()
 						break
 					}
 					time.Sleep(200 * time.Millisecond)
@@ -866,7 +862,6 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, livePrice float64, si
 				log.Printf("TRACE order.close placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
 					placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
 			}
-			mtxOrders.WithLabelValues("live", string(closeSide)).Inc()
 		}
 	}
 	// re-lock
@@ -1018,21 +1013,6 @@ func (t *Trader) closeLot(ctx context.Context, c []Candle, livePrice float64, si
 	}
 
 	archiveAndPruneExits(t.exitsArchivePath(), &t.lastExits, capN)
-
-	// --- NEW: increment win/loss trades ---
-	if pl >= 0 {
-		mtxTrades.WithLabelValues("win").Inc()
-	} else {
-		mtxTrades.WithLabelValues("loss").Inc()
-	}
-
-	// Normalize/sanitize reason and side label for metrics
-	reasonLbl := exitReason
-	sideLbl := "buy"
-	if lot.Side == SideSell {
-		sideLbl = "sell"
-	}
-	mtxExitReasons.WithLabelValues(reasonLbl, sideLbl).Inc()
 
 	// --- Phase 3: handle partial vs full exit ---
 	const tolExit = 1e-9
@@ -1885,8 +1865,6 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 					filled = ord
 					log.Printf("TRACE postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
 						orderID, filled.Price, filled.BaseSize, filled.QuoteSpent, filled.CommissionUSD)
-					mtxOrders.WithLabelValues("live", string(side)).Inc()
-					mtxTrades.WithLabelValues("open").Inc()
 					break
 				}
 

@@ -1495,7 +1495,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-93",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-94",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1507,8 +1507,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		t.model.SellThreshold,
 		t.cfg.LongOnly,
 	)
-
-	mtxDecisions.WithLabelValues(signalLabel(d.Signal)).Inc()
 
 	// Determine the side and its book
 	side := d.SignalToSide()
@@ -2001,7 +1999,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			f = 1.0
 		}
 		quote = quote * f
-		SetVolRiskFactorMetric(f)
 	}
 
 	// --- Fixed-USD ramping: scale around baseUSD, independent of equityUSD ---
@@ -2809,8 +2806,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 										CommissionUSD: sessFee,
 									}
 									log.Printf("TRACE postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f", orderID, ord.Price, ord.BaseSize, ord.QuoteSpent, ord.CommissionUSD)
-									mtxOrders.WithLabelValues("live", string(side)).Inc()
-									mtxTrades.WithLabelValues("open").Inc()
 									log.Printf("TRACE postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
 										side, orderID, (sessBase > 0 || sessQuote > 0), sessBase, sessQuote, sessFee)
 									log.Printf("[KPI] maker.open.filled side=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f order_id=%s",
@@ -3052,12 +3047,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				log.Printf("TRACE order.open placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
 					placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
 			}
-			mtxOrders.WithLabelValues("live", string(side)).Inc()
-			mtxTrades.WithLabelValues("open").Inc()
 		}
-	} else {
-		mtxTrades.WithLabelValues("open").Inc()
-	}
+	} 
 
 	// Re-lock to mutate state (append new lot to THIS SIDE).
 	t.mu.Lock()
@@ -3245,7 +3236,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	msg := ""
 	if t.cfg.DryRun {
-		mtxOrders.WithLabelValues("paper", string(side)).Inc()
 		msg = fmt.Sprintf("PAPER %s quote=%.2f base=%.6f take=%.2f fee=%.4f reason=%s [%s]",
 			side, actualQuote, baseToUse, newLot.Take, entryFee, newLot.Reason, d.Reason)
 	} else {

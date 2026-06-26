@@ -139,9 +139,6 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader) {
 	// Force paper for backtest accounting
 	trader.cfg.DryRun = true
 
-	// Initialize equity gauge so Prometheus shows a value immediately
-	mtxPnL.Set(trader.EquityUSD())
-
 	win, loss := 0, 0
 
 	// Optional slow-down so Prometheus can scrape during backtest
@@ -164,9 +161,6 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader) {
 		}
 		testP := test[len(test[:i+1])-1].Close
 		msg, _ := trader.step(ctx, test[:i+1], test[:i+1], testP)
-
-		// Keep Prometheus equity gauge in sync each tick
-		mtxPnL.Set(trader.EquityUSD())
 
 		// Count wins/losses on exits
 		if strings.HasPrefix(msg, "EXIT") {
@@ -201,7 +195,6 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader) {
 		"Backtest complete. Train=%d Test=%d Evaluated=%d Wins=%d Losses=%d Equity=%.2f",
 		trainN, testN, evalN, win, loss, trader.EquityUSD(),
 	)
-	mtxPnL.Set(trader.EquityUSD())
 
 	// Hold briefly after completion so Prometheus (or a human) can scrape one last time
 	if slowMs > 0 {
