@@ -373,6 +373,17 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	}
 	t.updateDaily(now)
 
+	// Process completed asynchronous maker exits before making any new decisions.
+	//
+	// Poller goroutines only report completion through pendingExitCh.
+	// All state mutation (lot removal, partial handling, P/L, exit records,
+	// runner updates, state save, etc.) is performed here on the main trading
+	// thread so Trader state remains single-writer and deterministic.
+	//
+	// This keeps the main loop non-blocking while ensuring completed exits are
+	// reflected before evaluating new entries, exits, or pyramiding decisions.
+	t.drainPendingExits(ctx, execHistory, livePrice)
+
 	// -------------------------------------------------------------------------------------------------
 	// Drain completed BUY maker-first order result, if any.
 	//
@@ -1214,7 +1225,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							i++
 							continue
 						}
-						msg, err := t.closeLot(ctx, execHistory, livePrice, side, i, "trailing_stop", d.Reason)
+						msg, err := t.closeLot(ctx, livePrice, side, i, "trailing_stop", d.Reason)
 						if err != nil {
 							return "", true, err
 						}
@@ -1387,7 +1398,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 			var msgs []string
 			for _, cand := range cands {
-				msg, err := t.closeLot(ctx, execHistory, livePrice, cand.side, cand.idx, cand.reason, cand.decision)
+				msg, err := t.closeLot(ctx, livePrice, cand.side, cand.idx, cand.reason, cand.decision)
 				if err != nil {
 					return strings.Join(msgs, "\n"), true, err
 				}
@@ -1412,15 +1423,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 			c := cands[0]
 
-			msg, err := t.closeLot(
-				ctx,
-				execHistory,
-				livePrice,
-				c.side,
-				c.idx,
-				c.reason,
-				c.decision,
-			)
+			msg, err := t.closeLot(ctx,	livePrice,	c.side,	c.idx, c.reason, c.decision)
 
 			return msg, true, err
 		}
@@ -3048,7 +3051,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
 			}
 		}
-	} 
+	}
 
 	// Re-lock to mutate state (append new lot to THIS SIDE).
 	t.mu.Lock()
