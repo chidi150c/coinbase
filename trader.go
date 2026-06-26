@@ -2097,7 +2097,9 @@ func (t *Trader) startPendingMakerExit(ctx context.Context, lotSide OrderSide, l
 }
 
 func (t *Trader) watchPendingExit(ctx context.Context, p *PendingExit) {
-	var filled *PlacedOrder
+	var sessBase, sessQuote, sessFee float64
+	var lastSeenBase, lastSeenQuote, lastSeenFee float64
+
 	orderID := p.OrderID
 	lastLimitPx := p.LimitPx
 	initLimit := lastLimitPx
@@ -2118,6 +2120,48 @@ func (t *Trader) watchPendingExit(ctx context.Context, p *PendingExit) {
 		closeSide = SideBuy
 	}
 
+	accrue := func(ord *PlacedOrder) {
+		if ord == nil {
+			return
+		}
+		dBase := ord.BaseSize - lastSeenBase
+		dQuote := ord.QuoteSpent - lastSeenQuote
+		dFee := ord.CommissionUSD - lastSeenFee
+		if dBase < 0 {
+			dBase = 0
+		}
+		if dQuote < 0 {
+			dQuote = 0
+		}
+		if dFee < 0 {
+			dFee = 0
+		}
+		sessBase += dBase
+		sessQuote += dQuote
+		sessFee += dFee
+		lastSeenBase = ord.BaseSize
+		lastSeenQuote = ord.QuoteSpent
+		lastSeenFee = ord.CommissionUSD
+	}
+
+	emit := func(orderID string) {
+		var placed *PlacedOrder
+		filled := sessBase > 0 || sessQuote > 0
+		if filled {
+			vwap := 0.0
+			if sessBase > 0 {
+				vwap = sessQuote / sessBase
+			}
+			placed = &PlacedOrder{Price: vwap, BaseSize: sessBase, QuoteSpent: sessQuote, CommissionUSD: sessFee}
+		}
+
+		select {
+		case t.pendingExitCh <- ExitResult{Filled: filled, Placed: placed, OrderID: orderID, Pending: p}:
+		case <-ctx.Done():
+			return
+		}
+	}
+
 	for time.Now().Before(p.Deadline) {
 		select {
 		case <-ctx.Done():
@@ -2126,14 +2170,28 @@ func (t *Trader) watchPendingExit(ctx context.Context, p *PendingExit) {
 		}
 
 		ord, err := t.broker.GetOrder(ctx, p.ProductID, orderID)
-		if err == nil && ord != nil && (ord.BaseSize > 0 || ord.QuoteSpent > 0) {
-			filled = ord
-			break
+		if err == nil && ord != nil {
+			accrue(ord)
+
+			status := strings.ToUpper(strings.TrimSpace(ord.Status))
+			log.Printf("TRACE pending_exit.poll.tick side=%s order_id=%s status=%s price=%.8f base=%.8f quote=%.2f fee=%.6f sess_base=%.8f sess_quote=%.2f sess_fee=%.6f", p.Side, orderID, status, ord.Price, ord.BaseSize, ord.QuoteSpent, ord.CommissionUSD, sessBase, sessQuote, sessFee)
+
+			switch status {
+			case "FILLED":
+				emit(orderID)
+				return
+			case "CANCELED", "REJECTED", "EXPIRED":
+				emit(orderID)
+				return
+			}
 		}
 
 		if cfg.RepriceEnable && cfg.RepriceIntervalMs > 0 && time.Since(lastReprice) >= time.Duration(cfg.RepriceIntervalMs)*time.Millisecond {
 			if cfg.RepriceMaxCount <= 0 || repriceCount < cfg.RepriceMaxCount {
-				px, gErr := t.broker.GetNowPrice(ctx, p.ProductID)
+				ctxPx, cancelPx := context.WithTimeout(ctx, time.Second)
+				px, gErr := t.broker.GetNowPrice(ctxPx, p.ProductID)
+				cancelPx()
+
 				if gErr == nil && px > 0 {
 					newLimitPx := px
 					if closeSide == SideSell {
@@ -2161,14 +2219,11 @@ func (t *Trader) watchPendingExit(ctx context.Context, p *PendingExit) {
 
 					if shouldReprice && tick > 0 && cfg.RepriceMinImprovTicks > 1 {
 						improveTicks := int(math.Abs(newLimitPx-lastLimitPx) / tick)
-						if closeSide == SideSell {
-							if !(newLimitPx > lastLimitPx && improveTicks >= cfg.RepriceMinImprovTicks) {
-								shouldReprice = false
-							}
-						} else {
-							if !(newLimitPx < lastLimitPx && improveTicks >= cfg.RepriceMinImprovTicks) {
-								shouldReprice = false
-							}
+						if closeSide == SideSell && !(newLimitPx > lastLimitPx && improveTicks >= cfg.RepriceMinImprovTicks) {
+							shouldReprice = false
+						}
+						if closeSide == SideBuy && !(newLimitPx < lastLimitPx && improveTicks >= cfg.RepriceMinImprovTicks) {
+							shouldReprice = false
 						}
 					}
 
@@ -2189,13 +2244,19 @@ func (t *Trader) watchPendingExit(ctx context.Context, p *PendingExit) {
 					}
 
 					if shouldReprice {
-						_ = t.broker.CancelOrder(ctx, p.ProductID, orderID)
+						oldID := orderID
+						_ = t.broker.CancelOrder(ctx, p.ProductID, oldID)
+
+						if oldOrd, oldErr := t.broker.GetOrder(ctx, p.ProductID, oldID); oldErr == nil && oldOrd != nil {
+							accrue(oldOrd)
+						}
+
 						newID, perr := t.broker.PlaceLimitPostOnly(ctx, p.ProductID, closeSide, newLimitPx, newBase)
 						if perr == nil && strings.TrimSpace(newID) != "" {
-							oldID := orderID
 							orderID = newID
 							lastLimitPx = newLimitPx
 							repriceCount++
+							lastSeenBase, lastSeenQuote, lastSeenFee = 0, 0, 0
 
 							t.apply(func(tt *Trader) {
 								delete(tt.pendingExits, oldID)
@@ -2224,16 +2285,12 @@ func (t *Trader) watchPendingExit(ctx context.Context, p *PendingExit) {
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	if filled == nil {
-		_ = t.broker.CancelOrder(ctx, p.ProductID, orderID)
-		log.Printf("TRACE pending_exit.timeout_cancel order_id=%s lot_id=%d", orderID, p.LotID)
+	_ = t.broker.CancelOrder(ctx, p.ProductID, orderID)
+	if ord, err := t.broker.GetOrder(ctx, p.ProductID, orderID); err == nil && ord != nil {
+		accrue(ord)
 	}
-
-	select {
-	case t.pendingExitCh <- ExitResult{Filled: filled != nil, Placed: filled, OrderID: orderID, Pending: p}:
-	default:
-		log.Printf("TRACE pending_exit.channel_full order_id=%s", orderID)
-	}
+	log.Printf("TRACE pending_exit.timeout_cancel order_id=%s lot_id=%d sess_base=%.8f sess_quote=%.2f sess_fee=%.6f", orderID, p.LotID, sessBase, sessQuote, sessFee)
+	emit(orderID)
 }
 
 func (t *Trader) drainPendingExits(ctx context.Context, candles []Candle, livePrice float64) {
