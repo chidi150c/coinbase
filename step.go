@@ -1195,11 +1195,30 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						} else {
 							cand.decision += " | EXIT_CLASS=L1_THRESHOLD_WARNING"
 							stopL1 = append(stopL1, cand)
-						}
 
+							// Arm/update maker-friendly exit limit price to be near current mark price.
+							offBps := t.cfg.TPMakerOffsetBps
+							makerExitPx := price
+							if lot.Side == SideBuy && offBps > 0 {
+								makerExitPx = price * (1.0 + offBps/10000.0)
+							}
+							if lot.Side == SideSell && offBps > 0 {
+								makerExitPx = price * (1.0 - offBps/10000.0)
+							}
+							// place/re-post every tick while gate holds (minimal emulation)
+							if !lot.FixedTPWorking || (lot.Side == SideBuy && makerExitPx < lot.Take) || (lot.Side == SideSell && makerExitPx > lot.Take) {
+								lot.Take = makerExitPx
+								lot.FixedTPWorking = true
+								log.Printf("TRACE stop_l1.post side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
+							} else {
+								log.Printf("TRACE stop_l1.repost side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
+							}
+						}
 						i++
 						continue
 					}
+					i++
+					continue
 				}
 
 				// AI/logic exit approval.
@@ -1325,7 +1344,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						// skip attempting a broker close; leave it armed or quiet it if you prefer
 						// (optional) quiet the spam:
 						lot.FixedTPWorking = false
-						lot.Take = 0
 						i++
 						continue
 					}

@@ -1762,7 +1762,39 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 
 	if !t.cfg.DryRun {
 		if usePendingMakerExit {
-			err := t.startPendingMakerExit(ctx, lot.Side, lot.LotID, lot.EntryOrderID, side, exitReason, exitDecision, livePrice, baseRequested)
+
+			limitPx := lot.Take
+
+			if limitPx <= 0 {
+				limitPx = livePrice
+
+				offBps := t.cfg.TPMakerOffsetBps
+				if closeSide == SideSell && offBps > 0 {
+					limitPx = livePrice * (1.0 + offBps/10000.0)
+				}
+				if closeSide == SideBuy && offBps > 0 {
+					limitPx = livePrice * (1.0 - offBps/10000.0)
+				}
+
+				log.Printf(
+					"TRACE pending_exit.maker_px side=%s lot_id=%d take=%.8f live=%.8f maker_px=%.8f",
+					lot.Side,
+					lot.LotID,
+					lot.Take,
+					livePrice,
+					limitPx,
+				)
+			}
+
+			if t.cfg.PriceTick > 0 {
+				if closeSide == SideSell {
+					limitPx = math.Ceil(limitPx/t.cfg.PriceTick) * t.cfg.PriceTick
+				} else {
+					limitPx = math.Floor(limitPx/t.cfg.PriceTick) * t.cfg.PriceTick
+				}
+			}
+
+			err := t.startPendingMakerExit(ctx, lot.Side, lot.LotID, lot.EntryOrderID, side, exitReason, exitDecision, limitPx, baseRequested)
 			t.mu.Lock()
 
 			if err != nil {
@@ -1770,7 +1802,7 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 				return "", nil
 			}
 
-			return fmt.Sprintf("PENDING_EXIT %s side=%s lot_id=%d entry_id=%s limit=%.2f base=%.8f reason=%s", exitTime.Format(time.RFC3339), lot.Side, lot.LotID, lot.EntryOrderID, livePrice, baseRequested, exitReason), nil
+			return fmt.Sprintf("PENDING_EXIT %s side=%s lot_id=%d entry_id=%s limit=%.2f base=%.8f reason=%s", exitTime.Format(time.RFC3339), lot.Side, lot.LotID, lot.EntryOrderID, limitPx, baseRequested, exitReason), nil
 		}
 
 		var err error
@@ -2109,8 +2141,13 @@ func (t *Trader) watchPendingExit(ctx context.Context, p *PendingExit) {
 					} else {
 						newLimitPx = px * (1.0 - offsetBps/10000.0)
 					}
+
 					if tick > 0 {
-						newLimitPx = math.Floor(newLimitPx/tick) * tick
+						if closeSide == SideSell {
+							newLimitPx = math.Ceil(newLimitPx/tick) * tick
+						} else {
+							newLimitPx = math.Floor(newLimitPx/tick) * tick
+						}
 					}
 
 					shouldReprice := (tick > 0 && math.Abs(newLimitPx-lastLimitPx) >= tick) || (tick <= 0 && newLimitPx != lastLimitPx)
