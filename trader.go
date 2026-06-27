@@ -1051,6 +1051,62 @@ func computeEntryDiscountPct(side OrderSide, openPrice float64, gatePriceRaw str
 	return ff(pct)
 }
 
+func decisionFlatReason(d Decision) string {
+	parts := []string{
+		fmt.Sprintf("pUp=%.5f", d.PUp),
+		fmt.Sprintf("confidence=%.2f", d.Confidence),
+		fmt.Sprintf("buyTh=%.5f", d.BuyThreshold),
+		fmt.Sprintf("sellTh=%.5f", d.SellThreshold),
+		fmt.Sprintf("modelUpAvg=%.5f", d.ModelUpAvg),
+		fmt.Sprintf("modelDownAvg=%.5f", d.ModelDownAvg),
+
+		fmt.Sprintf("aiRaw=%s", d.Raw),
+		fmt.Sprintf("logicOpinion=%s", d.LogicOpinion),
+		fmt.Sprintf("final=%s", d.Signal),
+
+		fmt.Sprintf("logicEPS=%.5f", d.LogicEPS),
+		fmt.Sprintf("logicNote=%s", d.LogicNote),
+	}
+
+	parts = append(parts,
+		fmt.Sprintf("previousAIRaw=%s", d.PreviousAIRaw),
+	)
+	if d.ExitNetPNLUSD != 0 {
+		parts = append(parts, fmt.Sprintf("exitNetPNL=%.5f", d.ExitNetPNLUSD))
+	}
+	if d.StopLossLimitUSD != 0 {
+		parts = append(parts, fmt.Sprintf("stopLossLimit=%.5f", d.StopLossLimitUSD))
+	}
+	if d.ExitClass != "" {
+		parts = append(parts, fmt.Sprintf("exitClass=%s", d.ExitClass))
+	}
+
+	parts = append(parts,
+		fmt.Sprintf("logic_macd_line=%.5f", d.LogicMACDLine),
+		fmt.Sprintf("logic_macd_turn=%.5f", d.LogicMACDTurn),
+		fmt.Sprintf("logic_macd_hist=%.5f", d.LogicMACDHist),
+		fmt.Sprintf("logic_macd_dhist=%.5f", d.LogicMACDDHist),
+		fmt.Sprintf("logic_macd_dsmooth=%.5f", d.LogicMACDDSmooth),
+
+		fmt.Sprintf("logic_macd_strong_positive=%t", d.LogicMACDStrongPositive),
+		fmt.Sprintf("logic_macd_strong_negative=%t", d.LogicMACDStrongNegative),
+		fmt.Sprintf("logic_macd_momentum_down=%t", d.LogicMACDMomentumDown),
+		fmt.Sprintf("logic_macd_momentum_up=%t", d.LogicMACDMomentumUp),
+
+		fmt.Sprintf("logic_ema_spread=%.6f", d.LogicEMASpread),
+		fmt.Sprintf("logic_ema2050=%.6f", d.LogicEMA2050),
+
+		fmt.Sprintf("logic_pattern_high_peak=%t", d.LogicPatternHighPeak),
+		fmt.Sprintf("logic_pattern_low_bottom=%t", d.LogicPatternLowBottom),
+		fmt.Sprintf("logic_pattern_price_down_up=%t", d.LogicPatternPriceDownUp),
+		fmt.Sprintf("logic_pattern_price_up_down=%t", d.LogicPatternPriceUpDown),
+		fmt.Sprintf("logic_pattern_buy=%t", d.LogicPatternBuy),
+		fmt.Sprintf("logic_pattern_sell=%t", d.LogicPatternSell),
+	)
+
+	return strings.Join(parts, "|")
+}
+
 func placedOrderID(p *PlacedOrder) string {
 	if p == nil {
 		return ""
@@ -1749,7 +1805,7 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		return fmt.Sprintf("EXIT-SKIP %s side=%s→%s notional=%.2f < min=%.2f reason=%s", exitTime.Format(time.RFC3339), lot.Side, closeSide, quote, minNotional, exitReason), nil
 	}
 
-	isL2DeepLoss := exitReason == "threshold_stop_loss" && strings.Contains(exitDecision, "EXIT_CLASS=L2_DEEP_LOSS")
+	isL2DeepLoss := exitReason == "threshold_stop_loss" && strings.Contains(exitDecision, "L2_DEEP_LOSS")
 	usePendingMakerExit := lot.ExitMode == ExitModeScalpFixedTP && !isL2DeepLoss && t.cfg.LimitTimeoutSec > 0
 
 	if usePendingMakerExit && strings.TrimSpace(lot.FixedTPOrderID) != "" {

@@ -59,10 +59,50 @@ type Decision struct {
 	Signal     Signal
 	Raw        Signal
 	Confidence float64
-	Reason     string
 
-	// Carry raw pUp and selected soft-gate flags for downstream gate-audit strings.
-	PUp float64
+	// Model / AI summary
+	PUp           float64
+	BuyThreshold  float64
+	SellThreshold float64
+	ModelUpAvg    float64
+	ModelDownAvg  float64
+
+	// Logic summary
+	LogicOpinion Signal
+
+	// Logic MACD raw materials
+	LogicMACDLine           float64
+	LogicMACDTurn           float64
+	LogicMACDHist           float64
+	LogicMACDDHist          float64
+	LogicMACDDSmooth        float64
+	LogicMACDStrongPositive bool
+	LogicMACDStrongNegative bool
+	LogicMACDMomentumDown   bool
+	LogicMACDMomentumUp     bool
+
+	// Logic EMA raw materials
+	LogicEMASpread float64
+	LogicEMA2050   float64
+
+	// Logic pattern raw materials
+	LogicPatternHighPeak    bool
+	LogicPatternLowBottom   bool
+	LogicPatternPriceDownUp bool
+	LogicPatternPriceUpDown bool
+	LogicPatternBuy         bool
+	LogicPatternSell        bool
+
+	// Stop-loss / exit context
+	Side             OrderSide
+	ExitReason       string
+	ExitClass        string
+	PreviousAIRaw    Signal
+	StopLossPNLUSD   float64
+	StopLossLimitUSD float64
+	ExitNetPNLUSD    float64
+	LogicEPS         float64
+	LogicNote        string
 }
 
 // SignalToSide converts the intent into a broker side.
@@ -83,7 +123,6 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 		return Decision{
 			Signal:     Flat,
 			Confidence: 0,
-			Reason:     "not_enough_data",
 			PUp:        0.0,
 			Raw:        Flat,
 		}
@@ -95,7 +134,6 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 		return Decision{
 			Signal:     Flat,
 			Confidence: 0,
-			Reason:     "not_enough_features",
 			PUp:        0.0,
 			Raw:        Flat,
 		}
@@ -147,39 +185,6 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 		base.Raw = Flat
 		base.Confidence = 0
 	}
-
-	signalTF := t.cfg.SignalTF()
-	reason := fmt.Sprintf(
-		"[AI_GATE] signalTF=%s pUp=%.5f "+
-			"range{high=%.4f low=%.4f} "+
-			"macd{line=%.2f turn=%.5f hist=%.2f dHist=%.2f dSmooth=%.2f} "+
-			"ema{spread=%.5f ema2050=%.5f slope20=%.5f slope50=%.5f} "+
-			"pattern{emaHighPeak=%t emaLowBottom=%t emaDownUp=%t emaUpDown=%t}",
-
-		signalTF,
-		pUp,
-		snap.DistHighPct,
-		snap.DistLowPct,
-
-		snap.MACDLine,
-		snap.MACDTurningPoint,
-		snap.MACDHist,
-		snap.MACDHistDelta,
-		snap.MACDHistDeltaSmooth,
-
-		snap.EMASpreadPct,
-		snap.EMA2050Spread,
-		snap.EMA20Slope,
-		snap.EMA50Slope,
-
-		snap.EMAHighPeak,
-		snap.EMALowBottom,
-		snap.EMAPriceDownGoingUp,
-		snap.EMAPriceUpGoingDown,
-	)
-
-	base.Reason = reason
-
 	return base
 }
 
@@ -192,12 +197,11 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	}
 
 	if len(execHistory) < 60 {
-		reason = fmt.Sprintf(
+		log.Fatalf(
 			"[LOGIC_GATE] skip insufficient_history len=%d gateTF=%s",
 			len(execHistory),
 			t.cfg.GateTF,
 		)
-		d.Reason = appendReason(d.Reason, reason)
 		return d
 	}
 
@@ -210,12 +214,11 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 
 	snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1, eps, t.cfg.AIFeatureDim)
 	if !ok {
-		reason = fmt.Sprintf(
+		log.Fatalf(
 			"[LOGIC_GATE] skip no_feature_snapshot len=%d gateTF=%s",
 			len(execHistory),
 			t.cfg.GateTF,
 		)
-		d.Reason = appendReason(d.Reason, reason)
 		return d
 	}
 
@@ -274,36 +277,34 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		d.PUp,
 	)
 
-	modelUpAvg := 0.0
-	modelDownAvg := 0.0
+	// Logic summary
+	d.LogicOpinion = logicOpinion
+	d.Confidence = confidence
+	d.LogicEPS = eps
+	d.LogicNote = reason
 
-	if t.model != nil {
-		if t.model.AvgUp > 0 {
-			modelUpAvg = t.model.AvgUp
-		}
-		if t.model.AvgDown > 0 {
-			modelDownAvg = t.model.AvgDown
-		}
-	}
+	// Logic MACD
+	d.LogicMACDLine = snap.MACDLine
+	d.LogicMACDTurn = snap.MACDTurningPoint
+	d.LogicMACDHist = snap.MACDHist
+	d.LogicMACDDHist = snap.MACDHistDelta
+	d.LogicMACDDSmooth = snap.MACDHistDeltaSmooth
+	d.LogicMACDStrongPositive = snap.MACDStrongPositive
+	d.LogicMACDStrongNegative = snap.MACDStrongNegative
+	d.LogicMACDMomentumDown = snap.MACDMomentumDown
+	d.LogicMACDMomentumUp = snap.MACDMomentumUp
 
-	logicNote := reason
+	// Logic Pattern
+	d.LogicPatternHighPeak = snap.EMAHighPeak
+	d.LogicPatternLowBottom = snap.EMALowBottom
+	d.LogicPatternPriceDownUp = snap.EMAPriceDownGoingUp
+	d.LogicPatternPriceUpDown = snap.EMAPriceUpGoingDown
+	d.LogicPatternSell = emaSellPattern
+	d.LogicPatternBuy = emaBuyPattern
 
-	logicReason := fmt.Sprintf(
-		"[LOGIC_GATE] signalTF=1m | Gate{confidence=%.2f eps=%.5f note=%v} | aiRaw=%s logicOpinion=%s final=%s | "+
-			"MACD{line=%.5f turn=%.5f hist=%.5f dHist=%.5f dSmooth=%.5f macdStrongPositive=%v macdStrongNegative=%v macdMomentumDown=%v macdMomentumUp=%v} | "+
-			"Pattern{emaHighPeak=%v emaLowBottom=%v emaPriceDownGoingUp=%v emaPriceUpGoingDown=%v emaSellPattern=%v emaBuyPattern=%v} | "+
-			"EMA{spread=%.6f ema2050=%.6f} | "+
-			"modelUpAvg=%.5f modelDownAvg=%.5f",
-		confidence, eps, logicNote,
-		d.Raw, logicOpinion, d.Signal,
-		snap.MACDLine, snap.MACDTurningPoint, snap.MACDHist, snap.MACDHistDelta, snap.MACDHistDeltaSmooth,
-		snap.MACDStrongPositive, snap.MACDStrongNegative, snap.MACDMomentumDown, snap.MACDMomentumUp,
-		snap.EMAHighPeak, snap.EMALowBottom, snap.EMAPriceDownGoingUp, snap.EMAPriceUpGoingDown, emaSellPattern, emaBuyPattern,
-		snap.EMASpreadPct, snap.EMA2050Spread,
-		modelUpAvg, modelDownAvg,
-	)
-
-	d.Reason = appendReason(d.Reason, logicReason)
+	// Logic EMA
+	d.LogicEMASpread = snap.EMASpreadPct
+	d.LogicEMA2050 = snap.EMA2050Spread
 
 	return d
 }

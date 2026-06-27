@@ -520,3 +520,9 @@ BEGIN {
 ./last_state_item.sh --exit 
 
 ==============================================================================
+
+ docker compose logs -f bot_binance | grep -E "tp.post|stop_l1.post|pending_exit|EXIT|partial"
+
+ =============================================================================
+
+ 

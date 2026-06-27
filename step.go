@@ -1093,8 +1093,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			book := t.book(side)
 			lossLimit := -math.Abs(t.cfg.StopLossPnLUSD)
 			enableStopLoss := t.cfg.EnableThresholdStopLoss
-			buyTh := t.model.BuyThreshold
-			sellTh := t.model.SellThreshold
 			minBuyDist := t.cfg.MinBuyDistance
 			minSellDist := t.cfg.MinSellDistance
 			previousAIRaw := t.previousAIRaw
@@ -1140,60 +1138,62 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						continue
 					}
 					stopLossExit := false
-					stopReason := fmt.Sprintf(
-						"threshold_stoploss_check side=%s pUp=%.5f buyTh=%.5f sellTh=%.5f previousAIRaw=%s raw=%s signal=%s pnl=%.2f lossLimit=%.2f",
-						lot.Side,
-						d.PUp,
-						buyTh,
-						sellTh,
-						previousAIRaw,
-						d.Raw,
-						d.Signal,
-						net,
-						lossLimit,
-					)
+
+					d.Side = lot.Side
+					d.PreviousAIRaw = previousAIRaw
+					d.ExitNetPNLUSD = net
+					d.StopLossLimitUSD = lossLimit
 
 					deepLossLimit := lossLimit * deepLossMult
 					deepLossExit := net <= deepLossLimit
 
 					if enableStopLoss && net <= lossLimit {
-						log.Printf("TRACE %s", stopReason)
+						log.Printf("TRACE %s threshold_stoploss_check side=%s pUp=%.5f buyTh=%.5f sellTh=%.5f previousAIRaw=%s raw=%s signal=%s pnl=%.2f lossLimit=%.2f",
+							d.Side,
+							d.PUp,
+							d.BuyThreshold,
+							d.SellThreshold,
+							d.PreviousAIRaw,
+							d.Raw,
+							d.Signal,
+							d.ExitNetPNLUSD,
+							d.StopLossLimitUSD,
+						)
 
 						switch lot.Side {
 						case SideBuy:
 							stopLossExit =
 								deepLossExit || (previousAIRaw == Flat &&
 									d.Raw == Buy &&
-									d.PUp > buyTh-minBuyDist &&
-									d.PUp <= buyTh &&
+									d.PUp > d.BuyThreshold-minBuyDist &&
+									d.PUp <= d.BuyThreshold &&
 									d.Signal != Buy) || (d.Signal == Sell && d.Confidence >= 0.60)
 
 						case SideSell:
 							stopLossExit =
 								deepLossExit || (previousAIRaw == Flat &&
 									d.Raw == Sell &&
-									d.PUp >= sellTh &&
-									d.PUp < sellTh+minSellDist &&
+									d.PUp >= d.SellThreshold &&
+									d.PUp < d.SellThreshold+minSellDist &&
 									d.Signal != Sell) || (d.Signal == Buy && d.Confidence >= 0.60)
 						}
 					}
 
 					if stopLossExit {
-						exitDecision := appendReason(d.Reason, stopReason)
 
 						cand := exitCandidate{
-							side:     side,
-							idx:      i,
-							reason:   "threshold_stop_loss",
-							decision: exitDecision,
-							net:      net,
+							side:   side,
+							idx:    i,
+							reason: "threshold_stop_loss",
+							net:    net,
 						}
-
 						if deepLossExit {
-							cand.decision += " | EXIT_CLASS=L2_DEEP_LOSS"
+							d.ExitClass = "L2_DEEP_LOSS"
+							cand.decision = decisionFlatReason(d)
 							stopL2 = append(stopL2, cand)
 						} else {
-							cand.decision += " | EXIT_CLASS=L1_THRESHOLD_WARNING"
+							d.ExitClass = "L1_THRESHOLD_WARNING"
+							cand.decision = decisionFlatReason(d)
 							stopL1 = append(stopL1, cand)
 
 							// Arm/update maker-friendly exit limit price to be near current mark price.
@@ -1244,7 +1244,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							i++
 							continue
 						}
-						msg, err := t.closeLot(ctx, livePrice, side, i, "trailing_stop", d.Reason)
+						msg, err := t.closeLot(ctx, livePrice, side, i, "trailing_stop", decisionFlatReason(d))
 						if err != nil {
 							return "", true, err
 						}
@@ -1351,21 +1351,22 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				if trigger {
 					cand := exitCandidate{
-						side:     side,
-						idx:      i,
-						reason:   exitReason,
-						decision: d.Reason,
-						net:      net,
+						side:   side,
+						idx:    i,
+						reason: exitReason,
+						net:    net,
 					}
 
 					gateUSD := lotProfitGateUSD(lot)
 					strongProfitExit := net >= gateUSD*strongProfitMult
 
 					if lot.ExitMode == ExitModeScalpFixedTP && strongProfitExit {
-						cand.decision += " | EXIT_CLASS=L2_STRONG_PROFIT"
+						d.ExitClass = "L2_STRONG_PROFIT"
+						cand.decision = decisionFlatReason(d)
 						profitL2 = append(profitL2, cand)
 					} else if lot.ExitMode == ExitModeScalpFixedTP {
-						cand.decision += " | EXIT_CLASS=L1_AI_PROFIT"
+						d.ExitClass = "L1_AI_PROFIT"
+						cand.decision = decisionFlatReason(d)
 						profitL1 = append(profitL1, cand)
 					}
 
@@ -1516,16 +1517,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s buyThresh=%.3f sellThresh=%.3f modelBuyThresh=%.3f modelSellThresh=%.3f LongOnly=%v ver-95",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-96",
 		totalLots,
 		d.Raw,
 		d.Signal,
 		price,
-		d.Reason,
-		t.cfg.BuyThreshold,
-		t.cfg.SellThreshold,
-		t.model.BuyThreshold,
-		t.model.SellThreshold,
+		decisionFlatReason(d),
 		t.cfg.LongOnly,
 	)
 
@@ -1643,7 +1640,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	if d.Signal == Sell && t.cfg.LongOnly {
 		updatePreviousState()
 		t.mu.Unlock()
-		return fmt.Sprintf("FLAT (long-only) [%s]", d.Reason), nil
+		return fmt.Sprintf("FLAT (long-only) [%s]", decisionFlatReason(d)), nil
 	}
 
 	//this block might be going out =========
@@ -1912,6 +1909,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// latched replaces baseline after hard latch
 				if t.latchedGateBuy > 0 {
 					oldLatch := t.latchedGateBuy
+					//Latch override
 					t.latchedGateBuy = math.Min(last-latchBufferPrice, t.latchedGateBuy)
 					if t.latchedGateBuy != oldLatch {
 						log.Printf("TRACE pyramid.latch_clamp.buy old=%.8f last=%.8f new=%.8f", oldLatch, last, t.latchedGateBuy)
@@ -2450,27 +2448,43 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		t.equityUSD -= entryFee
 	}
 
-	// --- NEW: side-biased Lot reason (without winLow) ---
+	// --- side-biased Lot reason ---
 	var gatesReason string
+
 	if equityTriggerSell && side == SideSell && equitySpareBase > 0 {
-		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquitySell=%.2f sellEquityMultiplier=%.6f(triggerAt:>=%.2f) equitySpareBase=%.8f confidenceMult=%.2f", t.equityUSD, t.lastAddEquitySell, t.equityUSD/t.lastAddEquitySell, t.cfg.SellEquityTriggerMult, equitySpareBase, confMult)
-	} else if equityTriggerBuy && side == SideBuy && equitySpareQuote > 0 {
-		gatesReason = fmt.Sprintf("EQUITY Trading: equityUSD=%.2f lastAddEquityBuy=%.2f buyEquityMultiplier=%.6f(triggerAt:>=%.2f) equitySpareQuote=%.2f confidenceMult=%.2f", t.equityUSD, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, t.cfg.BuyEquityTriggerMult, equitySpareQuote, confMult)
-	} else if side == SideBuy {
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|latchTargetHr>=%.2fHr|confidence=%.2f|targetNetUSD=%.2f",
-			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence, entryProfitGateUSD,
+			"equityTrading=true|equityUSD=%.2f|lastAddEquitySell=%.2f|sellEquityMultiplier=%.6f|sellEquityTriggerMult=%.2f|equitySpareBase=%.8f|confidenceMult=%.2f",
+			t.equityUSD,
+			t.lastAddEquitySell,
+			t.equityUSD/t.lastAddEquitySell,
+			t.cfg.SellEquityTriggerMult,
+			equitySpareBase,
+			confMult,
 		)
-	} else { // SideSell
+	} else if equityTriggerBuy && side == SideBuy && equitySpareQuote > 0 {
 		gatesReason = fmt.Sprintf(
-			"pUp=%.5f|gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|latchTargetHr>=%.2fHr|confidence=%.2f|targetNetUSD=%.2f",
-			d.PUp, reasonGatePrice, reasonLatched, reasonEffPct, reasonBasePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence, entryProfitGateUSD,
+			"equityTrading=true|equityUSD=%.2f|lastAddEquityBuy=%.2f|buyEquityMultiplier=%.6f|buyEquityTriggerMult=%.2f|equitySpareQuote=%.2f|confidenceMult=%.2f",
+			t.equityUSD,
+			t.lastAddEquityBuy,
+			t.equityUSD/t.lastAddEquityBuy,
+			t.cfg.BuyEquityTriggerMult,
+			equitySpareQuote,
+			confMult,
+		)
+	} else {
+		gatesReason = fmt.Sprintf(
+			"gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|latchTargetHr=%.2f|targetNetUSD=%.2f",
+			reasonGatePrice,
+			reasonLatched,
+			reasonEffPct,
+			reasonBasePct,
+			reasonElapsedHr,
+			2.0*reasonTFloorHr,
+			entryProfitGateUSD,
 		)
 	}
 
-	if d.Reason != "" {
-		gatesReason = appendReason(gatesReason, "decision{"+d.Reason+"}")
-	}
+	gatesReason = appendReason(gatesReason, decisionFlatReason(d))
 
 	refundFromOpposite := 0.0
 	refundMinConf := 0.60
@@ -3257,8 +3271,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	msg := ""
 	if t.cfg.DryRun {
-		msg = fmt.Sprintf("PAPER %s quote=%.2f base=%.6f take=%.2f fee=%.4f reason=%s [%s]",
-			side, actualQuote, baseToUse, newLot.Take, entryFee, newLot.Reason, d.Reason)
+		msg = fmt.Sprintf("PAPER %s quote=%.2f base=%.6f take=%.2f fee=%.4f reason=%s",
+			side, actualQuote, baseToUse, newLot.Take, entryFee, newLot.Reason)
 	} else {
 		msg = fmt.Sprintf("[LIVE ORDER] %s notional=%.2f take=%.2f fee=%.4f reason=%s",
 			side, newLot.OpenNotionalUSD, newLot.Take, entryFee, newLot.Reason)
