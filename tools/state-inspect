@@ -146,7 +146,7 @@ print_items() {
       | if $title == "EXIT" then
           "time=\(.time|cdt) side=\(.side // "n/a") reason=\(reason_type) exit_class=\(exit_class) pUp=\(pup) conf=\(conf) d_signal=\(final_sig) pnl=\(.pnl_usd // 0) open_notional_usd=\(open_notional) size=\(.size_base // "n/a") open=\(.open_price // 0) close=\(.close_price // 0) exit_mode=\(.exit_mode // "n/a") entry_id=\(.entry_order_id // "n/a") exit_id=\(.exit_order_id // "n/a")"
         else
-          "time=\(.OpenTime|cdt) side=\(.Side // "n/a") lot_id=\(.lot_id // .LotID // "n/a") open=\(.OpenPrice // 0) size=\(.SizeBase // 0) open_notional_usd=\(open_notional) unrealized_pnl_usd=\(unrealized_pnl) pUp=\(pup) conf=\(conf) net_gate_usd=\(.profit_gate_usd // .ProfitGateUSD // "n/a") entry_id=\(.entry_order_id // .EntryOrderID // "n/a")"
+          "time=\(.OpenTime|cdt) side=\(.Side // "n/a") open=\(.OpenPrice // 0) size=\(.SizeBase // 0) open_notional_usd=\(open_notional) unrealized_pnl_usd=\(unrealized_pnl) pUp=\(pup) conf=\(conf) net_gate_usd=\(.profit_gate_usd // .ProfitGateUSD // "n/a") entry_id=\(.entry_order_id // .EntryOrderID // "n/a")"
         end
     ' "$STATE_FILE"
 
@@ -154,7 +154,6 @@ print_items() {
     jq --argjson n "$N" "$path // [] | .[-\$n:] | reverse | .[] | {
       time:(.OpenTime // .time),
       side:(.Side // .side),
-      lot_id:(.lot_id // .LotID),
       open:(.OpenPrice // .open_price),
       close:.close_price,
       size_base:(.SizeBase // .size_base),

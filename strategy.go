@@ -231,7 +231,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	} else if normalSell {
 		logicOpinion = Sell
 	}
-	
+
 	// Final entry signal policy:
 	//
 	// AI BUY + logic BUY   → BUY

@@ -55,7 +55,7 @@
 //
 // Persistence & IDs
 //   - State mutations (equity, books, exits, pending) are persisted opportunistically.
-//   - Lots carry LotID and EntryOrderID; NextLotSeq is incremented on each append.
+//   - Lots carry EntryOrderID; NextLotSeq is incremented on each append.
 //
 // Dry-Run Behavior
 //   - Simulates fees and adjusts equity locally; no broker calls.
@@ -73,7 +73,6 @@ import (
 	"log"
 	"math"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -517,7 +516,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					Reason:          "async postonly filled",
 					Take:            0,
 					Version:         1,
-					LotID:           len(book.Lots),
 					EntryOrderID:    res.OrderID,
 				}
 
@@ -742,7 +740,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					Reason:          "async postonly filled",
 					Take:            0,
 					Version:         1,
-					LotID:           len(book.Lots),
 					EntryOrderID:    res.OrderID,
 				}
 
@@ -1517,7 +1514,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-97",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-98",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -3193,7 +3190,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		Reason:           gatesReason, // side-biased; no winLow
 		Take:             take,
 		Version:          1,
-		LotID:            len(book.Lots),
 		EntryOrderID:     placedOrderID(placed),
 		RefundPortionUSD: refundFromOpposite,
 		ConfidenceMult:   confMult,
@@ -3371,7 +3367,7 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 		a.OpenNotionalUSD = a.SizeBase * a.OpenPrice
 
 		// tag reason
-		a.Reason = strings.TrimSpace(a.Reason + "|merge:" + strconv.Itoa(b.LotID))
+		a.Reason = strings.TrimSpace(a.Reason + "|merge:" + b.EntryOrderID)
 
 		// drop fromIdx
 		book.Lots = append(book.Lots[:fromIdx], book.Lots[fromIdx+1:]...)
