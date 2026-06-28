@@ -866,67 +866,88 @@ func exitCSVHeader() []string {
 		"exit_fee_usd",
 		"pnl_usd",
 		"exit_reason",
+		"exit_class",
 		"exit_mode",
 		"was_runner",
 		"refund_portion_usd",
 		"lot_id",
 		"entry_order_id",
 		"exit_order_id",
+
 		"entry_pup",
-		"exit_pup",
 		"entry_confidence",
-		"exit_confidence",
-		"entry_signal",
-		"exit_signal",
-		"entry_buy_threshold",
-		"entry_sell_threshold",
-		"exit_buy_threshold",
-		"exit_sell_threshold",
-		"entry_price_discount_pct",
-		"entry_gate_price",
-		"entry_latched_price",
-		"entry_elapsed_hr",
-		"entry_effective_pct",
-		"entry_base_pct",
 		"entry_ai_raw",
 		"entry_logic_opinion",
 		"entry_final_signal",
+		"entry_buy_threshold",
+		"entry_sell_threshold",
+		"entry_model_up_avg",
+		"entry_model_down_avg",
+		"entry_logic_eps",
+
+		"entry_gate_price",
+		"entry_latched_price",
+		"entry_elapsed_hr",
+		"entry_latch_target_hr",
+		"entry_effective_pct",
+		"entry_base_pct",
+		"entry_target_net_usd",
+
+		"exit_pup",
+		"exit_confidence",
 		"exit_ai_raw",
 		"exit_logic_opinion",
 		"exit_final_signal",
+		"exit_buy_threshold",
+		"exit_sell_threshold",
+		"exit_model_up_avg",
+		"exit_model_down_avg",
+		"exit_logic_eps",
+		"exit_previous_ai_raw",
+		"exit_net_pnl_usd",
+		"exit_stop_loss_limit_usd",
+
+		"entry_logic_macd_line",
+		"entry_logic_macd_turn",
+		"entry_logic_macd_hist",
+		"entry_logic_macd_dhist",
+		"entry_logic_macd_dsmooth",
+		"entry_logic_macd_strong_positive",
+		"entry_logic_macd_strong_negative",
+		"entry_logic_macd_momentum_down",
+		"entry_logic_macd_momentum_up",
+		"entry_logic_ema_spread",
+		"entry_logic_ema2050",
+		"entry_logic_pattern_high_peak",
+		"entry_logic_pattern_low_bottom",
+		"entry_logic_pattern_price_down_up",
+		"entry_logic_pattern_price_up_down",
+		"entry_logic_pattern_buy",
+		"entry_logic_pattern_sell",
+
+		"exit_logic_macd_line",
+		"exit_logic_macd_turn",
+		"exit_logic_macd_hist",
+		"exit_logic_macd_dhist",
+		"exit_logic_macd_dsmooth",
+		"exit_logic_macd_strong_positive",
+		"exit_logic_macd_strong_negative",
+		"exit_logic_macd_momentum_down",
+		"exit_logic_macd_momentum_up",
+		"exit_logic_ema_spread",
+		"exit_logic_ema2050",
+		"exit_logic_pattern_high_peak",
+		"exit_logic_pattern_low_bottom",
+		"exit_logic_pattern_price_down_up",
+		"exit_logic_pattern_price_up_down",
+		"exit_logic_pattern_buy",
+		"exit_logic_pattern_sell",
 	}
 }
 
 func exitCSVRow(e ExitRecord) []string {
 	exitPart := extractExitPart(e.Reason)
 	entryPart := extractEntryPart(e.Reason)
-
-	entryPUp := kv(entryPart, "pUp")
-	exitPUp := kv(exitPart, "pUp")
-
-	entryConf := kv(entryPart, "confidence")
-	exitConf := kv(exitPart, "confidence")
-
-	entryFinal := kv(entryPart, "final")
-	exitFinal := kv(exitPart, "final")
-
-	entryGate := kv(entryPart, "gatePrice")
-	entryLatched := kv(entryPart, "latched")
-	entryElapsed := kv(entryPart, "elapsedHr")
-	entryEffPct := kv(entryPart, "effPct")
-	entryBasePct := kv(entryPart, "basePct")
-
-	entryAIRaw := kv(entryPart, "aiRaw")
-	entryLogic := kv(entryPart, "logicOpinion")
-	exitAIRaw := kv(exitPart, "aiRaw")
-	exitLogic := kv(exitPart, "logicOpinion")
-
-	exitBuyTh := kv(exitPart, "buyTh")
-	exitSellTh := kv(exitPart, "sellTh")
-	entryBuyTh := kv(entryPart, "buyTh")
-	entrySellTh := kv(entryPart, "sellTh")
-
-	entryDiscountPct := computeEntryDiscountPct(e.Side, e.OpenPrice, entryGate)
 
 	return []string{
 		e.Time.Format(time.RFC3339),
@@ -939,6 +960,7 @@ func exitCSVRow(e ExitRecord) []string {
 		ff(e.ExitFeeUSD),
 		ff(e.PNLUSD),
 		exitReasonType(e.Reason),
+		kv(exitPart, "exitClass"),
 		fmt.Sprintf("%v", e.ExitMode),
 		fmt.Sprintf("%v", e.WasRunner),
 		ff(e.RefundPortionUSD),
@@ -946,28 +968,74 @@ func exitCSVRow(e ExitRecord) []string {
 		e.EntryOrderID,
 		e.ExitOrderID,
 
-		entryPUp,
-		exitPUp,
-		entryConf,
-		exitConf,
-		entryFinal,
-		exitFinal,
-		entryBuyTh,
-		entrySellTh,
-		exitBuyTh,
-		exitSellTh,
-		entryDiscountPct,
-		entryGate,
-		entryLatched,
-		entryElapsed,
-		entryEffPct,
-		entryBasePct,
-		entryAIRaw,
-		entryLogic,
-		entryFinal,
-		exitAIRaw,
-		exitLogic,
-		exitFinal,
+		kv(entryPart, "pUp"),
+		kv(entryPart, "confidence"),
+		kv(entryPart, "aiRaw"),
+		kv(entryPart, "logicOpinion"),
+		kv(entryPart, "final"),
+		kv(entryPart, "buyTh"),
+		kv(entryPart, "sellTh"),
+		kv(entryPart, "modelUpAvg"),
+		kv(entryPart, "modelDownAvg"),
+		kv(entryPart, "logicEPS"),
+
+		kv(entryPart, "gatePrice"),
+		kv(entryPart, "latched"),
+		kv(entryPart, "elapsedHr"),
+		kv(entryPart, "latchTargetHr"),
+		kv(entryPart, "effPct"),
+		kv(entryPart, "basePct"),
+		kv(entryPart, "targetNetUSD"),
+
+		kv(exitPart, "pUp"),
+		kv(exitPart, "confidence"),
+		kv(exitPart, "aiRaw"),
+		kv(exitPart, "logicOpinion"),
+		kv(exitPart, "final"),
+		kv(exitPart, "buyTh"),
+		kv(exitPart, "sellTh"),
+		kv(exitPart, "modelUpAvg"),
+		kv(exitPart, "modelDownAvg"),
+		kv(exitPart, "logicEPS"),
+		kv(exitPart, "previousAIRaw"),
+		kv(exitPart, "exitNetPNL"),
+		kv(exitPart, "stopLossLimit"),
+
+		kv(entryPart, "logic_macd_line"),
+		kv(entryPart, "logic_macd_turn"),
+		kv(entryPart, "logic_macd_hist"),
+		kv(entryPart, "logic_macd_dhist"),
+		kv(entryPart, "logic_macd_dsmooth"),
+		kv(entryPart, "logic_macd_strong_positive"),
+		kv(entryPart, "logic_macd_strong_negative"),
+		kv(entryPart, "logic_macd_momentum_down"),
+		kv(entryPart, "logic_macd_momentum_up"),
+		kv(entryPart, "logic_ema_spread"),
+		kv(entryPart, "logic_ema2050"),
+		kv(entryPart, "logic_pattern_high_peak"),
+		kv(entryPart, "logic_pattern_low_bottom"),
+		kv(entryPart, "logic_pattern_price_down_up"),
+		kv(entryPart, "logic_pattern_price_up_down"),
+		kv(entryPart, "logic_pattern_buy"),
+		kv(entryPart, "logic_pattern_sell"),
+
+		kv(exitPart, "logic_macd_line"),
+		kv(exitPart, "logic_macd_turn"),
+		kv(exitPart, "logic_macd_hist"),
+		kv(exitPart, "logic_macd_dhist"),
+		kv(exitPart, "logic_macd_dsmooth"),
+		kv(exitPart, "logic_macd_strong_positive"),
+		kv(exitPart, "logic_macd_strong_negative"),
+		kv(exitPart, "logic_macd_momentum_down"),
+		kv(exitPart, "logic_macd_momentum_up"),
+		kv(exitPart, "logic_ema_spread"),
+		kv(exitPart, "logic_ema2050"),
+		kv(exitPart, "logic_pattern_high_peak"),
+		kv(exitPart, "logic_pattern_low_bottom"),
+		kv(exitPart, "logic_pattern_price_down_up"),
+		kv(exitPart, "logic_pattern_price_up_down"),
+		kv(exitPart, "logic_pattern_buy"),
+		kv(exitPart, "logic_pattern_sell"),
 	}
 }
 
@@ -983,16 +1051,6 @@ func extractExitPart(reason string) string {
 	start += len("exitReason{")
 
 	end := strings.Index(reason[start:], "}  ||  openReason{")
-	if end >= 0 {
-		return reason[start : start+end]
-	}
-
-	end = strings.Index(reason[start:], "} | openReason{")
-	if end >= 0 {
-		return reason[start : start+end]
-	}
-
-	end = strings.Index(reason[start:], "} || openReason{")
 	if end >= 0 {
 		return reason[start : start+end]
 	}
@@ -1035,24 +1093,9 @@ func kv(s, key string) string {
 	return ""
 }
 
-func computeEntryDiscountPct(side OrderSide, openPrice float64, gatePriceRaw string) string {
-	gatePrice, err := strconv.ParseFloat(gatePriceRaw, 64)
-	if err != nil || gatePrice <= 0 || openPrice <= 0 {
-		return ""
-	}
-
-	var pct float64
-	if side == SideBuy {
-		pct = ((gatePrice - openPrice) / gatePrice) * 100.0
-	} else {
-		pct = ((openPrice - gatePrice) / gatePrice) * 100.0
-	}
-
-	return ff(pct)
-}
-
 func decisionFlatReason(d Decision) string {
 	parts := []string{
+		// AI / model summary
 		fmt.Sprintf("pUp=%.5f", d.PUp),
 		fmt.Sprintf("confidence=%.2f", d.Confidence),
 		fmt.Sprintf("buyTh=%.5f", d.BuyThreshold),
@@ -1060,42 +1103,46 @@ func decisionFlatReason(d Decision) string {
 		fmt.Sprintf("modelUpAvg=%.5f", d.ModelUpAvg),
 		fmt.Sprintf("modelDownAvg=%.5f", d.ModelDownAvg),
 
+		// Decision summary
 		fmt.Sprintf("aiRaw=%s", d.Raw),
 		fmt.Sprintf("logicOpinion=%s", d.LogicOpinion),
 		fmt.Sprintf("final=%s", d.Signal),
 
+		// Logic gate
 		fmt.Sprintf("logicEPS=%.5f", d.LogicEPS),
-		fmt.Sprintf("logicNote=%s", d.LogicNote),
 	}
 
-	parts = append(parts,
-		fmt.Sprintf("previousAIRaw=%s", d.PreviousAIRaw),
-	)
+	// Exit-only fields
+	if d.PreviousAIRaw != Flat {
+		parts = append(parts, fmt.Sprintf("previousAIRaw=%s", d.PreviousAIRaw))
+	}
 	if d.ExitNetPNLUSD != 0 {
 		parts = append(parts, fmt.Sprintf("exitNetPNL=%.5f", d.ExitNetPNLUSD))
 	}
 	if d.StopLossLimitUSD != 0 {
 		parts = append(parts, fmt.Sprintf("stopLossLimit=%.5f", d.StopLossLimitUSD))
 	}
-	if d.ExitClass != "" {
-		parts = append(parts, fmt.Sprintf("exitClass=%s", d.ExitClass))
+	if strings.TrimSpace(d.ExitClass) != "" {
+		parts = append(parts, fmt.Sprintf("exitClass=%s", strings.TrimSpace(d.ExitClass)))
 	}
 
+	// Logic MACD
 	parts = append(parts,
 		fmt.Sprintf("logic_macd_line=%.5f", d.LogicMACDLine),
 		fmt.Sprintf("logic_macd_turn=%.5f", d.LogicMACDTurn),
 		fmt.Sprintf("logic_macd_hist=%.5f", d.LogicMACDHist),
 		fmt.Sprintf("logic_macd_dhist=%.5f", d.LogicMACDDHist),
 		fmt.Sprintf("logic_macd_dsmooth=%.5f", d.LogicMACDDSmooth),
-
 		fmt.Sprintf("logic_macd_strong_positive=%t", d.LogicMACDStrongPositive),
 		fmt.Sprintf("logic_macd_strong_negative=%t", d.LogicMACDStrongNegative),
 		fmt.Sprintf("logic_macd_momentum_down=%t", d.LogicMACDMomentumDown),
 		fmt.Sprintf("logic_macd_momentum_up=%t", d.LogicMACDMomentumUp),
 
+		// Logic EMA
 		fmt.Sprintf("logic_ema_spread=%.6f", d.LogicEMASpread),
 		fmt.Sprintf("logic_ema2050=%.6f", d.LogicEMA2050),
 
+		// Logic pattern
 		fmt.Sprintf("logic_pattern_high_peak=%t", d.LogicPatternHighPeak),
 		fmt.Sprintf("logic_pattern_low_bottom=%t", d.LogicPatternLowBottom),
 		fmt.Sprintf("logic_pattern_price_down_up=%t", d.LogicPatternPriceDownUp),

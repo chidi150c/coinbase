@@ -107,7 +107,7 @@ print_items() {
         ((.reason // .Reason // "") | split(" | ")[0] | split("|")[0]) // "n/a";
 
       def exit_class:
-        ((.reason // .Reason // "") | capture("EXIT_CLASS=(?<x>[A-Z0-9_]+)")? | .x)
+        ((.reason // .Reason // "") | capture("exitClass=(?<x>[A-Z0-9_]+)")? | .x)
         // "n/a";
       
       def open_notional:

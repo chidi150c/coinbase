@@ -17,7 +17,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"math"
 	"time"
@@ -102,7 +101,6 @@ type Decision struct {
 	StopLossLimitUSD float64
 	ExitNetPNLUSD    float64
 	LogicEPS         float64
-	LogicNote        string
 }
 
 // SignalToSide converts the intent into a broker side.
@@ -190,8 +188,6 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 
 func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 
-	reason := ""
-
 	if !t.cfg.UseMACDSlopeGate {
 		return d
 	}
@@ -235,9 +231,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	} else if normalSell {
 		logicOpinion = Sell
 	}
-
-	logicDisagreement := (d.Raw == Buy && logicOpinion == Sell) || (d.Raw == Sell && logicOpinion == Buy)
-
+	
 	// Final entry signal policy:
 	//
 	// AI BUY + logic BUY   → BUY
@@ -253,22 +247,6 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	final := finalSignalFromAILogic(d.Raw, logicOpinion)
 	d.Signal = final
 
-	if logicDisagreement {
-		reason = appendReason(reason, "logic_disagreement")
-	}
-
-	if d.Raw == Flat && logicOpinion != Flat {
-		reason = appendReason(reason, fmt.Sprintf("ai_FLAT_logicOpinion=%s_blocked", logicOpinion))
-	}
-
-	if d.Raw == logicOpinion && logicOpinion != Flat {
-		reason = appendReason(reason, fmt.Sprintf("ai_%s_logicOpinion=%s_match", d.Raw, logicOpinion))
-	}
-
-	if logicOpinion == Flat {
-		reason = appendReason(reason, fmt.Sprintf("ai_%s_logicOpinion=FLAT", d.Raw))
-	}
-
 	log.Printf(
 		"[KPI] logic ai=%s logic=%s final=%s pUp=%.5f",
 		d.Raw,
@@ -281,7 +259,6 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	d.LogicOpinion = logicOpinion
 	d.Confidence = confidence
 	d.LogicEPS = eps
-	d.LogicNote = reason
 
 	// Logic MACD
 	d.LogicMACDLine = snap.MACDLine
