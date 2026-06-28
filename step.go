@@ -1134,45 +1134,34 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						i++
 						continue
 					}
+					
+					exitD := d
+
 					stopLossExit := false
-
-					d.Side = lot.Side
-					d.PreviousAIRaw = previousAIRaw
-					d.ExitNetPNLUSD = net
-					d.StopLossLimitUSD = lossLimit
-
 					deepLossLimit := lossLimit * deepLossMult
 					deepLossExit := net <= deepLossLimit
 
 					if enableStopLoss && net <= lossLimit {
-						log.Printf("TRACE %s threshold_stoploss_check side=%s pUp=%.5f buyTh=%.5f sellTh=%.5f previousAIRaw=%s raw=%s signal=%s pnl=%.2f lossLimit=%.2f",
-							d.Side,
-							d.PUp,
-							d.BuyThreshold,
-							d.SellThreshold,
-							d.PreviousAIRaw,
-							d.Raw,
-							d.Signal,
-							d.ExitNetPNLUSD,
-							d.StopLossLimitUSD,
-						)
+						exitD.PreviousAIRaw = previousAIRaw
+						exitD.ExitNetPNLUSD = net
+						exitD.StopLossLimitUSD = lossLimit
 
 						switch lot.Side {
 						case SideBuy:
 							stopLossExit =
 								deepLossExit || (previousAIRaw == Flat &&
-									d.Raw == Buy &&
-									d.PUp > d.BuyThreshold-minBuyDist &&
-									d.PUp <= d.BuyThreshold &&
-									d.Signal != Buy) || (d.Signal == Sell && d.Confidence >= 0.60)
+									exitD.Raw == Buy &&
+									exitD.PUp > exitD.BuyThreshold-minBuyDist &&
+									exitD.PUp <= exitD.BuyThreshold &&
+									exitD.Signal != Buy) || (exitD.Signal == Sell && exitD.Confidence >= 0.60)
 
 						case SideSell:
 							stopLossExit =
 								deepLossExit || (previousAIRaw == Flat &&
-									d.Raw == Sell &&
-									d.PUp >= d.SellThreshold &&
-									d.PUp < d.SellThreshold+minSellDist &&
-									d.Signal != Sell) || (d.Signal == Buy && d.Confidence >= 0.60)
+									exitD.Raw == Sell &&
+									exitD.PUp >= exitD.SellThreshold &&
+									exitD.PUp < exitD.SellThreshold+minSellDist &&
+									exitD.Signal != Sell) || (exitD.Signal == Buy && exitD.Confidence >= 0.60)
 						}
 					}
 
@@ -1185,11 +1174,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							net:    net,
 						}
 						if deepLossExit {
-							d.ExitClass = "L2_DEEP_LOSS"
+							exitD.ExitClass = "L2_DEEP_LOSS"
 							cand.decision = decisionFlatReason(d)
 							stopL2 = append(stopL2, cand)
 						} else {
-							d.ExitClass = "L1_THRESHOLD_WARNING"
+							exitD.ExitClass = "L1_THRESHOLD_WARNING"
 							cand.decision = decisionFlatReason(d)
 							stopL1 = append(stopL1, cand)
 
