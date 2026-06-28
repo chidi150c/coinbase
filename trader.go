@@ -877,8 +877,6 @@ func exitCSVHeader() []string {
 		"entry_final_signal",
 		"entry_buy_threshold",
 		"entry_sell_threshold",
-		"entry_model_up_avg",
-		"entry_model_down_avg",
 		"entry_logic_eps",
 
 		"entry_gate_price",
@@ -970,8 +968,6 @@ func exitCSVRow(e ExitRecord) []string {
 		kv(entryPart, "final"),
 		kv(entryPart, "buyTh"),
 		kv(entryPart, "sellTh"),
-		kv(entryPart, "modelUpAvg"),
-		kv(entryPart, "modelDownAvg"),
 		kv(entryPart, "logicEPS"),
 
 		kv(entryPart, "gatePrice"),
@@ -989,8 +985,6 @@ func exitCSVRow(e ExitRecord) []string {
 		kv(exitPart, "final"),
 		kv(exitPart, "buyTh"),
 		kv(exitPart, "sellTh"),
-		kv(exitPart, "modelUpAvg"),
-		kv(exitPart, "modelDownAvg"),
 		kv(exitPart, "logicEPS"),
 		kv(exitPart, "previousAIRaw"),
 		kv(exitPart, "exitNetPNL"),
@@ -1095,8 +1089,6 @@ func decisionFlatReason(d Decision) string {
 		fmt.Sprintf("confidence=%.2f", d.Confidence),
 		fmt.Sprintf("buyTh=%.5f", d.BuyThreshold),
 		fmt.Sprintf("sellTh=%.5f", d.SellThreshold),
-		fmt.Sprintf("modelUpAvg=%.5f", d.ModelUpAvg),
-		fmt.Sprintf("modelDownAvg=%.5f", d.ModelDownAvg),
 
 		// Decision summary
 		fmt.Sprintf("aiRaw=%s", d.Raw),

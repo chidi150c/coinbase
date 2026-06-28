@@ -63,8 +63,6 @@ type Decision struct {
 	PUp           float64
 	BuyThreshold  float64
 	SellThreshold float64
-	ModelUpAvg    float64
-	ModelDownAvg  float64
 
 	// Logic summary
 	LogicOpinion Signal
@@ -147,35 +145,35 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 		PUp:        pUp,
 	}
 
-	buyThreshold := t.cfg.BuyThreshold
-	sellThreshold := t.cfg.SellThreshold
+	base.BuyThreshold = t.cfg.BuyThreshold
+	base.SellThreshold = t.cfg.SellThreshold
 	if t.model != nil {
 		if t.model.BuyThreshold > 0 {
-			buyThreshold = t.model.BuyThreshold
+			base.BuyThreshold = t.model.BuyThreshold
 		}
 		if t.model.SellThreshold > 0 {
-			sellThreshold = t.model.SellThreshold
+			base.SellThreshold = t.model.SellThreshold
 		}
 	}
 
-	if pUp <= buyThreshold {
+	if pUp <= base.BuyThreshold {
 		base.Signal = Buy
 		base.Raw = Buy
 		base.Confidence = confidenceRiskMultiplier(
 			Buy,
 			pUp,
-			buyThreshold,
-			sellThreshold,
+			base.BuyThreshold,
+			base.SellThreshold,
 		)
 
-	} else if pUp >= sellThreshold {
+	} else if pUp >= base.SellThreshold {
 		base.Signal = Sell
 		base.Raw = Sell
 		base.Confidence = confidenceRiskMultiplier(
 			Sell,
 			pUp,
-			buyThreshold,
-			sellThreshold,
+			base.BuyThreshold,
+			base.SellThreshold,
 		)
 
 	} else {
@@ -201,8 +199,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		return d
 	}
 
-	confidence := d.Confidence
-	epsMult := confidenceEffPctMultiplier(confidence)
+	epsMult := confidenceEffPctMultiplier(d.Confidence)
 	eps := t.cfg.MACDLineEPS * epsMult
 	if eps < 10 {
 		eps = 10
@@ -257,7 +254,6 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 
 	// Logic summary
 	d.LogicOpinion = logicOpinion
-	d.Confidence = confidence
 	d.LogicEPS = eps
 
 	// Logic MACD

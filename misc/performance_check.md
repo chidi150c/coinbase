@@ -104,9 +104,7 @@ awk -v cutoff="$(date -u -d '24 hours ago' '+%Y/%m/%d %H:%M:%S')" '
   ts = $3 " " $4
   if (ts < cutoff) next
 
-  if (match($0,/pUp=([0-9.]+)/,p) &&
-      match($0,/modelUpAvg=([0-9.]+)/,u) &&
-      match($0,/modelDownAvg=([0-9.]+)/,d)) {
+  if (match($0,/pUp=([0-9.]+)/,p)) {
     pup=p[1]+0; up=u[1]+0; down=d[1]+0
     total++
     if (pup >= up) buyBias++
