@@ -894,8 +894,6 @@ func exitCSVHeader() []string {
 		"exit_final_signal",
 		"exit_buy_threshold",
 		"exit_sell_threshold",
-		"exit_model_up_avg",
-		"exit_model_down_avg",
 		"exit_logic_eps",
 		"exit_previous_ai_raw",
 		"exit_net_pnl_usd",
@@ -1028,60 +1026,6 @@ func exitCSVRow(e ExitRecord) []string {
 	}
 }
 
-func ff(v float64) string {
-	return strconv.FormatFloat(v, 'f', -1, 64)
-}
-
-func extractExitPart(reason string) string {
-	start := strings.Index(reason, "exitReason{")
-	if start < 0 {
-		return reason
-	}
-	start += len("exitReason{")
-
-	end := strings.Index(reason[start:], "}  ||  openReason{")
-	if end >= 0 {
-		return reason[start : start+end]
-	}
-
-	return reason[start:]
-}
-
-func extractEntryPart(reason string) string {
-	start := strings.Index(reason, "openReason{")
-	if start < 0 {
-		return ""
-	}
-	start += len("openReason{")
-	entry := reason[start:]
-	entry = strings.TrimSuffix(entry, "}")
-	return entry
-}
-
-func exitReasonType(reason string) string {
-	if reason == "" {
-		return ""
-	}
-	parts := strings.Split(reason, " | ")
-	if len(parts) > 0 {
-		return strings.TrimSpace(parts[0])
-	}
-	return strings.TrimSpace(reason)
-}
-
-func kv(s, key string) string {
-	if s == "" || key == "" {
-		return ""
-	}
-
-	re := regexp.MustCompile(regexp.QuoteMeta(key) + `=([A-Za-z0-9_.+-]+)`)
-	m := re.FindStringSubmatch(s)
-	if len(m) >= 2 {
-		return m[1]
-	}
-	return ""
-}
-
 func decisionFlatReason(d Decision) string {
 	parts := []string{
 		// AI / model summary
@@ -1140,6 +1084,61 @@ func decisionFlatReason(d Decision) string {
 
 	return strings.Join(parts, "|")
 }
+
+func ff(v float64) string {
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
+func extractExitPart(reason string) string {
+	start := strings.Index(reason, "exitReason{")
+	if start < 0 {
+		return reason
+	}
+	start += len("exitReason{")
+
+	end := strings.Index(reason[start:], "}  ||  openReason{")
+	if end >= 0 {
+		return reason[start : start+end]
+	}
+
+	return reason[start:]
+}
+
+func extractEntryPart(reason string) string {
+	start := strings.Index(reason, "openReason{")
+	if start < 0 {
+		return ""
+	}
+	start += len("openReason{")
+	entry := reason[start:]
+	entry = strings.TrimSuffix(entry, "}")
+	return entry
+}
+
+func exitReasonType(reason string) string {
+	if reason == "" {
+		return ""
+	}
+	parts := strings.Split(reason, " | ")
+	if len(parts) > 0 {
+		return strings.TrimSpace(parts[0])
+	}
+	return strings.TrimSpace(reason)
+}
+
+func kv(s, key string) string {
+	if s == "" || key == "" {
+		return ""
+	}
+
+	re := regexp.MustCompile(regexp.QuoteMeta(key) + `=([A-Za-z0-9_.+-]+)`)
+	m := re.FindStringSubmatch(s)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
+
 
 func placedOrderID(p *PlacedOrder) string {
 	if p == nil {

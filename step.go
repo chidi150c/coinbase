@@ -1134,7 +1134,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						i++
 						continue
 					}
-					
+
 					exitD := d
 
 					stopLossExit := false
@@ -1175,11 +1175,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						}
 						if deepLossExit {
 							exitD.ExitClass = "L2_DEEP_LOSS"
-							cand.decision = decisionFlatReason(d)
+							cand.decision = decisionFlatReason(exitD)
 							stopL2 = append(stopL2, cand)
 						} else {
 							exitD.ExitClass = "L1_THRESHOLD_WARNING"
-							cand.decision = decisionFlatReason(d)
+							cand.decision = decisionFlatReason(exitD)
 							stopL1 = append(stopL1, cand)
 
 							// Arm/update maker-friendly exit limit price to be near current mark price.
@@ -1503,7 +1503,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-101",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-102",
 		totalLots,
 		d.Raw,
 		d.Signal,
