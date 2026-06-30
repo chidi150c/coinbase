@@ -1265,7 +1265,7 @@ func (t *Trader) snapshotStateLocked() BotState {
 		RegimeUntil:        t.RegimeUntil,
 		RecentLowBreakAt:   t.RecentLowBreakAt,
 		RecentHighBreakAt:  t.RecentHighBreakAt,
-		RegimeMultiplier: t.RegimeMultiplier,
+		RegimeMultiplier:   t.RegimeMultiplier,
 	}
 }
 

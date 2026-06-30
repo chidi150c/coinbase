@@ -204,15 +204,19 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 
 	baseEPS := t.cfg.MACDLineEPS
 	regimeEPS := baseEPS
+	regimeMult := t.RegimeMultiplier
+	if regimeMult <= 0 {
+		regimeMult = 1.0
+	}
 
 	switch t.MarketRegime {
 	case RegimeDown:
 		if d.Raw == Buy {
-			regimeEPS = baseEPS * 2.0
+			regimeEPS = baseEPS * regimeMult
 		}
 	case RegimeUp:
 		if d.Raw == Sell {
-			regimeEPS = baseEPS * 2.0
+			regimeEPS = baseEPS * regimeMult
 		}
 	}
 
@@ -242,17 +246,18 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 
 	d.Signal = finalSignalFromAILogic(d.Raw, logicOpinion)
 
-	log.Printf(
-		"[KPI] logic regime=%s baseEPS=%.2f regimeEPS=%.2f effEPS=%.2f ai=%s logic=%s final=%s pUp=%.5f",
-		t.MarketRegime,
-		baseEPS,
-		regimeEPS,
-		eps,
-		d.Raw,
-		logicOpinion,
-		d.Signal,
-		d.PUp,
-	)
+log.Printf(
+	"[KPI] logic regime=%s mult=%.2f baseEPS=%.2f regimeEPS=%.2f effEPS=%.2f ai=%s logic=%s final=%s pUp=%.5f",
+	t.MarketRegime,
+	regimeMult,
+	baseEPS,
+	regimeEPS,
+	eps,
+	d.Raw,
+	logicOpinion,
+	d.Signal,
+	d.PUp,
+)
 
 	d.LogicOpinion = logicOpinion
 	d.LogicEPS = eps
@@ -479,6 +484,12 @@ func highestHigh(candles []Candle, lookback time.Duration) float64 {
 }
 
 func (t *Trader) updateMarketRegimeFromRecentExtremes(wallNow time.Time) {
+	const (
+		startMult = 2.0
+		stepMult  = 0.25
+		maxMult   = 3.0
+	)
+
 	freshLow :=
 		t.PreviousRecentLow > 0 &&
 			t.RecentLow > 0 &&
@@ -491,17 +502,38 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(wallNow time.Time) {
 
 	expiredByTime := !t.RegimeUntil.IsZero() && wallNow.After(t.RegimeUntil)
 
-	setRegime := func(regime MarketRegime, reason string) {
+	if t.MarketRegime == "" {
+		t.MarketRegime = RegimeNormal
+	}
+	if t.RegimeMultiplier <= 0 {
+		t.RegimeMultiplier = 1.0
+	}
+
+	clampMult := func(v float64) float64 {
+		if v > maxMult {
+			return maxMult
+		}
+		if v < 1.0 {
+			return 1.0
+		}
+		return v
+	}
+
+	setRegime := func(regime MarketRegime, mult float64, reason string) {
 		old := t.MarketRegime
+		oldMult := t.RegimeMultiplier
 
 		t.MarketRegime = regime
+		t.RegimeMultiplier = clampMult(mult)
 		t.RegimeUntil = wallNow.Add(2 * time.Hour)
 
 		log.Printf(
-			"TRACE regime.set old=%s new=%s reason=%s recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f until=%s",
+			"TRACE regime.set old=%s new=%s reason=%s oldMult=%.2f mult=%.2f recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f until=%s",
 			old,
 			t.MarketRegime,
 			reason,
+			oldMult,
+			t.RegimeMultiplier,
 			t.RecentLow,
 			t.PreviousRecentLow,
 			t.RecentHigh,
@@ -511,13 +543,18 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(wallNow time.Time) {
 	}
 
 	extendRegime := func(regime MarketRegime, reason string) {
+		oldMult := t.RegimeMultiplier
+
 		t.MarketRegime = regime
+		t.RegimeMultiplier = clampMult(t.RegimeMultiplier + stepMult)
 		t.RegimeUntil = wallNow.Add(2 * time.Hour)
 
 		log.Printf(
-			"TRACE regime.extend regime=%s reason=%s recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f until=%s",
+			"TRACE regime.extend regime=%s reason=%s oldMult=%.2f mult=%.2f recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f until=%s",
 			t.MarketRegime,
 			reason,
+			oldMult,
+			t.RegimeMultiplier,
 			t.RecentLow,
 			t.PreviousRecentLow,
 			t.RecentHigh,
@@ -528,15 +565,19 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(wallNow time.Time) {
 
 	toNormal := func(reason string) {
 		old := t.MarketRegime
+		oldMult := t.RegimeMultiplier
 
 		t.MarketRegime = RegimeNormal
+		t.RegimeMultiplier = 1.0
 		t.RegimeUntil = time.Time{}
 
 		log.Printf(
-			"TRACE regime.normal old=%s new=%s reason=%s recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f",
+			"TRACE regime.normal old=%s new=%s reason=%s oldMult=%.2f mult=%.2f recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f",
 			old,
 			t.MarketRegime,
 			reason,
+			oldMult,
+			t.RegimeMultiplier,
 			t.RecentLow,
 			t.PreviousRecentLow,
 			t.RecentHigh,
@@ -547,19 +588,18 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(wallNow time.Time) {
 	if freshLow {
 		t.RecentLowBreakAt = wallNow
 	}
-
 	if freshHigh {
 		t.RecentHighBreakAt = wallNow
 	}
 
 	switch t.MarketRegime {
-	case RegimeNormal, "":
+	case RegimeNormal:
 		if freshLow {
-			setRegime(RegimeDown, "fresh_12h_low_from_normal")
+			setRegime(RegimeDown, startMult, "fresh_12h_low_from_normal")
 			return
 		}
 		if freshHigh {
-			setRegime(RegimeUp, "fresh_12h_high_from_normal")
+			setRegime(RegimeUp, startMult, "fresh_12h_high_from_normal")
 			return
 		}
 
@@ -568,7 +608,6 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(wallNow time.Time) {
 			extendRegime(RegimeDown, "fresh_12h_low_extend_down")
 			return
 		}
-
 		if expiredByTime && freshHigh {
 			toNormal("expired_and_fresh_12h_high")
 			return
@@ -579,7 +618,6 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(wallNow time.Time) {
 			extendRegime(RegimeUp, "fresh_12h_high_extend_up")
 			return
 		}
-
 		if expiredByTime && freshLow {
 			toNormal("expired_and_fresh_12h_low")
 			return
