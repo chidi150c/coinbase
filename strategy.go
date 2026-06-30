@@ -193,46 +193,37 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 }
 
 func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
-
 	if !t.cfg.UseMACDSlopeGate {
 		return d
 	}
 
 	if len(execHistory) < 60 {
-		log.Fatalf(
-			"[LOGIC_GATE] skip insufficient_history len=%d gateTF=%s",
-			len(execHistory),
-			t.cfg.GateTF,
-		)
+		log.Fatalf("[LOGIC_GATE] skip insufficient_history len=%d gateTF=%s", len(execHistory), t.cfg.GateTF)
 		return d
 	}
 
 	baseEPS := t.cfg.MACDLineEPS
+	regimeEPS := baseEPS
 
 	switch t.MarketRegime {
 	case RegimeDown:
 		if d.Raw == Buy {
-			baseEPS *= 2
+			regimeEPS = baseEPS * 2.0
 		}
 	case RegimeUp:
 		if d.Raw == Sell {
-			baseEPS *= 2
+			regimeEPS = baseEPS * 2.0
 		}
 	}
 
-	eps := baseEPS * confidenceEffPctMultiplier(d.Confidence)
-
+	eps := regimeEPS * confidenceEffPctMultiplier(d.Confidence)
 	if eps < 10 {
 		eps = 10
 	}
 
 	snap, ok := BuildFeatureSnapshot(execHistory, len(execHistory)-1, eps, t.cfg.AIFeatureDim)
 	if !ok {
-		log.Fatalf(
-			"[LOGIC_GATE] skip no_feature_snapshot len=%d gateTF=%s",
-			len(execHistory),
-			t.cfg.GateTF,
-		)
+		log.Fatalf("[LOGIC_GATE] skip no_feature_snapshot len=%d gateTF=%s", len(execHistory), t.cfg.GateTF)
 		return d
 	}
 
@@ -240,7 +231,6 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	emaBuyPattern := snap.EMALowBottom || snap.EMAPriceDownGoingUp
 
 	normalBuy := snap.MACDStrongNegative && snap.MACDMomentumUp && emaBuyPattern
-
 	normalSell := snap.MACDStrongPositive && snap.MACDMomentumDown && emaSellPattern
 
 	logicOpinion := Flat
@@ -250,34 +240,23 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		logicOpinion = Sell
 	}
 
-	// Final entry signal policy:
-	//
-	// AI BUY + logic BUY   → BUY
-	// AI FLAT + logic BUY  → FLAT
-	// AI SELL + logic BUY  → FLAT
-	//
-	// AI SELL + logic SELL → SELL
-	// AI FLAT + logic SELL → FLAT
-	// AI BUY + logic SELL  → FLAT
-	//
-	// logicOpinion already represents the MACD/EMA reversal logic,
-	// so we no longer hard-block d.Signal separately below.
-	final := finalSignalFromAILogic(d.Raw, logicOpinion)
-	d.Signal = final
+	d.Signal = finalSignalFromAILogic(d.Raw, logicOpinion)
 
 	log.Printf(
-		"[KPI] logic ai=%s logic=%s final=%s pUp=%.5f",
+		"[KPI] logic regime=%s baseEPS=%.2f regimeEPS=%.2f effEPS=%.2f ai=%s logic=%s final=%s pUp=%.5f",
+		t.MarketRegime,
+		baseEPS,
+		regimeEPS,
+		eps,
 		d.Raw,
 		logicOpinion,
 		d.Signal,
 		d.PUp,
 	)
 
-	// Logic summary
 	d.LogicOpinion = logicOpinion
 	d.LogicEPS = eps
 
-	// Logic MACD
 	d.LogicMACDLine = snap.MACDLine
 	d.LogicMACDTurn = snap.MACDTurningPoint
 	d.LogicMACDHist = snap.MACDHist
@@ -288,7 +267,6 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	d.LogicMACDMomentumDown = snap.MACDMomentumDown
 	d.LogicMACDMomentumUp = snap.MACDMomentumUp
 
-	// Logic Pattern
 	d.LogicPatternHighPeak = snap.EMAHighPeak
 	d.LogicPatternLowBottom = snap.EMALowBottom
 	d.LogicPatternPriceDownUp = snap.EMAPriceDownGoingUp
@@ -296,7 +274,6 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	d.LogicPatternSell = emaSellPattern
 	d.LogicPatternBuy = emaBuyPattern
 
-	// Logic EMA
 	d.LogicEMASpread = snap.EMASpreadPct
 	d.LogicEMA2050 = snap.EMA2050Spread
 
@@ -519,12 +496,18 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(wallNow time.Time) {
 		t.RecentLow > 0 &&
 		t.RecentLow < t.PreviousRecentLow {
 
+		action := "set"
+		if t.MarketRegime == RegimeDown {
+			action = "extend"
+		}
+
 		t.RecentLowBreakAt = wallNow
 		t.MarketRegime = RegimeDown
 		t.RegimeUntil = wallNow.Add(2 * time.Hour)
 
 		log.Printf(
-			"TRACE regime.set regime=%s reason=fresh_12h_low recentLow=%.2f previousRecentLow=%.2f breakAt=%s until=%s",
+			"TRACE regime.%s regime=%s reason=fresh_12h_low recentLow=%.2f previousRecentLow=%.2f breakAt=%s until=%s",
+			action,
 			t.MarketRegime,
 			t.RecentLow,
 			t.PreviousRecentLow,
@@ -537,12 +520,18 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(wallNow time.Time) {
 		t.RecentHigh > 0 &&
 		t.RecentHigh > t.PreviousRecentHigh {
 
+		action := "set"
+		if t.MarketRegime == RegimeUp {
+			action = "extend"
+		}
+
 		t.RecentHighBreakAt = wallNow
 		t.MarketRegime = RegimeUp
 		t.RegimeUntil = wallNow.Add(2 * time.Hour)
 
 		log.Printf(
-			"TRACE regime.set regime=%s reason=fresh_12h_high recentHigh=%.2f previousRecentHigh=%.2f breakAt=%s until=%s",
+			"TRACE regime.%s regime=%s reason=fresh_12h_high recentHigh=%.2f previousRecentHigh=%.2f breakAt=%s until=%s",
+			action,
 			t.MarketRegime,
 			t.RecentHigh,
 			t.PreviousRecentHigh,
@@ -553,6 +542,8 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(wallNow time.Time) {
 }
 
 func (t *Trader) afterStepStateUpdate(wallNow time.Time, res StepResult) {
+	_ = wallNow
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
