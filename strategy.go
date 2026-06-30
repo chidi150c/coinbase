@@ -22,6 +22,14 @@ import (
 	"time"
 )
 
+type MarketRegime string
+
+const (
+	RegimeNormal MarketRegime = "NORMAL"
+	RegimeUp     MarketRegime = "UP"
+	RegimeDown   MarketRegime = "DOWN"
+)
+
 // Candle is the normalized OHLCV row the bot uses everywhere.
 type Candle struct {
 	Time   time.Time
@@ -199,8 +207,21 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		return d
 	}
 
-	epsMult := confidenceEffPctMultiplier(d.Confidence)
-	eps := t.cfg.MACDLineEPS * epsMult
+	baseEPS := t.cfg.MACDLineEPS
+
+	switch t.MarketRegime {
+	case RegimeDown:
+		if d.Raw == Buy {
+			baseEPS *= 2
+		}
+	case RegimeUp:
+		if d.Raw == Sell {
+			baseEPS *= 2
+		}
+	}
+
+	eps := baseEPS * confidenceEffPctMultiplier(d.Confidence)
+
 	if eps < 10 {
 		eps = 10
 	}
@@ -478,4 +499,70 @@ func highestHigh(candles []Candle, lookback time.Duration) float64 {
 	}
 
 	return highest
+}
+
+func (t *Trader) updateMarketRegimeFromRecentExtremes(wallNow time.Time) {
+	if !t.RegimeUntil.IsZero() && wallNow.After(t.RegimeUntil) {
+		log.Printf(
+			"TRACE regime.expire old=%s until=%s lowBreakAt=%s highBreakAt=%s",
+			t.MarketRegime,
+			t.RegimeUntil.Format(time.RFC3339),
+			t.RecentLowBreakAt.Format(time.RFC3339),
+			t.RecentHighBreakAt.Format(time.RFC3339),
+		)
+
+		t.MarketRegime = RegimeNormal
+		t.RegimeUntil = time.Time{}
+	}
+
+	if t.PreviousRecentLow > 0 &&
+		t.RecentLow > 0 &&
+		t.RecentLow < t.PreviousRecentLow {
+
+		t.RecentLowBreakAt = wallNow
+		t.MarketRegime = RegimeDown
+		t.RegimeUntil = wallNow.Add(2 * time.Hour)
+
+		log.Printf(
+			"TRACE regime.set regime=%s reason=fresh_12h_low recentLow=%.2f previousRecentLow=%.2f breakAt=%s until=%s",
+			t.MarketRegime,
+			t.RecentLow,
+			t.PreviousRecentLow,
+			t.RecentLowBreakAt.Format(time.RFC3339),
+			t.RegimeUntil.Format(time.RFC3339),
+		)
+	}
+
+	if t.PreviousRecentHigh > 0 &&
+		t.RecentHigh > 0 &&
+		t.RecentHigh > t.PreviousRecentHigh {
+
+		t.RecentHighBreakAt = wallNow
+		t.MarketRegime = RegimeUp
+		t.RegimeUntil = wallNow.Add(2 * time.Hour)
+
+		log.Printf(
+			"TRACE regime.set regime=%s reason=fresh_12h_high recentHigh=%.2f previousRecentHigh=%.2f breakAt=%s until=%s",
+			t.MarketRegime,
+			t.RecentHigh,
+			t.PreviousRecentHigh,
+			t.RecentHighBreakAt.Format(time.RFC3339),
+			t.RegimeUntil.Format(time.RFC3339),
+		)
+	}
+}
+
+func (t *Trader) afterStepStateUpdate(wallNow time.Time, res StepResult) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.previousAIRaw = res.Raw
+
+	if t.RecentLow > 0 {
+		t.PreviousRecentLow = t.RecentLow
+	}
+
+	if t.RecentHigh > 0 {
+		t.PreviousRecentHigh = t.RecentHigh
+	}
 }

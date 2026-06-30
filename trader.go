@@ -132,6 +132,10 @@ type BotState struct {
 	SpareSellUSD       float64
 	PreviousAIRaw      Signal
 	PendingExits       map[string]*PendingExit
+	MarketRegime       MarketRegime `json:"market_regime,omitempty"`
+	RegimeUntil        time.Time    `json:"regime_until,omitempty"`
+	RecentLowBreakAt   time.Time    `json:"recent_low_break_at,omitempty"`
+	RecentHighBreakAt  time.Time    `json:"recent_high_break_at,omitempty"`
 }
 
 // --- NEW (Phase 1): pending async maker-first open support ---
@@ -269,6 +273,11 @@ type Trader struct {
 	refundSellUSD float64
 	SpareBuyUSD   float64
 	SpareSellUSD  float64
+
+	MarketRegime      MarketRegime
+	RegimeUntil       time.Time
+	RecentLowBreakAt  time.Time
+	RecentHighBreakAt time.Time
 }
 
 func NewTrader(cfg Config, broker Broker) *Trader {
@@ -1139,7 +1148,6 @@ func kv(s, key string) string {
 	return ""
 }
 
-
 func placedOrderID(p *PlacedOrder) string {
 	if p == nil {
 		return ""
@@ -1250,6 +1258,10 @@ func (t *Trader) snapshotStateLocked() BotState {
 		SpareBuyUSD:        t.SpareBuyUSD,
 		SpareSellUSD:       t.SpareSellUSD,
 		PendingExits:       t.pendingExits,
+		MarketRegime:       t.MarketRegime,
+		RegimeUntil:        t.RegimeUntil,
+		RecentLowBreakAt:   t.RecentLowBreakAt,
+		RecentHighBreakAt:  t.RecentHighBreakAt,
 	}
 }
 
@@ -1295,6 +1307,13 @@ func (t *Trader) loadState() error {
 	if !st.LastFit.IsZero() {
 		t.lastFit = st.LastFit
 	}
+	t.MarketRegime = st.MarketRegime
+	if t.MarketRegime == "" {
+		t.MarketRegime = RegimeNormal
+	}
+	t.RegimeUntil = st.RegimeUntil
+	t.RecentLowBreakAt = st.RecentLowBreakAt
+	t.RecentHighBreakAt = st.RecentHighBreakAt
 
 	// Restore per-side books (no migration; assume st.Book*.RunnerIDs reflects persisted state)
 	t.books[SideBuy] = &SideBook{

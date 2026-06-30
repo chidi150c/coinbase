@@ -30,6 +30,12 @@ import (
 	"sync" // <-- added
 )
 
+type StepResult struct {
+	Msg    string
+	Raw    Signal
+	Signal Signal
+}
+
 // runLive executes the real-time loop with cadence intervalSec (seconds).
 func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 
@@ -503,6 +509,8 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				trader.RecentHigh = highestHigh(signalHistory, 12*time.Hour)
 				trader.RecentLow = lowestLow(signalHistory, 12*time.Hour)
 
+				trader.updateMarketRegimeFromRecentExtremes(time.Now().UTC())
+
 				buyLots := 0
 				sellLots := 0
 
@@ -564,14 +572,19 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				// Step trader
 				//=====================================================================
 				//=====================================================================
-				msg, err := trader.step(ctx, execHistory, signalHistory, px)
+				res, err := trader.step(ctx, execHistory, signalHistory, px)
+
 				if err != nil {
 					log.Printf("step err: %v", err)
 					time.Sleep(time.Duration(trader.cfg.TickInterval()) * time.Second)
 					continue
-				} else if msg != "" {
+				}
+
+				trader.afterStepStateUpdate(time.Now().UTC(), res)
+
+				if res.Msg != "" {
 					// Print EXIT / PAPER lines in tick mode too
-					log.Printf("%s", msg)
+					log.Printf("%s", res.Msg)
 				}
 
 				// Live equity refresh (bridge or broker)
@@ -703,12 +716,15 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 					trader.mu.Unlock()
 				}
 
-				msg, err := trader.step(ctx, execHistory, signalHistory, execHistory[len(execHistory)-1].Close)
+				res, err := trader.step(ctx, execHistory, signalHistory, execHistory[len(execHistory)-1].Close)
 				if err != nil {
 					log.Printf("step err: %v", err)
 					continue
 				}
-				log.Printf("%s", msg)
+
+				trader.afterStepStateUpdate(time.Now().UTC(), res)
+
+				log.Printf("%s", res.Msg)
 
 				// Live equity refresh (bridge or broker)
 				if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun {

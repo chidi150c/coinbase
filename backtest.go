@@ -160,12 +160,12 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader) {
 		default:
 		}
 		testP := test[len(test[:i+1])-1].Close
-		msg, _ := trader.step(ctx, test[:i+1], test[:i+1], testP)
+		res, _ := trader.step(ctx, test[:i+1], test[:i+1], testP)
 
 		// Count wins/losses on exits
-		if strings.HasPrefix(msg, "EXIT") {
-			if idx := strings.LastIndex(msg, "P/L="); idx >= 0 {
-				pl, _ := strconv.ParseFloat(msg[idx+4:], 64)
+		if strings.HasPrefix(res.Msg, "EXIT") {
+			if idx := strings.LastIndex(res.Msg, "P/L="); idx >= 0 {
+				pl, _ := strconv.ParseFloat(res.Msg[idx+4:], 64)
 				if pl > 0 {
 					win++
 				} else if pl < 0 {
@@ -176,7 +176,7 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader) {
 
 		// Periodic progress
 		if i%100 == 0 {
-			log.Printf("[BT] i=%d msg=%s", i, msg)
+			log.Printf("[BT] i=%d msg=%s", i, res.Msg)
 		}
 
 		// Pace the loop for observability
