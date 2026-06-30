@@ -479,65 +479,111 @@ func highestHigh(candles []Candle, lookback time.Duration) float64 {
 }
 
 func (t *Trader) updateMarketRegimeFromRecentExtremes(wallNow time.Time) {
-	if !t.RegimeUntil.IsZero() && wallNow.After(t.RegimeUntil) {
+	freshLow :=
+		t.PreviousRecentLow > 0 &&
+			t.RecentLow > 0 &&
+			t.RecentLow < t.PreviousRecentLow
+
+	freshHigh :=
+		t.PreviousRecentHigh > 0 &&
+			t.RecentHigh > 0 &&
+			t.RecentHigh > t.PreviousRecentHigh
+
+	expiredByTime := !t.RegimeUntil.IsZero() && wallNow.After(t.RegimeUntil)
+
+	setRegime := func(regime MarketRegime, reason string) {
+		old := t.MarketRegime
+
+		t.MarketRegime = regime
+		t.RegimeUntil = wallNow.Add(2 * time.Hour)
+
 		log.Printf(
-			"TRACE regime.expire old=%s until=%s lowBreakAt=%s highBreakAt=%s",
+			"TRACE regime.set old=%s new=%s reason=%s recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f until=%s",
+			old,
 			t.MarketRegime,
+			reason,
+			t.RecentLow,
+			t.PreviousRecentLow,
+			t.RecentHigh,
+			t.PreviousRecentHigh,
 			t.RegimeUntil.Format(time.RFC3339),
-			t.RecentLowBreakAt.Format(time.RFC3339),
-			t.RecentHighBreakAt.Format(time.RFC3339),
 		)
+	}
+
+	extendRegime := func(regime MarketRegime, reason string) {
+		t.MarketRegime = regime
+		t.RegimeUntil = wallNow.Add(2 * time.Hour)
+
+		log.Printf(
+			"TRACE regime.extend regime=%s reason=%s recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f until=%s",
+			t.MarketRegime,
+			reason,
+			t.RecentLow,
+			t.PreviousRecentLow,
+			t.RecentHigh,
+			t.PreviousRecentHigh,
+			t.RegimeUntil.Format(time.RFC3339),
+		)
+	}
+
+	toNormal := func(reason string) {
+		old := t.MarketRegime
 
 		t.MarketRegime = RegimeNormal
 		t.RegimeUntil = time.Time{}
-	}
-
-	if t.PreviousRecentLow > 0 &&
-		t.RecentLow > 0 &&
-		t.RecentLow < t.PreviousRecentLow {
-
-		action := "set"
-		if t.MarketRegime == RegimeDown {
-			action = "extend"
-		}
-
-		t.RecentLowBreakAt = wallNow
-		t.MarketRegime = RegimeDown
-		t.RegimeUntil = wallNow.Add(2 * time.Hour)
 
 		log.Printf(
-			"TRACE regime.%s regime=%s reason=fresh_12h_low recentLow=%.2f previousRecentLow=%.2f breakAt=%s until=%s",
-			action,
+			"TRACE regime.normal old=%s new=%s reason=%s recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f",
+			old,
 			t.MarketRegime,
+			reason,
 			t.RecentLow,
 			t.PreviousRecentLow,
-			t.RecentLowBreakAt.Format(time.RFC3339),
-			t.RegimeUntil.Format(time.RFC3339),
+			t.RecentHigh,
+			t.PreviousRecentHigh,
 		)
 	}
 
-	if t.PreviousRecentHigh > 0 &&
-		t.RecentHigh > 0 &&
-		t.RecentHigh > t.PreviousRecentHigh {
+	if freshLow {
+		t.RecentLowBreakAt = wallNow
+	}
 
-		action := "set"
-		if t.MarketRegime == RegimeUp {
-			action = "extend"
+	if freshHigh {
+		t.RecentHighBreakAt = wallNow
+	}
+
+	switch t.MarketRegime {
+	case RegimeNormal, "":
+		if freshLow {
+			setRegime(RegimeDown, "fresh_12h_low_from_normal")
+			return
+		}
+		if freshHigh {
+			setRegime(RegimeUp, "fresh_12h_high_from_normal")
+			return
 		}
 
-		t.RecentHighBreakAt = wallNow
-		t.MarketRegime = RegimeUp
-		t.RegimeUntil = wallNow.Add(2 * time.Hour)
+	case RegimeDown:
+		if freshLow {
+			extendRegime(RegimeDown, "fresh_12h_low_extend_down")
+			return
+		}
 
-		log.Printf(
-			"TRACE regime.%s regime=%s reason=fresh_12h_high recentHigh=%.2f previousRecentHigh=%.2f breakAt=%s until=%s",
-			action,
-			t.MarketRegime,
-			t.RecentHigh,
-			t.PreviousRecentHigh,
-			t.RecentHighBreakAt.Format(time.RFC3339),
-			t.RegimeUntil.Format(time.RFC3339),
-		)
+		if expiredByTime && freshHigh {
+			toNormal("expired_and_fresh_12h_high")
+			return
+		}
+
+	case RegimeUp:
+		if freshHigh {
+			extendRegime(RegimeUp, "fresh_12h_high_extend_up")
+			return
+		}
+
+		if expiredByTime && freshLow {
+			toNormal("expired_and_fresh_12h_low")
+			return
+		}
 	}
 }
 

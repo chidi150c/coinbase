@@ -136,6 +136,7 @@ type BotState struct {
 	RegimeUntil        time.Time    `json:"regime_until,omitempty"`
 	RecentLowBreakAt   time.Time    `json:"recent_low_break_at,omitempty"`
 	RecentHighBreakAt  time.Time    `json:"recent_high_break_at,omitempty"`
+	RegimeMultiplier   float64
 }
 
 // --- NEW (Phase 1): pending async maker-first open support ---
@@ -278,6 +279,7 @@ type Trader struct {
 	RegimeUntil       time.Time
 	RecentLowBreakAt  time.Time
 	RecentHighBreakAt time.Time
+	RegimeMultiplier  float64
 }
 
 func NewTrader(cfg Config, broker Broker) *Trader {
@@ -293,6 +295,7 @@ func NewTrader(cfg Config, broker Broker) *Trader {
 			SideSell: {RunnerIDs: []int{}, Lots: nil},
 		},
 		stateApplyCh: make(chan func(*Trader), 128),
+		MarketRegime: RegimeNormal,
 	}
 
 	// Start centralized state manager goroutine
@@ -1262,6 +1265,7 @@ func (t *Trader) snapshotStateLocked() BotState {
 		RegimeUntil:        t.RegimeUntil,
 		RecentLowBreakAt:   t.RecentLowBreakAt,
 		RecentHighBreakAt:  t.RecentHighBreakAt,
+		RegimeMultiplier: t.RegimeMultiplier,
 	}
 }
 
@@ -1310,6 +1314,10 @@ func (t *Trader) loadState() error {
 	t.MarketRegime = st.MarketRegime
 	if t.MarketRegime == "" {
 		t.MarketRegime = RegimeNormal
+	}
+	t.RegimeMultiplier = st.RegimeMultiplier
+	if t.RegimeMultiplier <= 0 {
+		t.RegimeMultiplier = 1.0
 	}
 	t.RegimeUntil = st.RegimeUntil
 	t.RecentLowBreakAt = st.RecentLowBreakAt
