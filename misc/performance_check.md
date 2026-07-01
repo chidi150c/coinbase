@@ -521,6 +521,19 @@ BEGIN {
 
  docker compose logs -f bot_binance | grep -E "tp.post|stop_l1.post|pending_exit|EXIT|partial"
 
- =============================================================================
+=============================================================================
+
+ Search the log for the regime transitions:
+
+zgrep -Ei 'regime\.set|regime\.extend|regime\.normal|ver-|regime\.expire' \
+/opt/coinbase/logs/audit/binance_audit.log* | tail -100
+
+=========================================================
+
+To find the missing original set, search farther back and specifically for fresh_12h_high_from_normal:
+
+zgrep -Ei 'fresh_12h_high_from_normal|new=UP|regime\.set.*UP' \
+/opt/coinbase/logs/audit/binance_audit.log* | head -20
+====================================================================
 
  

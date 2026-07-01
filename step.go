@@ -1195,7 +1195,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				// AI/logic exit approval.
 				// Winning trades are held while AI/logic still supports them.
-				aiExit := shouldExitByAILogic(lot, d)
+				aiANDlogicExit := shouldExitByAILogic(lot, d)
 
 				// Profit gate passed.
 				// Apply exit-mode-specific behavior.
@@ -1229,7 +1229,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					// Does AI/logic still supports this profitable trade.
 
 					// Hold winner; do not exit yet.
-					if !aiExit {
+					if !aiANDlogicExit {
 						log.Printf(
 							"TRACE ai.exit.hold side=%s idx=%d signal=%s net=%.4f",
 							lot.Side,
@@ -1305,7 +1305,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// FixedTPWorking means the lot has passed ProfitGate + AI/logic exit approval,
 				// and lot.Take has been set as the intended post-only exit limit.
 				// We call closeLot immediately so the maker order is placed before price crosses it.
-				if lot.ExitMode == ExitModeScalpFixedTP && lot.FixedTPWorking && aiExit {
+				if lot.ExitMode == ExitModeScalpFixedTP && lot.FixedTPWorking && aiANDlogicExit {
 					trigger = true
 				}
 
@@ -1483,7 +1483,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-106",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-107",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1597,7 +1597,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 	}
 
-	log.Printf("[DEBUG] EQUITY Trading: equityUSD=%.2f lastAddEquitySell=%.2f sellEquityMultiplier=%.6f(triggerAt:>=%.2f) lastAddEquityBuy=%.2f buyEquityMultiplier=%.6f(triggerAt:>=%.2f) ", t.equityUSD, t.lastAddEquitySell, t.equityUSD/t.lastAddEquitySell, t.cfg.SellEquityTriggerMult, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, t.cfg.BuyEquityTriggerMult)
+	log.Printf("[DEBUG] EQUITY Trading: equityUSD=%.2f lastAddEquitySell=%.2f sellEquityMultiplier=%.6f(trigger if above: %.2f) lastAddEquityBuy=%.2f buyEquityMultiplier=%.6f(trigger if below: %.2f) ", t.equityUSD, t.lastAddEquitySell, t.equityUSD/t.lastAddEquitySell, t.cfg.SellEquityTriggerMult, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, t.cfg.BuyEquityTriggerMult)
 
 	// Long-only veto for SELL when flat; unchanged behavior.
 	if d.Signal == Sell && t.cfg.LongOnly {
@@ -3182,6 +3182,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			t.SpareSellUSD = 0
 		}
 	}
+	
 	// --- NEW: capture equity snapshots at add (side-specific) ---
 	if side == SideSell {
 		old := t.lastAddEquitySell
