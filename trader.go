@@ -137,6 +137,7 @@ type BotState struct {
 	RecentLowBreakAt   time.Time    `json:"recent_low_break_at,omitempty"`
 	RecentHighBreakAt  time.Time    `json:"recent_high_break_at,omitempty"`
 	RegimeMultiplier   float64
+	RecoveryDebtUSD    float64
 }
 
 // --- NEW (Phase 1): pending async maker-first open support ---
@@ -280,6 +281,7 @@ type Trader struct {
 	RecentLowBreakAt  time.Time
 	RecentHighBreakAt time.Time
 	RegimeMultiplier  float64
+	RecoveryDebtUSD   float64
 }
 
 func NewTrader(cfg Config, broker Broker) *Trader {
@@ -1266,6 +1268,7 @@ func (t *Trader) snapshotStateLocked() BotState {
 		RecentLowBreakAt:   t.RecentLowBreakAt,
 		RecentHighBreakAt:  t.RecentHighBreakAt,
 		RegimeMultiplier:   t.RegimeMultiplier,
+		RecoveryDebtUSD:    t.RecoveryDebtUSD,
 	}
 }
 
@@ -1318,6 +1321,10 @@ func (t *Trader) loadState() error {
 	t.RegimeMultiplier = st.RegimeMultiplier
 	if t.RegimeMultiplier <= 0 {
 		t.RegimeMultiplier = 1.0
+	}
+	t.RecoveryDebtUSD = st.RecoveryDebtUSD
+	if t.RecoveryDebtUSD < 0 {
+		t.RecoveryDebtUSD = 0
 	}
 	t.RegimeUntil = st.RegimeUntil
 	t.RecentLowBreakAt = st.RecentLowBreakAt
@@ -2056,6 +2063,14 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 		EntryOrderID:     lot.EntryOrderID,
 		ExitOrderID:      exitOrderID,
 	}
+
+	t.applyRecoveryDebtFromExit(rec.PNLUSD)
+
+	log.Printf(
+		"TRACE recovery.exit pnl=%.4f debt_after=%.4f",
+		rec.PNLUSD,
+		t.RecoveryDebtUSD,
+	)
 
 	t.lastExits = append(t.lastExits, rec)
 

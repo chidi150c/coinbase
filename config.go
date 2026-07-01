@@ -138,12 +138,8 @@ type Config struct {
 	VolRiskAdjust  bool // enable volatility-aware risk sizing
 	UseDirectSlack bool // true if SLACK_WEBHOOK is set
 
-	// Mirror (Gate2 bypass) ramping
-	MirrorEnabled      bool    // turn on/off
-	MirrorGateUSD      float64 // base gate, e.g., 0.020
-	MirrorGateSlopeUSD float64 // per-index increment, e.g., 0.003
-	MirrorGateStartIdx int     // start ramping at this nearest idx, e.g., 2
-	MirrorGateMaxUSD   float64 // cap the gate, e.g., 0.050
+	RecoveryTargetPct float64
+	RecoveryMaxAddUSD float64
 }
 
 // loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
@@ -259,30 +255,11 @@ func loadConfigFromEnv() Config {
 		AIMinEdgePct:   getEnvFloat("AI_MIN_EDGE_PCT", 0.05),
 
 		// Runtime optional toggles
-		WalkForwardMin: getEnvInt("WALK_FORWARD_MIN", 0),
-		VolRiskAdjust:  getEnvBool("VOL_RISK_ADJUST", false),
-		UseDirectSlack: getEnv("SLACK_WEBHOOK", "") != "",
-
-		// Mirror (Gate2 bypass) ramping
-		MirrorEnabled:      getEnvBool("MIRROR_ENABLED", true),
-		MirrorGateUSD:      getEnvFloat("MIRROR_GATE_USD", 0.0),
-		MirrorGateSlopeUSD: getEnvFloat("MIRROR_GATE_SLOPE_USD", 0.0),
-		MirrorGateStartIdx: getEnvInt("MIRROR_GATE_START_IDX", 0),
-		MirrorGateMaxUSD:   getEnvFloat("MIRROR_GATE_MAX_USD", 0.0),
-	}
-
-	// sensible defaults if unset
-	if cfg.MirrorGateUSD == 0 {
-		cfg.MirrorGateUSD = cfg.ProfitGateUSD
-	}
-	if cfg.MirrorGateSlopeUSD == 0 {
-		cfg.MirrorGateSlopeUSD = 0.25 * cfg.MirrorGateUSD
-	}
-	if cfg.MirrorGateStartIdx == 0 {
-		cfg.MirrorGateStartIdx = 1
-	}
-	if cfg.MirrorGateMaxUSD == 0 {
-		cfg.MirrorGateMaxUSD = cfg.ProfitGateUSD + cfg.MirrorGateSlopeUSD*8
+		WalkForwardMin:    getEnvInt("WALK_FORWARD_MIN", 0),
+		VolRiskAdjust:     getEnvBool("VOL_RISK_ADJUST", false),
+		UseDirectSlack:    getEnv("SLACK_WEBHOOK", "") != "",
+		RecoveryTargetPct: getEnvFloat("RECOVERY_TARGET_PCT", 0.25),
+		RecoveryMaxAddUSD: getEnvFloat("RECOVERY_MAX_ADD_USD", 0.50),
 	}
 
 	// dependency defaults

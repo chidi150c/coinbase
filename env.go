@@ -202,6 +202,10 @@ func loadBotEnv() {
 		"BINANCE_RECV_WINDOW_MS": {}, // default 5000
 		"BINANCE_USE_TESTNET":    {}, // ignored unless you opt-in
 		"BINANCE_FEE_RATE_PCT":   {}, // per-exchange fee override for binance
+
+		"RECOVERY_TARGET_PCT":   {},
+		"RECOVERY_MAX_ADD_USD":   {},
+
 	}
 
 	s := bufio.NewScanner(f)

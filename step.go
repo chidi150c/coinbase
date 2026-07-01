@@ -1483,7 +1483,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-104",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-105",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -2068,6 +2068,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	if entryProfitGateUSD < 0.30 {
 		entryProfitGateUSD = 0.30
 	}
+
+	recoveryAddUSD := t.recoveryTargetAddUSD()
+	entryProfitGateUSD += recoveryAddUSD
+
+	log.Printf(
+		"TRACE recovery.entry debt=%.4f add=%.4f targetNetUSD=%.4f",
+		t.RecoveryDebtUSD,
+		recoveryAddUSD,
+		entryProfitGateUSD,
+	)
 
 	//Applying confidence multiplier to scalp, that of equity comes later
 	if !(equityTriggerSell || equityTriggerBuy) {

@@ -246,18 +246,18 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 
 	d.Signal = finalSignalFromAILogic(d.Raw, logicOpinion)
 
-log.Printf(
-	"[KPI] logic regime=%s mult=%.2f baseEPS=%.2f regimeEPS=%.2f effEPS=%.2f ai=%s logic=%s final=%s pUp=%.5f",
-	t.MarketRegime,
-	regimeMult,
-	baseEPS,
-	regimeEPS,
-	eps,
-	d.Raw,
-	logicOpinion,
-	d.Signal,
-	d.PUp,
-)
+	log.Printf(
+		"[KPI] logic regime=%s mult=%.2f baseEPS=%.2f regimeEPS=%.2f effEPS=%.2f ai=%s logic=%s final=%s pUp=%.5f",
+		t.MarketRegime,
+		regimeMult,
+		baseEPS,
+		regimeEPS,
+		eps,
+		d.Raw,
+		logicOpinion,
+		d.Signal,
+		d.PUp,
+	)
 
 	d.LogicOpinion = logicOpinion
 	d.LogicEPS = eps
@@ -639,5 +639,62 @@ func (t *Trader) afterStepStateUpdate(wallNow time.Time, res StepResult) {
 
 	if t.RecentHigh > 0 {
 		t.PreviousRecentHigh = t.RecentHigh
+	}
+}
+
+func (t *Trader) recoveryTargetAddUSD() float64 {
+	if t.RecoveryDebtUSD <= 0 {
+		return 0
+	}
+
+	pct := t.cfg.RecoveryTargetPct
+	if pct <= 0 {
+		pct = 0.25
+	}
+
+	maxAdd := t.cfg.RecoveryMaxAddUSD
+	if maxAdd <= 0 {
+		maxAdd = 0.50
+	}
+
+	add := t.RecoveryDebtUSD * pct
+	if add > maxAdd {
+		add = maxAdd
+	}
+	if add < 0 {
+		add = 0
+	}
+	return add
+}
+
+func (t *Trader) applyRecoveryDebtFromExit(pnl float64) {
+	if pnl < 0 {
+		old := t.RecoveryDebtUSD
+		t.RecoveryDebtUSD += math.Abs(pnl)
+
+		log.Printf(
+			"TRACE recovery.loss pnl=%.4f debt_before=%.4f debt_after=%.4f",
+			pnl,
+			old,
+			t.RecoveryDebtUSD,
+		)
+		return
+	}
+
+	if pnl > 0 && t.RecoveryDebtUSD > 0 {
+		old := t.RecoveryDebtUSD
+		recovered := math.Min(pnl, t.RecoveryDebtUSD)
+		t.RecoveryDebtUSD -= recovered
+		if t.RecoveryDebtUSD < 0 {
+			t.RecoveryDebtUSD = 0
+		}
+
+		log.Printf(
+			"TRACE recovery.profit pnl=%.4f recovered=%.4f debt_before=%.4f debt_after=%.4f",
+			pnl,
+			recovered,
+			old,
+			t.RecoveryDebtUSD,
+		)
 	}
 }
