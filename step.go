@@ -1483,7 +1483,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-105",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-106",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1866,8 +1866,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// latched replaces baseline after hard latch
 				if t.latchedGateBuy > 0 {
 					oldLatch := t.latchedGateBuy
-					//Latch override
-					t.latchedGateBuy = math.Min(last-latchBufferPrice, t.latchedGateBuy)
+					if t.MarketRegime != RegimeUp {
+						//Latch override
+						t.latchedGateBuy = math.Min(last-latchBufferPrice, t.latchedGateBuy)
+					}
 					if t.latchedGateBuy != oldLatch {
 						log.Printf("TRACE pyramid.latch_clamp.buy old=%.8f last=%.8f new=%.8f", oldLatch, last, t.latchedGateBuy)
 					}
@@ -1927,7 +1929,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// latched replaces baseline
 				if t.latchedGateSell > 0 {
 					oldLatch := t.latchedGateSell
-					t.latchedGateSell = math.Max(last+latchBufferPrice, t.latchedGateSell)
+					if t.MarketRegime != RegimeDown {
+						t.latchedGateSell = math.Max(last+latchBufferPrice, t.latchedGateSell)
+					}
 					if t.latchedGateSell != oldLatch {
 						log.Printf("TRACE pyramid.latch_clamp.sell old=%.8f last=%.8f new=%.8f", oldLatch, last, t.latchedGateSell)
 					}

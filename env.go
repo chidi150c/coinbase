@@ -203,9 +203,8 @@ func loadBotEnv() {
 		"BINANCE_USE_TESTNET":    {}, // ignored unless you opt-in
 		"BINANCE_FEE_RATE_PCT":   {}, // per-exchange fee override for binance
 
-		"RECOVERY_TARGET_PCT":   {},
-		"RECOVERY_MAX_ADD_USD":   {},
-
+		"RECOVERY_TARGET_PCT":  {},
+		"RECOVERY_MAX_ADD_USD": {},
 	}
 
 	s := bufio.NewScanner(f)
