@@ -1483,7 +1483,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-109",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-110",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1597,7 +1597,21 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 	}
 
-	log.Printf("[DEBUG] EQUITY Trading: equityUSD=%.2f lastAddEquity=%.2f sellEquityMultiplier=%.6f(trigger if above: %.2f) lastAddEquity=%.2f buyEquityMultiplier=%.6f(trigger if below: %.2f) ", t.equityUSD, t.lastAddEquity, t.equityUSD/t.lastAddEquity, t.cfg.SellEquityTriggerMult, t.lastAddEquity, t.equityUSD/t.lastAddEquity, t.cfg.BuyEquityTriggerMult)
+	buyTriggerEquity := 0.0
+	sellTriggerEquity := 0.0
+
+	if t.lastAddEquity > 0 {
+		buyTriggerEquity = t.lastAddEquity * t.cfg.BuyEquityTriggerMult
+		sellTriggerEquity = t.lastAddEquity * t.cfg.SellEquityTriggerMult
+	}
+
+	log.Printf(
+		"[DEBUG] EQUITY Trading: equityUSD=%.2f baseline=%.2f BUY trigger at<=%.2f SELL trigger at>=%.2f",
+		t.equityUSD,
+		t.lastAddEquity,
+		buyTriggerEquity,
+		sellTriggerEquity,
+	)
 
 	// Long-only veto for SELL when flat; unchanged behavior.
 	if d.Signal == Sell && t.cfg.LongOnly {
@@ -3182,17 +3196,15 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			t.SpareSellUSD = 0
 		}
 	}
-	
-	// --- NEW: capture equity snapshots at add (side-specific) ---
-	if side == SideSell {
-		old := t.lastAddEquity
-		t.lastAddEquity = t.equityUSD
-		log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquity)
-	} else {
-		old := t.lastAddEquity
-		t.lastAddEquity = t.equityUSD
-		log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquity)
-	}
+
+	old := t.lastAddEquity
+	t.lastAddEquity = t.equityUSD
+	log.Printf(
+		"TRACE equity.baseline.set side=%s old=%.2f new=%.2f",
+		side,
+		old,
+		t.lastAddEquity,
+	)
 
 	// Assign/designate runner logic
 	// --- CHANGED: Do NOT auto-assign runner for first/non-equity lots; instead,

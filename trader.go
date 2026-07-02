@@ -1241,7 +1241,7 @@ func (t *Trader) snapshotStateLocked() BotState {
 		PreviousAIRaw:   t.previousAIRaw,
 		LatchedGateSell: t.latchedGateSell,
 
-		LastAddEquity:  t.lastAddEquity,
+		LastAddEquity: t.lastAddEquity,
 
 		// Persist equity stages
 		EquityStageBuy:  t.equityStageBuy,
