@@ -113,8 +113,7 @@ type BotState struct {
 	LatchedGateSell float64
 
 	// --- NEW: equity-at-last-add snapshots (SELL persisted; legacy fallback supported) ---
-	LastAddEquitySell float64
-	LastAddEquityBuy  float64
+	LastAddEquity float64
 
 	// --- NEW: persist equity trigger staging indices per side ---
 	EquityStageBuy  int
@@ -232,9 +231,7 @@ type Trader struct {
 	BuyGateTouchedAt   time.Time
 
 	// --- NEW: equity-at-last-add snapshots for equity strategy trading ---
-	lastAddEquitySell float64 // replaces legacy lastAddEquity (SELL path)
-	lastAddEquityBuy  float64 // BUY-side dip trigger baseline (not persisted)
-
+	lastAddEquity float64
 	// --- NEW: equity trigger staging indices per side (0..3 for 25/50/75/100) ---
 	equityStageBuy  int
 	equityStageSell int
@@ -786,7 +783,7 @@ func (t *Trader) consolidateRunners(book *SideBook, px float64) {
 	}
 
 	// NOTE:
-	// - we did NOT touch t.lastAddEquityBuy / t.lastAddEquitySell / t.equityStage*
+	// - we did NOT touch t.lastAddEquity / t.equityStage*
 	// - only per-lot fields on this side's book were rewritten
 }
 
@@ -1244,9 +1241,7 @@ func (t *Trader) snapshotStateLocked() BotState {
 		PreviousAIRaw:   t.previousAIRaw,
 		LatchedGateSell: t.latchedGateSell,
 
-		// Persist SELL equity baseline; keep legacy field for older state compatibility.
-		LastAddEquitySell: t.lastAddEquitySell,
-		LastAddEquityBuy:  t.lastAddEquityBuy,
+		LastAddEquity:  t.lastAddEquity,
 
 		// Persist equity stages
 		EquityStageBuy:  t.equityStageBuy,
@@ -1379,8 +1374,7 @@ func (t *Trader) loadState() error {
 	t.latchedGateBuy = st.LatchedGateBuy
 	t.previousAIRaw = st.PreviousAIRaw
 	t.latchedGateSell = st.LatchedGateSell
-	t.lastAddEquitySell = st.LastAddEquitySell
-	t.lastAddEquityBuy = st.LastAddEquityBuy
+	t.lastAddEquity = st.LastAddEquity
 	t.lastExits = st.Exits
 
 	// Restore equity stages

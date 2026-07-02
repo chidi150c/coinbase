@@ -286,7 +286,7 @@ BK="$(ls -t ${STATE}.bak.* 2>/dev/null | head -n1)"
 echo "Restoring from: $BK"
 
 # 4) Quick sanity on backup (lots present? keys look right?)
-jq -r '.EquityUSD, .LastAddEquitySell, .LastAddEquityBuy' "$BK"
+jq -r '.EquityUSD, .LastAddEquity, ' "$BK"
 jq -r '((.BookBuy.lots // [])|length) as $b | ((.BookSell.lots // [])|length) as $s | "BookBuy.lots=\($b)  BookSell.lots=\($s)"' "$BK"
 
 # 5) Snapshot the CURRENT (bad) file before overwrite
@@ -296,7 +296,7 @@ sudo cp -a "$STATE" "${STATE}.bad.$(date +%Y%m%d%H%M%S)"
 sudo install -m 0644 -o 65532 -g 65532 "$BK" "$STATE"
 
 # 7) Verify restored values
-jq -r '.EquityUSD, .LastAddEquitySell, .LastAddEquityBuy' "$STATE"
+jq -r '.EquityUSD, .LastAddEquity, .LastAddEquity' "$STATE"
 jq -r '((.BookBuy.lots // [])|length) as $b | ((.BookSell.lots // [])|length) as $s | "BookBuy.lots=\($b)  BookSell.lots=\($s)"' "$STATE"
 
 # 8) If everything looks correct, start the service again
@@ -450,7 +450,7 @@ Make sure BK is set
 [[ -n "$BK" && -r "$BK" ]] || { echo "Backup not found or unreadable: $BK"; exit 1; } echo "Restoring from: $BK"
 
 # 4) Quick sanity on backup (lots present? keys look right?)
-jq -r '.EquityUSD, .LastAddEquitySell, .LastAddEquityBuy' "$BK" jq -r '((.BookBuy.lots // [])|length) as $b | ((.BookSell.lots // [])|length) as $s | "BookBuy.lots=($b) BookSell.lots=($s)"' "$BK"
+jq -r '.EquityUSD, .LastAddEquity, .LastAddEquity' "$BK" jq -r '((.BookBuy.lots // [])|length) as $b | ((.BookSell.lots // [])|length) as $s | "BookBuy.lots=($b) BookSell.lots=($s)"' "$BK"
 
 # 5) Snapshot the CURRENT (bad) file before overwrite
 sudo cp -a "$STATE" "${STATE}.bad.$(date +%Y%m%d%H%M%S)"
@@ -459,7 +459,7 @@ sudo cp -a "$STATE" "${STATE}.bad.$(date +%Y%m%d%H%M%S)"
 sudo install -m 0644 -o 65532 -g 65532 "$BK" "$STATE"
 
 # 7) Verify restored values
-jq -r '.EquityUSD, .LastAddEquitySell, .LastAddEquityBuy' "$STATE" jq -r '((.BookBuy.lots // [])|length) as $b | ((.BookSell.lots // [])|length) as $s | "BookBuy.lots=($b) BookSell.lots=($s)"' "$STATE"
+jq -r '.EquityUSD, .LastAddEquity, .LastAddEquity' "$STATE" jq -r '((.BookBuy.lots // [])|length) as $b | ((.BookSell.lots // [])|length) as $s | "BookBuy.lots=($b) BookSell.lots=($s)"' "$STATE"
 
 # 8) If everything looks correct, start the service again
 docker compose start bot

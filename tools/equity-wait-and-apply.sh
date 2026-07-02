@@ -5,7 +5,7 @@
 #   Take an investment fund amount and service (coinbase|binance|hitbtc), then:
 #     1) Poll the bot state file every second until EquityUSD increases by ~<amount> (±tolerance).
 #     2) Stop the docker compose service.
-#     3) Increase LastAddEquitySell AND LastAddEquityBuy by <amount> in the state file (with a backup).
+#     3) Increase LastAddEquity AND LastAddEquity by <amount> in the state file (with a backup).
 #     4) Show updated values and ask to restart the service.
 #
 # Quick usage:
@@ -16,7 +16,7 @@
 #   equity-wait-and-apply.sh <amount> <coinbase|binance|hitbtc> [state_file] [--tolerance 1.0] [--timeout 0]
 #
 # Notes:
-#   - Uses JSON keys with proper case: EquityUSD, LastAddEquitySell, LastAddEquityBuy.
+#   - Uses JSON keys with proper case: EquityUSD, LastAddEquity, LastAddEquity.
 #   - Default tolerance is ±1.0; default timeout is 0 (no timeout).
 #   - Auto-elevates to root so it can stop services and edit files under /opt/coinbase/state/.
 #   - Minimal edits from baseline:
@@ -58,7 +58,7 @@ usage() {
 Usage: $0 <amount> <coinbase|binance|hitbtc> [state_file] [--tolerance 1.0] [--timeout 0]
 
 Waits until EquityUSD increases by approximately <amount> (±tolerance),
-then stops the service, increases LastAddEquitySell and LastAddEquityBuy by <amount>, and prompts to restart.
+then stops the service, increases LastAddEquity and LastAddEquity by <amount>, and prompts to restart.
 
 Examples:
   $0 200 coinbase
@@ -178,22 +178,21 @@ pushd "$COMPOSE_DIR" >/dev/null
 $COMPOSE_BIN stop "$COMPOSE_SVC"
 popd >/dev/null
 
-# --- Apply LastAddEquitySell += AMOUNT and LastAddEquityBuy += AMOUNT ---
-echo "Updating LastAddEquitySell and LastAddEquityBuy by +${AMOUNT} in ${STATE_FILE}"
+# --- Apply LastAddEquity += AMOUNT and LastAddEquity += AMOUNT ---
+echo "Updating LastAddEquity and LastAddEquity by +${AMOUNT} in ${STATE_FILE}"
 cp -a "$STATE_FILE" "${STATE_FILE}.bak.$(date +%Y%m%d%H%M%S)"
 
 edit_json_inplace "$STATE_FILE" \
-  ".LastAddEquitySell = ((.LastAddEquitySell // 0) + (${AMOUNT}|tonumber)) |
-   .LastAddEquityBuy  = ((.LastAddEquityBuy  // 0) + (${AMOUNT}|tonumber))"
+  ".LastAddEquity = ((.LastAddEquity // 0) + (${AMOUNT}|tonumber))"
 
 NEW_EQ="$(read_json_key "$STATE_FILE" "EquityUSD" || true)"
-NEW_LAES="$(read_json_key "$STATE_FILE" "LastAddEquitySell" || true)"
-NEW_LAEB="$(read_json_key "$STATE_FILE" "LastAddEquityBuy"  || true)"
+NEW_LAES="$(read_json_key "$STATE_FILE" "LastAddEquity" || true)"
+NEW_LAEB="$(read_json_key "$STATE_FILE" "LastAddEquity"  || true)"
 
 echo "Updated values:"
 echo "  EquityUSD:           ${NEW_EQ}"
-echo "  LastAddEquitySell:   ${NEW_LAES}"
-echo "  LastAddEquityBuy:    ${NEW_LAEB}"
+echo "  LastAddEquity:   ${NEW_LAES}"
+echo "  LastAddEquity:    ${NEW_LAEB}"
 
 # Re-check lots after edit; abort restart if non-zero -> zero drop detected.
 POST_BUY_LOTS="$(lots_count "$STATE_FILE" "BookBuy")"

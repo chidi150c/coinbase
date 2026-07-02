@@ -578,10 +578,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				t.winLowBuy = priceToUse
 				t.latchedGateBuy = 0
 
-				old := t.lastAddEquityBuy
-				t.lastAddEquityBuy = t.equityUSD
+				old := t.lastAddEquity
+				t.lastAddEquity = t.equityUSD
 				log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f",
-					side, old, t.lastAddEquityBuy)
+					side, old, t.lastAddEquity)
 
 				msg := fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
 					side, quoteSpent, newLot.Take, entryFee, newLot.Reason, "async postonly filled")
@@ -798,10 +798,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				t.winHighSell = priceToUse
 				t.latchedGateSell = 0
 
-				old := t.lastAddEquitySell
-				t.lastAddEquitySell = t.equityUSD
+				old := t.lastAddEquity
+				t.lastAddEquity = t.equityUSD
 				log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f",
-					side, old, t.lastAddEquitySell)
+					side, old, t.lastAddEquity)
 
 				msg := fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
 					side, quoteSpent, newLot.Take, entryFee, newLot.Reason, "async postonly filled")
@@ -1483,7 +1483,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-108",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-109",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1564,7 +1564,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// --- NEW (minimal): equity strategy trigger detection (SELL runner add of entire spare base)
 	equityTriggerSell := false
 	var equitySpareBase float64
-	if t.lastAddEquitySell > 0 && t.equityUSD >= t.lastAddEquitySell*t.cfg.SellEquityTriggerMult && d.Signal == Sell {
+	if t.lastAddEquity > 0 && t.equityUSD >= t.lastAddEquity*t.cfg.SellEquityTriggerMult && d.Signal == Sell {
 		// Only proceed if not long-only; respect existing guard
 		if t.cfg.LongOnly {
 			t.mu.Unlock()
@@ -1585,7 +1585,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// --- NEW (minimal): BUY equity-trigger flag ---(Buy runner of entire spare quote on dip)
 	equityTriggerBuy := false
 	var equitySpareQuote float64
-	if t.lastAddEquityBuy > 0 && t.equityUSD <= t.lastAddEquityBuy*t.cfg.BuyEquityTriggerMult && d.Signal == Buy {
+	if t.lastAddEquity > 0 && t.equityUSD <= t.lastAddEquity*t.cfg.BuyEquityTriggerMult && d.Signal == Buy {
 		if spare < 0 {
 			spare = 0
 		}
@@ -1597,7 +1597,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 	}
 
-	log.Printf("[DEBUG] EQUITY Trading: equityUSD=%.2f lastAddEquitySell=%.2f sellEquityMultiplier=%.6f(trigger if above: %.2f) lastAddEquityBuy=%.2f buyEquityMultiplier=%.6f(trigger if below: %.2f) ", t.equityUSD, t.lastAddEquitySell, t.equityUSD/t.lastAddEquitySell, t.cfg.SellEquityTriggerMult, t.lastAddEquityBuy, t.equityUSD/t.lastAddEquityBuy, t.cfg.BuyEquityTriggerMult)
+	log.Printf("[DEBUG] EQUITY Trading: equityUSD=%.2f lastAddEquity=%.2f sellEquityMultiplier=%.6f(trigger if above: %.2f) lastAddEquity=%.2f buyEquityMultiplier=%.6f(trigger if below: %.2f) ", t.equityUSD, t.lastAddEquity, t.equityUSD/t.lastAddEquity, t.cfg.SellEquityTriggerMult, t.lastAddEquity, t.equityUSD/t.lastAddEquity, t.cfg.BuyEquityTriggerMult)
 
 	// Long-only veto for SELL when flat; unchanged behavior.
 	if d.Signal == Sell && t.cfg.LongOnly {
@@ -2417,20 +2417,20 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	if equityTriggerSell && side == SideSell && equitySpareBase > 0 {
 		gatesReason = fmt.Sprintf(
-			"equityTrading=true|equityUSD=%.2f|lastAddEquitySell=%.2f|sellEquityMultiplier=%.6f|sellEquityTriggerMult=%.2f|equitySpareBase=%.8f|confidenceMult=%.2f",
+			"equityTrading=true|equityUSD=%.2f|lastAddEquity=%.2f|sellEquityMultiplier=%.6f|sellEquityTriggerMult=%.2f|equitySpareBase=%.8f|confidenceMult=%.2f",
 			t.equityUSD,
-			t.lastAddEquitySell,
-			t.equityUSD/t.lastAddEquitySell,
+			t.lastAddEquity,
+			t.equityUSD/t.lastAddEquity,
 			t.cfg.SellEquityTriggerMult,
 			equitySpareBase,
 			confMult,
 		)
 	} else if equityTriggerBuy && side == SideBuy && equitySpareQuote > 0 {
 		gatesReason = fmt.Sprintf(
-			"equityTrading=true|equityUSD=%.2f|lastAddEquityBuy=%.2f|buyEquityMultiplier=%.6f|buyEquityTriggerMult=%.2f|equitySpareQuote=%.2f|confidenceMult=%.2f",
+			"equityTrading=true|equityUSD=%.2f|lastAddEquity=%.2f|buyEquityMultiplier=%.6f|buyEquityTriggerMult=%.2f|equitySpareQuote=%.2f|confidenceMult=%.2f",
 			t.equityUSD,
-			t.lastAddEquityBuy,
-			t.equityUSD/t.lastAddEquityBuy,
+			t.lastAddEquity,
+			t.equityUSD/t.lastAddEquity,
 			t.cfg.BuyEquityTriggerMult,
 			equitySpareQuote,
 			confMult,
@@ -3185,13 +3185,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	
 	// --- NEW: capture equity snapshots at add (side-specific) ---
 	if side == SideSell {
-		old := t.lastAddEquitySell
-		t.lastAddEquitySell = t.equityUSD
-		log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquitySell)
+		old := t.lastAddEquity
+		t.lastAddEquity = t.equityUSD
+		log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquity)
 	} else {
-		old := t.lastAddEquityBuy
-		t.lastAddEquityBuy = t.equityUSD
-		log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquityBuy)
+		old := t.lastAddEquity
+		t.lastAddEquity = t.equityUSD
+		log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f", side, old, t.lastAddEquity)
 	}
 
 	// Assign/designate runner logic
