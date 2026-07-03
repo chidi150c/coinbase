@@ -918,6 +918,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		t.mu.Unlock()
 		return StepResult{Msg: "HOLD pending SELL cancel requested: signal changed", Raw: d.Raw, Signal: d.Signal}, nil
 	}
+
+	if msg, done, err := t.maybeCloseDustBasket(ctx, SideBuy, price); done || err != nil {
+		t.mu.Unlock()
+		return StepResult{Msg: msg, Raw: d.Raw, Signal: d.Signal}, err
+	}
+
+	if msg, done, err := t.maybeCloseDustBasket(ctx, SideSell, price); done || err != nil {
+		t.mu.Unlock()
+		return StepResult{Msg: msg, Raw: d.Raw, Signal: d.Signal}, err
+	}
 	// --------------------------------------------------------------------------------------------------------
 	// EXIT path: fee-aware per-lot exit management.
 	//
@@ -1485,7 +1495,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-111",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-112",
 		totalLots,
 		d.Raw,
 		d.Signal,

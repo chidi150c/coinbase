@@ -2615,3 +2615,163 @@ func (t *Trader) applyPendingExitResult(ctx context.Context, candles []Candle, l
 
 	log.Printf("TRACE pending_exit.applied order_id=%s entry_id=%s msg=%s", orderID, p.EntryOrderID, msg)
 }
+
+func (t *Trader) maybeCloseDustBasket(ctx context.Context, side OrderSide, livePrice float64) (string, bool, error) {
+	if livePrice <= 0 {
+		return "", false, nil
+	}
+
+	minNotional := t.cfg.MinNotional
+	if minNotional <= 0 {
+		minNotional = t.cfg.OrderMinUSD
+	}
+
+	var dust []*Position
+	if side == SideBuy {
+		dust = t.dustBuyLots
+	} else {
+		dust = t.dustSellLots
+	}
+
+	if len(dust) == 0 {
+		return "", false, nil
+	}
+
+	totalBase := 0.0
+	totalOpenNotional := 0.0
+	totalEntryFee := 0.0
+	var entryIDs []string
+
+	for _, lot := range dust {
+		if lot == nil || lot.SizeBase <= 0 {
+			continue
+		}
+		totalBase += lot.SizeBase
+		totalOpenNotional += lot.OpenPrice * lot.SizeBase
+		totalEntryFee += lot.EntryFee
+		if strings.TrimSpace(lot.EntryOrderID) != "" {
+			entryIDs = append(entryIDs, lot.EntryOrderID)
+		}
+	}
+
+	baseRequested := floorToStep(totalBase, t.cfg.BaseStep)
+	if baseRequested <= 0 {
+		return "", false, nil
+	}
+
+	notional := baseRequested * livePrice
+	if notional < minNotional {
+		return "", false, nil
+	}
+
+	closeSide := SideSell
+	if side == SideSell {
+		closeSide = SideBuy
+	}
+
+	exitTime := time.Now().UTC()
+
+	t.mu.Unlock()
+
+	var placed *PlacedOrder
+	var err error
+
+	if !t.cfg.DryRun {
+		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, notional)
+		if err != nil {
+			t.mu.Lock()
+			return "", false, err
+		}
+	}
+
+	t.mu.Lock()
+
+	priceExec := livePrice
+	baseFilled := baseRequested
+	exitOrderID := ""
+
+	if placed != nil {
+		if placed.Price > 0 {
+			priceExec = placed.Price
+		}
+		if placed.BaseSize > 0 {
+			baseFilled = placed.BaseSize
+		}
+		exitOrderID = placed.ID
+	}
+
+	exitFee := baseFilled * priceExec * (t.cfg.FeeRatePct / 100.0)
+	if placed != nil && placed.CommissionUSD > 0 {
+		exitFee = placed.CommissionUSD
+	}
+
+	weightedOpen := 0.0
+	if totalBase > 0 {
+		weightedOpen = totalOpenNotional / totalBase
+	}
+
+	gross := 0.0
+	for _, lot := range dust {
+		if lot == nil || lot.SizeBase <= 0 {
+			continue
+		}
+		if side == SideBuy {
+			gross += (priceExec - lot.OpenPrice) * lot.SizeBase
+		} else {
+			gross += (lot.OpenPrice - priceExec) * lot.SizeBase
+		}
+	}
+
+	pl := gross - totalEntryFee - exitFee
+
+	t.dailyPnL += pl
+	t.equityUSD += pl
+
+	rec := ExitRecord{
+		Time:            exitTime,
+		Side:            side,
+		OpenPrice:       weightedOpen,
+		ClosePrice:      priceExec,
+		SizeBase:        baseFilled,
+		OpenNotionalUSD: totalOpenNotional,
+		EntryFeeUSD:     totalEntryFee,
+		ExitFeeUSD:      exitFee,
+		PNLUSD:          pl,
+		Reason:          "dust_basket_cleanup",
+		ExitMode:        ExitModeDustBasket,
+		WasRunner:       false,
+		EntryOrderID:    "basket:" + strings.Join(entryIDs, ","),
+		ExitOrderID:     exitOrderID,
+	}
+
+	t.lastExits = append(t.lastExits, rec)
+
+	capN := t.cfg.ExitHistorySize
+	if capN <= 0 {
+		capN = 8
+	}
+	archiveAndPruneExits(t.exitsArchivePath(), &t.lastExits, capN)
+
+	if side == SideBuy {
+		t.dustBuyLots = nil
+	} else {
+		t.dustSellLots = nil
+	}
+
+	msg := fmt.Sprintf(
+		"DUST-BASKET-EXIT %s side=%s closeSide=%s base=%.8f open=%.2f close=%.2f pnl=%.4f notional=%.2f",
+		exitTime.Format(time.RFC3339),
+		side,
+		closeSide,
+		baseFilled,
+		weightedOpen,
+		priceExec,
+		pl,
+		notional,
+	)
+
+	log.Printf("TRACE dust.basket.close %s", msg)
+
+	_ = t.saveStateNoLock()
+	return msg, true, nil
+}
