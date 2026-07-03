@@ -870,19 +870,19 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		minNotional = t.cfg.OrderMinUSD
 	}
 
-	// One-time dust consolidation right after startup (uses current price snapshot)
-	if !t.didConsolidateStartup {
-		// We already hold t.mu here
-		t.consolidateDust(t.book(SideBuy), price, minNotional)
-		t.consolidateDust(t.book(SideSell), price, minNotional)
-		t.archiveOrphanDust(t.book(SideBuy), price, minNotional)
-		t.archiveOrphanDust(t.book(SideSell), price, minNotional)
-		if err := t.saveStateNoLock(); err != nil {
-			log.Printf("[WARN] saveState (startup consolidate): %v", err)
-		}
-		t.didConsolidateStartup = true
-		log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
-	}
+	// // One-time dust consolidation right after startup (uses current price snapshot)
+	// if !t.didConsolidateStartup {
+	// 	// We already hold t.mu here
+	// 	t.consolidateDust(t.book(SideBuy), price, minNotional)
+	// 	t.consolidateDust(t.book(SideSell), price, minNotional)
+	// 	t.archiveOrphanDust(t.book(SideBuy), price, minNotional)
+	// 	t.archiveOrphanDust(t.book(SideSell), price, minNotional)
+	// 	if err := t.saveStateNoLock(); err != nil {
+	// 		log.Printf("[WARN] saveState (startup consolidate): %v", err)
+	// 	}
+	// 	t.didConsolidateStartup = true
+	// 	log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
+	// }
 
 	//AI-LOGIC
 	d := t.decide(signalHistory)
@@ -1496,7 +1496,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-113",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-114",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1848,6 +1848,26 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		// Use side-aware latest entry for adverse gate anchoring
 		last := t.latestEntryBySide(side)
 
+		if side == SideBuy {
+			last := t.latestEntryBySide(side)
+			if last <= 0 {
+				if t.RecentLow > 0 {
+					last = t.RecentLow
+				} else {
+					last = price
+				}
+			}
+		}
+		if side == SideSell {
+			if last <= 0 {
+				if t.RecentHigh > 0 {
+					last = t.RecentHigh
+				} else {
+					last = price
+				}
+			}
+		}
+
 		// Convert stop-loss USD risk into a price distance and use 20% as a
 		// latch buffer. Keeps BUY latches below recent entries and SELL latches
 		// above recent entries, preventing immediate re-adds near the last fill.
@@ -1937,9 +1957,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					if elapsedMin < 2.0*tFloorMin && t.RecentHigh > 0 {
 						oldGate := gatePrice
 						gatePrice = math.Min(gatePrice, t.RecentHigh)
-						if gatePrice <= 0.0 {
-							gatePrice = t.RecentHigh
-						}
 						if gatePrice != oldGate {
 							log.Printf("[DEBUG] SOFT GATE SELL: elapsedMin=%.1f tFloorMin=%.2f old_gate=%.2f recentHigh=%.2f soft_gate=%.2f winHigh=%.2f price=%.2f",
 								elapsedMin, tFloorMin, oldGate, t.RecentHigh, gatePrice, t.winHighSell, price)
