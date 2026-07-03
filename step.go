@@ -550,6 +550,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				// Clean up any dust created by partial fills/refund service.
 				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
+				t.archiveOrphanDust(book, priceToUse, t.cfg.MinNotional)
 				t.didConsolidateStartup = false
 
 				// Deduct quote actually kept as open BUY exposure.
@@ -773,6 +774,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				book.Lots = append(book.Lots, newLot)
 
 				t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
+				t.archiveOrphanDust(book, priceToUse, t.cfg.MinNotional)
 				t.didConsolidateStartup = false
 
 				t.SpareSellUSD -= quoteSpent
@@ -1483,7 +1485,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-110",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-111",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1654,6 +1656,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			// then the generic dust consolidation (unchanged)
 			t.consolidateDust(t.book(SideBuy), price, minNotional)
 			t.consolidateDust(t.book(SideSell), price, minNotional)
+			t.archiveOrphanDust(t.book(SideBuy), price, minNotional)
+			t.archiveOrphanDust(t.book(SideSell), price, minNotional)
 
 			if err := t.saveStateNoLock(); err != nil {
 				log.Printf("[WARN] saveState (startup consolidate): %v", err)
@@ -1922,7 +1926,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					if elapsedMin < 2.0*tFloorMin && t.RecentHigh > 0 {
 						oldGate := gatePrice
 						gatePrice = math.Min(gatePrice, t.RecentHigh)
-
+						if gatePrice <= 0.0 {
+							gatePrice = t.RecentHigh
+						}
 						if gatePrice != oldGate {
 							log.Printf("[DEBUG] SOFT GATE SELL: elapsedMin=%.1f tFloorMin=%.2f old_gate=%.2f recentHigh=%.2f soft_gate=%.2f winHigh=%.2f price=%.2f",
 								elapsedMin, tFloorMin, oldGate, t.RecentHigh, gatePrice, t.winHighSell, price)
@@ -3177,6 +3183,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	book.Lots = append(book.Lots, newLot)
 	t.consolidateDust(book, priceToUse, minNotional)
+	t.archiveOrphanDust(book, priceToUse, minNotional)
 	t.didConsolidateStartup = false
 	// Use wall clock for lastAdd to drive spacing/decay even if candle time is zero.
 	if side == SideBuy {
@@ -3384,4 +3391,46 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 		}
 		i++
 	}
+}
+func (t *Trader) archiveOrphanDust(book *SideBook, px float64, minNotional float64) {
+	if book == nil || len(book.Lots) != 1 || px <= 0 || minNotional <= 0 {
+		return
+	}
+
+	lot := book.Lots[0]
+	if lot == nil || lot.SizeBase*px >= minNotional {
+		return
+	}
+
+	side := lot.Side
+	wallNow := time.Now().UTC()
+
+	if side == SideBuy {
+		t.dustBuyLots = append(t.dustBuyLots, lot)
+		t.lastAddBuy = wallNow
+		t.winLowBuy = 0
+		t.latchedGateBuy = 0
+		t.equityStageBuy = 0
+	} else if side == SideSell {
+		t.dustSellLots = append(t.dustSellLots, lot)
+		t.lastAddSell = wallNow
+		t.winHighSell = 0
+		t.latchedGateSell = 0
+		t.equityStageSell = 0
+	} else {
+		return
+	}
+
+	book.Lots = nil
+	book.RunnerIDs = nil
+
+	log.Printf(
+		"TRACE dust.archive side=%s open=%.8f base=%.8f notional=%.4f minNotional=%.2f lastAddReset=%s",
+		side,
+		lot.OpenPrice,
+		lot.SizeBase,
+		lot.SizeBase*px,
+		minNotional,
+		wallNow.Format(time.RFC3339),
+	)
 }

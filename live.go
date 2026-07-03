@@ -491,48 +491,6 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 					trader.mu.Unlock()
 				}
 
-				// -----------------------------------------------------------------
-				// Refresh rolling recent extremes used for stale pyramid latch
-				// rebase logic.
-				//
-				// Why here:
-				// - Computed once per tick (cheap O(window))
-				// - Avoids recomputing inside step() hot path
-				// - Uses freshly synced candle history
-				// - Available for next-tick latch maintenance
-				//
-				// Window:
-				// Last 4 hours of candles.
-				// BUY side uses RecentLow.
-				// SELL side uses RecentHigh.
-				// -----------------------------------------------------------------
-				trader.RecentHigh = highestHigh(signalHistory, 12*time.Hour)
-				trader.RecentLow = lowestLow(signalHistory, 12*time.Hour)
-
-				trader.updateMarketRegimeFromRecentExtremes(time.Now().UTC())
-
-				buyLots := 0
-				sellLots := 0
-
-				for range trader.book(SideBuy).Lots {
-					buyLots++
-				}
-				for range trader.book(SideSell).Lots {
-					sellLots++
-				}
-
-				log.Printf(
-					"TRACE recent.window high=%.2f low=%.2f latchedBuy=%.2f latchedSell=%.2f winLowBuy=%.2f winHighSell=%.2f buyLots=%d sellLots=%d",
-					trader.RecentHigh,
-					trader.RecentLow,
-					trader.latchedGateBuy,
-					trader.latchedGateSell,
-					trader.winLowBuy,
-					trader.winHighSell,
-					buyLots,
-					sellLots,
-				)
-
 				//-------------------------------------------------------------
 				// Per-tick price updates (bridge or broker)
 				//---------------------------------------------------
@@ -581,6 +539,28 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				}
 
 				trader.afterStepStateUpdate(time.Now().UTC(), res)
+
+				// -----------------------------------------------------------------
+				// Refresh rolling recent extremes used for stale pyramid latch
+				// rebase logic.
+				//
+				// Why here:
+				// - Computed once per tick (cheap O(window))
+				// - Avoids recomputing inside step() hot path
+				// - Uses freshly synced candle history
+				// - Available for next-tick latch maintenance
+				//
+				// Window:
+				// Last 4 hours of candles.
+				// BUY side uses RecentLow.
+				// SELL side uses RecentHigh.
+				// -----------------------------------------------------------------
+				trader.updateMarketRegimeFromRecentExtremes(signalHistory, time.Now().UTC())
+
+				// Add a periodic check:
+				// Sum the notional of dustBuyLots.
+				// Sum the notional of dustSellLots.
+				// If either side reaches MIN_NOTIONAL, submit one basket cleanup order.
 
 				if res.Msg != "" {
 					// Print EXIT / PAPER lines in tick mode too
@@ -650,127 +630,10 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 			}
 		}
 	} else {
-		// Candle-driven loop
-		ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				log.Println("shutdown")
-				return
-			case <-ticker.C:
-				//fetch candles for execHistory
-				latestSlice, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.GateTF, 1)
-				if err != nil || len(latestSlice) == 0 {
-					log.Printf("poll err: %v", err)
-					continue
-				}
-				latest := latestSlice[0]
-				if len(execHistory) == 0 || latest.Time.After(execHistory[len(execHistory)-1].Time) {
-					execHistory = append(execHistory, latest)
-				} else {
-					execHistory[len(execHistory)-1] = latest
-				}
-				if len(execHistory) > trader.cfg.MaxHistoryCandles {
-					execHistory = execHistory[len(execHistory)-trader.cfg.MaxHistoryCandles:]
-				}
-
-				if sigSlice, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, signalGateTF, 1); err == nil && len(sigSlice) > 0 {
-					sigLatest := sigSlice[len(sigSlice)-1]
-					if sigLatest.Time.IsZero() {
-						sigLatest.Time = time.Now().UTC()
-					}
-					if len(signalHistory) == 0 || sigLatest.Time.After(signalHistory[len(signalHistory)-1].Time) {
-						signalHistory = append(signalHistory, sigLatest)
-					} else {
-						signalHistory[len(signalHistory)-1] = sigLatest
-					}
-					if len(signalHistory) > trader.cfg.MaxHistoryCandles {
-						signalHistory = signalHistory[len(signalHistory)-trader.cfg.MaxHistoryCandles:]
-					}
-					log.Printf("[SIGNAL_SYNC] tf=%s gateTF=%s latest=%s signal_last=%s len=%d", signalTF, signalGateTF, sigLatest.Time, signalHistory[len(signalHistory)-1].Time, len(signalHistory))
-				} else if err != nil {
-					log.Fatalf("[SIGNAL_SYNC] signal candle update failed tf=%s gateTF=%s error=%v", signalTF, signalGateTF, err)
-				}
-
-				// TODO: remove TRACE
-				log.Printf("TRACE execHistory readiness len=%d need=%d signal_len=%d", len(execHistory), trader.cfg.MaxHistoryCandles, len(signalHistory))
-
-				prevLastFit := trader.lastFit
-
-				lastRefit, model = maybeWalkForwardRefit(trader.cfg, model, signalHistory, lastRefit)
-
-				if lastRefit != nil && lastRefit.After(prevLastFit) && model != nil {
-					trader.mu.Lock()
-					trader.model = model
-					trader.lastFit = *lastRefit
-					if err := trader.saveStateNoLock(); err != nil {
-						log.Printf("[WARN] saveState after walk-forward refit: %v", err)
-					} else {
-						log.Printf("[MODEL_STATE] saved lastFit=%s feat_dim=%d weights=%d",
-							trader.lastFit.Format(time.RFC3339),
-							trader.model.FeatDim,
-							len(trader.model.W),
-						)
-					}
-					trader.mu.Unlock()
-				}
-
-				res, err := trader.step(ctx, execHistory, signalHistory, execHistory[len(execHistory)-1].Close)
-				if err != nil {
-					log.Printf("step err: %v", err)
-					continue
-				}
-
-				trader.afterStepStateUpdate(time.Now().UTC(), res)
-
-				log.Printf("%s", res.Msg)
-
-				// Live equity refresh (bridge or broker)
-				if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun {
-					ctxEq, cancelEq := context.WithTimeout(ctx, 5*time.Second)
-					var bal map[string]float64
-					if trader.cfg.BridgeURL != "" {
-						bal, err = fetchBridgeAccounts(ctxEq, trader.cfg.BridgeURL)
-						if err != nil && errors.Is(err, errBridgeAccountsNotFound) {
-							log.Printf("TRACE EQUITY fallback: bridge /accounts 404 -> broker")
-							bal, err = fetchBrokerBalances(ctxEq, trader, trader.cfg.ProductID)
-						}
-					} else {
-						bal, err = fetchBrokerBalances(ctxEq, trader, trader.cfg.ProductID)
-					}
-					if err == nil {
-						base, quote := splitProductID(trader.cfg.ProductID)
-						eq := computeLiveEquity(bal, base, quote, latest.Close)
-						if eq > 0 {
-							if !eqReady {
-								log.Printf("[EQUITY] live balances received; rebased equity to %.2f", eq)
-							}
-							trader.SetEquityUSD(eq)
-							eqReady = true
-						} else if !eqReady {
-							// TRACE: break down balances and price to see why eq<=0
-							lb := bal[strings.ToUpper(base)]
-							lq := bal[strings.ToUpper(quote)]
-							lp := execHistory[len(execHistory)-1].Close // or latest.Close in candle loop
-							log.Printf("TRACE equity_breakdown path=%s base=%s quote=%s bal_base=%.8f bal_quote=%.8f lastPrice=%.8f eq=%.8f",
-								func() string {
-									if trader.cfg.BridgeURL != "" {
-										return "bridge|fallback"
-									}
-									return "broker"
-								}(),
-								base, quote, lb, lq, lp, eq)
-							log.Printf("[EQUITY] waiting for accounts (eq<=0)")
-						}
-
-					} else if !eqReady {
-						log.Printf("[EQUITY] waiting for accounts (error: %v)", err)
-					}
-					cancelEq()
-				}
-			}
-		}
+		log.Fatalf(
+			"candle-driven mode is no longer supported (USE_TICK_PRICE=%v); enable USE_TICK_PRICE=true",
+			useTick,
+		)
 	}
 }
 

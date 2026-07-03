@@ -44,6 +44,7 @@ type ExitMode string
 const (
 	ExitModeRunnerTrailing ExitMode = "RunnerTrailing"
 	ExitModeScalpFixedTP   ExitMode = "ScalpFixedTP"
+	ExitModeDustBasket     ExitMode = "DustBasket"
 )
 
 type Position struct {
@@ -137,6 +138,8 @@ type BotState struct {
 	RecentHighBreakAt  time.Time    `json:"recent_high_break_at,omitempty"`
 	RegimeMultiplier   float64
 	RecoveryDebtUSD    float64
+	DustBuyLots        []*Position
+	DustSellLots       []*Position
 }
 
 // --- NEW (Phase 1): pending async maker-first open support ---
@@ -279,6 +282,8 @@ type Trader struct {
 	RecentHighBreakAt time.Time
 	RegimeMultiplier  float64
 	RecoveryDebtUSD   float64
+	dustBuyLots       []*Position
+	dustSellLots      []*Position
 }
 
 func NewTrader(cfg Config, broker Broker) *Trader {
@@ -1039,19 +1044,42 @@ func exitCSVRow(e ExitRecord) []string {
 
 func decisionFlatReason(d Decision) string {
 	parts := []string{
-		// AI / model summary
+		// AI/model decision
 		fmt.Sprintf("pUp=%.5f", d.PUp),
-		fmt.Sprintf("confidence=%.2f", d.Confidence),
+		// Threshold context
 		fmt.Sprintf("buyTh=%.5f", d.BuyThreshold),
 		fmt.Sprintf("sellTh=%.5f", d.SellThreshold),
 
-		// Decision summary
+		fmt.Sprintf("regime=%s", d.MarketRegime),
+		fmt.Sprintf("regimeMult=%.2f", d.RegimeMult),
+		fmt.Sprintf("confidence=%.2f", d.Confidence),
+		fmt.Sprintf("logicEPS=%.5f", d.LogicEPS),
+
+		// MACD decision evidence
+		fmt.Sprintf("logic_macd_line=%.5f", d.LogicMACDLine),
+		fmt.Sprintf("logic_macd_turn=%.5f", d.LogicMACDTurn),
+		fmt.Sprintf("logic_macd_hist=%.5f", d.LogicMACDHist),
+		fmt.Sprintf("logic_macd_dhist=%.5f", d.LogicMACDDHist),
+		fmt.Sprintf("logic_macd_dsmooth=%.5f", d.LogicMACDDSmooth),
+		fmt.Sprintf("logic_macd_strong_positive=%t", d.LogicMACDStrongPositive),
+		fmt.Sprintf("logic_macd_strong_negative=%t", d.LogicMACDStrongNegative),
+		fmt.Sprintf("logic_macd_momentum_down=%t", d.LogicMACDMomentumDown),
+		fmt.Sprintf("logic_macd_momentum_up=%t", d.LogicMACDMomentumUp),
+
+		// EMA/pattern evidence
+		fmt.Sprintf("logic_ema_spread=%.6f", d.LogicEMASpread),
+		fmt.Sprintf("logic_ema2050=%.6f", d.LogicEMA2050),
+		fmt.Sprintf("logic_pattern_high_peak=%t", d.LogicPatternHighPeak),
+		fmt.Sprintf("logic_pattern_low_bottom=%t", d.LogicPatternLowBottom),
+		fmt.Sprintf("logic_pattern_price_down_up=%t", d.LogicPatternPriceDownUp),
+		fmt.Sprintf("logic_pattern_price_up_down=%t", d.LogicPatternPriceUpDown),
+		fmt.Sprintf("logic_pattern_buy=%t", d.LogicPatternBuy),
+		fmt.Sprintf("logic_pattern_sell=%t", d.LogicPatternSell),
+
+		// Decision flow
 		fmt.Sprintf("aiRaw=%s", d.Raw),
 		fmt.Sprintf("logicOpinion=%s", d.LogicOpinion),
 		fmt.Sprintf("final=%s", d.Signal),
-
-		// Logic gate
-		fmt.Sprintf("logicEPS=%.5f", d.LogicEPS),
 	}
 
 	// Exit-only fields
@@ -1067,31 +1095,6 @@ func decisionFlatReason(d Decision) string {
 	if strings.TrimSpace(d.ExitClass) != "" {
 		parts = append(parts, fmt.Sprintf("exitClass=%s", strings.TrimSpace(d.ExitClass)))
 	}
-
-	// Logic MACD
-	parts = append(parts,
-		fmt.Sprintf("logic_macd_line=%.5f", d.LogicMACDLine),
-		fmt.Sprintf("logic_macd_turn=%.5f", d.LogicMACDTurn),
-		fmt.Sprintf("logic_macd_hist=%.5f", d.LogicMACDHist),
-		fmt.Sprintf("logic_macd_dhist=%.5f", d.LogicMACDDHist),
-		fmt.Sprintf("logic_macd_dsmooth=%.5f", d.LogicMACDDSmooth),
-		fmt.Sprintf("logic_macd_strong_positive=%t", d.LogicMACDStrongPositive),
-		fmt.Sprintf("logic_macd_strong_negative=%t", d.LogicMACDStrongNegative),
-		fmt.Sprintf("logic_macd_momentum_down=%t", d.LogicMACDMomentumDown),
-		fmt.Sprintf("logic_macd_momentum_up=%t", d.LogicMACDMomentumUp),
-
-		// Logic EMA
-		fmt.Sprintf("logic_ema_spread=%.6f", d.LogicEMASpread),
-		fmt.Sprintf("logic_ema2050=%.6f", d.LogicEMA2050),
-
-		// Logic pattern
-		fmt.Sprintf("logic_pattern_high_peak=%t", d.LogicPatternHighPeak),
-		fmt.Sprintf("logic_pattern_low_bottom=%t", d.LogicPatternLowBottom),
-		fmt.Sprintf("logic_pattern_price_down_up=%t", d.LogicPatternPriceDownUp),
-		fmt.Sprintf("logic_pattern_price_up_down=%t", d.LogicPatternPriceUpDown),
-		fmt.Sprintf("logic_pattern_buy=%t", d.LogicPatternBuy),
-		fmt.Sprintf("logic_pattern_sell=%t", d.LogicPatternSell),
-	)
 
 	return strings.Join(parts, "|")
 }
@@ -1264,6 +1267,8 @@ func (t *Trader) snapshotStateLocked() BotState {
 		RecentHighBreakAt:  t.RecentHighBreakAt,
 		RegimeMultiplier:   t.RegimeMultiplier,
 		RecoveryDebtUSD:    t.RecoveryDebtUSD,
+		DustBuyLots:        append([]*Position(nil), t.dustBuyLots...),
+		DustSellLots:       append([]*Position(nil), t.dustSellLots...),
 	}
 }
 
@@ -1376,6 +1381,9 @@ func (t *Trader) loadState() error {
 	t.latchedGateSell = st.LatchedGateSell
 	t.lastAddEquity = st.LastAddEquity
 	t.lastExits = st.Exits
+
+	t.dustBuyLots = append([]*Position(nil), st.DustBuyLots...)
+	t.dustSellLots = append([]*Position(nil), st.DustSellLots...)
 
 	// Restore equity stages
 	t.equityStageBuy = st.EquityStageBuy
@@ -2086,6 +2094,7 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 		lot.OpenNotionalUSD = lot.SizeBase * lot.OpenPrice
 		if priceExec > 0 && minNotional > 0 {
 			t.consolidateDust(book, priceExec, minNotional)
+			t.archiveOrphanDust(book, priceExec, minNotional)
 		}
 
 		msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)", exitTime.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, entryPortion+exitFee)
@@ -2114,6 +2123,7 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 
 	if priceExec > 0 && minNotional > 0 {
 		t.consolidateDust(book, priceExec, minNotional)
+		t.archiveOrphanDust(book, priceExec, minNotional)
 	}
 
 	if wasNewest {

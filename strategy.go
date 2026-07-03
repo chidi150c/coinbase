@@ -107,6 +107,10 @@ type Decision struct {
 	StopLossLimitUSD float64
 	ExitNetPNLUSD    float64
 	LogicEPS         float64
+	LogicBaseEPS     float64
+	LogicRegimeEPS   float64
+	MarketRegime     MarketRegime
+	RegimeMult       float64
 }
 
 // SignalToSide converts the intent into a broker side.
@@ -246,19 +250,6 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 
 	d.Signal = finalSignalFromAILogic(d.Raw, logicOpinion)
 
-	log.Printf(
-		"[KPI] logic regime=%s mult=%.2f baseEPS=%.2f regimeEPS=%.2f effEPS=%.2f ai=%s logic=%s final=%s pUp=%.5f",
-		t.MarketRegime,
-		regimeMult,
-		baseEPS,
-		regimeEPS,
-		eps,
-		d.Raw,
-		logicOpinion,
-		d.Signal,
-		d.PUp,
-	)
-
 	d.LogicOpinion = logicOpinion
 	d.LogicEPS = eps
 
@@ -281,6 +272,8 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 
 	d.LogicEMASpread = snap.EMASpreadPct
 	d.LogicEMA2050 = snap.EMA2050Spread
+	d.MarketRegime = t.MarketRegime
+	d.RegimeMult = regimeMult
 
 	return d
 }
@@ -483,12 +476,17 @@ func highestHigh(candles []Candle, lookback time.Duration) float64 {
 	return highest
 }
 
-func (t *Trader) updateMarketRegimeFromRecentExtremes(wallNow time.Time) {
+func (t *Trader) updateMarketRegimeFromRecentExtremes(candles []Candle, wallNow time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	const (
 		startMult = 2.0
 		stepMult  = 0.25
 		maxMult   = 3.0
 	)
+
+	t.RecentHigh = highestHigh(candles, 12*time.Hour)
+	t.RecentLow = lowestLow(candles, 12*time.Hour)
 
 	freshLow :=
 		t.PreviousRecentLow > 0 &&
@@ -592,37 +590,90 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(wallNow time.Time) {
 		t.RecentHighBreakAt = wallNow
 	}
 
+	changed := false
+
 	switch t.MarketRegime {
 	case RegimeNormal:
 		if freshLow {
 			setRegime(RegimeDown, startMult, "fresh_12h_low_from_normal")
-			return
-		}
-		if freshHigh {
+			changed = true
+		} else if freshHigh {
 			setRegime(RegimeUp, startMult, "fresh_12h_high_from_normal")
-			return
+			changed = true
 		}
 
 	case RegimeDown:
 		if freshLow {
 			extendRegime(RegimeDown, "fresh_12h_low_extend_down")
-			return
-		}
-		if expiredByTime && freshHigh {
+			changed = true
+		} else if expiredByTime && freshHigh {
 			toNormal("expired_and_fresh_12h_high")
-			return
+			changed = true
 		}
 
 	case RegimeUp:
 		if freshHigh {
 			extendRegime(RegimeUp, "fresh_12h_high_extend_up")
-			return
-		}
-		if expiredByTime && freshLow {
+			changed = true
+		} else if expiredByTime && freshLow {
 			toNormal("expired_and_fresh_12h_low")
-			return
+			changed = true
 		}
 	}
+
+	_ = changed
+
+	buyLots := len(t.book(SideBuy).Lots)
+	sellLots := len(t.book(SideSell).Lots)
+
+	elapsedBuyHr := 0.0
+	elapsedSellHr := 0.0
+
+	if !t.lastAddBuy.IsZero() {
+		elapsedBuyHr = wallNow.Sub(t.lastAddBuy).Hours()
+	}
+	if !t.lastAddSell.IsZero() {
+		elapsedSellHr = wallNow.Sub(t.lastAddSell).Hours()
+	}
+
+	untilHr := 0.0
+	if !t.RegimeUntil.IsZero() {
+		untilHr = t.RegimeUntil.Sub(wallNow).Hours()
+	}
+
+	lowAgeHr := 0.0
+	highAgeHr := 0.0
+	if !t.RecentLowBreakAt.IsZero() {
+		lowAgeHr = wallNow.Sub(t.RecentLowBreakAt).Hours()
+	}
+	if !t.RecentHighBreakAt.IsZero() {
+		highAgeHr = wallNow.Sub(t.RecentHighBreakAt).Hours()
+	}
+
+	log.Printf(
+		"TRACE recent.window regime=%s mult=%.2f untilHr=%.2f freshHigh=%t freshLow=%t high=%.2f prevHigh=%.2f low=%.2f prevLow=%.2f highAgeHr=%.2f lowAgeHr=%.2f latchedBuy=%.2f latchedSell=%.2f winLowBuy=%.2f winHighSell=%.2f elapsedBuyHr=%.2f elapsedSellHr=%.2f buyLots=%d sellLots=%d dustBuy=%d dustSell=%d",
+		t.MarketRegime,
+		t.RegimeMultiplier,
+		untilHr,
+		freshHigh,
+		freshLow,
+		t.RecentHigh,
+		t.PreviousRecentHigh,
+		t.RecentLow,
+		t.PreviousRecentLow,
+		highAgeHr,
+		lowAgeHr,
+		t.latchedGateBuy,
+		t.latchedGateSell,
+		t.winLowBuy,
+		t.winHighSell,
+		elapsedBuyHr,
+		elapsedSellHr,
+		buyLots,
+		sellLots,
+		len(t.dustBuyLots),
+		len(t.dustSellLots),
+	)
 }
 
 func (t *Trader) afterStepStateUpdate(wallNow time.Time, res StepResult) {
