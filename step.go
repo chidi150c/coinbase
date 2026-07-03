@@ -870,18 +870,19 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		minNotional = t.cfg.OrderMinUSD
 	}
 
-	// // One-time dust consolidation right after startup (uses current price snapshot)
-	// if !t.didConsolidateStartup {
-	// 	// We already hold t.mu here
-	// 	t.consolidateDust(t.book(SideBuy),  price, minNotional)
-	// 	t.consolidateDust(t.book(SideSell), price, minNotional)
-
-	// 	if err := t.saveStateNoLock(); err != nil {
-	// 		log.Printf("[WARN] saveState (startup consolidate): %v", err)
-	// 	}
-	// 	t.didConsolidateStartup = true
-	// 	log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
-	// }
+	// One-time dust consolidation right after startup (uses current price snapshot)
+	if !t.didConsolidateStartup {
+		// We already hold t.mu here
+		t.consolidateDust(t.book(SideBuy), price, minNotional)
+		t.consolidateDust(t.book(SideSell), price, minNotional)
+		t.archiveOrphanDust(t.book(SideBuy), price, minNotional)
+		t.archiveOrphanDust(t.book(SideSell), price, minNotional)
+		if err := t.saveStateNoLock(); err != nil {
+			log.Printf("[WARN] saveState (startup consolidate): %v", err)
+		}
+		t.didConsolidateStartup = true
+		log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
+	}
 
 	//AI-LOGIC
 	d := t.decide(signalHistory)
@@ -1495,7 +1496,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f Reason=%s LongOnly=%v ver-113",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-113",
 		totalLots,
 		d.Raw,
 		d.Signal,
