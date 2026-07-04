@@ -536,4 +536,13 @@ zgrep -Ei 'fresh_12h_high_from_normal|new=UP|regime\.set.*UP' \
 /opt/coinbase/logs/audit/binance_audit.log* | head -20
 ====================================================================
 
+why not buy filter:
+
+grep 'aiRaw=BUY' /opt/coinbase/logs/audit/binance_audit.log \
+| grep -oE 'pUp=[^|]*|logicEPS=[^|]*|confidence=[^|]*|logic_macd_turn=[^|]*|logic_macd_strong_negative=[^|]*|logic_macd_momentum_up=[^|]*|logic_pattern_buy=[^|]*|logicOpinion=[^|]*|final=[^| ]*' \
+| paste - - - - - - - \
+| tail -50
+
  
+=[^|]*|
+=[^|]*

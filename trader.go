@@ -510,7 +510,7 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 
 	// Determine trailing parameters by ExitMode
 	actUSD := t.cfg.TrailActivateUSDRunner
-	
+
 	if actUSD == 0 {
 		stage := t.equityStageBuy
 		if lot.Side == SideSell {
@@ -524,7 +524,7 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 
 		actUSD = runnerMult * t.cfg.ProfitGateUSD
 	}
-	
+
 	distPct := t.cfg.TrailDistancePctRunner
 	switch lot.ExitMode {
 	case ExitModeRunnerTrailing:
