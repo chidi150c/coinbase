@@ -1,3 +1,7 @@
+# sudo rm /usr/local/bin/why-trade
+# sudo nano /usr/local/bin/why-trade 
+# copy and paste everything below before and do not include WHYTRADE_EOF
+
 #!/usr/bin/env bash
 # why-trade — explain trading decision/gates near a price, timestamp, or order-id
 # Default audit log: /opt/coinbase/logs/audit/binance_audit.log
@@ -30,7 +34,7 @@ Description:
 
 Modes:
   price <PRICE>
-    Finds the TRACE step.start line whose price is closest to PRICE.
+    Finds the [TRACE] step.start line whose price is closest to PRICE.
 
   ts <TIMESTAMP_SUBSTR>
     Finds the first log line matching the timestamp substring, then shows the
@@ -121,7 +125,7 @@ done
 nearest_step_line_by_price() {
   local price="$1" log="$2"
   nl -ba "$log" | awk -v p="$price" '
-    /TRACE step.start/ && match($0,/price=([0-9]+\.[0-9]+)/,m) {
+    /[TRACE] step.start/ && match($0,/price=([0-9]+\.[0-9]+)/,m) {
       px=m[1]+0; d=px-p; if (d<0) d=-d; print d "\t" $1
     }' | sort -n | head -1 | cut -f2
 }
@@ -133,7 +137,7 @@ first_line_matching_ts() {
 
 next_step_line_after() {
   local ln="$1" log="$2"
-  sed -n "$((ln+1)),\$p" "$log" | nl -ba -v $((ln+1)) | awk '/TRACE step.start/ {print $1; exit}'
+  sed -n "$((ln+1)),\$p" "$log" | nl -ba -v $((ln+1)) | awk '/[TRACE] step.start/ {print $1; exit}'
 }
 
 filter_block() {
@@ -142,7 +146,7 @@ filter_block() {
   local PENDING="OPEN-PENDING side=${side}"
   local MFALL="postonly\\.market_fallback\\.blocked side=${side}"
   local PEND_SET="postonly\\.pending\\.set side=${side}"
-  grep -E "TRACE step.start|Decision=|${PENDING}|${MFALL}|${PEND_SET}|\
+  grep -E "[TRACE] step.start|Decision=|${PENDING}|${MFALL}|${PEND_SET}|\
 FUNDS_EXHAUSTED ${side}|${SIDE_LC}\\.gate\\.(pre|block|post)|\
 pyramid\\.(spacing|adverse|block\\.${SIDE_LC})|GATE1 lot cap reached|EQUITY GATE: blocked|^FLAT \\[|HOLD$|order\\.(open|close)|postonly\\."
 }
@@ -200,10 +204,10 @@ print_chunk_around_line() {
 # Ensure our primary file has step markers if we’ll use price/ts modes on it
 ensure_has_steps_or_die() {
   local f="$1"
-  if [[ -f "$f" ]] && grep -q "TRACE step.start" "$f"; then
+  if [[ -f "$f" ]] && grep -q "[TRACE] step.start" "$f"; then
     return 0
   fi
-  echo "No 'TRACE step.start' in $f; try rotated logs or use OID mode." >&2
+  echo "No '[TRACE] step.start' in $f; try rotated logs or use OID mode." >&2
   exit 1
 }
 
@@ -254,7 +258,7 @@ analyze_after_path() {
       print "Path Outcome (+" mins "m)"
       print "-------------------"
     }
-    /TRACE step.start/ {
+    /[TRACE] step.start/ {
       if (match($0,/ts=([^ ]+)/,tm) && match($0,/price=([0-9.]+)/,pm)) {
         ts=tm[1]
         px=pm[1]+0
@@ -364,7 +368,7 @@ case "$MODE" in
     [[ -n "$LN" ]] || { echo "No lines matching '$TS'." >&2; exit 1; }
 
     CHUNK_START="$LN"
-    if ! sed -n "${LN}p" "$LOG" | grep -q "TRACE step.start"; then
+    if ! sed -n "${LN}p" "$LOG" | grep -q "[TRACE] step.start"; then
       NS="$(next_step_line_after "$LN" "$LOG" || true)"
       [[ -n "$NS" ]] && CHUNK_START="$NS"
     fi
@@ -404,9 +408,9 @@ case "$MODE" in
       # Walk backward to nearest preceding step.start as chunk anchor
       local_start=$(( LINE - 2000 )); (( local_start < 1 )) && local_start=1
       if [[ "$FILE" == *.gz ]]; then
-        STEP_LINE="$(zcat "$FILE" | sed -n "${local_start},${LINE}p" | nl -ba -v "$local_start" | awk '/TRACE step.start/ {ln=$1} END{if(ln) print ln}')"
+        STEP_LINE="$(zcat "$FILE" | sed -n "${local_start},${LINE}p" | nl -ba -v "$local_start" | awk '/[TRACE] step.start/ {ln=$1} END{if(ln) print ln}')"
       else
-        STEP_LINE="$(sed -n "${local_start},${LINE}p" "$FILE" | nl -ba -v "$local_start" | awk '/TRACE step.start/ {ln=$1} END{if(ln) print ln}')"
+        STEP_LINE="$(sed -n "${local_start},${LINE}p" "$FILE" | nl -ba -v "$local_start" | awk '/[TRACE] step.start/ {ln=$1} END{if(ln) print ln}')"
       fi
       [[ -z "$STEP_LINE" ]] && STEP_LINE="$LINE"
 
@@ -431,3 +435,9 @@ case "$MODE" in
 
   *) usage; exit 1;;
 esac
+# stop copy here paste save, exit and run the commands below
+WHYTRADE_EOF
+
+sudo chmod 755 /usr/local/bin/why-trade
+sudo chown chidi:chidi /usr/local/bin/why-trade
+bash -n /usr/local/bin/why-trade

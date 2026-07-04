@@ -379,7 +379,7 @@ func (t *Trader) SetEquityUSD(v float64) {
 	if err := t.saveState(); err != nil {
 		log.Printf("[WARN] saveState: %v", err)
 		// TODO: remove TRACE
-		log.Printf("TRACE state.save error=%v", err)
+		log.Printf("[TRACE] state.save error=%v", err)
 	}
 }
 
@@ -418,7 +418,7 @@ func (t *Trader) updateDaily(date time.Time) {
 		if err := t.saveStateNoLock(); err != nil {
 			log.Printf("[WARN] saveState: %v", err)
 			// TODO: remove TRACE
-			log.Printf("TRACE state.save error=%v", err)
+			log.Printf("[TRACE] state.save error=%v", err)
 		}
 	}
 }
@@ -547,7 +547,7 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 			lot.TrailStop = price * (1.0 + distPct/100.0)
 		}
 		// --- breadcrumb ---
-		log.Printf("TRACE trail.activate side=%s activate_usd=%.2f net=%.2f price=%.8f peak=%.8f stop=%.8f",
+		log.Printf("[TRACE] trail.activate side=%s activate_usd=%.2f net=%.2f price=%.8f peak=%.8f stop=%.8f",
 			lot.Side, actUSD, lot.UnrealizedPnLUSD, price, lot.TrailPeak, lot.TrailStop)
 	}
 
@@ -560,12 +560,12 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 				if ts > lot.TrailStop {
 					lot.TrailStop = ts
 					// --- breadcrumb ---
-					log.Printf("TRACE trail.raise lotSide=BUY peak=%.8f stop=%.8f", lot.TrailPeak, lot.TrailStop)
+					log.Printf("[TRACE] trail.raise lotSide=BUY peak=%.8f stop=%.8f", lot.TrailPeak, lot.TrailStop)
 				}
 			}
 			if price <= lot.TrailStop && lot.TrailStop > 0 {
 				// --- breadcrumb ---
-				log.Printf("TRACE trail.trigger lotSide=BUY price=%.8f stop=%.8f", price, lot.TrailStop)
+				log.Printf("[TRACE] trail.trigger lotSide=BUY price=%.8f stop=%.8f", price, lot.TrailStop)
 				return true, lot.TrailStop
 			}
 		} else { // SELL
@@ -573,11 +573,11 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 				lot.TrailPeak = price
 				lot.TrailStop = lot.TrailPeak * (1.0 + distPct/100.0)
 				// --- breadcrumb ---
-				log.Printf("TRACE trail.raise lotSide=SELL trough=%.8f stop=%.8f", lot.TrailPeak, lot.TrailStop)
+				log.Printf("[TRACE] trail.raise lotSide=SELL trough=%.8f stop=%.8f", lot.TrailPeak, lot.TrailStop)
 			}
 			if price >= lot.TrailStop && lot.TrailStop > 0 {
 				// --- breadcrumb ---
-				log.Printf("TRACE trail.trigger lotSide=SELL price=%.8f stop=%.8f", price, lot.TrailStop)
+				log.Printf("[TRACE] trail.trigger lotSide=SELL price=%.8f stop=%.8f", price, lot.TrailStop)
 				return true, lot.TrailStop
 			}
 		}
@@ -1674,7 +1674,7 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 				// 1) Check for fill
 				if ord, gErr := b.GetOrder(pc, productID, orderID); gErr == nil && ord != nil && (ord.BaseSize > 0 || ord.QuoteSpent > 0) {
 					filled = ord
-					log.Printf("TRACE postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
+					log.Printf("[TRACE] postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
 						orderID, filled.Price, filled.BaseSize, filled.QuoteSpent, filled.CommissionUSD)
 					break
 				}
@@ -1744,7 +1744,7 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 							if shouldReprice {
 								_ = b.CancelOrder(pc, productID, orderID)
 								if newID, perr := b.PlaceLimitPostOnly(pc, productID, side, newLimitPx, newBase); perr == nil && strings.TrimSpace(newID) != "" {
-									log.Printf("TRACE postonly.reprice side=%s old_id=%s new_id=%s limit=%.8f baseReq=%.8f",
+									log.Printf("[TRACE] postonly.reprice side=%s old_id=%s new_id=%s limit=%.8f baseReq=%.8f",
 										side, orderID, newID, newLimitPx, newBase)
 									orderID = newID
 									lastLimitPx = newLimitPx
@@ -1787,7 +1787,7 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 			// On timeout or cancellation, cancel any resting order.
 			if filled == nil {
 				_ = b.CancelOrder(pc, productID, orderID)
-				log.Printf("TRACE postonly.timeout order_id=%s", orderID)
+				log.Printf("[TRACE] postonly.timeout order_id=%s", orderID)
 			}
 
 			// Non-blocking completion signal.
@@ -1803,7 +1803,7 @@ func (t *Trader) RehydratePending(ctx context.Context, mode RehydrateMode) {
 			t.apply(func(tt *Trader) {
 				err := tt.saveStateFrom(tt.snapshotStateLocked())
 				if err != nil {
-					log.Fatalf("TRACE Unable to save state after RehydratePending poller finish!!! side=%s Error: %v", side, err)
+					log.Fatalf("[TRACE] Unable to save state after RehydratePending poller finish!!! side=%s Error: %v", side, err)
 				}
 			})
 		}(p, *ch, *pctx)
@@ -1937,7 +1937,7 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 				}
 
 				log.Printf(
-					"TRACE pending_exit.maker_px side=%s entry_id=%s take=%.8f live=%.8f maker_px=%.8f",
+					"[TRACE] pending_exit.maker_px side=%s entry_id=%s take=%.8f live=%.8f maker_px=%.8f",
 					lot.Side,
 					lot.EntryOrderID,
 					lot.Take,
@@ -1959,7 +1959,7 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 			t.mu.Lock()
 
 			if err != nil {
-				log.Printf("TRACE pending_exit.start_failed side=%s entry_id=%s err=%v", lot.Side, lot.EntryOrderID, err)
+				log.Printf("[TRACE] pending_exit.start_failed side=%s entry_id=%s err=%v", lot.Side, lot.EntryOrderID, err)
 				return "", nil
 			}
 
@@ -1969,7 +1969,7 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		var err error
 		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote)
 
-		log.Printf("TRACE order.close request side=%s baseReq=%.8f quoteEst=%.2f priceSnap=%.8f", closeSide, baseRequested, quote, livePrice)
+		log.Printf("[TRACE] order.close request side=%s baseReq=%.8f quoteEst=%.2f priceSnap=%.8f", closeSide, baseRequested, quote, livePrice)
 		log.Printf("[KPI] taker.exit side=%s base=%.8f quote_est=%.2f reason=market_now", closeSide, baseRequested, quote)
 
 		if err != nil {
@@ -1981,7 +1981,7 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		}
 
 		if placed != nil {
-			log.Printf("TRACE order.close placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f", placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
+			log.Printf("[TRACE] order.close placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f", placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
 		}
 	}
 
@@ -2006,7 +2006,7 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		const tol = 1e-9
 		if baseFilled+tol < baseRequested {
 			log.Printf("[WARN] partial fill (exit): requested_base=%.8f filled_base=%.8f (%.2f%%)", baseRequested, baseFilled, 100.0*(baseFilled/baseRequested))
-			log.Printf("TRACE fill.exit partial requested=%.8f filled=%.8f", baseRequested, baseFilled)
+			log.Printf("[TRACE] fill.exit partial requested=%.8f filled=%.8f", baseRequested, baseFilled)
 		}
 	}
 
@@ -2059,7 +2059,7 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 		}
 	}
 
-	log.Printf("TRACE exit.classify side=%s kind=%s reason=%s open=%.8f exec=%.8f baseFilled=%.8f rawPL=%.6f entryFee=%.6f exitFee=%.6f finalPL=%.6f", lot.Side, kind, exitReason, lot.OpenPrice, priceExec, baseFilled, rawPL, entryPortion, exitFee, pl)
+	log.Printf("[TRACE] exit.classify side=%s kind=%s reason=%s open=%.8f exec=%.8f baseFilled=%.8f rawPL=%.6f entryFee=%.6f exitFee=%.6f finalPL=%.6f", lot.Side, kind, exitReason, lot.OpenPrice, priceExec, baseFilled, rawPL, entryPortion, exitFee, pl)
 
 	t.dailyPnL += pl
 	t.equityUSD += pl
@@ -2097,7 +2097,7 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 	t.applyRecoveryDebtFromExit(rec.PNLUSD)
 
 	log.Printf(
-		"TRACE recovery.exit pnl=%.4f debt_after=%.4f",
+		"[TRACE] recovery.exit pnl=%.4f debt_after=%.4f",
 		rec.PNLUSD,
 		t.RecoveryDebtUSD,
 	)
@@ -2258,8 +2258,8 @@ func (t *Trader) startPendingMakerExit(ctx context.Context, lotSide OrderSide, e
 
 	t.pendingExits[oid] = p
 
-	log.Printf("TRACE pending_exit.register exit_id=%s pending=%d", oid, len(t.pendingExits))
-	log.Printf("TRACE pending_exit.start side=%s exit_id=%s entry_id=%s limit=%.8f base=%.8f reason=%s", p.Side, p.OrderID, p.EntryOrderID, p.LimitPx, p.BaseRequested, p.ExitReason)
+	log.Printf("[TRACE] pending_exit.register exit_id=%s pending=%d", oid, len(t.pendingExits))
+	log.Printf("[TRACE] pending_exit.start side=%s exit_id=%s entry_id=%s limit=%.8f base=%.8f reason=%s", p.Side, p.OrderID, p.EntryOrderID, p.LimitPx, p.BaseRequested, p.ExitReason)
 
 	if err := t.saveStateNoLock(); err != nil {
 		log.Printf("[WARN] saveState: %v", err)
@@ -2366,7 +2366,7 @@ func (t *Trader) watchPendingExit(ctx context.Context, p *PendingExit) {
 
 			status := strings.ToUpper(strings.TrimSpace(ord.Status))
 			log.Printf(
-				"TRACE pending_exit.poll.tick side=%s exit_id=%s entry_id=%s status=%s price=%.8f base=%.8f quote=%.2f fee=%.6f sess_base=%.8f sess_quote=%.2f sess_fee=%.6f",
+				"[TRACE] pending_exit.poll.tick side=%s exit_id=%s entry_id=%s status=%s price=%.8f base=%.8f quote=%.2f fee=%.6f sess_base=%.8f sess_quote=%.2f sess_fee=%.6f",
 				p.Side,
 				orderID,
 				p.EntryOrderID,
@@ -2494,7 +2494,7 @@ func (t *Trader) watchPendingExit(ctx context.Context, p *PendingExit) {
 							})
 
 							log.Printf(
-								"TRACE pending_exit.reprice side=%s old_exit_id=%s new_exit_id=%s entry_id=%s limit=%.8f base=%.8f count=%d",
+								"[TRACE] pending_exit.reprice side=%s old_exit_id=%s new_exit_id=%s entry_id=%s limit=%.8f base=%.8f count=%d",
 								p.Side,
 								oldID,
 								newID,
@@ -2521,7 +2521,7 @@ func (t *Trader) watchPendingExit(ctx context.Context, p *PendingExit) {
 	}
 
 	log.Printf(
-		"TRACE pending_exit.timeout_cancel exit_id=%s entry_id=%s sess_base=%.8f sess_quote=%.2f sess_fee=%.6f",
+		"[TRACE] pending_exit.timeout_cancel exit_id=%s entry_id=%s sess_base=%.8f sess_quote=%.2f sess_fee=%.6f",
 		orderID,
 		p.EntryOrderID,
 		sessBase,
@@ -2549,7 +2549,7 @@ func (t *Trader) applyPendingExitResult(ctx context.Context, candles []Candle, l
 
 	p := res.Pending
 	if p == nil {
-		log.Printf("TRACE pending_exit.apply_skip reason=nil_pending order_id=%s", res.OrderID)
+		log.Printf("[TRACE] pending_exit.apply_skip reason=nil_pending order_id=%s", res.OrderID)
 		return
 	}
 
@@ -2572,7 +2572,7 @@ func (t *Trader) applyPendingExitResult(ctx context.Context, candles []Candle, l
 
 	if lot == nil || localIdx < 0 {
 		delete(t.pendingExits, orderID)
-		log.Printf("TRACE pending_exit.apply_skip reason=lot_not_found order_id=%s entry_id=%s", orderID, p.EntryOrderID)
+		log.Printf("[TRACE] pending_exit.apply_skip reason=lot_not_found order_id=%s entry_id=%s", orderID, p.EntryOrderID)
 		_ = t.saveStateNoLock()
 		return
 	}
@@ -2581,7 +2581,7 @@ func (t *Trader) applyPendingExitResult(ctx context.Context, candles []Candle, l
 
 	if !res.Filled || res.Placed == nil {
 		delete(t.pendingExits, orderID)
-		log.Printf("TRACE pending_exit.unfilled order_id=%s entry_id=%s reason=%s", orderID, p.EntryOrderID, p.ExitReason)
+		log.Printf("[TRACE] pending_exit.unfilled order_id=%s entry_id=%s reason=%s", orderID, p.EntryOrderID, p.ExitReason)
 		_ = t.saveStateNoLock()
 		return
 	}
@@ -2600,7 +2600,7 @@ func (t *Trader) applyPendingExitResult(ctx context.Context, candles []Candle, l
 	}
 	if baseRequested <= 0 {
 		delete(t.pendingExits, orderID)
-		log.Printf("TRACE pending_exit.apply_skip reason=bad_base_requested order_id=%s", orderID)
+		log.Printf("[TRACE] pending_exit.apply_skip reason=bad_base_requested order_id=%s", orderID)
 		_ = t.saveStateNoLock()
 		return
 	}
@@ -2621,7 +2621,7 @@ func (t *Trader) applyPendingExitResult(ctx context.Context, candles []Candle, l
 	const tol = 1e-9
 	if baseFilled+tol < baseRequested {
 		log.Printf("[WARN] partial fill (pending exit): requested_base=%.8f filled_base=%.8f (%.2f%%)", baseRequested, baseFilled, 100.0*(baseFilled/baseRequested))
-		log.Printf("TRACE pending_exit.partial order_id=%s requested=%.8f filled=%.8f", orderID, baseRequested, baseFilled)
+		log.Printf("[TRACE] pending_exit.partial order_id=%s requested=%.8f filled=%.8f", orderID, baseRequested, baseFilled)
 	}
 
 	commissionUSD := 0.0
@@ -2633,7 +2633,7 @@ func (t *Trader) applyPendingExitResult(ctx context.Context, candles []Candle, l
 
 	msg, err := t.applyFilledExitLocked(livePrice, priceExec, baseRequested, baseFilled, p.Side, localIdx, p.ExitReason, p.ExitDecision, exitTime, orderID, commissionUSD, minNotional, wasNewest)
 	if err != nil {
-		log.Printf("TRACE pending_exit.apply_error order_id=%s err=%v", orderID, err)
+		log.Printf("[TRACE] pending_exit.apply_error order_id=%s err=%v", orderID, err)
 		_ = t.saveStateNoLock()
 		return
 	}
@@ -2641,7 +2641,7 @@ func (t *Trader) applyPendingExitResult(ctx context.Context, candles []Candle, l
 	delete(t.pendingExits, orderID)
 	_ = t.saveStateNoLock()
 
-	log.Printf("TRACE pending_exit.applied order_id=%s entry_id=%s msg=%s", orderID, p.EntryOrderID, msg)
+	log.Printf("[TRACE] pending_exit.applied order_id=%s entry_id=%s msg=%s", orderID, p.EntryOrderID, msg)
 }
 
 func (t *Trader) maybeCloseDustBasket(ctx context.Context, side OrderSide, livePrice float64) (string, bool, error) {
@@ -2798,7 +2798,7 @@ func (t *Trader) maybeCloseDustBasket(ctx context.Context, side OrderSide, liveP
 		notional,
 	)
 
-	log.Printf("TRACE dust.basket.close %s", msg)
+	log.Printf("[TRACE] dust.basket.close %s", msg)
 
 	_ = t.saveStateNoLock()
 	return msg, true, nil

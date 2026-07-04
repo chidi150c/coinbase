@@ -49,13 +49,13 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 		trader.broker.Name(), trader.cfg.ProductID, trader.cfg.DryRun)
 
 	// Safety banner
-	log.Printf("[SAFETY] LONG_ONLY=%v | ORDER_MIN_USD=%.2f | RISK_PER_TRADE_USD=%.2f | MAX_DAILY_LOSS_PCT=%.2f | TAKE_PROFIT_PCT=%.2f | STOP_LOSS_PCT=%.2f | MAX_HISTORY_CANDLES=%d",
+	log.Printf("[SAFETY] LONG_ONLY=%v | ORDER_MIN_USD=%.2f | RISK_PER_TRADE_USD=%.2f | MAX_DAILY_LOSS_PCT=%.2f | TAKE_PROFIT_PCT=%.2f | STOP_LOSS_PNL_USD=%.2f | MAX_HISTORY_CANDLES=%d",
 		trader.cfg.LongOnly, trader.cfg.OrderMinUSD, trader.cfg.RiskPerTradeUSD,
-		trader.cfg.MaxDailyLossPct, trader.cfg.TakeProfitPct, trader.cfg.StopLossPct, trader.cfg.MaxHistoryCandles)
+		trader.cfg.MaxDailyLossPct, trader.cfg.TakeProfitPct, trader.cfg.StopLossPnLUSD, trader.cfg.MaxHistoryCandles)
 
 	// --- Startup health-gate ---
 	if trader.cfg.BridgeURL != "" {
-		log.Printf("TRACE BOOT bridge_url=%s product=%s gateTF=%s target=%d",
+		log.Printf("[TRACE] BOOT bridge_url=%s product=%s gateTF=%s target=%d",
 			trader.cfg.BridgeURL, trader.cfg.ProductID, trader.cfg.GateTF, func() int {
 				if trader.cfg.MaxHistoryCandles > 0 {
 					return trader.cfg.MaxHistoryCandles
@@ -65,13 +65,13 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 		if !waitBridgeHealthy(trader.cfg.BridgeURL, 90*time.Second) {
 			log.Printf("[BOOT] bridge health not ready after 90s; proceeding with warmup anyway")
 		} else {
-			log.Printf("TRACE BOOT bridge health OK")
+			log.Printf("[TRACE] BOOT bridge health OK")
 		}
 	} else {
 		if !waitBrokerHealthy(ctx, trader, 90*time.Second) {
 			log.Printf("[BOOT] broker health not ready after 90s; proceeding with warmup anyway")
 		} else {
-			log.Printf("TRACE BOOT broker health OK")
+			log.Printf("[TRACE] BOOT broker health OK")
 		}
 	}
 
@@ -132,21 +132,21 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 	// Warmup execHistory candles separately: history remains the execution history (1m/tick)
 	//-------------------------------------------------------------------------------------
 	if trader.cfg.BridgeURL != "" {
-		log.Printf("TRACE WARMUP using bridge paged fetch tries=10 pageLimit=300 target=%d", target)
+		log.Printf("[TRACE] WARMUP using bridge paged fetch tries=10 pageLimit=300 target=%d", target)
 		const tries = 10
 		for i := 0; i < tries && len(execHistory) == 0; i++ {
-			log.Printf("TRACE WARMUP attempt=%d (bridge paged)", i+1)
+			log.Printf("[TRACE] WARMUP attempt=%d (bridge paged)", i+1)
 			if hs, err := fetchHistoryPaged(trader.cfg.BridgeURL, trader.cfg.ProductID, trader.cfg.GateTF, 300, target); err == nil && len(hs) > 0 {
 				execHistory = hs
 				log.Printf("[BOOT] execHistory=%d (paged to %d target)", len(execHistory), target)
 				// TODO: remove TRACE
-				log.Printf("TRACE execHistory readiness len=%d need=%d", len(execHistory), trader.cfg.MaxHistoryCandles)
+				log.Printf("[TRACE] execHistory readiness len=%d need=%d", len(execHistory), trader.cfg.MaxHistoryCandles)
 				break
 			} else if err != nil {
 				log.Printf("[BOOT] paged warmup error: %v", err)
 				time.Sleep(3 * time.Second)
 			} else {
-				log.Printf("TRACE WARMUP bridge paged returned 0 rows (attempt=%d)", i+1)
+				log.Printf("[TRACE] WARMUP bridge paged returned 0 rows (attempt=%d)", i+1)
 				time.Sleep(1 * time.Second)
 			}
 		}
@@ -156,45 +156,45 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 		if limitTry < 200 {
 			limitTry = 200
 		}
-		log.Printf("TRACE WARMUP broker large batch path limitTry=%d product=%s GateTF=%s", limitTry, trader.cfg.ProductID, trader.cfg.GateTF)
+		log.Printf("[TRACE] WARMUP broker large batch path limitTry=%d product=%s GateTF=%s", limitTry, trader.cfg.ProductID, trader.cfg.GateTF)
 		if cs, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.GateTF, limitTry); err == nil && len(cs) > 0 {
 			execHistory = cs
 			log.Printf("[BOOT] execHistory=%d (broker large batch, limit=%d)", len(execHistory), limitTry)
 			// TODO: remove TRACE
-			log.Printf("TRACE execHistory readiness len=%d need=%d", len(execHistory), trader.cfg.MaxHistoryCandles)
+			log.Printf("[TRACE] execHistory readiness len=%d need=%d", len(execHistory), trader.cfg.MaxHistoryCandles)
 		} else if err != nil {
-			log.Printf("TRACE WARMUP broker large batch error: %v", err)
-			log.Printf("TRACE WARMUP broker fallback limit=350")
+			log.Printf("[TRACE] WARMUP broker large batch error: %v", err)
+			log.Printf("[TRACE] WARMUP broker fallback limit=350")
 			if cs2, err2 := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.GateTF, 350); err2 == nil && len(cs2) > 0 {
 				execHistory = cs2
 				log.Printf("[BOOT] execHistory=%d (broker fallback, limit=350)", len(execHistory))
 				// TODO: remove TRACE
-				log.Printf("TRACE execHistory readiness len=%d need=%d", len(execHistory), trader.cfg.MaxHistoryCandles)
+				log.Printf("[TRACE] execHistory readiness len=%d need=%d", len(execHistory), trader.cfg.MaxHistoryCandles)
 			} else {
 				log.Printf("warmup GetRecentCandles error: %v", err)
 				if err2 != nil {
-					log.Printf("TRACE WARMUP broker fallback error: %v", err2)
+					log.Printf("[TRACE] WARMUP broker fallback error: %v", err2)
 				} else {
-					log.Printf("TRACE WARMUP broker fallback returned 0 rows")
+					log.Printf("[TRACE] WARMUP broker fallback returned 0 rows")
 				}
 			}
 		} else {
-			log.Printf("TRACE WARMUP broker large batch returned 0 rows (limitTry=%d)", limitTry)
-			log.Printf("TRACE WARMUP broker fallback limit=350")
+			log.Printf("[TRACE] WARMUP broker large batch returned 0 rows (limitTry=%d)", limitTry)
+			log.Printf("[TRACE] WARMUP broker fallback limit=350")
 			if cs2, err2 := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.GateTF, 350); err2 == nil && len(cs2) > 0 {
 				execHistory = cs2
 				log.Printf("[BOOT] execHistory=%d (broker fallback, limit=350)", len(execHistory))
 				// TODO: remove TRACE
-				log.Printf("TRACE execHistory readiness len=%d need=%d", len(execHistory), trader.cfg.MaxHistoryCandles)
+				log.Printf("[TRACE] execHistory readiness len=%d need=%d", len(execHistory), trader.cfg.MaxHistoryCandles)
 			} else if err2 != nil {
-				log.Printf("TRACE WARMUP broker fallback error: %v", err2)
+				log.Printf("[TRACE] WARMUP broker fallback error: %v", err2)
 			} else {
-				log.Printf("TRACE WARMUP broker fallback returned 0 rows")
+				log.Printf("[TRACE] WARMUP broker fallback returned 0 rows")
 			}
 		}
 	}
 	if len(execHistory) == 0 {
-		log.Printf("TRACE WARMUP giving up: no candles after bridge-paged and broker-large/fallback")
+		log.Printf("[TRACE] WARMUP giving up: no candles after bridge-paged and broker-large/fallback")
 		log.Fatalf("warmup failed: no candles returned")
 	}
 
@@ -202,10 +202,10 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 	// // Warmup signal candles separately: signalHistory is used only for ML direction
 	//-------------------------------------------------------------------------------------
 	if trader.cfg.BridgeURL != "" {
-		log.Printf("TRACE SIGNAL_WARMUP using bridge paged fetch tries=10 pageLimit=300 target=%d tf=%s GateTF=%s", target, signalTF, signalGateTF)
+		log.Printf("[TRACE] SIGNAL_WARMUP using bridge paged fetch tries=10 pageLimit=300 target=%d tf=%s GateTF=%s", target, signalTF, signalGateTF)
 		const tries = 10
 		for i := 0; i < tries && len(signalHistory) == 0; i++ {
-			log.Printf("TRACE SIGNAL_WARMUP attempt=%d (bridge paged)", i+1)
+			log.Printf("[TRACE] SIGNAL_WARMUP attempt=%d (bridge paged)", i+1)
 			if hs, err := fetchHistoryPaged(trader.cfg.BridgeURL, trader.cfg.ProductID, signalGateTF, 300, target); err == nil && len(hs) > 0 {
 				signalHistory = hs
 				log.Printf("[BOOT] signal_history=%d tf=%s GateTF=%s (paged to %d target)", len(signalHistory), signalTF, signalGateTF, target)
@@ -214,7 +214,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				log.Printf("[BOOT] signal paged warmup error: %v", err)
 				time.Sleep(3 * time.Second)
 			} else {
-				log.Printf("TRACE SIGNAL_WARMUP bridge paged returned 0 rows (attempt=%d)", i+1)
+				log.Printf("[TRACE] SIGNAL_WARMUP bridge paged returned 0 rows (attempt=%d)", i+1)
 				time.Sleep(1 * time.Second)
 			}
 		}
@@ -225,26 +225,26 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 		if limitTry < 200 {
 			limitTry = 200
 		}
-		log.Printf("TRACE SIGNAL_WARMUP broker large batch path limitTry=%d product=%s tf=%s GateTF=%s", limitTry, trader.cfg.ProductID, signalTF, signalGateTF)
+		log.Printf("[TRACE] SIGNAL_WARMUP broker large batch path limitTry=%d product=%s tf=%s GateTF=%s", limitTry, trader.cfg.ProductID, signalTF, signalGateTF)
 		if cs, err := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, signalGateTF, limitTry); err == nil && len(cs) > 0 {
 			signalHistory = cs
 			log.Printf("[BOOT] signal_history=%d tf=%s GateTF=%s (broker large batch, limit=%d)", len(signalHistory), signalTF, signalGateTF, limitTry)
 		} else if err != nil {
-			log.Printf("TRACE SIGNAL_WARMUP broker large batch error: %v", err)
-			log.Printf("TRACE SIGNAL_WARMUP broker fallback limit=350")
+			log.Printf("[TRACE] SIGNAL_WARMUP broker large batch error: %v", err)
+			log.Printf("[TRACE] SIGNAL_WARMUP broker fallback limit=350")
 			if cs2, err2 := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, signalGateTF, 350); err2 == nil && len(cs2) > 0 {
 				signalHistory = cs2
 				log.Printf("[BOOT] signal_history=%d tf=%s GateTF=%s (broker fallback, limit=350)", len(signalHistory), signalTF, signalGateTF)
 			} else {
 				log.Printf("signal warmup GetRecentCandles error: %v", err)
 				if err2 != nil {
-					log.Printf("TRACE SIGNAL_WARMUP broker fallback error: %v", err2)
+					log.Printf("[TRACE] SIGNAL_WARMUP broker fallback error: %v", err2)
 				} else {
-					log.Printf("TRACE SIGNAL_WARMUP broker fallback returned 0 rows")
+					log.Printf("[TRACE] SIGNAL_WARMUP broker fallback returned 0 rows")
 				}
 			}
 		} else {
-			log.Printf("TRACE SIGNAL_WARMUP broker large batch returned 0 rows (limitTry=%d)", limitTry)
+			log.Printf("[TRACE] SIGNAL_WARMUP broker large batch returned 0 rows (limitTry=%d)", limitTry)
 		}
 	}
 
@@ -321,7 +321,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 	// --- Tick vs Candle loop selector (bridge optional) ---
 	useTick := trader.cfg.UseTick()
 	// TODO: remove TRACE
-	log.Printf("TRACE selector useTick=%v GateTF=%s tick_interval=%d", useTick, trader.cfg.GateTF, trader.cfg.TickInterval())
+	log.Printf("[TRACE] selector useTick=%v GateTF=%s tick_interval=%d", useTick, trader.cfg.GateTF, trader.cfg.TickInterval())
 	// -------------------------------------------------------------------
 
 	if useTick {
@@ -402,7 +402,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 
 						lastCandleSync = time.Now().UTC()
 						// TODO: remove TRACE
-						log.Printf("TRACE execHistory readiness len=%d need=%d", len(execHistory), trader.cfg.MaxHistoryCandles)
+						log.Printf("[TRACE] execHistory readiness len=%d need=%d", len(execHistory), trader.cfg.MaxHistoryCandles)
 						log.Printf("[SYNC] latest=%s execHistory_last=%s len=%d", latest.Time, execHistory[len(execHistory)-1].Time, len(execHistory))
 					} else if err != nil {
 						log.Fatalf("[SYNC] Candle update failed: error: %v", err)
@@ -505,18 +505,18 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 					stale = false
 				}
 				// TODO: remove TRACE
-				log.Printf("TRACE price_fetch px=%.8f stale=%v err=%v", px, stale, err)
+				log.Printf("[TRACE] price_fetch px=%.8f stale=%v err=%v", px, stale, err)
 
 				// Gate traces (reason why [TICK] block may not run)
 				if err != nil {
 					// TODO: remove TRACE
-					log.Printf("TRACE gate:err err=%v", err)
+					log.Printf("[TRACE] gate:err err=%v", err)
 				} else if stale {
 					// TODO: remove TRACE
-					log.Printf("TRACE gate:stale px=%.8f", px)
+					log.Printf("[TRACE] gate:stale px=%.8f", px)
 				} else if px <= 0 {
 					// TODO: remove TRACE
-					log.Printf("TRACE gate:px<=0 px=%.8f", px)
+					log.Printf("[TRACE] gate:px<=0 px=%.8f", px)
 				}
 
 				if err != nil || stale || px <= 0 {
@@ -575,7 +575,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 						bal, err = fetchBridgeAccounts(ctxEq, trader.cfg.BridgeURL)
 						if err != nil && errors.Is(err, errBridgeAccountsNotFound) {
 							// Fallback to broker if bridge lacks /accounts
-							log.Printf("TRACE EQUITY fallback: bridge /accounts 404 -> broker")
+							log.Printf("[TRACE] EQUITY fallback: bridge /accounts 404 -> broker")
 							bal, err = fetchBrokerBalances(ctxEq, trader, trader.cfg.ProductID)
 						}
 					} else {
@@ -608,7 +608,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 							lb := bal[strings.ToUpper(base)]
 							lq := bal[strings.ToUpper(quote)]
 							lp := execHistory[len(execHistory)-1].Close // or latest.Close in candle loop
-							log.Printf("TRACE equity_breakdown path=%s base=%s quote=%s bal_base=%.8f bal_quote=%.8f lastPrice=%.8f eq=%.8f",
+							log.Printf("[TRACE] equity_breakdown path=%s base=%s quote=%s bal_base=%.8f bal_quote=%.8f lastPrice=%.8f eq=%.8f",
 								func() string {
 									if trader.cfg.BridgeURL != "" {
 										return "bridge|fallback"
@@ -756,8 +756,8 @@ func attemptLiveEquityRebase(ctx context.Context, cfg Config, trader *Trader, la
 	bal, err := fetchBridgeAccounts(ctx, cfg.BridgeURL)
 	if err != nil {
 		if errors.Is(err, errBridgeAccountsNotFound) {
-			log.Printf("TRACE EQUITY fallback: bridge /accounts 404 -> broker") // <-- added
-			return attemptLiveEquityRebaseBroker(ctx, trader, lastPrice)        // <-- added
+			log.Printf("[TRACE] EQUITY fallback: bridge /accounts 404 -> broker") // <-- added
+			return attemptLiveEquityRebaseBroker(ctx, trader, lastPrice)          // <-- added
 		}
 		return false
 	}
@@ -1069,7 +1069,7 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 			}
 
 			log.Printf(
-				"TRACE WARMUP PAGE url=%s (style=%s)",
+				"[TRACE] WARMUP PAGE url=%s (style=%s)",
 				u,
 				map[int]string{
 					candleStyleLegacy:  "legacy",
@@ -1106,7 +1106,7 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 			rows = normalizeCandles(raw)
 
 			log.Printf(
-				"TRACE WARMUP PAGE rows=%d window=[%d,%d] limit=%d (style=%s)",
+				"[TRACE] WARMUP PAGE rows=%d window=[%d,%d] limit=%d (style=%s)",
 				len(rows),
 				start.Unix(),
 				end.Unix(),
@@ -1122,7 +1122,7 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 				setCandleStyle(bridgeURL, try)
 
 				log.Printf(
-					"TRACE WARMUP schema selected=%s",
+					"[TRACE] WARMUP schema selected=%s",
 					map[int]string{
 						candleStyleLegacy:  "legacy",
 						candleStyleBinance: "binance",
@@ -1197,7 +1197,7 @@ func fetchHistoryPaged(bridgeURL, productID, granularity string, pageLimit, want
 	}
 
 	log.Printf(
-		"TRACE WARMUP SUMMARY collected=%d want=%d gateTF=%s",
+		"[TRACE] WARMUP SUMMARY collected=%d want=%d gateTF=%s",
 		len(out),
 		want,
 		granularity,

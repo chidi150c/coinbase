@@ -424,7 +424,7 @@ func (bb *BridgeBroker) GetExchangeFilters(ctx context.Context, product string) 
 	if !forceRemote {
 		if v, ok := fCacheCoinbase[key]; ok && (v.StepSize > 0 || v.TickSize > 0 || v.PriceTick > 0 || v.BaseStep > 0 || v.QuoteStep > 0 || v.MinNotional > 0) {
 			fMuCoinbase.Unlock()
-			log.Printf("TRACE exch.filters source=cache product=%s step=%.10f tick=%.10f price_tick=%.10f base_step=%.10f quote_step=%.10f min_notional=%.10f",
+			log.Printf("[TRACE] exch.filters source=cache product=%s step=%.10f tick=%.10f price_tick=%.10f base_step=%.10f quote_step=%.10f min_notional=%.10f",
 				key, v.StepSize, v.TickSize, v.PriceTick, v.BaseStep, v.QuoteStep, v.MinNotional)
 			return v, nil
 		}
@@ -456,7 +456,7 @@ func (bb *BridgeBroker) GetExchangeFilters(ctx context.Context, product string) 
 			fMuCoinbase.Lock()
 			fCacheCoinbase[key] = f
 			fMuCoinbase.Unlock()
-			log.Printf("TRACE exch.filters source=env product=%s step=%.10f tick=%.10f price_tick=%.10f base_step=%.10f quote_step=%.10f min_notional=%.10f",
+			log.Printf("[TRACE] exch.filters source=env product=%s step=%.10f tick=%.10f price_tick=%.10f base_step=%.10f quote_step=%.10f min_notional=%.10f",
 				key, f.StepSize, f.TickSize, f.PriceTick, f.BaseStep, f.QuoteStep, f.MinNotional)
 			return f, nil
 		}
@@ -516,7 +516,7 @@ func (bb *BridgeBroker) GetExchangeFilters(ctx context.Context, product string) 
 				fMuCoinbase.Lock()
 				fCacheCoinbase[key] = f
 				fMuCoinbase.Unlock()
-				log.Printf("TRACE exch.filters source=bridge-http url=%s product=%s step=%.10f tick=%.10f price_tick=%.10f base_step=%.10f quote_step=%.10f min_notional=%.10f",
+				log.Printf("[TRACE] exch.filters source=bridge-http url=%s product=%s step=%.10f tick=%.10f price_tick=%.10f base_step=%.10f quote_step=%.10f min_notional=%.10f",
 					u, key, f.StepSize, f.TickSize, f.PriceTick, f.BaseStep, f.QuoteStep, f.MinNotional)
 				lastErr = nil
 			} else {

@@ -196,6 +196,8 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 	return base
 }
 
+const trendMult = 0.5
+
 func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	if !t.cfg.UseMACDSlopeGate {
 		return d
@@ -221,7 +223,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		}
 		if d.Raw == Sell {
 			// Trend SELL → easier
-			regimeEPS = baseEPS * 0.5
+			regimeEPS = baseEPS * trendMult
 		}
 
 	case RegimeUp:
@@ -231,7 +233,7 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		}
 		if d.Raw == Buy {
 			// Trend BUY → easier
-			regimeEPS = baseEPS * 0.5
+			regimeEPS = baseEPS * trendMult
 		}
 	}
 
@@ -537,7 +539,7 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(candles []Candle, wallNow 
 		t.RegimeUntil = wallNow.Add(2 * time.Hour)
 
 		log.Printf(
-			"TRACE regime.set old=%s new=%s reason=%s oldMult=%.2f mult=%.2f recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f until=%s",
+			"[TRACE] regime.set old=%s new=%s reason=%s oldMult=%.2f mult=%.2f recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f until=%s",
 			old,
 			t.MarketRegime,
 			reason,
@@ -559,7 +561,7 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(candles []Candle, wallNow 
 		t.RegimeUntil = wallNow.Add(2 * time.Hour)
 
 		log.Printf(
-			"TRACE regime.extend regime=%s reason=%s oldMult=%.2f mult=%.2f recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f until=%s",
+			"[TRACE] regime.extend regime=%s reason=%s oldMult=%.2f mult=%.2f recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f until=%s",
 			t.MarketRegime,
 			reason,
 			oldMult,
@@ -581,7 +583,7 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(candles []Candle, wallNow 
 		t.RegimeUntil = time.Time{}
 
 		log.Printf(
-			"TRACE regime.normal old=%s new=%s reason=%s oldMult=%.2f mult=%.2f recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f",
+			"[TRACE] regime.normal old=%s new=%s reason=%s oldMult=%.2f mult=%.2f recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f",
 			old,
 			t.MarketRegime,
 			reason,
@@ -662,7 +664,7 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(candles []Candle, wallNow 
 	}
 
 	log.Printf(
-		"TRACE recent.window regime=%s mult=%.2f untilHr=%.2f freshHigh=%t freshLow=%t high=%.2f prevHigh=%.2f low=%.2f prevLow=%.2f highAgeHr=%.2f lowAgeHr=%.2f latchedBuy=%.2f latchedSell=%.2f winLowBuy=%.2f winHighSell=%.2f elapsedBuyHr=%.2f elapsedSellHr=%.2f buyLots=%d sellLots=%d dustBuy=%d dustSell=%d",
+		"[TRACE] recent.window regime=%s mult=%.2f untilHr=%.2f freshHigh=%t freshLow=%t high=%.2f prevHigh=%.2f low=%.2f prevLow=%.2f highAgeHr=%.2f lowAgeHr=%.2f latchedBuy=%.2f latchedSell=%.2f winLowBuy=%.2f winHighSell=%.2f elapsedBuyHr=%.2f elapsedSellHr=%.2f buyLots=%d sellLots=%d dustBuy=%d dustSell=%d",
 		t.MarketRegime,
 		t.RegimeMultiplier,
 		untilHr,
@@ -735,7 +737,7 @@ func (t *Trader) applyRecoveryDebtFromExit(pnl float64) {
 		t.RecoveryDebtUSD += math.Abs(pnl)
 
 		log.Printf(
-			"TRACE recovery.loss pnl=%.4f debt_before=%.4f debt_after=%.4f",
+			"[TRACE] recovery.loss pnl=%.4f debt_before=%.4f debt_after=%.4f",
 			pnl,
 			old,
 			t.RecoveryDebtUSD,
@@ -752,7 +754,7 @@ func (t *Trader) applyRecoveryDebtFromExit(pnl float64) {
 		}
 
 		log.Printf(
-			"TRACE recovery.profit pnl=%.4f recovered=%.4f debt_before=%.4f debt_after=%.4f",
+			"[TRACE] recovery.profit pnl=%.4f recovered=%.4f debt_before=%.4f debt_after=%.4f",
 			pnl,
 			recovered,
 			old,

@@ -211,7 +211,7 @@ func (m *LogisticModel) fit(c []Candle, lr float64, epochs int) {
 	}
 
 	if len(feats) == 0 || len(labels) == 0 {
-		log.Printf("TRACE model.train.skip reason=no_dataset")
+		log.Printf("[TRACE] model.train.skip reason=no_dataset")
 		return
 	}
 

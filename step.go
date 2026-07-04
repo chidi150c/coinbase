@@ -137,12 +137,12 @@ func safeSend(ch chan OpenResult, res OpenResult) {
 	select {
 	case ch <- res:
 	default:
-		log.Printf("TRACE fallback.buffer.full: empty the buffer (drop stale) and resending")
+		log.Printf("[TRACE] fallback.buffer.full: empty the buffer (drop stale) and resending")
 		select {
 		case <-ch:
 		default:
 		}
-		log.Printf("TRACE fallback.buffer.emptied: emptied buffer and resending")
+		log.Printf("[TRACE] fallback.buffer.emptied: emptied buffer and resending")
 		ch <- res
 	}
 }
@@ -169,13 +169,13 @@ func (t *Trader) creditRefundService(side OrderSide, refundQuote, refundFee floa
 
 	if side == SideBuy {
 		t.SpareSellUSD += refundNet
-		log.Printf("TRACE refund.sell.service_credited side=%s gross=%.8f fee=%.8f net=%.8f spareSell_after=%.8f",
+		log.Printf("[TRACE] refund.sell.service_credited side=%s gross=%.8f fee=%.8f net=%.8f spareSell_after=%.8f",
 			side, refundQuote, refundFee, refundNet, t.SpareSellUSD)
 		return
 	}
 
 	t.SpareBuyUSD += refundNet
-	log.Printf("TRACE refund.buy.service_credited side=%s gross=%.8f fee=%.8f net=%.8f spareBuy_after=%.8f",
+	log.Printf("[TRACE] refund.buy.service_credited side=%s gross=%.8f fee=%.8f net=%.8f spareBuy_after=%.8f",
 		side, refundQuote, refundFee, refundNet, t.SpareBuyUSD)
 }
 
@@ -331,9 +331,9 @@ func (t *Trader) maybeRepriceOnce(
 	}
 
 	if useBBO {
-		log.Printf("TRACE postonly.reprice.touch side=%s bid=%.8f ask=%.8f new=%.8f last=%.8f", side, bid, ask, newLimitPx, lastLimitPx)
+		log.Printf("[TRACE] postonly.reprice.touch side=%s bid=%.8f ask=%.8f new=%.8f last=%.8f", side, bid, ask, newLimitPx, lastLimitPx)
 	} else {
-		log.Printf("TRACE postonly.reprice.mark side=%s new=%.8f last=%.8f", side, newLimitPx, lastLimitPx)
+		log.Printf("[TRACE] postonly.reprice.mark side=%s new=%.8f last=%.8f", side, newLimitPx, lastLimitPx)
 	}
 
 	// Cancel current and re-place at the new price
@@ -343,7 +343,7 @@ func (t *Trader) maybeRepriceOnce(
 		return orderID, lastLimitPx, repriceCount, false
 	}
 
-	log.Printf("TRACE postonly.reprice side=%s old_id=%s new_id=%s limit=%.8f baseReq=%.8f",
+	log.Printf("[TRACE] postonly.reprice side=%s old_id=%s new_id=%s limit=%.8f baseReq=%.8f",
 		side, orderID, newID, newLimitPx, newBase)
 
 	// Update focus to new order + persist (also appends old ID to History)
@@ -401,7 +401,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	if t.pendingBuyCh != nil {
 		select {
 		case res := <-t.pendingBuyCh:
-			log.Printf("TRACE postonly.drain.recv side=%s order_id=%s filled=%v placed_nil=%v",
+			log.Printf("[TRACE] postonly.drain.recv side=%s order_id=%s filled=%v placed_nil=%v",
 				SideBuy, res.OrderID, res.Filled, res.Placed == nil)
 
 			// Decide whether this async result is safe to apply to state.
@@ -410,7 +410,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			// 2) any historical replaced order ID recorded in PendingOpen.History.
 			accept := false
 			if res.Filled && res.Placed != nil {
-				log.Printf("TRACE postonly.drain.placed side=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f",
+				log.Printf("[TRACE] postonly.drain.placed side=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f",
 					SideBuy, res.OrderID, res.Placed.Price, res.Placed.BaseSize, res.Placed.QuoteSpent, res.Placed.CommissionUSD)
 
 				if t.pendingBuy != nil {
@@ -456,7 +456,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					}
 				}
 
-				log.Printf("TRACE postonly.drain.accept side=%s match_current=%v match_history=%v pending_nil=%v",
+				log.Printf("[TRACE] postonly.drain.accept side=%s match_current=%v match_history=%v pending_nil=%v",
 					SideBuy,
 					t.pendingBuy != nil && res.OrderID == t.pendingBuy.OrderID,
 					matchHistory,
@@ -570,7 +570,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					r.TrailStop = 0
 					t.applyRunnerTargets(r)
 
-					log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f",
+					log.Printf("[TRACE] runner.assign idx=%d side=%s open=%.8f take=%.8f",
 						newIdx, side, r.OpenPrice, r.Take)
 				}
 
@@ -581,7 +581,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				old := t.lastAddEquity
 				t.lastAddEquity = t.equityUSD
-				log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f",
+				log.Printf("[TRACE] equity.baseline.set side=%s old=%.2f new=%.2f",
 					side, old, t.lastAddEquity)
 
 				msg := fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
@@ -601,14 +601,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				if cancelRequested {
 					t.pendingRecheckBuy = false
 					log.Printf(
-						"TRACE postonly.cancel.ack side=%s order_id=%s fallback=false reason=signal_changed",
+						"[TRACE] postonly.cancel.ack side=%s order_id=%s fallback=false reason=signal_changed",
 						SideBuy,
 						res.OrderID,
 					)
 				} else {
 					t.pendingRecheckBuy = true
 					log.Printf(
-						"TRACE postonly.recheck side=%s set=true reason=timeout_or_error order_id=%s",
+						"[TRACE] postonly.recheck side=%s set=true reason=timeout_or_error order_id=%s",
 						SideBuy,
 						res.OrderID,
 					)
@@ -643,12 +643,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	if t.pendingSellCh != nil {
 		select {
 		case res := <-t.pendingSellCh:
-			log.Printf("TRACE postonly.drain.recv side=%s order_id=%s filled=%v placed_nil=%v",
+			log.Printf("[TRACE] postonly.drain.recv side=%s order_id=%s filled=%v placed_nil=%v",
 				SideSell, res.OrderID, res.Filled, res.Placed == nil)
 
 			accept := false
 			if res.Filled && res.Placed != nil {
-				log.Printf("TRACE postonly.drain.placed side=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f",
+				log.Printf("[TRACE] postonly.drain.placed side=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f",
 					SideSell, res.OrderID, res.Placed.Price, res.Placed.BaseSize, res.Placed.QuoteSpent, res.Placed.CommissionUSD)
 
 				if t.pendingSell != nil {
@@ -689,7 +689,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					}
 				}
 
-				log.Printf("TRACE postonly.drain.accept side=%s match_current=%v match_history=%v pending_nil=%v",
+				log.Printf("[TRACE] postonly.drain.accept side=%s match_current=%v match_history=%v pending_nil=%v",
 					SideSell,
 					t.pendingSell != nil && res.OrderID == t.pendingSell.OrderID,
 					matchHistory,
@@ -792,7 +792,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					r.TrailStop = 0
 					t.applyRunnerTargets(r)
 
-					log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f",
+					log.Printf("[TRACE] runner.assign idx=%d side=%s open=%.8f take=%.8f",
 						newIdx, side, r.OpenPrice, r.Take)
 				}
 
@@ -802,7 +802,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				old := t.lastAddEquity
 				t.lastAddEquity = t.equityUSD
-				log.Printf("TRACE equity.baseline.set side=%s old=%.2f new=%.2f",
+				log.Printf("[TRACE] equity.baseline.set side=%s old=%.2f new=%.2f",
 					side, old, t.lastAddEquity)
 
 				msg := fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
@@ -821,14 +821,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				if cancelRequested {
 					t.pendingRecheckSell = false
 					log.Printf(
-						"TRACE postonly.cancel.ack side=%s order_id=%s fallback=false reason=signal_changed",
+						"[TRACE] postonly.cancel.ack side=%s order_id=%s fallback=false reason=signal_changed",
 						SideSell,
 						res.OrderID,
 					)
 				} else {
 					t.pendingRecheckSell = true
 					log.Printf(
-						"TRACE postonly.recheck side=%s set=true reason=timeout_or_error order_id=%s",
+						"[TRACE] postonly.recheck side=%s set=true reason=timeout_or_error order_id=%s",
 						SideSell,
 						res.OrderID,
 					)
@@ -858,7 +858,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// TODO: remove TRACE
 	lsb := len(t.book(SideBuy).Lots)
 	lss := len(t.book(SideSell).Lots)
-	log.Printf("TRACE step.start ts=%s livePrice=%.8f candleClose=%.8f lotsBuy=%d lotsSell=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f recentLow=%.8f recentHigh=%.8f elapsed_Hours_Buy=%.1f elapsed_Hours_Sell=%.1f",
+	log.Printf("[TRACE] step.start ts=%s livePrice=%.8f candleClose=%.8f lotsBuy=%d lotsSell=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f recentLow=%.8f recentHigh=%.8f elapsed_Hours_Buy=%.1f elapsed_Hours_Sell=%.1f",
 		now.Format(time.RFC3339), livePrice, execHistory[len(execHistory)-1].Close, lsb, lss,
 		t.lastAddBuy.Format(time.RFC3339), t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell, t.RecentLow, t.RecentHigh, time.Since(t.lastAddBuy).Hours(), time.Since(t.lastAddSell).Hours())
 
@@ -881,7 +881,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// 		log.Printf("[WARN] saveState (startup consolidate): %v", err)
 	// 	}
 	// 	t.didConsolidateStartup = true
-	// 	log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
+	// 	log.Printf("[TRACE] consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
 	// }
 
 	//AI-LOGIC
@@ -1093,7 +1093,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			minSellDist := t.cfg.MinSellDistance
 			previousAIRaw := t.previousAIRaw
 
-			deepLossMult := 2.0
+			deepLossMult := 1.4
 			strongProfitMult := 1.5
 
 			for i := 0; i < len(book.Lots); {
@@ -1194,9 +1194,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							if !lot.FixedTPWorking || (lot.Side == SideBuy && makerExitPx < lot.Take) || (lot.Side == SideSell && makerExitPx > lot.Take) {
 								lot.Take = makerExitPx
 								lot.FixedTPWorking = true
-								log.Printf("TRACE stop_l1.post side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
+								log.Printf("[TRACE] stop_l1.post side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
 							} else {
-								log.Printf("TRACE stop_l1.repost side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
+								log.Printf("[TRACE] stop_l1.repost side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
 							}
 						}
 						i++
@@ -1244,7 +1244,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					// Hold winner; do not exit yet.
 					if !aiANDlogicExit {
 						log.Printf(
-							"TRACE ai.exit.hold side=%s idx=%d signal=%s net=%.4f",
+							"[TRACE] ai.exit.hold side=%s idx=%d signal=%s net=%.4f",
 							lot.Side,
 							i,
 							d.Signal,
@@ -1266,7 +1266,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					// Opposite AI/logic appeared while profitable.
 					// Allow maker-friendly exit.
 					log.Printf(
-						"TRACE ai.exit.allow side=%s idx=%d signal=%s net=%.4f",
+						"[TRACE] ai.exit.allow side=%s idx=%d signal=%s net=%.4f",
 						lot.Side,
 						i,
 						d.Signal,
@@ -1286,9 +1286,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					if !lot.FixedTPWorking || (lot.Side == SideBuy && makerExitPx < lot.Take) || (lot.Side == SideSell && makerExitPx > lot.Take) {
 						lot.Take = makerExitPx
 						lot.FixedTPWorking = true
-						log.Printf("TRACE tp.post side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
+						log.Printf("[TRACE] tp.post side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
 					} else {
-						log.Printf("TRACE tp.repost side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
+						log.Printf("[TRACE] tp.repost side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
 					}
 				}
 
@@ -1496,7 +1496,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-116",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-117",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1674,7 +1674,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				log.Printf("[WARN] saveState (startup consolidate): %v", err)
 			}
 			t.didConsolidateStartup = true
-			log.Printf("TRACE consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
+			log.Printf("[TRACE] consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
 		}
 		t.mu.Unlock()
 		log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", t.cfg.MaxConcurrentLots)
@@ -1701,7 +1701,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		elapsedHr = time.Since(t.lastAddBuy).Hours()
 		t.lastAddBuy = wallNow
 
-		log.Printf("TRACE pyramid.latch_extend side=BUY recentLow=%.2f prevRecentLow=%.2f elapsedResetAtHr=%.2f",
+		log.Printf("[TRACE] pyramid.latch_extend side=BUY recentLow=%.2f prevRecentLow=%.2f elapsedResetAtHr=%.2f",
 			t.RecentLow, t.PreviousRecentLow, elapsedHr)
 	}
 
@@ -1714,7 +1714,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		elapsedHr = time.Since(t.lastAddSell).Hours()
 		t.lastAddSell = wallNow
 
-		log.Printf("TRACE pyramid.latch_extend side=SELL recentHigh=%.2f prevRecentHigh=%.2f elapsedResetAtHr=%.2f",
+		log.Printf("[TRACE] pyramid.latch_extend side=SELL recentHigh=%.2f prevRecentHigh=%.2f elapsedResetAtHr=%.2f",
 			t.RecentHigh, t.PreviousRecentHigh, elapsedHr)
 	}
 
@@ -1772,7 +1772,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		// 1) Spacing
 		psb := t.cfg.PyramidMinSecondsBetween
 		// TODO: remove TRACE
-		log.Printf("TRACE pyramid.spacing since_last=%.1fs need>=%ds", time.Since(lastAddSide).Seconds(), psb)
+		log.Printf("[TRACE] pyramid.spacing since_last=%.1fs need>=%ds", time.Since(lastAddSide).Seconds(), psb)
 		if time.Since(lastAddSide) < time.Duration(psb)*time.Second {
 			t.mu.Unlock()
 			hrs := time.Since(lastAddSide).Hours()
@@ -1824,7 +1824,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			effPct = decayed * gateMult
 
 			log.Printf(
-				"TRACE pyramid.conf_gate side=%s confidence=%.4f gateMult=%.4f decayedPct=%.4f effPct=%.4f",
+				"[TRACE] pyramid.conf_gate side=%s confidence=%.4f gateMult=%.4f decayedPct=%.4f effPct=%.4f",
 				side, d.Confidence, gateMult, decayed, effPct,
 			)
 		}
@@ -1842,7 +1842,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		tFloorMin := baseTFloorMin * gateMult
 		reasonTFloorHr = tFloorMin / 60.0
 		// TODO: remove TRACE
-		log.Printf("TRACE pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
+		log.Printf("[TRACE] pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
 			side, elapsedMin, basePct, effPct, lambda, floor, tFloorMin)
 
 		// Use side-aware latest entry for adverse gate anchoring
@@ -1874,7 +1874,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		latchBufferPrice := 0.0
 		if t.cfg.RiskPerTradeUSD > 0 && price > 0 {
 			fullDistance := math.Abs(t.cfg.StopLossPnLUSD) * price / t.cfg.RiskPerTradeUSD
-			latchBufferPrice = fullDistance / 3.0
+			latchBufferPrice = fullDistance / 4.5
 		}
 
 		if last > 0 {
@@ -1920,7 +1920,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						t.latchedGateBuy = math.Min(last-latchBufferPrice, t.latchedGateBuy)
 					}
 					if t.latchedGateBuy != oldLatch {
-						log.Printf("TRACE pyramid.latch_clamp.buy old=%.8f last=%.8f new=%.8f", oldLatch, last, t.latchedGateBuy)
+						log.Printf("[TRACE] pyramid.latch_clamp.buy old=%.8f last=%.8f new=%.8f", oldLatch, last, t.latchedGateBuy)
 					}
 					gatePrice = t.latchedGateBuy
 				}
@@ -1938,7 +1938,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					t.mu.Unlock()
 					log.Printf("[DEBUG] pyramid: blocked by last gate (BUY); price=%.2f last_gate<=%.8f latched=%.3f win_low=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f latch_target_Hr>=%.2fHr confidence=%.2f",
 						price, gatePrice, t.latchedGateBuy, t.winLowBuy, effPct, basePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence)
-					log.Printf("TRACE pyramid.block.buy price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateBuy)
+					log.Printf("[TRACE] pyramid.block.buy price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateBuy)
 					return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
 				}
 			} else { // SELL
@@ -1981,7 +1981,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						t.latchedGateSell = math.Max(last+latchBufferPrice, t.latchedGateSell)
 					}
 					if t.latchedGateSell != oldLatch {
-						log.Printf("TRACE pyramid.latch_clamp.sell old=%.8f last=%.8f new=%.8f", oldLatch, last, t.latchedGateSell)
+						log.Printf("[TRACE] pyramid.latch_clamp.sell old=%.8f last=%.8f new=%.8f", oldLatch, last, t.latchedGateSell)
 					}
 					gatePrice = t.latchedGateSell
 				}
@@ -2000,7 +2000,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					t.mu.Unlock()
 					log.Printf("[DEBUG] pyramid: blocked by last gate (SELL); price=%.2f last_gate>=%.2f latched=%.8f win_high=%.3f eff_pct=%.3f base_pct=%.3f elapsed_Hours=%.1f, latch_target_Hr>=%.2fHr confidence=%.2f",
 						price, gatePrice, t.latchedGateSell, t.winHighSell, effPct, basePct, reasonElapsedHr, 2.0*reasonTFloorHr, d.Confidence)
-					log.Printf("TRACE pyramid.block.sell price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateSell)
+					log.Printf("[TRACE] pyramid.block.sell price=%.8f last=%.8f gate=%.8f latched=%.8f", price, last, gatePrice, t.latchedGateSell)
 					return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
 				}
 			}
@@ -2125,7 +2125,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	entryProfitGateUSD += recoveryAddUSD
 
 	log.Printf(
-		"TRACE recovery.entry debt=%.4f add=%.4f targetNetUSD=%.4f",
+		"[TRACE] recovery.entry debt=%.4f add=%.4f targetNetUSD=%.4f",
 		t.RecoveryDebtUSD,
 		recoveryAddUSD,
 		entryProfitGateUSD,
@@ -2136,7 +2136,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		oldQuote := quote
 		quote *= confMult
 		log.Printf(
-			"TRACE sizing.confidence side=%s pUp=%.5f mult=%.2f quote_before=%.2f quote_after=%.2f",
+			"[TRACE] sizing.confidence side=%s pUp=%.5f mult=%.2f quote_before=%.2f quote_after=%.2f",
 			side, d.PUp, confMult, oldQuote, quote,
 		)
 	}
@@ -2159,7 +2159,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			oldBase := tb
 			tb *= confMult
 			log.Printf(
-				"TRACE sizing.equity.confidence side=%s pUp=%.5f mult=%.2f size_before=%.2f size_after=%.2f",
+				"[TRACE] sizing.equity.confidence side=%s pUp=%.5f mult=%.2f size_before=%.2f size_after=%.2f",
 				side, d.PUp, confMult, oldBase, tb,
 			)
 			tb = snapToStep(tb, baseStep)
@@ -2191,7 +2191,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			oldQuote := tq
 			tq *= confMult
 			log.Printf(
-				"TRACE sizing.equity.confidence side=%s pUp=%.5f mult=%.2f quote_before=%.2f quote_after=%.2f",
+				"[TRACE] sizing.equity.confidence side=%s pUp=%.5f mult=%.2f quote_before=%.2f quote_after=%.2f",
 				side, d.PUp, confMult, oldQuote, tq,
 			)
 			tq = snapToStep(tq, quoteStep)
@@ -2214,7 +2214,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	}
 
 	// TODO: remove TRACE
-	log.Printf("TRACE sizing.pre side=%s eq=%.2f quote=%.2f price=%.8f base=%.8f", side, t.equityUSD, quote, price, base)
+	log.Printf("[TRACE] sizing.pre side=%s eq=%.2f quote=%.2f price=%.8f base=%.8f", side, t.equityUSD, quote, price, base)
 
 	// Unified epsilon for spare checks
 	const spareEps = 1e-9
@@ -2225,7 +2225,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// --- BUY gating (require spare quote after reserving open shorts) ---
 	if side == SideBuy {
 		// TODO: remove TRACE
-		log.Printf("TRACE buy.gate.pre availQuote=%.2f reservedShort=%.2f needQuoteRaw=%.2f quoteStep=%.8f",
+		log.Printf("[TRACE] buy.gate.pre availQuote=%.2f reservedShort=%.2f needQuoteRaw=%.2f quoteStep=%.8f",
 			availQuote, reservedShortQuoteWithFee, quote, quoteStep)
 
 		// Floor the needed quote to step.
@@ -2256,7 +2256,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
 					log.Printf("[DEBUG] GATE BUY: need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 						neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
-					log.Printf("TRACE buy.gate.block minNotional need=%.2f spare=%.2f", neededQuote, spare)
+					log.Printf("[TRACE] buy.gate.block minNotional need=%.2f spare=%.2f", neededQuote, spare)
 
 					short := neededQuote - spare
 					if short > 0 {
@@ -2272,7 +2272,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			quote = neededQuote
 			base = quote / price
 
-			log.Printf("TRACE buy.gate.post needQuote=%.2f spare=%.2f base=%.8f", quote, spare, base)
+			log.Printf("[TRACE] buy.gate.post needQuote=%.2f spare=%.2f base=%.8f", quote, spare, base)
 		} else {
 			// Slow path: we don't have enough to fund neededQuote → try to degrade to available spare
 			log.Printf("[WARN] FUNDS_SHORT BUY need=%.2f quote, spare=%.2f → attempting degrade-to-spare",
@@ -2307,14 +2307,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			quote = useQuote
 			base = quote / price
 
-			log.Printf("TRACE buy.gate.post.degraded useQuote=%.2f spare=%.2f base=%.8f", quote, spare, base)
+			log.Printf("[TRACE] buy.gate.post.degraded useQuote=%.2f spare=%.2f base=%.8f", quote, spare, base)
 		}
 	}
 
 	// If SELL, require spare base inventory (spot safe)
 	if side == SideSell && t.cfg.RequireBaseForShort {
 		// TODO: remove TRACE
-		log.Printf("TRACE sell.gate.pre availBase=%.8f reservedLong=%.8f needBaseRaw=%.8f baseStep=%.8f",
+		log.Printf("[TRACE] sell.gate.pre availBase=%.8f reservedLong=%.8f needBaseRaw=%.8f baseStep=%.8f",
 			availBase, reservedLongBase, base, baseStep)
 
 		// Floor the *needed* base to baseStep (if known)
@@ -2354,7 +2354,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						base, spare, availBase, reservedLongBase, baseStep)
 					log.Printf("[DEBUG] GATE SELL: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
 						base, spare, availBase, reservedLongBase, baseStep)
-					log.Printf("TRACE sell.gate.block minNotional need=%.8f spare=%.8f", base, spare)
+					log.Printf("[TRACE] sell.gate.block minNotional need=%.8f spare=%.8f", base, spare)
 
 					// convert the short to USD at current price so we can reuse later on BUY
 					shortBase := base - spare
@@ -2367,7 +2367,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				}
 			}
 
-			log.Printf("TRACE sell.gate.post needBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
+			log.Printf("[TRACE] sell.gate.post needBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
 		} else {
 			// Slow path: not enough spare for neededBase → try degrade-to-spare
 			log.Printf("[WARN] FUNDS_SHORT SELL need=%.8f base, spare=%.8f → attempting degrade-to-spare",
@@ -2404,7 +2404,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			base = useBase
 			quote = base * price
 
-			log.Printf("TRACE sell.gate.post.degraded useBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
+			log.Printf("[TRACE] sell.gate.post.degraded useBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
 		}
 	}
 
@@ -2538,7 +2538,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 		}
 	} else if t.refundBuyUSD > 0 && side == SideSell && confMult < refundMinConf {
-		log.Printf("TRACE refund.block side=%s conf=%.2f need>=%.2f refundBuyUSD=%.2f",
+		log.Printf("[TRACE] refund.block side=%s conf=%.2f need>=%.2f refundBuyUSD=%.2f",
 			side, confMult, refundMinConf, t.refundBuyUSD)
 	}
 
@@ -2578,7 +2578,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 		}
 	} else if t.refundSellUSD > 0 && side == SideBuy && confMult < refundMinConf {
-		log.Printf("TRACE refund.block side=%s conf=%.2f need>=%.2f refundSellUSD=%.2f",
+		log.Printf("[TRACE] refund.block side=%s conf=%.2f need>=%.2f refundSellUSD=%.2f",
 			side, confMult, refundMinConf, t.refundSellUSD)
 	}
 
@@ -2620,7 +2620,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 		if wantLimit && recheckNow {
 			wantLimit = false
-			log.Printf("TRACE postonly.skip reason=recheck_market_next_tick side=%s", side)
+			log.Printf("[TRACE] postonly.skip reason=recheck_market_next_tick side=%s", side)
 		}
 		// consume the one-shot preference immediately so it never lingers
 		t.mu.Lock()
@@ -2658,7 +2658,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 
 			if baseAtLimit > 0 && baseAtLimit*limitPx >= minNotional {
-				log.Printf("TRACE postonly.place side=%s limit=%.8f baseReq=%.8f timeout_sec=%d", side, limitPx, baseAtLimit, limitWait)
+				log.Printf("[TRACE] postonly.place side=%s limit=%.8f baseReq=%.8f timeout_sec=%d", side, limitPx, baseAtLimit, limitWait)
 				orderID, err := t.broker.PlaceLimitPostOnly(ctx, t.cfg.ProductID, side, limitPx, baseAtLimit)
 				if err == nil && strings.TrimSpace(orderID) != "" {
 					// Initialize per-side channel
@@ -2721,7 +2721,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							ProfitGateUSD:    entryProfitGateUSD,
 						}
 						if side == SideBuy && t.pendingBuy != nil {
-							log.Printf("TRACE postonly.pending.set side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f dl=%s eqFlags[buy=%v sell=%v]",
+							log.Printf("[TRACE] postonly.pending.set side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f dl=%s eqFlags[buy=%v sell=%v]",
 								side, t.pendingBuy.OrderID, t.pendingBuy.LimitPx, t.pendingBuy.BaseAtLimit, t.pendingBuy.Quote,
 								t.pendingBuy.Deadline.Format(time.RFC3339), t.pendingBuy.EquityBuy, t.pendingBuy.EquitySell)
 						}
@@ -2748,7 +2748,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							ProfitGateUSD:    entryProfitGateUSD,
 						}
 						if side == SideSell && t.pendingSell != nil {
-							log.Printf("TRACE postonly.pending.set side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f dl=%s eqFlags[buy=%v sell=%v]",
+							log.Printf("[TRACE] postonly.pending.set side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f dl=%s eqFlags[buy=%v sell=%v]",
 								side, t.pendingSell.OrderID, t.pendingSell.LimitPx, t.pendingSell.BaseAtLimit, t.pendingSell.Quote,
 								t.pendingSell.Deadline.Format(time.RFC3339), t.pendingSell.EquityBuy, t.pendingSell.EquitySell)
 						}
@@ -2785,9 +2785,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					// step() drain path remains the single synchronous authority that
 					// converts PendingOpen → Position and persists state.
 					go func(initOrderID string, side OrderSide, deadline time.Time, initLimitPx, initBaseAtLimit float64, pend *PendingOpen, ch chan OpenResult, pctx context.Context) {
-						log.Printf("TRACE postonly.poll.start side=%s init_id=%s init_limit=%.8f init_base=%.8f deadline=%s offset_bps=%.3f",
+						log.Printf("[TRACE] postonly.poll.start side=%s init_id=%s init_limit=%.8f init_base=%.8f deadline=%s offset_bps=%.3f",
 							side, initOrderID, initLimitPx, initBaseAtLimit, deadline.Format(time.RFC3339), offsetBps)
-						defer func() { log.Printf("TRACE postonly.poll.stopped side=%s initial_id=%s", side, initOrderID) }()
+						defer func() { log.Printf("[TRACE] postonly.poll.stopped side=%s initial_id=%s", side, initOrderID) }()
 
 						orderID := initOrderID
 						lastLimitPx := initLimitPx
@@ -2804,7 +2804,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							// Check for cancellation before doing work
 							select {
 							case <-pctx.Done():
-								log.Printf("TRACE postonly.poll.cancelled side=%s last_id=%s", side, orderID)
+								log.Printf("[TRACE] postonly.poll.cancelled side=%s last_id=%s", side, orderID)
 								break poll
 							default:
 							}
@@ -2834,7 +2834,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 								lastSeenQuote = ord.QuoteSpent
 								lastSeenFee = ord.CommissionUSD
 
-								log.Printf("TRACE postonly.poll.tick side=%s order_id=%s status=%s price=%.8f base=%.8f quote=%.2f fee=%.6f sess_agg[base=%.8f quote=%.2f fee=%.6f] reprices=%d",
+								log.Printf("[TRACE] postonly.poll.tick side=%s order_id=%s status=%s price=%.8f base=%.8f quote=%.2f fee=%.6f sess_agg[base=%.8f quote=%.2f fee=%.6f] reprices=%d",
 									side, orderID, strings.ToUpper(strings.TrimSpace(ord.Status)), ord.Price, ord.BaseSize, ord.QuoteSpent, ord.CommissionUSD,
 									sessBase, sessQuote, sessFee, repriceCount)
 
@@ -2852,8 +2852,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 										QuoteSpent:    sessQuote,
 										CommissionUSD: sessFee,
 									}
-									log.Printf("TRACE postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f", orderID, ord.Price, ord.BaseSize, ord.QuoteSpent, ord.CommissionUSD)
-									log.Printf("TRACE postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
+									log.Printf("[TRACE] postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f", orderID, ord.Price, ord.BaseSize, ord.QuoteSpent, ord.CommissionUSD)
+									log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
 										side, orderID, (sessBase > 0 || sessQuote > 0), sessBase, sessQuote, sessFee)
 									log.Printf("[KPI] maker.open.filled side=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f order_id=%s",
 										side, placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD, orderID)
@@ -2863,13 +2863,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 								case "PARTIALLY_FILLED":
 									if t.pendingCancelRequested(side) {
-										log.Printf("TRACE postonly.reprice.skip.cancel_requested side=%s order_id=%s", side, orderID)
+										log.Printf("[TRACE] postonly.reprice.skip.cancel_requested side=%s order_id=%s", side, orderID)
 										lastReprice = time.Now()
 										break
 									}
 									// still open; allow reprice path (throttled)
 									if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
-										log.Printf("TRACE postonly.reprice.try.partially side=%s order_id=%s last_limit=%.8f reprice_count=%d",
+										log.Printf("[TRACE] postonly.reprice.try.partially side=%s order_id=%s last_limit=%.8f reprice_count=%d",
 											side, orderID, lastLimitPx, repriceCount)
 										newID, newLastLimitPx, newRepriceCount, did := t.maybeRepriceOnce(
 											pctx,
@@ -2883,7 +2883,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 											repriceCount,
 										)
 										if did && newID != orderID {
-											log.Printf("TRACE postonly.reprice.swap.partially side=%s old_id=%s new_id=%s new_limit=%.8f count=%d",
+											log.Printf("[TRACE] postonly.reprice.swap.partially side=%s old_id=%s new_id=%s new_limit=%.8f count=%d",
 												side, orderID, newID, newLastLimitPx, newRepriceCount)
 											// switched to a new order: reset per-order deltas (session aggregates stay)
 											orderID = newID
@@ -2891,7 +2891,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 											repriceCount = newRepriceCount
 											lastSeenBase, lastSeenQuote, lastSeenFee = 0, 0, 0
 										} else {
-											log.Printf("TRACE postonly.reprice.skip.partially side=%s order_id=%s reason=no_guard_or_no_improve last_limit=%.8f count=%d",
+											log.Printf("[TRACE] postonly.reprice.skip.partially side=%s order_id=%s reason=no_guard_or_no_improve last_limit=%.8f count=%d",
 												side, orderID, lastLimitPx, repriceCount)
 											lastLimitPx = newLastLimitPx
 											repriceCount = newRepriceCount
@@ -2901,13 +2901,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 								case "NEW", "PENDING_CANCEL":
 									if t.pendingCancelRequested(side) {
-										log.Printf("TRACE postonly.reprice.skip.cancel_requested side=%s order_id=%s", side, orderID)
+										log.Printf("[TRACE] postonly.reprice.skip.cancel_requested side=%s order_id=%s", side, orderID)
 										lastReprice = time.Now()
 										break
 									}
 									// resting or in cancel transition; keep polling
 									if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
-										log.Printf("TRACE postonly.reprice.try.new side=%s order_id=%s last_limit=%.8f reprice_count=%d",
+										log.Printf("[TRACE] postonly.reprice.try.new side=%s order_id=%s last_limit=%.8f reprice_count=%d",
 											side, orderID, lastLimitPx, repriceCount)
 										newID, newLastLimitPx, newRepriceCount, did := t.maybeRepriceOnce(
 											pctx,
@@ -2921,14 +2921,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 											repriceCount,
 										)
 										if did && newID != orderID {
-											log.Printf("TRACE postonly.reprice.swap.new side=%s old_id=%s new_id=%s new_limit=%.8f count=%d",
+											log.Printf("[TRACE] postonly.reprice.swap.new side=%s old_id=%s new_id=%s new_limit=%.8f count=%d",
 												side, orderID, newID, newLastLimitPx, newRepriceCount)
 											orderID = newID
 											lastLimitPx = newLastLimitPx
 											repriceCount = newRepriceCount
 											lastSeenBase, lastSeenQuote, lastSeenFee = 0, 0, 0
 										} else {
-											log.Printf("TRACE postonly.reprice.skip.new side=%s order_id=%s reason=no_guard_or_no_improve last_limit=%.8f count=%d",
+											log.Printf("[TRACE] postonly.reprice.skip.new side=%s order_id=%s reason=no_guard_or_no_improve last_limit=%.8f count=%d",
 												side, orderID, lastLimitPx, repriceCount)
 											lastLimitPx = newLastLimitPx
 											repriceCount = newRepriceCount
@@ -2960,16 +2960,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 											}(),
 											sessBase, sessQuote, sessFee, orderID, strings.ToUpper(strings.TrimSpace(ord.Status)))
 
-										log.Printf("TRACE postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
+										log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
 											side, orderID, (sessBase > 0 || sessQuote > 0), sessBase, sessQuote, sessFee)
 										safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
 									} else {
-										log.Printf("TRACE postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
+										log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
 											side, orderID, (sessBase > 0 || sessQuote > 0), sessBase, sessQuote, sessFee)
 										safeSend(ch, OpenResult{Filled: false, Placed: nil, OrderID: orderID})
 									}
 
-									log.Printf("TRACE postonly.poll.done side=%s order_id=%s final=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f",
+									log.Printf("[TRACE] postonly.poll.done side=%s order_id=%s final=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f",
 										side, orderID, strings.ToUpper(strings.TrimSpace(ord.Status)),
 										func() float64 {
 											if sessBase > 0 {
@@ -2988,7 +2988,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							// Sleep-or-cancel wait
 							select {
 							case <-pctx.Done():
-								log.Printf("TRACE postonly.poll.cancelled side=%s last_id=%s", side, orderID)
+								log.Printf("[TRACE] postonly.poll.cancelled side=%s last_id=%s", side, orderID)
 								break poll
 							case <-time.After(200 * time.Millisecond):
 							}
@@ -2996,9 +2996,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 						// On timeout or cancellation, cancel any resting order if still open.
 						_ = t.broker.CancelOrder(pctx, t.cfg.ProductID, orderID)
-						log.Printf("TRACE postonly.poll.timeout side=%s last_id=%s sess_base=%.8f sess_quote=%.2f sess_fee=%.6f",
+						log.Printf("[TRACE] postonly.poll.timeout side=%s last_id=%s sess_base=%.8f sess_quote=%.2f sess_fee=%.6f",
 							side, orderID, sessBase, sessQuote, sessFee)
-						log.Printf("TRACE postonly.timeout order_id=%s", orderID)
+						log.Printf("[TRACE] postonly.timeout order_id=%s", orderID)
 
 						// On TIMEOUT: emit VWAP if any session fills, else non-fill
 						if sessBase > 0 || sessQuote > 0 {
@@ -3012,11 +3012,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 								QuoteSpent:    sessQuote,
 								CommissionUSD: sessFee,
 							}
-							log.Printf("TRACE postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
+							log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
 								side, orderID, (sessBase > 0 || sessQuote > 0), sessBase, sessQuote, sessFee)
 							safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
 						} else {
-							log.Printf("TRACE postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
+							log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
 								side, orderID, (sessBase > 0 || sessQuote > 0), sessBase, sessQuote, sessFee)
 							safeSend(ch, OpenResult{Filled: false, Placed: nil, OrderID: orderID})
 						}
@@ -3031,7 +3031,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					t.mu.Unlock()
 					return StepResult{Msg: fmt.Sprintf("OPEN-PENDING side=%s", side), Raw: d.Raw, Signal: d.Signal}, nil
 				} else if err != nil {
-					log.Printf("TRACE postonly.error hold_for_recheck err=%v", err)
+					log.Printf("[TRACE] postonly.error hold_for_recheck err=%v", err)
 				}
 			}
 		}
@@ -3049,15 +3049,15 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		// If maker path did not result in a fill (or was skipped), fall back to market path (baseline behavior).
 		if placed == nil {
 			if !allowMarket {
-				log.Printf("TRACE postonly.market_fallback.blocked side=%s reason=recheck_flag_not_set", side)
+				log.Printf("[TRACE] postonly.market_fallback.blocked side=%s reason=recheck_flag_not_set", side)
 				return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
 			}
 			var err error
 			placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
 			// TODO: remove TRACE
-			log.Printf("TRACE order.open request side=%s quote=%.2f baseEst=%.8f priceSnap=%.8f take=%.8f",
+			log.Printf("[TRACE] order.open request side=%s quote=%.2f baseEst=%.8f priceSnap=%.8f take=%.8f",
 				side, quote, base, price, take)
-			log.Printf("TRACE postonly.market_fallback.go side=%s quote=%.2f", side, quote)
+			log.Printf("[TRACE] postonly.market_fallback.go side=%s quote=%.2f", side, quote)
 			log.Printf("[KPI] taker.open side=%s quote=%.2f reason=market_fallback", side, quote)
 
 			if err != nil {
@@ -3068,7 +3068,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					quote = minNotional
 					base = quote / price
 					// TODO: remove TRACE
-					log.Printf("TRACE order.open retry side=%s quote=%.2f baseEst=%.8f", side, quote, base)
+					log.Printf("[TRACE] order.open retry side=%s quote=%.2f baseEst=%.8f", side, quote, base)
 					placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
 				}
 				if err != nil {
@@ -3080,7 +3080,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 			// TODO: remove TRACE
 			if placed != nil {
-				log.Printf("TRACE order.open placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
+				log.Printf("[TRACE] order.open placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
 					placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
 			}
 		}
@@ -3128,7 +3128,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			log.Printf("[WARN] partial fill: requested_base=%.8f filled_base=%.8f (%.2f%%)",
 				baseRequested, baseToUse, 100.0*(baseToUse/baseRequested))
 			// TODO: remove TRACE
-			log.Printf("TRACE fill.open partial requested=%.8f filled=%.8f", baseRequested, baseToUse)
+			log.Printf("[TRACE] fill.open partial requested=%.8f filled=%.8f", baseRequested, baseToUse)
 		}
 	}
 
@@ -3235,7 +3235,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	old := t.lastAddEquity
 	t.lastAddEquity = t.equityUSD
 	log.Printf(
-		"TRACE equity.baseline.set side=%s old=%.2f new=%.2f",
+		"[TRACE] equity.baseline.set side=%s old=%.2f new=%.2f",
 		side,
 		old,
 		t.lastAddEquity,
@@ -3254,7 +3254,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		r.TrailStop = 0
 		// Apply runner targets (stretched TP)
 		t.applyRunnerTargets(r)
-		log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
+		log.Printf("[TRACE] runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
 	}
 	// --- NEW (minimal): promote equity-triggered BUY add to runner ---
 	if equityTriggerBuy && side == SideBuy {
@@ -3265,7 +3265,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		r.TrailPeak = r.OpenPrice
 		r.TrailStop = 0
 		t.applyRunnerTargets(r)
-		log.Printf("TRACE runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
+		log.Printf("[TRACE] runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
 	}
 	// (If not equityTriggerSell/equityTriggerBuy, leave RunnerIDs unchanged so first lot is NOT the runner.)
 
@@ -3283,7 +3283,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// persist new state (no locking while writing; snapshot constructed here under lock)
 	if err := t.saveStateNoLock(); err != nil {
 		log.Printf("[WARN] saveState: %v", err)
-		log.Printf("TRACE state.save error=%v", err)
+		log.Printf("[TRACE] state.save error=%v", err)
 	}
 	log.Printf("[KPI] summary equity=%.2f daily_pnl=%.2f lots_buy=%d lots_sell=%d product=%s",
 		t.equityUSD, t.dailyPnL, len(t.book(SideBuy).Lots), len(t.book(SideSell).Lots), t.cfg.ProductID)
@@ -3453,7 +3453,7 @@ func (t *Trader) archiveOrphanDust(book *SideBook, px float64, minNotional float
 	book.RunnerIDs = nil
 
 	log.Printf(
-		"TRACE dust.archive side=%s open=%.8f base=%.8f notional=%.4f minNotional=%.2f lastAddReset=%s",
+		"[TRACE] dust.archive side=%s open=%.8f base=%.8f notional=%.4f minNotional=%.2f lastAddReset=%s",
 		side,
 		lot.OpenPrice,
 		lot.SizeBase,

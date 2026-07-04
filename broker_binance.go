@@ -502,10 +502,10 @@ func (b *BinanceBridge) GetExchangeFilters(ctx context.Context, product string) 
 	// Helper to log a consistent line with the resolved source.
 	logFilters := func(source, urlHint string, f ExFilters) {
 		if urlHint == "" {
-			log.Printf("TRACE exch.filters source=%s product=%s step=%.10f tick=%.10f price_tick=%.10f base_step=%.10f quote_step=%.10f min_notional=%.10f",
+			log.Printf("[TRACE] exch.filters source=%s product=%s step=%.10f tick=%.10f price_tick=%.10f base_step=%.10f quote_step=%.10f min_notional=%.10f",
 				source, product, f.StepSize, f.TickSize, f.PriceTick, f.BaseStep, f.QuoteStep, f.MinNotional)
 		} else {
-			log.Printf("TRACE exch.filters source=%s url=%s product=%s step=%.10f tick=%.10f price_tick=%.10f base_step=%.10f quote_step=%.10f min_notional=%.10f",
+			log.Printf("[TRACE] exch.filters source=%s url=%s product=%s step=%.10f tick=%.10f price_tick=%.10f base_step=%.10f quote_step=%.10f min_notional=%.10f",
 				source, urlHint, product, f.StepSize, f.TickSize, f.PriceTick, f.BaseStep, f.QuoteStep, f.MinNotional)
 		}
 	}

@@ -198,7 +198,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				history = hs
 				log.Printf("[BOOT] history=%d (paged to %d target)", len(history), target)
 				// TODO: remove TRACE
-				log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
+				log.Printf("[TRACE] history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
 				break
 			} else if err != nil {
 				log.Printf("[BOOT] paged warmup error: %v", err)
@@ -218,13 +218,13 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 			history = cs
 			log.Printf("[BOOT] history=%d (broker large batch, limit=%d)", len(history), limitTry)
 			// TODO: remove TRACE
-			log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
+			log.Printf("[TRACE] history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
 		} else if err != nil {
 			if cs2, err2 := trader.broker.GetRecentCandles(ctx, trader.cfg.ProductID, trader.cfg.Granularity, 350); err2 == nil && len(cs2) > 0 {
 				history = cs2
 				log.Printf("[BOOT] history=%d (broker fallback, limit=350)", len(history))
 				// TODO: remove TRACE
-				log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
+				log.Printf("[TRACE] history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
 			} else {
 				log.Printf("warmup GetRecentCandles error: %v", err)
 			}
@@ -268,7 +268,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 	// --- Tick vs Candle loop selector (bridge optional) ---
 	useTick := trader.cfg.UseTick()
 	// TODO: remove TRACE
-	log.Printf("TRACE selector useTick=%v granularity=%s tick_interval=%d", useTick, trader.cfg.Granularity, trader.cfg.TickInterval())
+	log.Printf("[TRACE] selector useTick=%v granularity=%s tick_interval=%d", useTick, trader.cfg.Granularity, trader.cfg.TickInterval())
 	// -------------------------------------------------------------------
 
 	if useTick {
@@ -298,7 +298,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 						}
 						lastCandleSync = time.Now().UTC()
 						// TODO: remove TRACE
-						log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
+						log.Printf("[TRACE] history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
 						log.Printf("[SYNC] latest=%s history_last=%s len=%d", latest.Time, history[len(history)-1].Time, len(history))
 					} else if err != nil {
 						log.Fatalf("[SYNC] Candle update failed: error: %v", err)
@@ -317,25 +317,25 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 					stale = false
 				}
 				// TODO: remove TRACE
-				log.Printf("TRACE price_fetch px=%.8f stale=%v err=%v", px, stale, err)
+				log.Printf("[TRACE] price_fetch px=%.8f stale=%v err=%v", px, stale, err)
 
 				// Gate traces (reason why [TICK] block may not run)
 				if err != nil {
 					// TODO: remove TRACE
-					log.Printf("TRACE gate:err err=%v", err)
+					log.Printf("[TRACE] gate:err err=%v", err)
 				} else if stale {
 					// TODO: remove TRACE
-					log.Printf("TRACE gate:stale px=%.8f", px)
+					log.Printf("[TRACE] gate:stale px=%.8f", px)
 				} else if px <= 0 {
 					// TODO: remove TRACE
-					log.Printf("TRACE gate:px<=0 px=%.8f", px)
+					log.Printf("[TRACE] gate:px<=0 px=%.8f", px)
 				}
 
 				if err == nil && !stale && px > 0 {
 					// Defensive: ensure history non-empty before tick mutate
 					if len(history) == 0 {
 						// TODO: remove TRACE
-						log.Printf("TRACE gate:history_empty before applyTick")
+						log.Printf("[TRACE] gate:history_empty before applyTick")
 						cancelPx()
 						// Skip this iteration safely
 						time.Sleep(time.Duration(trader.cfg.TickInterval()) * time.Second)
@@ -344,7 +344,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 					applyTickToLastCandle(history, px)
 					log.Printf("[TICK] px=%.2f lastClose(before-step)=%.2f", px, history[len(history)-1].Close)
 					// TODO: remove TRACE
-					log.Printf("TRACE TARGET [TICK] px=%.2f lastClose(before-step)=%.2f", px, history[len(history)-1].Close)
+					log.Printf("[TRACE] TARGET [TICK] px=%.2f lastClose(before-step)=%.2f", px, history[len(history)-1].Close)
 				}
 				cancelPx()
 
@@ -367,7 +367,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 						bal, err = fetchBridgeAccounts(ctxEq, trader.cfg.BridgeURL)
 						if err != nil && errors.Is(err, errBridgeAccountsNotFound) {
 							// Fallback to broker if bridge lacks /accounts
-							log.Printf("TRACE EQUITY fallback: bridge /accounts 404 -> broker")
+							log.Printf("[TRACE] EQUITY fallback: bridge /accounts 404 -> broker")
 							bal, err = fetchBrokerBalances(ctxEq, trader, trader.cfg.ProductID)
 						}
 					} else {
@@ -387,7 +387,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 							lb := bal[strings.ToUpper(base)]
 							lq := bal[strings.ToUpper(quote)]
 							lp := history[len(history)-1].Close // or latest.Close in candle loop
-							log.Printf("TRACE equity_breakdown path=%s base=%s quote=%s bal_base=%.8f bal_quote=%.8f lastPrice=%.8f eq=%.8f",
+							log.Printf("[TRACE] equity_breakdown path=%s base=%s quote=%s bal_base=%.8f bal_quote=%.8f lastPrice=%.8f eq=%.8f",
 								func() string {
 									if trader.cfg.BridgeURL != "" {
 										return "bridge|fallback"
@@ -440,7 +440,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 				}
 
 				// TODO: remove TRACE
-				log.Printf("TRACE history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
+				log.Printf("[TRACE] history readiness len=%d need=%d", len(history), trader.cfg.MaxHistoryCandles)
 
 				lastRefit, trader.mdlExt = maybeWalkForwardRefit(trader.cfg, trader.mdlExt, history, lastRefit)
 
@@ -458,7 +458,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 					if trader.cfg.BridgeURL != "" {
 						bal, err = fetchBridgeAccounts(ctxEq, trader.cfg.BridgeURL)
 						if err != nil && errors.Is(err, errBridgeAccountsNotFound) {
-							log.Printf("TRACE EQUITY fallback: bridge /accounts 404 -> broker")
+							log.Printf("[TRACE] EQUITY fallback: bridge /accounts 404 -> broker")
 							bal, err = fetchBrokerBalances(ctxEq, trader, trader.cfg.ProductID)
 						}
 					} else {
@@ -478,7 +478,7 @@ func runLive(ctx context.Context, trader *Trader, model *AIMicroModel, intervalS
 							lb := bal[strings.ToUpper(base)]
 							lq := bal[strings.ToUpper(quote)]
 							lp := history[len(history)-1].Close // or latest.Close in candle loop
-							log.Printf("TRACE equity_breakdown path=%s base=%s quote=%s bal_base=%.8f bal_quote=%.8f lastPrice=%.8f eq=%.8f",
+							log.Printf("[TRACE] equity_breakdown path=%s base=%s quote=%s bal_base=%.8f bal_quote=%.8f lastPrice=%.8f eq=%.8f",
 								func() string {
 									if trader.cfg.BridgeURL != "" {
 										return "bridge|fallback"
@@ -612,7 +612,7 @@ func attemptLiveEquityRebase(ctx context.Context, cfg Config, trader *Trader, la
 	bal, err := fetchBridgeAccounts(ctx, cfg.BridgeURL)
 	if err != nil {
 		if errors.Is(err, errBridgeAccountsNotFound) {
-			log.Printf("TRACE EQUITY fallback: bridge /accounts 404 -> broker") // <-- added
+			log.Printf("[TRACE] EQUITY fallback: bridge /accounts 404 -> broker") // <-- added
 			return attemptLiveEquityRebaseBroker(ctx, trader, lastPrice)        // <-- added
 		}
 		return false

@@ -157,7 +157,6 @@ func loadConfigFromEnv() Config {
 		SellEquityTriggerMult: getEnvFloat("SELL_EQUITY_TRIGGER_MULT", 1.05),
 		BuyEquityTriggerMult:  getEnvFloat("BUY_EQUITY_TRIGGER_MULT", 0.95),
 		TakeProfitPct:         getEnvFloat("TAKE_PROFIT_PCT", 0.8),
-		StopLossPct:           getEnvFloat("STOP_LOSS_PCT", 0.4),
 
 		MinSellDistance:         getEnvFloat("MIN_SELL_DISTANCE", 0.0189),
 		MinBuyDistance:          getEnvFloat("MIN_BUY_DISTANCE", 0.0047),

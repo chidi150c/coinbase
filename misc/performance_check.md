@@ -90,7 +90,7 @@ grep -nE "00:00:|00:02:|sizing|sell.gate|FUNDS|HOLD|LIVE ORDER|OPEN-PENDING|FILL
 
 3) Next check should be why pyramid blocked:
 
-grep -E "TRACE pyramid.block.(buy|sell)" /opt/coinbase/logs/audit/binance_audit.log | tail -30
+grep -E "[TRACE] pyramid.block.(buy|sell)" /opt/coinbase/logs/audit/binance_audit.log | tail -30
 
 =============================================================
 Case 2.2A — AI_FLAT but pUp is outside the model's avg band
@@ -311,7 +311,7 @@ grep -E "LATCH REBASE" /opt/coinbase/logs/audit/binance_audit.log | tail -100
 ------------output------------
 bot_binance-1  | 2026/06/11 13:01:07 [DEBUG] LATCH REBASE BUY: ageHr=150.60 logic=SELL old_latched=61104.24 old_winLow=61104.24 new_latched=62600.00 new_winLow=62600.00 price=62959.34
 
-grep "TRACE recent.window" /opt/coinbase/logs/audit/binance_audit.log | tail -1
+grep "[TRACE] recent.window" /opt/coinbase/logs/audit/binance_audit.log | tail -1
 
 -------------output-----------------
 bot_binance-1  | 2026/06/11 18:51:35 TRACE recent.window high=63780.00 low=62353.30
@@ -320,7 +320,7 @@ bot_binance-1  | 2026/06/11 18:51:35 TRACE recent.window high=63780.00 low=62353
 
 So recentLow shows that at a point price was below latched so why no trade:
 
-grep -E "TRACE step.start|Decision=BUY|pyramid: blocked by last gate \(BUY\)" /opt/coinbase/logs/audit/binance_audit.log | \
+grep -E "[TRACE] step.start|Decision=BUY|pyramid: blocked by last gate \(BUY\)" /opt/coinbase/logs/audit/binance_audit.log | \
 awk '
 /TRACE step.start/ {
   ts=$3" "$4
