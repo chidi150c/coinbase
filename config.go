@@ -211,7 +211,7 @@ func loadConfigFromEnv() Config {
 		ScalpTPMinPct:      getEnvFloat("SCALP_TP_MIN_PCT", 0.0),
 
 		// USD trailing / profit gates
-		TrailActivateUSDRunner: getEnvFloat("TRAIL_ACTIVATE_USD_RUNNER", 1.00),
+		TrailActivateUSDRunner: getEnvFloat("TRAIL_ACTIVATE_USD_RUNNER", 0.00),
 		TrailDistancePctRunner: getEnvFloat("TRAIL_DISTANCE_PCT_RUNNER", 0.40),
 		ProfitGateUSD:          getEnvFloat("PROFIT_GATE_USD", 1.16),
 		TPMakerOffsetBps:       getEnvFloat("TP_MAKER_OFFSET_BPS", 0.0),
@@ -260,11 +260,6 @@ func loadConfigFromEnv() Config {
 		UseDirectSlack:    getEnv("SLACK_WEBHOOK", "") != "",
 		RecoveryTargetPct: getEnvFloat("RECOVERY_TARGET_PCT", 0.25),
 		RecoveryMaxAddUSD: getEnvFloat("RECOVERY_MAX_ADD_USD", 0.50),
-	}
-
-	// dependency defaults
-	if cfg.TrailActivateUSDRunner == 0 {
-		cfg.TrailActivateUSDRunner = 8.0 * cfg.ProfitGateUSD
 	}
 
 	// Historical carry-over: if someone still sets BROKER=X, we may still

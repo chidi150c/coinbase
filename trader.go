@@ -472,6 +472,19 @@ func (t *Trader) applyRunnerTargets(p *Position) {
 		return
 	}
 	actUSD := t.cfg.TrailActivateUSDRunner
+	if actUSD == 0 {
+		stage := t.equityStageBuy
+		if p.Side == SideSell {
+			stage = t.equityStageSell
+		}
+
+		runnerMult := 1.0 + float64(stage)
+		if runnerMult > 6.0 {
+			runnerMult = 6.0
+		}
+
+		actUSD = runnerMult * t.cfg.ProfitGateUSD
+	}
 	if actUSD <= 0 {
 		actUSD = t.cfg.ProfitGateUSD
 	}
@@ -497,6 +510,21 @@ func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64)
 
 	// Determine trailing parameters by ExitMode
 	actUSD := t.cfg.TrailActivateUSDRunner
+	
+	if actUSD == 0 {
+		stage := t.equityStageBuy
+		if lot.Side == SideSell {
+			stage = t.equityStageSell
+		}
+
+		runnerMult := 1.0 + float64(stage)
+		if runnerMult > 6.0 {
+			runnerMult = 6.0
+		}
+
+		actUSD = runnerMult * t.cfg.ProfitGateUSD
+	}
+	
 	distPct := t.cfg.TrailDistancePctRunner
 	switch lot.ExitMode {
 	case ExitModeRunnerTrailing:

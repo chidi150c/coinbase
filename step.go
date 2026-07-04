@@ -1496,7 +1496,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-114",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-115",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -2159,7 +2159,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			oldBase := tb
 			tb *= confMult
 			log.Printf(
-				"TRACE sizing.equity.confidence side=%s pUp=%.5f mult=%.2f quote_before=%.2f quote_after=%.2f",
+				"TRACE sizing.equity.confidence side=%s pUp=%.5f mult=%.2f size_before=%.2f size_after=%.2f",
 				side, d.PUp, confMult, oldBase, tb,
 			)
 			tb = snapToStep(tb, baseStep)
