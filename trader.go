@@ -284,6 +284,7 @@ type Trader struct {
 	RecoveryDebtUSD   float64
 	dustBuyLots       []*Position
 	dustSellLots      []*Position
+	hotStart          time.Time
 }
 
 func NewTrader(cfg Config, broker Broker) *Trader {

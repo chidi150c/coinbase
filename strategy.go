@@ -196,7 +196,7 @@ func (t *Trader) decide(signalHistory []Candle) Decision {
 	return base
 }
 
-const trendMult = 0.5
+const trendMult = 0.80
 
 func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 	if !t.cfg.UseMACDSlopeGate {

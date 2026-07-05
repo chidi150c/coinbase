@@ -504,8 +504,15 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 					px, err = trader.broker.GetNowPrice(ctxPx, trader.cfg.ProductID)
 					stale = false
 				}
-				// TODO: remove TRACE
-				log.Printf("[TRACE] price_fetch px=%.8f stale=%v err=%v", px, stale, err)
+
+				trader.mu.Lock()
+				trader.hotStart = time.Now()
+				hotStart := trader.hotStart
+				trader.mu.Unlock()
+
+				// after price fetch
+				log.Printf("[TRACE] hotpath.price_fetched elapsed_ms=%d price=%.2f stale=%v err=%v",
+					time.Since(hotStart).Milliseconds(), px, stale, err)
 
 				// Gate traces (reason why [TICK] block may not run)
 				if err != nil {

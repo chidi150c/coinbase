@@ -888,6 +888,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	d := t.decide(signalHistory)
 	d = t.applyLogicGate(d, execHistory)
 
+	// after decision
+	log.Printf("[TRACE] hotpath.decision elapsed_ms=%d final=%s raw=%s logic=%s pUp=%.5f",
+		time.Since(t.hotStart).Milliseconds(), d.Signal, d.Raw, d.LogicOpinion, d.PUp)
+
 	// Cancel stale pending opens if the current decision no longer supports them.
 	// Do NOT clear pending here.
 	// Do NOT cancel pending context here.
@@ -1496,7 +1500,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-117",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-118",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -2596,6 +2600,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 		t.SpareSellUSD = sellSpareUSD
 	}
+
 	//-----------------------------------------------------------------------------------------------------------
 	//------------------ Place live order without holding the lock.=====================
 	//-------------------------------------------------------------------------------------------------------------------
@@ -2656,6 +2661,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			if t.cfg.BaseStep > 0 {
 				baseAtLimit = math.Floor(baseAtLimit/t.cfg.BaseStep) * t.cfg.BaseStep
 			}
+
+			// before order submit
+			log.Printf("TRACE hotpath.order_submit elapsed_ms=%d side=%s limit=%.2f live=%.2f",
+				time.Since(t.hotStart).Milliseconds(), side, limitPx, price)
 
 			if baseAtLimit > 0 && baseAtLimit*limitPx >= minNotional {
 				log.Printf("[TRACE] postonly.place side=%s limit=%.8f baseReq=%.8f timeout_sec=%d", side, limitPx, baseAtLimit, limitWait)
@@ -3052,6 +3061,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				log.Printf("[TRACE] postonly.market_fallback.blocked side=%s reason=recheck_flag_not_set", side)
 				return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
 			}
+
+			// before order submit
+			log.Printf("TRACE hotpath.order_submit.market_quote elapsed_ms=%d side=%s live=%.2f",
+				time.Since(t.hotStart).Milliseconds(), side, price)
+
 			var err error
 			placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
 			// TODO: remove TRACE
