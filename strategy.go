@@ -114,14 +114,14 @@ type Decision struct {
 }
 
 // SignalToSide converts the intent into a broker side.
-func (d Decision) SignalToSide() OrderSide {
+func (d Decision) SignalToSide() (OrderSide, bool) {
 	switch d.Signal {
 	case Buy:
-		return SideBuy
+		return SideBuy, true
 	case Sell:
-		return SideSell
+		return SideSell, true
 	default:
-		return SideBuy
+		return "", false
 	}
 }
 

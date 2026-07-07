@@ -1555,7 +1555,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	)
 
 	// Determine the side and its book
-	side := d.SignalToSide()
+	side, ok := d.SignalToSide()
+	if !ok {
+		log.Printf("[TRACE] signal.no_side signal=%s raw=%s final=%s", d.Signal, d.Raw, d.Signal)
+		t.mu.Unlock()
+		return StepResult{Msg: "FLAT", Raw: d.Raw, Signal: d.Signal}, nil
+	}
+
 	book := t.book(side)
 
 	// Prevent duplicate opens while pending on this side (exits already ran) ---
