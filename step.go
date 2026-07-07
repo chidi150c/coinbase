@@ -1545,7 +1545,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-120",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-121",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1574,6 +1574,73 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		t.mu.Unlock()
 		return StepResult{Msg: "OPEN-PENDING side=SELL", Raw: d.Raw, Signal: d.Signal}, nil
 	}
+
+
+// -----------------------------------------------------------------------------
+// Case 3A-Opposite - DOWN-Regime BUY Protection
+//
+// If the immediately previous exit was a BUY threshold-stop loss,
+// block any new BUY entry above that loss-exit SELL price while the
+// market regime remains DOWN.
+// -----------------------------------------------------------------------------
+if side == SideBuy &&
+	t.MarketRegime == RegimeDown &&
+	len(t.lastExits) > 0 {
+
+	last := t.lastExits[len(t.lastExits)-1]
+
+	if last.Side == SideBuy &&
+		last.Reason == "threshold_stop_loss" &&
+		last.PNLUSD < 0 &&
+		price > last.ClosePrice {
+
+		log.Printf(
+			"[TRACE] case3A.block_buy regime=%s buy_price=%.8f last_exit_sell_price=%.8f last_exit_net=%.6f",
+			t.MarketRegime,
+			price,
+			last.ClosePrice,
+			last.PNLUSD,
+		)
+
+		t.mu.Unlock()
+		return StepResult{Msg: "HOLD case3A block BUY above last loss-exit SELL price", Raw: d.Raw, Signal: d.Signal}, nil
+	}
+}
+// -----------------------------------------------------------------------------
+// Case 3A - UP-Regime SELL Protection
+//
+// If the immediately previous exit was a SELL threshold-stop loss,
+// block any new SELL entry below that loss-exit BUY price while the
+// market regime remains UP.
+// -----------------------------------------------------------------------------
+if side == SideSell &&
+	t.MarketRegime == RegimeUp &&
+	len(t.lastExits) > 0 {
+
+	last := t.lastExits[len(t.lastExits)-1]
+
+	if last.Side == SideSell &&
+		last.Reason == "threshold_stop_loss" &&
+		last.PNLUSD < 0 &&
+		price < last.ClosePrice {
+
+		log.Printf(
+			"[TRACE] case3A.block_sell regime=%s sell_price=%.8f last_exit_buy_price=%.8f last_exit_net=%.6f",
+			t.MarketRegime,
+			price,
+			last.ClosePrice,
+			last.PNLUSD,
+		)
+
+		t.mu.Unlock()
+		return StepResult{Msg: "HOLD case3A block SELL below last loss-exit BUY price", Raw: d.Raw, Signal: d.Signal}, nil
+	}
+}
+
+
+
+
+
 
 	//Required spare inventory
 	var spare float64
