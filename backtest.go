@@ -160,7 +160,7 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader) {
 		default:
 		}
 		testP := test[len(test[:i+1])-1].Close
-		res, _ := trader.step(ctx, test[:i+1], test[:i+1], testP)
+		res, _ := trader.step(ctx, test[:i+1], test[:i+1], testP, time.Now())
 
 		// Count wins/losses on exits
 		if strings.HasPrefix(res.Msg, "EXIT") {

@@ -355,7 +355,7 @@ func (t *Trader) maybeRepriceOnce(
 
 // step consumes the current candle history and may place/close a position.
 // It returns a human-readable status string for logging.
-func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory []Candle, livePrice float64) (StepResult, error) {
+func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory []Candle, livePrice float64, hotStart time.Time) (StepResult, error) {
 	if len(execHistory) == 0 {
 		return StepResult{Msg: "NO_DATA"}, nil
 	}
@@ -855,6 +855,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// --- NEW: walk-forward (re)fit guard hook (no-op other than the guard) ---
 	_ = t.shouldRefit(len(execHistory)) // intentionally unused here (guard only)
 
+	log.Printf("[TRACE] hotpath.after_drain elapsed_ms=%d",
+		time.Since(hotStart).Milliseconds())
+
 	// TODO: remove TRACE
 	lsb := len(t.book(SideBuy).Lots)
 	lss := len(t.book(SideSell).Lots)
@@ -884,13 +887,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// 	log.Printf("[TRACE] consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
 	// }
 
+	//--------------------------------------------------------------------
 	//AI-LOGIC
+	//---------------------------------------------------------
 	d := t.decide(signalHistory)
-	d = t.applyLogicGate(d, execHistory)
+	log.Printf("[TRACE] hotpath.after_decision elapsed_ms=%d",
+		time.Since(hotStart).Milliseconds())
 
-	// after decision
-	log.Printf("[TRACE] hotpath.decision elapsed_ms=%d final=%s raw=%s logic=%s pUp=%.5f",
-		time.Since(t.hotStart).Milliseconds(), d.Signal, d.Raw, d.LogicOpinion, d.PUp)
+	d = t.applyLogicGate(d, execHistory)
+	log.Printf("[TRACE] hotpath.after_logic_gate elapsed_ms=%d final=%s raw=%s logic=%s pUp=%.5f",
+		time.Since(hotStart).Milliseconds(), d.Signal, d.Raw, d.LogicOpinion, d.PUp)
 
 	// Cancel stale pending opens if the current decision no longer supports them.
 	// Do NOT clear pending here.
@@ -933,6 +939,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		t.mu.Unlock()
 		return StepResult{Msg: msg, Raw: d.Raw, Signal: d.Signal}, err
 	}
+
+	log.Printf("[TRACE] hotpath.after_dust elapsed_ms=%d",
+		time.Since(hotStart).Milliseconds())
+
 	// --------------------------------------------------------------------------------------------------------
 	// EXIT path: fee-aware per-lot exit management.
 	//
@@ -1467,6 +1477,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	}
 
+	log.Printf("[TRACE] hotpath.after_exit_scan elapsed_ms=%d",
+		time.Since(hotStart).Milliseconds())
+
 	feeMult := 1.0 + (t.cfg.FeeRatePct / 100.0)
 	// Sum reserved base for long lots (BUY side)
 	var reservedLongBase float64
@@ -1500,7 +1513,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-118",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-119",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1532,6 +1545,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	var symQ string
 	var availQuote, quoteStep float64
 	var errQ error
+
+	log.Printf("[TRACE] hotpath.before_balance elapsed_ms=%d side=%s",
+		time.Since(hotStart).Milliseconds(), side)
 
 	// If BUY, required spare quote inventory
 	if side == SideBuy {
@@ -2010,6 +2026,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 		}
 	}
+
+	log.Printf("[TRACE] hotpath.before_sizing elapsed_ms=%d",
+		time.Since(hotStart).Milliseconds())
 
 	// --- Fixed-USD risk sizing & ramping (no equity dependency) ---
 	// Base dollar size for the first lot
@@ -2663,13 +2682,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 
 			// before order submit
-			log.Printf("TRACE hotpath.order_submit elapsed_ms=%d side=%s limit=%.2f live=%.2f",
-				time.Since(t.hotStart).Milliseconds(), side, limitPx, price)
+			log.Printf("[TRACE] hotpath.before_submit elapsed_ms=%d side=%s limit=%.2f live=%.2f",
+				time.Since(hotStart).Milliseconds(), side, limitPx, price)
 
 			if baseAtLimit > 0 && baseAtLimit*limitPx >= minNotional {
 				log.Printf("[TRACE] postonly.place side=%s limit=%.8f baseReq=%.8f timeout_sec=%d", side, limitPx, baseAtLimit, limitWait)
 				orderID, err := t.broker.PlaceLimitPostOnly(ctx, t.cfg.ProductID, side, limitPx, baseAtLimit)
 				if err == nil && strings.TrimSpace(orderID) != "" {
+					log.Printf("[TRACE] hotpath.order.done elapsed_ms=%d orderID=%s",
+						time.Since(hotStart).Milliseconds(),
+						orderID)
 					// Initialize per-side channel
 					if side == SideBuy && t.pendingBuyCh == nil {
 						t.pendingBuyCh = make(chan OpenResult, 1)
@@ -3063,8 +3085,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 
 			// before order submit
-			log.Printf("TRACE hotpath.order_submit.market_quote elapsed_ms=%d side=%s live=%.2f",
-				time.Since(t.hotStart).Milliseconds(), side, price)
+			log.Printf("[TRACE] hotpath.before_submit.market_quote elapsed_ms=%d side=%s live=%.2f",
+				time.Since(hotStart).Milliseconds(), side, price)
 
 			var err error
 			placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
@@ -3073,6 +3095,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				side, quote, base, price, take)
 			log.Printf("[TRACE] postonly.market_fallback.go side=%s quote=%.2f", side, quote)
 			log.Printf("[KPI] taker.open side=%s quote=%.2f reason=market_fallback", side, quote)
+			log.Printf("[TRACE] hotpath.order.done elapsed_ms=%d",
+				time.Since(hotStart).Milliseconds())
 
 			if err != nil {
 				// Retry once with ORDER_MIN_USD on insufficient-funds style failures.

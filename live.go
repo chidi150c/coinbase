@@ -505,10 +505,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 					stale = false
 				}
 
-				trader.mu.Lock()
-				trader.hotStart = time.Now()
-				hotStart := trader.hotStart
-				trader.mu.Unlock()
+				hotStart := time.Now()
 
 				// after price fetch
 				log.Printf("[TRACE] hotpath.price_fetched elapsed_ms=%d price=%.2f stale=%v err=%v",
@@ -537,7 +534,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				// Step trader
 				//=====================================================================
 				//=====================================================================
-				res, err := trader.step(ctx, execHistory, signalHistory, px)
+				res, err := trader.step(ctx, execHistory, signalHistory, px, hotStart)
 
 				if err != nil {
 					log.Printf("step err: %v", err)
