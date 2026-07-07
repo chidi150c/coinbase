@@ -231,7 +231,7 @@ func (t *Trader) maybeRepriceOnce(
 	pend *PendingOpen,
 	repriceCount int,
 ) (string, float64, int, bool) {
-
+	rpStart := time.Now()
 	// Global guards
 	if !t.cfg.RepriceEnable {
 		return orderID, lastLimitPx, repriceCount, false
@@ -325,6 +325,38 @@ func (t *Trader) maybeRepriceOnce(
 	if shouldReprice && !(newBase > 0 && newBase*newLimitPx >= t.cfg.MinNotional) {
 		shouldReprice = false
 	}
+
+	driftBps := 0.0
+	if initLimitPx > 0 {
+		driftBps = math.Abs((newLimitPx-initLimitPx)/initLimitPx) * 10000.0
+	}
+
+	improveTicks := 0.0
+	if tick > 0 {
+		improveTicks = math.Abs(newLimitPx-lastLimitPx) / tick
+	}
+
+	notional := newBase * newLimitPx
+	notionalOK := newBase > 0 && notional >= t.cfg.MinNotional
+
+	log.Printf(
+		"[TRACE] postonly.reprice.eval elapsed_ms=%d side=%s order_id=%s "+
+			"use_bbo=%v bid=%.8f ask=%.8f "+
+			"init_limit=%.8f last_limit=%.8f candidate_limit=%.8f "+
+			"tick=%.8f improve_ticks=%.2f "+
+			"drift_bps=%.4f max_drift_bps=%.4f "+
+			"new_base=%.8f notional=%.2f min_notional=%.2f notional_ok=%v "+
+			"should_reprice=%v reprice_count=%d max_count=%d",
+		time.Since(rpStart).Milliseconds(),
+		side,
+		orderID,
+		useBBO, bid, ask,
+		initLimitPx, lastLimitPx, newLimitPx,
+		tick, improveTicks,
+		driftBps, t.cfg.RepriceMaxDriftBps,
+		newBase, notional, t.cfg.MinNotional, notionalOK,
+		shouldReprice, repriceCount, t.cfg.RepriceMaxCount,
+	)
 
 	if !shouldReprice {
 		return orderID, lastLimitPx, repriceCount, false
