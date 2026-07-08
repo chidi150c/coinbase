@@ -122,24 +122,25 @@ type BotState struct {
 	Exits           []ExitRecord
 
 	// --- NEW (persist pending maker-first opens & recheck flags) ---
-	PendingBuy         *PendingOpen
-	PendingSell        *PendingOpen
-	PendingRecheckBuy  bool
-	PendingRecheckSell bool
-	RefundBuyUSD       float64
-	RefundSellUSD      float64
-	SpareBuyUSD        float64
-	SpareSellUSD       float64
-	PreviousAIRaw      Signal
-	PendingExits       map[string]*PendingExit
-	MarketRegime       MarketRegime `json:"market_regime,omitempty"`
-	RegimeUntil        time.Time    `json:"regime_until,omitempty"`
-	RecentLowBreakAt   time.Time    `json:"recent_low_break_at,omitempty"`
-	RecentHighBreakAt  time.Time    `json:"recent_high_break_at,omitempty"`
-	RegimeMultiplier   float64
-	RecoveryDebtUSD    float64
-	DustBuyLots        []*Position
-	DustSellLots       []*Position
+	PendingBuy              *PendingOpen
+	PendingSell             *PendingOpen
+	PendingRecheckBuy       bool
+	PendingRecheckSell      bool
+	RefundBuyUSD            float64
+	RefundSellUSD           float64
+	SpareBuyUSD             float64
+	SpareSellUSD            float64
+	PreviousAIRaw           Signal
+	PendingExits            map[string]*PendingExit
+	MarketRegime            MarketRegime `json:"market_regime,omitempty"`
+	RegimeUntil             time.Time    `json:"regime_until,omitempty"`
+	RecentLowBreakAt        time.Time    `json:"recent_low_break_at,omitempty"`
+	RecentHighBreakAt       time.Time    `json:"recent_high_break_at,omitempty"`
+	RegimeMultiplier        float64
+	RecoveryDebtUSD         float64
+	DustBuyLots             []*Position
+	DustSellLots            []*Position
+	PendingReplacementRetry PendingReplacementRetry
 }
 
 // --- NEW (Phase 1): pending async maker-first open support ---
@@ -276,14 +277,15 @@ type Trader struct {
 	SpareBuyUSD   float64
 	SpareSellUSD  float64
 
-	MarketRegime      MarketRegime
-	RegimeUntil       time.Time
-	RecentLowBreakAt  time.Time
-	RecentHighBreakAt time.Time
-	RegimeMultiplier  float64
-	RecoveryDebtUSD   float64
-	dustBuyLots       []*Position
-	dustSellLots      []*Position
+	MarketRegime            MarketRegime
+	RegimeUntil             time.Time
+	RecentLowBreakAt        time.Time
+	RecentHighBreakAt       time.Time
+	RegimeMultiplier        float64
+	RecoveryDebtUSD         float64
+	dustBuyLots             []*Position
+	dustSellLots            []*Position
+	PendingReplacementRetry PendingReplacementRetry
 }
 
 func NewTrader(cfg Config, broker Broker) *Trader {
@@ -1251,6 +1253,135 @@ func (t *Trader) saveStateNoLock() error {
 	return t.saveStateFrom(st)
 }
 
+//
+// CASE 3A - UP-Regime SELL Protection
+// -----------------------------------
+//
+// Trigger:
+//
+//     Immediately previous exit
+//             ↓
+//     SELL threshold_stop_loss with loss
+//             ↓
+//     Current MarketRegime == UP
+//             ↓
+//     New SELL entry price < previous loss-exit BUY price
+//
+// Action:
+//
+//     BLOCK the SELL.
+//
+// Rationale:
+//
+// If the previous SELL already failed and the market is now in an UP regime,
+// opening another SELL even lower weakens the trading position and increases
+// the probability of repeated losses.
+//
+
+//
+// CASE 3B MODE A
+// --------------
+//
+// Condition:
+//
+//     spareBase >= replacementBase
+//
+// Use:
+//
+//     Recovery Method 2.
+//
+// Sequence:
+//
+//     Current Tick
+//
+//     1. Post replacement SELL (post-only)
+//            using replacementBase.
+//
+//     2. Spawn replacement watcher.
+//
+//     3. Post loss-exit BUY.
+//
+//     4. Spawn exit watcher.
+//
+//     5. Return.
+//
+// Subsequent ticks:
+//
+//     Independently drain:
+//
+//         replacement
+//         exit
+//
+// =============================================================================
+//
+// CASE 3B MODE B
+// --------------
+//
+// Condition:
+//
+//     spareBase < replacementBase
+//
+// Use:
+//
+//     Recovery Method 1.
+//
+// Sequence:
+//
+//     Current Tick
+//
+//     1. Post loss-exit BUY (post-only).
+//
+//     2. Spawn exit watcher.
+//
+//     3. Immediately attempt replacement SELL
+//            using Recovery Method 1
+//            (normalBase + increased profit target).
+//
+//     4. Spawn replacement watcher.
+//
+//     5. Return.
+//
+// Subsequent ticks:
+//
+//     Drain both pending lifecycles independently.
+//
+// If replacement:
+//
+//     fills
+//         → continue normally.
+//
+//     remains pending
+//         → continue monitoring.
+//
+//     cancels / times out / exchange rejects
+//         → memorize retry request.
+//
+// After funds become available
+// (typically after loss-exit releases inventory),
+// retry the replacement SELL.
+//
+// =============================================================================
+//
+// Summary
+// -------
+//
+// UP regime:
+//
+//     Protect capital.
+//     Do not repeat weaker SELL entries.
+//
+// DOWN regime:
+//
+//     Recover aggressively.
+//
+//     Prefer Recovery Method 2 when spare inventory permits.
+//
+//     Otherwise,
+//     immediately attempt Recovery Method 1,
+//     and retry later if the initial replacement cannot survive.
+//
+// =============================================================================
+
 // snapshotStateLocked builds the BotState assuming the caller already holds t.mu (write or read if immutable reads).
 func (t *Trader) snapshotStateLocked() BotState {
 	return BotState{
@@ -1280,23 +1411,24 @@ func (t *Trader) snapshotStateLocked() BotState {
 		Exits:           t.lastExits,
 
 		// NEW: persist pending and recheck flags
-		PendingBuy:         t.pendingBuy,
-		PendingSell:        t.pendingSell,
-		PendingRecheckBuy:  t.pendingRecheckBuy,
-		PendingRecheckSell: t.pendingRecheckSell,
-		RefundBuyUSD:       t.refundBuyUSD,
-		RefundSellUSD:      t.refundSellUSD,
-		SpareBuyUSD:        t.SpareBuyUSD,
-		SpareSellUSD:       t.SpareSellUSD,
-		PendingExits:       t.pendingExits,
-		MarketRegime:       t.MarketRegime,
-		RegimeUntil:        t.RegimeUntil,
-		RecentLowBreakAt:   t.RecentLowBreakAt,
-		RecentHighBreakAt:  t.RecentHighBreakAt,
-		RegimeMultiplier:   t.RegimeMultiplier,
-		RecoveryDebtUSD:    t.RecoveryDebtUSD,
-		DustBuyLots:        append([]*Position(nil), t.dustBuyLots...),
-		DustSellLots:       append([]*Position(nil), t.dustSellLots...),
+		PendingBuy:              t.pendingBuy,
+		PendingSell:             t.pendingSell,
+		PendingRecheckBuy:       t.pendingRecheckBuy,
+		PendingRecheckSell:      t.pendingRecheckSell,
+		RefundBuyUSD:            t.refundBuyUSD,
+		RefundSellUSD:           t.refundSellUSD,
+		SpareBuyUSD:             t.SpareBuyUSD,
+		SpareSellUSD:            t.SpareSellUSD,
+		PendingExits:            t.pendingExits,
+		MarketRegime:            t.MarketRegime,
+		RegimeUntil:             t.RegimeUntil,
+		RecentLowBreakAt:        t.RecentLowBreakAt,
+		RecentHighBreakAt:       t.RecentHighBreakAt,
+		RegimeMultiplier:        t.RegimeMultiplier,
+		RecoveryDebtUSD:         t.RecoveryDebtUSD,
+		DustBuyLots:             append([]*Position(nil), t.dustBuyLots...),
+		DustSellLots:            append([]*Position(nil), t.dustSellLots...),
+		PendingReplacementRetry: t.PendingReplacementRetry,
 	}
 }
 
@@ -1412,6 +1544,8 @@ func (t *Trader) loadState() error {
 
 	t.dustBuyLots = append([]*Position(nil), st.DustBuyLots...)
 	t.dustSellLots = append([]*Position(nil), st.DustSellLots...)
+
+	t.PendingReplacementRetry = st.PendingReplacementRetry
 
 	// Restore equity stages
 	t.equityStageBuy = st.EquityStageBuy
@@ -1873,8 +2007,184 @@ func isMounted(dir string) (bool, error) {
 	return false, nil
 }
 
+type RecoveryMethod int
+
+const (
+	RecoveryByProfitTarget RecoveryMethod = iota
+	RecoveryByPositionSize
+)
+
+func (m RecoveryMethod) String() string {
+	switch m {
+	case RecoveryByProfitTarget:
+		return "RecoveryByProfitTarget"
+	case RecoveryByPositionSize:
+		return "RecoveryByPositionSize"
+	default:
+		return "RecoveryUnknown"
+	}
+}
+
+type ReplacementRequest struct {
+	Enabled        bool
+	Side           OrderSide
+	EntryPrice     float64
+	Base           float64
+	RecoveryNetUSD float64
+	Method         RecoveryMethod
+	ProfitGateUSD  float64
+	Reason         string
+}
+type PendingReplacementRetry struct {
+	Enabled            bool
+	Replacement        ReplacementRequest
+	WaitForExitOrderID string
+	Reason             string
+	CreatedAt          time.Time
+}
+
+func (t *Trader) startPendingReplacementEntry(
+	ctx context.Context,
+	repl ReplacementRequest,
+) error {
+	if !repl.Enabled {
+		return nil
+	}
+	if repl.Side != SideSell {
+		return fmt.Errorf("replacement only supports SELL for now: side=%s", repl.Side)
+	}
+	if repl.EntryPrice <= 0 || repl.Base <= 0 {
+		return fmt.Errorf("invalid replacement entry price/base price=%.8f base=%.8f", repl.EntryPrice, repl.Base)
+	}
+	if t.pendingSell != nil {
+		return fmt.Errorf("replacement blocked: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
+	}
+
+	limitPx := repl.EntryPrice
+	if t.cfg.PriceTick > 0 {
+		limitPx = math.Ceil(limitPx/t.cfg.PriceTick) * t.cfg.PriceTick
+	}
+
+	t.mu.Unlock()
+	orderID, err := t.broker.PlaceLimitPostOnly(ctx, t.cfg.ProductID, repl.Side, limitPx, repl.Base)
+	t.mu.Lock()
+
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(orderID) == "" {
+		return fmt.Errorf("empty replacement order id")
+	}
+
+	deadline := time.Now().Add(time.Duration(t.cfg.LimitTimeoutSec) * time.Second)
+
+	t.pendingSell = &PendingOpen{
+		OrderID:        orderID,
+		Side:           repl.Side,
+		LimitPx:        limitPx,
+		BaseAtLimit:    repl.Base,
+		Quote:          repl.Base * limitPx,
+		Deadline:       deadline,
+		Reason:         repl.Reason,
+		ProfitGateUSD:  repl.ProfitGateUSD,
+		EntryAIMode:    repl.Method.String(),
+		ConfidenceMult: 1.0,
+	}
+
+	log.Printf(
+		"[TRACE] case3B.replacement.posted side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f method=%s gate=%.6f reason=%s",
+		repl.Side,
+		orderID,
+		limitPx,
+		repl.Base,
+		repl.Base*limitPx,
+		repl.Method.String(),
+		repl.ProfitGateUSD,
+		repl.Reason,
+	)
+
+	return t.saveStateNoLock()
+}
+
+func (t *Trader) markCase3BReplacementRetryLocked(repl ReplacementRequest, waitForExitOrderID string, reason string) {
+	if !repl.Enabled {
+		return
+	}
+
+	t.PendingReplacementRetry = PendingReplacementRetry{
+		Enabled:            true,
+		Replacement:        repl,
+		WaitForExitOrderID: waitForExitOrderID,
+		Reason:             reason,
+		CreatedAt:          time.Now().UTC(),
+	}
+
+	log.Printf(
+		"[TRACE] case3B.retry.marked side=%s price=%.8f base=%.8f method=%s wait_exit_id=%s reason=%s",
+		repl.Side,
+		repl.EntryPrice,
+		repl.Base,
+		repl.Method.String(),
+		waitForExitOrderID,
+		reason,
+	)
+
+	_ = t.saveStateNoLock()
+}
+
+func (t *Trader) startCase3BReplacement(ctx context.Context, repl ReplacementRequest) error {
+	if !repl.Enabled {
+		return nil
+	}
+
+	if err := t.startPendingReplacementEntry(ctx, repl); err != nil {
+		log.Printf(
+			"[TRACE] case3B.replacement.failed side=%s price=%.8f base=%.8f method=%s err=%v",
+			repl.Side,
+			repl.EntryPrice,
+			repl.Base,
+			repl.Method.String(),
+			err,
+		)
+		return err
+	}
+
+	log.Printf(
+		"[TRACE] case3B.replacement.started side=%s price=%.8f base=%.8f method=%s",
+		repl.Side,
+		repl.EntryPrice,
+		repl.Base,
+		repl.Method.String(),
+	)
+
+	return nil
+}
+
+func (t *Trader) processPendingReplacementRetry(ctx context.Context) {
+	if !t.PendingReplacementRetry.Enabled {
+		return
+	}
+
+	repl := t.PendingReplacementRetry.Replacement
+
+	if t.pendingSell != nil {
+		return
+	}
+
+	if err := t.startCase3BReplacement(ctx, repl); err != nil {
+		log.Printf("[TRACE] case3B.retry.failed err=%v", err)
+		return
+	}
+
+	log.Printf("[TRACE] case3B.retry.started")
+
+	t.PendingReplacementRetry = PendingReplacementRetry{}
+	_ = t.saveStateNoLock()
+}
+
 // --- NEW: side-aware lot closing (no global index) ---
 func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide, localIdx int, exitReason string, exitDecision string) (string, error) {
+
 	book := t.book(side)
 	lot := book.Lots[localIdx]
 	closeSide := SideSell
@@ -1902,8 +2212,200 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		return fmt.Sprintf("EXIT-SKIP %s side=%s→%s notional=%.2f < min=%.2f reason=%s", exitTime.Format(time.RFC3339), lot.Side, closeSide, quote, minNotional, exitReason), nil
 	}
 
-	isL2DeepLoss := exitReason == "threshold_stop_loss" && strings.Contains(exitDecision, "L2_DEEP_LOSS")
-	usePendingMakerExit := lot.ExitMode == ExitModeScalpFixedTP && !isL2DeepLoss && t.cfg.LimitTimeoutSec > 0
+	isL2DeepLoss := exitReason == "threshold_stop_loss" &&
+		strings.Contains(exitDecision, "L2_DEEP_LOSS")
+
+	usePendingMakerExit := lot.ExitMode == ExitModeScalpFixedTP &&
+		!isL2DeepLoss &&
+		t.cfg.LimitTimeoutSec > 0
+
+	// =============================================================================
+	// CASE 3 - SELL LOSS RECOVERY & PROTECTION
+	// Motivation
+	// ----------
+	// Observed behavior:
+	// 		SELL(add maker)
+	// 		     ↓
+	// 		SELL threshold_stop_loss (BUY exit)
+	// 		     ↓
+	// 		New SELL entered below the previous loss-exit BUY price
+	// 		     ↓
+	// 		Repeated losses with little opportunity to recover.
+	//
+	// Case 3 introduces two complementary strategies:
+	//   • Case 3A - Prevent repeating weak SELLs in an UP regime.
+	//   • Case 3B - Recover intelligently in a continuing DOWN regime.
+	// =============================================================================
+
+	case3BLossUSD := 0.0
+	var repl ReplacementRequest
+
+	if lot.Side == SideSell &&
+		exitReason == "threshold_stop_loss" &&
+		t.MarketRegime == RegimeDown {
+
+		// =============================================================================
+		// CASE 3B - DOWN-Regime SELL Recovery
+		// -----------------------------------
+		// Trigger:
+		//     SELL threshold_stop_loss with loss
+		//             ↓
+		//     MarketRegime == DOWN
+		// Philosophy:
+		//    The SELL thesis may still be correct. Instead of abandoning the position,
+		//    immediately attempt a structured recovery.
+		// Two recovery methods exist.
+		//	  *  Recovery Mode A (RecoveryByPositionSize)
+		//	  *  Recovery Mode B (RecoveryByProfitTarget)
+		//===============================================================================
+		estExitFee := quote * (t.cfg.FeeRatePct / 100.0)
+		gross := (lot.OpenPrice - livePrice) * baseRequested
+		net := gross - lot.EntryFee - estExitFee
+
+		if net < 0 {
+			case3BLossUSD = -net
+
+			log.Printf(
+				"[TRACE] case3B.detect side=%s closeSide=%s regime=%s entry_price=%.8f stop_price=%.8f base=%.8f net_loss=%.6f",
+				lot.Side,
+				closeSide,
+				t.MarketRegime,
+				lot.OpenPrice,
+				livePrice,
+				baseRequested,
+				case3BLossUSD,
+			)
+
+			recoveryNetUSD := case3BLossUSD
+
+			if recoveryNetUSD > 0 {
+				beforeDebt := t.RecoveryDebtUSD
+				afterDebt := beforeDebt + recoveryNetUSD
+
+				log.Printf(
+					"[TRACE] case3B.recovery_preview side=%s loss=%.6f recovery=%.6f debt_before=%.6f debt_after=%.6f",
+					lot.Side,
+					case3BLossUSD,
+					recoveryNetUSD,
+					beforeDebt,
+					afterDebt,
+				)
+
+				replacementEntryPrice := livePrice
+				recoveryExitPrice := lot.OpenPrice
+				priceMove := replacementEntryPrice - recoveryExitPrice
+
+				if priceMove > 0 {
+					feeRate := t.cfg.FeeRatePct / 100.0
+					netPerBase := priceMove - (replacementEntryPrice * feeRate) - (recoveryExitPrice * feeRate)
+
+					extraBase := 0.0
+					if netPerBase > 0 {
+						extraBase = recoveryNetUSD / netPerBase
+						if t.cfg.BaseStep > 0 {
+							extraBase = math.Ceil(extraBase/t.cfg.BaseStep) * t.cfg.BaseStep
+						}
+					}
+
+					normalBase := baseRequested
+
+					freshSpareBase, freshBaseStep, err := t.currentSpareBaseLocked(ctx)
+					if err != nil {
+						log.Printf("[TRACE] case3B.spare_base.failed err=%v", err)
+						freshSpareBase = 0
+					}
+
+					if freshBaseStep > 0 {
+						normalBase = math.Floor(normalBase/freshBaseStep) * freshBaseStep
+						extraBase = math.Ceil(extraBase/freshBaseStep) * freshBaseStep
+					}
+
+					method := RecoveryByPositionSize
+					replacementBase := normalBase + extraBase
+
+					if freshSpareBase >= replacementBase {
+						// -----------------------------------------------------------------------------
+						// Recovery Mode A (RecoveryByPositionSize)
+						// -----------------------------------------------------------------------------
+						// Keep the normal exit target. Recovery is achieved by increasing position size with available
+						// spare fund.
+						// Compute:
+						//     RecoveryNetUSD
+						//     extraBase
+						// Then:
+						//     replacementBase = normalBase + extraBase
+						// 	   spare >= replacementBase must be true
+						// 	   the replacement SELL is opened at the stop-loss BUY price.
+						// The intended profit exit remains the original SELL entry price.
+						// extraBase is calculated so that:
+						//     if price moves back from the stop-loss price to the original SELL entry price,
+						// 	   the extraBase portion recovers the full loss.
+						method = RecoveryByPositionSize
+					} else {
+
+						// -----------------------------------------------------------------------------
+						// Recovery Mode B (RecoveryByProfitTarget)
+						// -----------------------------------------------------------------------------
+						// Keep the normal entry size.
+						// Recovery is achieved by increasing the future required net profit target.
+						//     Profit Target = normalNetProfit + RecoveryDebtUSD
+						//     replacementBase = normalBase
+						// This is the existing recovery mechanism.
+						method = RecoveryByProfitTarget
+						replacementBase = normalBase
+					}
+
+					profitGateUSD := t.cfg.ProfitGateUSD
+					if method == RecoveryByProfitTarget {
+						profitGateUSD = t.cfg.ProfitGateUSD + recoveryNetUSD
+					}
+
+					repl = ReplacementRequest{
+						Enabled:        true,
+						Side:           SideSell,
+						EntryPrice:     replacementEntryPrice,
+						Base:           replacementBase,
+						RecoveryNetUSD: recoveryNetUSD,
+						Method:         method,
+						ProfitGateUSD:  profitGateUSD,
+						Reason: fmt.Sprintf(
+							"case3B_replacement method=%s recovery=%.6f",
+							method.String(),
+							recoveryNetUSD,
+						),
+					}
+
+					log.Printf(
+						"[TRACE] case3B.recovery_mode side=%s spare_base=%.8f normal_base=%.8f extra_base=%.8f method=%s replacement_base=%.8f replacement_notional=%.2f profit_gate=%.6f reason=%s",
+						lot.Side,
+						freshSpareBase,
+						normalBase,
+						extraBase,
+						repl.Method.String(),
+						repl.Base,
+						repl.Base*repl.EntryPrice,
+						repl.ProfitGateUSD,
+						repl.Reason,
+					)
+				} else {
+					log.Printf(
+						"[TRACE] case3B.extra_base.skip side=%s recovery_net=%.6f stop_entry=%.8f recovery_exit=%.8f reason=no_positive_sell_recovery_move",
+						lot.Side,
+						recoveryNetUSD,
+						replacementEntryPrice,
+						recoveryExitPrice,
+					)
+				}
+			}
+		}
+	}
+
+	if repl.Enabled && repl.Method == RecoveryByPositionSize {
+		// Case 3B Mode A:
+		// Sufficient spare for normalBase + extraBase.
+		// Post replacement first, then continue to loss-exit.
+		_ = t.startCase3BReplacement(ctx, repl)
+	}
 
 	if usePendingMakerExit && strings.TrimSpace(lot.FixedTPOrderID) != "" {
 		return fmt.Sprintf(
@@ -1958,9 +2460,29 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 			err := t.startPendingMakerExit(ctx, lot.Side, lot.EntryOrderID, side, exitReason, exitDecision, limitPx, baseRequested)
 			t.mu.Lock()
 
+			waitID := ""
+
+			book = t.book(side)
+			if localIdx >= 0 && localIdx < len(book.Lots) {
+				waitID = book.Lots[localIdx].FixedTPOrderID
+			}
+
 			if err != nil {
 				log.Printf("[TRACE] pending_exit.start_failed side=%s entry_id=%s err=%v", lot.Side, lot.EntryOrderID, err)
 				return "", nil
+			}
+
+			if repl.Enabled && repl.Method == RecoveryByProfitTarget {
+				// Case 3B Mode B:
+				// Post loss-exit first, then attempt replacement in same tick.
+				// If replacement fails later, retry waits until loss-exit fill.
+				if err := t.startCase3BReplacement(ctx, repl); err != nil {
+					t.markCase3BReplacementRetryLocked(
+						repl,
+						waitID,
+						fmt.Sprintf("initial_modeB_replacement_failed: %v", err),
+					)
+				}
 			}
 
 			return fmt.Sprintf("PENDING_EXIT %s side=%s entry_id=%s limit=%.2f base=%.8f reason=%s", exitTime.Format(time.RFC3339), lot.Side, lot.EntryOrderID, limitPx, baseRequested, exitReason), nil
@@ -1982,6 +2504,17 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 
 		if placed != nil {
 			log.Printf("[TRACE] order.close placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f", placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
+		}
+		if repl.Enabled && repl.Method == RecoveryByProfitTarget {
+			if err := t.startCase3BReplacement(ctx, repl); err != nil {
+				waitID := placedOrderID(placed)
+
+				t.markCase3BReplacementRetryLocked(
+					repl,
+					waitID,
+					fmt.Sprintf("initial_modeB_replacement_failed: %v", err),
+				)
+			}
 		}
 	}
 
@@ -2011,6 +2544,38 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 	}
 
 	return t.applyFilledExitLocked(livePrice, priceExec, baseRequested, baseFilled, side, localIdx, exitReason, exitDecision, exitTime, placedOrderID(placed), commissionUSD, minNotional, wasNewest)
+}
+
+func (t *Trader) currentSpareBaseLocked(ctx context.Context) (float64, float64, error) {
+	var reservedLongBase float64
+
+	if bb := t.book(SideBuy); bb != nil {
+		for _, lot := range bb.Lots {
+			reservedLongBase += lot.SizeBase
+		}
+	}
+
+	if t.pendingSell != nil && t.cfg.RequireBaseForShort {
+		reservedLongBase += t.pendingSell.BaseAtLimit
+	}
+
+	t.mu.Unlock()
+	_, availBase, baseStep, err := t.broker.GetAvailableBase(ctx, t.cfg.ProductID)
+	t.mu.Lock()
+
+	if err != nil {
+		return 0, 0, err
+	}
+	if baseStep <= 0 {
+		return 0, 0, fmt.Errorf("invalid baseStep %.8f", baseStep)
+	}
+
+	spareBase := availBase - reservedLongBase
+	if spareBase < 0 {
+		spareBase = 0
+	}
+
+	return spareBase, baseStep, nil
 }
 
 func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, baseRequested float64, baseFilled float64, side OrderSide, localIdx int, exitReason string, exitDecision string, exitTime time.Time, exitOrderID string, commissionUSD float64, minNotional float64, wasNewest bool) (string, error) {
