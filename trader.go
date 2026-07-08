@@ -2065,9 +2065,22 @@ func (t *Trader) startPendingReplacementEntry(
 		limitPx = math.Ceil(limitPx/t.cfg.PriceTick) * t.cfg.PriceTick
 	}
 
+	log.Printf(
+		"[TRACE] case3B.replacement.before_postonly side=%s limit=%.8f base=%.8f",
+		repl.Side,
+		limitPx,
+		repl.Base,
+	)
+
 	t.mu.Unlock()
 	orderID, err := t.broker.PlaceLimitPostOnly(ctx, t.cfg.ProductID, repl.Side, limitPx, repl.Base)
 	t.mu.Lock()
+
+	log.Printf(
+		"[TRACE] case3B.replacement.after_postonly order_id=%s err=%v",
+		orderID,
+		err,
+	)
 
 	if err != nil {
 		return err
@@ -2134,8 +2147,27 @@ func (t *Trader) markCase3BReplacementRetryLocked(repl ReplacementRequest, waitF
 
 func (t *Trader) startCase3BReplacement(ctx context.Context, repl ReplacementRequest) error {
 	if !repl.Enabled {
+		log.Printf(
+			"[TRACE] case3B.replacement.disabled side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
+			repl.Side,
+			repl.Method.String(),
+			repl.Base,
+			repl.EntryPrice,
+			repl.Base*repl.EntryPrice,
+		)
 		return nil
 	}
+
+	log.Printf(
+		"[TRACE] case3B.replacement.enter side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
+		repl.Side,
+		repl.Method.String(),
+		repl.Base,
+		repl.EntryPrice,
+		repl.Base*repl.EntryPrice,
+	)
+
+	defer log.Printf("[TRACE] case3B.replacement.leave")
 
 	if err := t.startPendingReplacementEntry(ctx, repl); err != nil {
 		log.Printf(
@@ -2369,9 +2401,10 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 						Method:         method,
 						ProfitGateUSD:  profitGateUSD,
 						Reason: fmt.Sprintf(
-							"case3B_replacement method=%s recovery=%.6f",
+							"case3B_replacement method=%s recovery=%.6f usePendingMakerExit=%v",
 							method.String(),
 							recoveryNetUSD,
+							usePendingMakerExit,
 						),
 					}
 

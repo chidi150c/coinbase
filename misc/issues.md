@@ -113,4 +113,235 @@ Measure hot-path latency from price fetch to order submission.
 Instrument and analyze maybeRepriceOnce() to determine why repricing is skipped.
 Tune the repricing logic based on the collected diagnostics.
 
-Those are the two active engineering tracks right now, with Case 2 (execution) being the highest priority because the signal generation is now functioning and execution is the limiting factor.
+Case 3A — SELL Loss Protection
+
+Status: Implemented
+
+Observation
+
+Repeated pattern:
+
+Maker SELL
+
+↓
+
+Loss stop
+
+↓
+
+Taker BUY exit
+
+↓
+
+New SELL below previous loss BUY
+
+↓
+
+Another loss
+
+↓
+
+Repeat
+
+The bot repeatedly sold at worse prices during an UP regime.
+
+Rule Implemented
+
+Only consider
+
+the immediately previous exit
+
+If
+
+previous exit
+
+=
+
+SELL threshold_stop_loss
+
+and
+
+MarketRegime == UP
+
+then
+
+block
+
+SELL entry
+
+below
+
+previous SELL loss BUY exit price
+New State
+
+Tracked
+
+LastExitSellLossBuyPrice
+
+LastExitSellLossTime
+
+from the immediately preceding exit record.
+
+Result
+
+The bot no longer repeatedly chases SELL entries downward after an unsuccessful SELL while the market has transitioned into an uptrend.
+
+Case 3B — SELL Loss Recovery
+
+Status: Nearly Complete
+
+This has become the largest engineering feature.
+
+Observation
+
+In a DOWN regime
+
+the previous SELL thesis may still be correct.
+
+The stop-loss may simply have been a temporary adverse move.
+
+Instead of accepting the loss and waiting,
+
+the bot immediately attempts to recover.
+
+Recovery Methods
+
+Two recovery methods were designed.
+
+RecoveryByPositionSize
+
+Recover the loss by increasing the replacement position size.
+
+Formula:
+
+extraBase
+
+×
+
+netProfitPerBase
+
+=
+
+case3BLossUSD
+
+Thus
+
+replacementBase
+
+=
+
+normalBase
+
++
+
+extraBase
+
+If price returns
+
+stop-loss BUY price
+
+↓
+
+original SELL entry
+
+the additional position recovers the entire realized loss.
+
+RecoveryByProfitTarget
+
+Keep
+
+replacementBase
+
+=
+
+normalBase
+
+but increase
+
+profitGateUSD
+
+=
+
+normalProfitTarget
+
++
+
+case3BLossUSD
+
+The replacement position remains the same size but stays open longer so that its eventual profit offsets the realized loss.
+
+Recovery Modes
+
+These are execution strategies rather than recovery methods.
+
+Mode A
+
+Enough spare base exists.
+
+Sequence:
+
+Replacement SELL
+
+↓
+
+Loss-exit BUY
+
+↓
+
+Both drain independently.
+
+This minimizes time out of the market.
+
+Mode B
+
+Not enough spare for the larger replacement.
+
+Sequence:
+
+Loss-exit
+
+↓
+
+Attempt replacement immediately
+(using RecoveryByProfitTarget)
+
+↓
+
+Return pending
+
+If the replacement fails because of insufficient funds, post-only rejection, timeout, or cancellation:
+
+Remember retry
+
+↓
+
+Retry automatically on later ticks
+
+↓
+
+Clear retry after successful placement
+
+This preserves the opportunity without requiring the replacement to succeed immediately.
+
+New Components Implemented
+Replacement request structure.
+Recovery method enumeration:
+RecoveryByPositionSize
+RecoveryByProfitTarget
+Retry state:
+PendingReplacementRetry
+Persistent storage of retry state in BotState.
+Automatic retry processor.
+Fresh spare-base computation for replacement sizing.
+Full-loss recovery sizing (recoveryNetUSD = case3BLossUSD).
+Consistent handling for both pending-maker and market/taker exit paths.
+Extensive [TRACE] logging for detection, sizing, recovery mode selection, replacement preview, retry creation, retry execution, and replacement lifecycle.
+Current Remaining Work
+
+Case 3B is functionally very close to complete. The remaining effort is primarily:
+
+End-to-end validation under live trading conditions.
+Verifying retry behavior across exchange responses (fills, cancellations, timeouts).
+Confirming that the replacement logic consistently improves realized performance without introducing unintended exposure.
+
+At this point, the project has evolved from primarily tuning entry signals (Case 1) into improving execution quality (Case 2) and intelligent loss management with adaptive recovery (Case 3).
