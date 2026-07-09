@@ -1,0 +1,186 @@
+
+chidi@localhost:~$ cat /usr/local/bin/plot-buy-gate
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_FILE="${1:-/opt/coinbase/logs/audit/binance_audit.log}"
+OUT_DIR="${2:-/tmp/buy_sell_gate_debug}"
+
+mkdir -p "$OUT_DIR"
+
+python3 - "$LOG_FILE" "$OUT_DIR" <<'PY'
+import sys, re
+from pathlib import Path
+from datetime import datetime
+import pandas as pd
+import matplotlib.pyplot as plt
+
+log_file = Path(sys.argv[1])
+out_dir = Path(sys.argv[2])
+
+def parse_side(side):
+    rows = []
+
+    for line in log_file.read_text(errors="ignore").splitlines():
+        if f"aiRaw={side}" not in line or "logicEPS=" not in line:
+            continue
+
+        mt = re.search(r'(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})', line)
+        if not mt:
+            continue
+
+        def f(name):
+            m = re.search(fr'{name}=([-+]?\d*\.?\d+)', line)
+            return float(m.group(1)) if m else None
+
+        def b(name):
+            m = re.search(fr'{name}=(true|false)', line)
+            return m.group(1) == "true" if m else None
+
+        def s(name):
+            m = re.search(fr'{name}=([A-Z]+)', line)
+            return m.group(1) if m else None
+
+        eps = f("logicEPS")
+        turn = f("logic_macd_turn")
+        if eps is None or turn is None:
+            continue
+
+        if side == "BUY":
+            threshold = -eps
+            gap = abs(turn - threshold)
+            ready = (
+                b("logic_macd_strong_negative") is True and
+                b("logic_macd_momentum_up") is True and
+                b("logic_pattern_buy") is True
+            )
+        else:
+            threshold = eps
+            gap = abs(turn - threshold)
+            ready = (
+                b("logic_macd_strong_positive") is True and
+                b("logic_macd_momentum_down") is True and
+                b("logic_pattern_sell") is True
+            )
+
+        rows.append({
+            "time": datetime.strptime(mt.group(1), "%Y/%m/%d %H:%M:%S"),
+            "pUp": f("pUp"),
+            "buyTh": f("buyTh"),
+            "sellTh": f("sellTh"),
+            "threshold": threshold,
+            "logicEPS": eps,
+            "logic_macd_turn": turn,
+            "gap": gap,
+            "strong_negative": b("logic_macd_strong_negative"),
+            "strong_positive": b("logic_macd_strong_positive"),
+            "momentum_up": b("logic_macd_momentum_up"),
+            "momentum_down": b("logic_macd_momentum_down"),
+            "pattern_buy": b("logic_pattern_buy"),
+            "pattern_sell": b("logic_pattern_sell"),
+            "ready": ready,
+            "logicOpinion": s("logicOpinion"),
+            "final": s("final"),
+        })
+
+    return pd.DataFrame(rows)
+
+def make_plots(side, df):
+    if df.empty:
+        (out_dir / f"{side.lower()}_gate_summary.txt").write_text(
+            f"No aiRaw={side} rows with logicEPS and logic_macd_turn found.\n"
+        )
+        return
+
+    closest = df.loc[df["gap"].idxmin()]
+    start = closest["time"] - pd.Timedelta(minutes=45)
+    end = closest["time"] + pd.Timedelta(minutes=45)
+    zoom = df[(df["time"] >= start) & (df["time"] <= end)].copy()
+
+    # Full chart
+    plt.figure(figsize=(12,4.5))
+    plt.plot(df["time"], df["threshold"], label=("-logicEPS" if side == "BUY" else "+logicEPS"))
+    plt.plot(df["time"], df["logic_macd_turn"], label="logic_macd_turn")
+    plt.axvspan(start, end, alpha=0.15)
+    plt.title(f"{side} gate debug: full period")
+    plt.xlabel("Time")
+    plt.ylabel("Value")
+    plt.grid(True)
+    plt.legend()
+    plt.gcf().autofmt_xdate()
+    plt.tight_layout()
+    plt.savefig(out_dir / f"{side.lower()}_gate_full.png", dpi=160)
+    plt.close()
+
+    # Zoom chart
+    plt.figure(figsize=(12,5))
+    plt.plot(zoom["time"], zoom["threshold"], label=("-logicEPS" if side == "BUY" else "+logicEPS"))
+    plt.plot(zoom["time"], zoom["logic_macd_turn"], label="logic_macd_turn")
+
+    ready_zoom = zoom[zoom["ready"] == True]
+    if not ready_zoom.empty:
+        plt.scatter(ready_zoom["time"], ready_zoom["logic_macd_turn"], label=f"{side} logic ready")
+
+    closest_zoom = zoom.loc[zoom["gap"].idxmin()]
+    plt.scatter([closest_zoom["time"]], [closest_zoom["logic_macd_turn"]], marker="x", s=90, label="closest approach")
+
+    plt.title(f"{side} gate debug: zoom around closest approach")
+    plt.xlabel("Time")
+    plt.ylabel("Value")
+    plt.grid(True)
+    plt.legend()
+    plt.gcf().autofmt_xdate()
+    plt.tight_layout()
+    plt.savefig(out_dir / f"{side.lower()}_gate_zoom.png", dpi=160)
+    plt.close()
+
+    if side == "BUY":
+        condition_text = "BUY requires strong_negative=true AND momentum_up=true AND pattern_buy=true."
+    else:
+        condition_text = "SELL requires strong_positive=true AND momentum_down=true AND pattern_sell=true."
+
+    summary = out_dir / f"{side.lower()}_gate_summary.txt"
+    summary.write_text(
+f"""{side} gate debug summary
+
+Records parsed: {len(df)}
+Time range: {df['time'].min()} to {df['time'].max()}
+
+Closest approach:
+  time: {closest['time']}
+  threshold: {closest['threshold']:.5f}
+  logic_macd_turn: {closest['logic_macd_turn']:.5f}
+  gap: {closest['gap']:.5f}
+
+Counts:
+  strong_negative=true: {(df['strong_negative'] == True).sum()}
+  strong_positive=true: {(df['strong_positive'] == True).sum()}
+  momentum_up=true: {(df['momentum_up'] == True).sum()}
+  momentum_down=true: {(df['momentum_down'] == True).sum()}
+  pattern_buy=true: {(df['pattern_buy'] == True).sum()}
+  pattern_sell=true: {(df['pattern_sell'] == True).sum()}
+  all {side} logic conditions true: {(df['ready'] == True).sum()}
+  logicOpinion={side}: {(df['logicOpinion'] == side).sum()}
+  final={side}: {(df['final'] == side).sum()}
+
+Main interpretation:
+  {condition_text}
+  If all {side} logic conditions true is 0, the missing condition is the blocker.
+""")
+
+for side in ["BUY", "SELL"]:
+    df = parse_side(side)
+    make_plots(side, df)
+
+print("Created:")
+for name in [
+    "buy_gate_full.png",
+    "buy_gate_zoom.png",
+    "buy_gate_summary.txt",
+    "sell_gate_full.png",
+    "sell_gate_zoom.png",
+    "sell_gate_summary.txt",
+]:
+    print(f"  {out_dir / name}")
+PY
+chidi@localhost:~$

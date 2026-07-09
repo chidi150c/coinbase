@@ -1176,8 +1176,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// gather nearest TAKE/mode/net while we're already here (no extra loops later)
 				updateNearest(book, side, i, lot, net, price)
 
+				gateUSD := lotProfitGateUSD(lot)
+				strongProfitExit := net >= gateUSD*strongProfitMult
+
 				if lot.ExitMode == ExitModeScalpFixedTP {
-					gateUSD := lotProfitGateUSD(lot)
 					pass = net >= gateUSD
 					lot.TrailActivateGateUSD = gateUSD
 				}
@@ -1303,7 +1305,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					// Does AI/logic still supports this profitable trade.
 
 					// Hold winner; do not exit yet.
-					if !aiANDlogicExit {
+
+					if !aiANDlogicExit && !strongProfitExit {
 						log.Printf(
 							"[TRACE] ai.exit.hold side=%s idx=%d signal=%s net=%.4f",
 							lot.Side,
@@ -1379,7 +1382,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// FixedTPWorking means the lot has passed ProfitGate + AI/logic exit approval,
 				// and lot.Take has been set as the intended post-only exit limit.
 				// We call closeLot immediately so the maker order is placed before price crosses it.
-				if lot.ExitMode == ExitModeScalpFixedTP && lot.FixedTPWorking && aiANDlogicExit {
+				if lot.ExitMode == ExitModeScalpFixedTP && lot.FixedTPWorking && (aiANDlogicExit || strongProfitExit) {
 					trigger = true
 				}
 
@@ -1402,9 +1405,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						reason: exitReason,
 						net:    net,
 					}
-
-					gateUSD := lotProfitGateUSD(lot)
-					strongProfitExit := net >= gateUSD*strongProfitMult
 
 					if lot.ExitMode == ExitModeScalpFixedTP && strongProfitExit {
 						d.ExitClass = "L2_STRONG_PROFIT"

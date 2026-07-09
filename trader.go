@@ -2042,7 +2042,6 @@ type PendingReplacementRetry struct {
 	CreatedAt          time.Time
 }
 
-
 func (t *Trader) startPendingReplacementEntry(
 	ctx context.Context,
 	repl ReplacementRequest,
@@ -2142,20 +2141,20 @@ func (t *Trader) startPendingReplacementEntry(
 	pctx, cancel := context.WithCancel(ctx)
 
 	pend := &PendingOpen{
-		Side:            repl.Side,
-		LimitPx:         limitPx,
-		BaseAtLimit:     repl.Base,
-		Quote:           repl.Base * limitPx,
-		Take:            0,
-		Reason:          repl.Reason,
-		ProductID:       t.cfg.ProductID,
-		CreatedAt:       now,
-		Deadline:        deadline,
-		OrderID:         orderID,
-		History:         make([]string, 0, 5),
-		ConfidenceMult:  1.0,
-		ProfitGateUSD:   repl.ProfitGateUSD,
-		EntryAIMode:     repl.Method.String(),
+		Side:             repl.Side,
+		LimitPx:          limitPx,
+		BaseAtLimit:      repl.Base,
+		Quote:            repl.Base * limitPx,
+		Take:             0,
+		Reason:           repl.Reason,
+		ProductID:        t.cfg.ProductID,
+		CreatedAt:        now,
+		Deadline:         deadline,
+		OrderID:          orderID,
+		History:          make([]string, 0, 5),
+		ConfidenceMult:   1.0,
+		ProfitGateUSD:    repl.ProfitGateUSD,
+		EntryAIMode:      repl.Method.String(),
 		RefundPortionUSD: 0,
 	}
 
