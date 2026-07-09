@@ -23,11 +23,8 @@ import (
 // Config holds all runtime knobs for trading and operations.
 type Config struct {
 	// Trading target
-	ProductID string // e.g., "BTC-USD" or "BTCUSDT"
-	GateTF    string // e.g., "ONE_MINUTE"
-
-	// Safety & sizing
-	DryRun                bool
+	ProductID             string // e.g., "BTC-USD" or "BTCUSDT"
+	GateTF                string // e.g., "ONE_MINUTE"
 	MaxDailyLossPct       float64
 	RiskPerTradeUSD       float64
 	USDEquity             float64
@@ -149,8 +146,7 @@ func loadConfigFromEnv() Config {
 		ProductID: getEnv("PRODUCT_ID", "BTC-USD"),
 		GateTF:    getEnv("GATE_TF", "ONE_MINUTE"),
 
-		// Universal, unprefixed knobs
-		DryRun:                getEnvBool("DRY_RUN", true),
+		// Universal, unprefixed knobs\
 		MaxDailyLossPct:       getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
 		RiskPerTradeUSD:       getEnvFloat("RISK_PER_TRADE_USD", 80.0),
 		USDEquity:             getEnvFloat("USD_EQUITY", 1000.0),

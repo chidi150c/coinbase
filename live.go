@@ -45,8 +45,8 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 	if intervalSec <= 0 {
 		intervalSec = 60
 	}
-	log.Printf("Starting %s — product=%s dry_run=%v",
-		trader.broker.Name(), trader.cfg.ProductID, trader.cfg.DryRun)
+	log.Printf("Starting %s — product=%s ",
+		trader.broker.Name(), trader.cfg.ProductID)
 
 	// Safety banner
 	log.Printf("[SAFETY] LONG_ONLY=%v | ORDER_MIN_USD=%.2f | RISK_PER_TRADE_USD=%.2f | MAX_DAILY_LOSS_PCT=%.2f | TAKE_PROFIT_PCT=%.2f | STOP_LOSS_PNL_USD=%.2f | MAX_HISTORY_CANDLES=%d",
@@ -300,9 +300,9 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 	lastRefit := &trader.lastFit
 
 	// Track if we've successfully rebased equity from live balances (metrics gate).
-	eqReady := !(trader.cfg.UseLiveEquity() && !trader.cfg.DryRun)
+	eqReady := !trader.cfg.UseLiveEquity()
 
-	if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun {
+	if trader.cfg.UseLiveEquity() {
 		ctxInit, cancelInit := context.WithTimeout(context.Background(), 5*time.Second)
 		var attempt bool
 		if trader.cfg.BridgeURL != "" {
@@ -572,7 +572,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 				}
 
 				// Live equity refresh (bridge or broker)
-				if trader.cfg.UseLiveEquity() && !trader.cfg.DryRun {
+				if trader.cfg.UseLiveEquity() {
 					ctxEq, cancelEq := context.WithTimeout(ctx, 5*time.Second)
 					var bal map[string]float64
 					if trader.cfg.BridgeURL != "" {

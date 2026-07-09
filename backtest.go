@@ -136,9 +136,6 @@ func runBacktest(ctx context.Context, csvPath string, trader *Trader) {
 	// Train the unified logistic model.
 	// model.fit(train, 0.05, 4)
 
-	// Force paper for backtest accounting
-	trader.cfg.DryRun = true
-
 	win, loss := 0, 0
 
 	// Optional slow-down so Prometheus can scrape during backtest
