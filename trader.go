@@ -2042,6 +2042,79 @@ type PendingReplacementRetry struct {
 	CreatedAt          time.Time
 }
 
+func (t *Trader) markCase3BReplacementRetryLocked(repl ReplacementRequest, waitForExitOrderID string, reason string) {
+	if !repl.Enabled {
+		return
+	}
+
+	t.PendingReplacementRetry = PendingReplacementRetry{
+		Enabled:            true,
+		Replacement:        repl,
+		WaitForExitOrderID: waitForExitOrderID,
+		Reason:             reason,
+		CreatedAt:          time.Now().UTC(),
+	}
+
+	log.Printf(
+		"[TRACE] case3B.retry.marked side=%s price=%.8f base=%.8f method=%s wait_exit_id=%s reason=%s",
+		repl.Side,
+		repl.EntryPrice,
+		repl.Base,
+		repl.Method.String(),
+		waitForExitOrderID,
+		reason,
+	)
+
+	_ = t.saveStateNoLock()
+}
+
+func (t *Trader) startCase3BReplacement(ctx context.Context, repl ReplacementRequest) error {
+	if !repl.Enabled {
+		log.Printf(
+			"[TRACE] case3B.replacement.disabled side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
+			repl.Side,
+			repl.Method.String(),
+			repl.Base,
+			repl.EntryPrice,
+			repl.Base*repl.EntryPrice,
+		)
+		return nil
+	}
+
+	log.Printf(
+		"[TRACE] case3B.replacement.enter side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
+		repl.Side,
+		repl.Method.String(),
+		repl.Base,
+		repl.EntryPrice,
+		repl.Base*repl.EntryPrice,
+	)
+
+	defer log.Printf("[TRACE] case3B.replacement.leave")
+
+	if err := t.startPendingReplacementEntry(ctx, repl); err != nil {
+		log.Printf(
+			"[TRACE] case3B.replacement.failed side=%s price=%.8f base=%.8f method=%s err=%v",
+			repl.Side,
+			repl.EntryPrice,
+			repl.Base,
+			repl.Method.String(),
+			err,
+		)
+		return err
+	}
+
+	log.Printf(
+		"[TRACE] case3B.replacement.started side=%s price=%.8f base=%.8f method=%s",
+		repl.Side,
+		repl.EntryPrice,
+		repl.Base,
+		repl.Method.String(),
+	)
+
+	return nil
+}
+
 func (t *Trader) startPendingReplacementEntry(
 	ctx context.Context,
 	repl ReplacementRequest,
@@ -2488,84 +2561,160 @@ func (t *Trader) startPendingReplacementEntry(
 	return nil
 }
 
-func (t *Trader) markCase3BReplacementRetryLocked(repl ReplacementRequest, waitForExitOrderID string, reason string) {
-	if !repl.Enabled {
-		return
-	}
-
-	t.PendingReplacementRetry = PendingReplacementRetry{
-		Enabled:            true,
-		Replacement:        repl,
-		WaitForExitOrderID: waitForExitOrderID,
-		Reason:             reason,
-		CreatedAt:          time.Now().UTC(),
-	}
-
-	log.Printf(
-		"[TRACE] case3B.retry.marked side=%s price=%.8f base=%.8f method=%s wait_exit_id=%s reason=%s",
-		repl.Side,
-		repl.EntryPrice,
-		repl.Base,
-		repl.Method.String(),
-		waitForExitOrderID,
-		reason,
-	)
-
-	_ = t.saveStateNoLock()
+type exitFanoutResult struct {
+	Side         OrderSide
+	EntryOrderID string
+	Reason       string
+	Msg          string
+	Err          error
 }
 
-func (t *Trader) startCase3BReplacement(ctx context.Context, repl ReplacementRequest) error {
-	if !repl.Enabled {
-		log.Printf(
-			"[TRACE] case3B.replacement.disabled side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
-			repl.Side,
-			repl.Method.String(),
-			repl.Base,
-			repl.EntryPrice,
-			repl.Base*repl.EntryPrice,
-		)
+func (t *Trader) fanOutExits(
+	ctx context.Context,
+	livePrice float64,
+	cands []exitCandidate,
+) []exitFanoutResult {
+	if len(cands) == 0 {
 		return nil
 	}
 
-	log.Printf(
-		"[TRACE] case3B.replacement.enter side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
-		repl.Side,
-		repl.Method.String(),
-		repl.Base,
-		repl.EntryPrice,
-		repl.Base*repl.EntryPrice,
-	)
+	resultsCh := make(chan exitFanoutResult, len(cands))
 
-	defer log.Printf("[TRACE] case3B.replacement.leave")
+	var wg sync.WaitGroup
+	wg.Add(len(cands))
 
-	if err := t.startPendingReplacementEntry(ctx, repl); err != nil {
-		log.Printf(
-			"[TRACE] case3B.replacement.failed side=%s price=%.8f base=%.8f method=%s err=%v",
-			repl.Side,
-			repl.EntryPrice,
-			repl.Base,
-			repl.Method.String(),
-			err,
-		)
-		return err
+	for _, cand := range cands {
+		cand := cand
+
+		go func() {
+			defer wg.Done()
+
+			log.Printf(
+				"[TRACE] exit.fanout.start side=%s idx_snapshot=%d entry_id=%s reason=%s net=%.6f",
+				cand.side,
+				cand.idx,
+				cand.entryOrderID,
+				cand.reason,
+				cand.net,
+			)
+
+			msg, err := t.closeLotByEntryID(
+				ctx,
+				livePrice,
+				cand.side,
+				cand.entryOrderID,
+				cand.reason,
+				cand.decision,
+			)
+
+			resultsCh <- exitFanoutResult{
+				Side:         cand.side,
+				EntryOrderID: cand.entryOrderID,
+				Reason:       cand.reason,
+				Msg:          msg,
+				Err:          err,
+			}
+		}()
 	}
 
-	log.Printf(
-		"[TRACE] case3B.replacement.started side=%s price=%.8f base=%.8f method=%s",
-		repl.Side,
-		repl.EntryPrice,
-		repl.Base,
-		repl.Method.String(),
+	go func() {
+		wg.Wait()
+		close(resultsCh)
+	}()
+
+	results := make([]exitFanoutResult, 0, len(cands))
+
+	for res := range resultsCh {
+		results = append(results, res)
+	}
+
+	return results
+}
+
+func (t *Trader) closeLotByEntryID(
+	ctx context.Context,
+	livePrice float64,
+	side OrderSide,
+	entryOrderID string,
+	exitReason string,
+	exitDecision string,
+) (string, error) {
+	entryOrderID = strings.TrimSpace(entryOrderID)
+	if entryOrderID == "" {
+		return "", fmt.Errorf(
+			"close by entry id: empty entry id side=%s reason=%s",
+			side,
+			exitReason,
+		)
+	}
+
+	t.mu.Lock()
+
+	idx := t.findLotIndexByEntryIDLocked(side, entryOrderID)
+	if idx < 0 {
+		t.mu.Unlock()
+
+		return "", fmt.Errorf(
+			"close by entry id: lot not found side=%s entry_id=%s reason=%s",
+			side,
+			entryOrderID,
+			exitReason,
+		)
+	}
+
+	// closeLot requires t.mu to be held and returns with it held.
+	msg, err := t.closeLot(
+		ctx,
+		livePrice,
+		side,
+		idx,
+		exitReason,
+		exitDecision,
 	)
 
-	return nil
+	t.mu.Unlock()
+	return msg, err
 }
 
 // --- NEW: side-aware lot closing (no global index) ---
-func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide, localIdx int, exitReason string, exitDecision string) (string, error) {
+func (t *Trader) closeLot(
+	ctx context.Context,
+	livePrice float64,
+	side OrderSide,
+	localIdx int,
+	exitReason string,
+	exitDecision string,
+) (string, error) {
 
 	book := t.book(side)
+
+	if localIdx < 0 || localIdx >= len(book.Lots) {
+		return "", fmt.Errorf(
+			"close lot invalid index side=%s idx=%d lots=%d",
+			side,
+			localIdx,
+			len(book.Lots),
+		)
+	}
+
 	lot := book.Lots[localIdx]
+	if lot == nil {
+		return "", fmt.Errorf(
+			"close lot nil position side=%s idx=%d",
+			side,
+			localIdx,
+		)
+	}
+
+	entryOrderID := strings.TrimSpace(lot.EntryOrderID)
+	if entryOrderID == "" {
+		return "", fmt.Errorf(
+			"close lot empty entry id side=%s idx=%d",
+			side,
+			localIdx,
+		)
+	}
+
 	closeSide := SideSell
 	if lot.Side == SideSell {
 		closeSide = SideBuy
@@ -2784,7 +2933,9 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		// Case 3B Mode A:
 		// Sufficient spare for normalBase + extraBase.
 		// Post replacement first, then continue to loss-exit.
-		_ = t.startCase3BReplacement(ctx, repl)
+		if err := t.startCase3BReplacement(ctx, repl); err != nil {
+			return "", err
+		}
 	}
 
 	if usePendingMakerExit && strings.TrimSpace(lot.FixedTPOrderID) != "" {
@@ -2842,8 +2993,10 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		waitID := ""
 
 		book = t.book(side)
-		if localIdx >= 0 && localIdx < len(book.Lots) {
-			waitID = book.Lots[localIdx].FixedTPOrderID
+
+		currentIdx := t.findLotIndexByEntryIDLocked(side, entryOrderID)
+		if currentIdx >= 0 {
+			waitID = book.Lots[currentIdx].FixedTPOrderID
 		}
 
 		if err != nil {
@@ -2904,6 +3057,21 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 
 	t.mu.Lock()
 
+	book = t.book(side)
+
+	currentIdx := t.findLotIndexByEntryIDLocked(side, entryOrderID)
+	if currentIdx < 0 {
+		return "", fmt.Errorf(
+			"market exit filled but local lot disappeared side=%s entry_id=%s exit_id=%s",
+			side,
+			entryOrderID,
+			placedOrderID(placed),
+		)
+	}
+
+	localIdx = currentIdx
+	lot = book.Lots[localIdx]
+
 	wasNewest := localIdx == len(book.Lots)-1
 	priceExec := livePrice
 	baseFilled := baseRequested
@@ -2918,6 +3086,22 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		}
 		if placed.CommissionUSD > 0 {
 			commissionUSD = placed.CommissionUSD
+		}
+	}
+
+	// RecoveryByProfitTarget:
+	// The loss exit has been accepted by the exchange.
+	// Submit the replacement immediately before heavier exit bookkeeping.
+	if repl.Enabled && repl.Method == RecoveryByProfitTarget {
+		if rerr := t.startCase3BReplacement(ctx, repl); rerr != nil {
+			t.markCase3BReplacementRetryLocked(
+				repl,
+				placedOrderID(placed),
+				fmt.Sprintf(
+					"initial_modeB_replacement_failed: %v",
+					rerr,
+				),
+			)
 		}
 	}
 
@@ -2937,18 +3121,41 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		wasNewest,
 	)
 
-	if repl.Enabled && repl.Method == RecoveryByProfitTarget {
-		if rerr := t.startCase3BReplacement(ctx, repl); rerr != nil {
-			t.markCase3BReplacementRetryLocked(
-				repl,
-				placedOrderID(placed),
-				fmt.Sprintf("initial_modeB_replacement_failed: %v", rerr),
-			)
+	return msg, err
+
+}
+
+// findLotIndexByEntryIDLocked returns the current lot index.
+//
+// Caller must hold t.mu.
+//
+// EntryOrderID is authoritative because slice indexes can change when
+// concurrent exit workers remove earlier lots.
+func (t *Trader) findLotIndexByEntryIDLocked(
+	side OrderSide,
+	entryOrderID string,
+) int {
+	entryOrderID = strings.TrimSpace(entryOrderID)
+	if entryOrderID == "" {
+		return -1
+	}
+
+	book := t.book(side)
+	if book == nil {
+		return -1
+	}
+
+	for i, lot := range book.Lots {
+		if lot == nil {
+			continue
+		}
+
+		if strings.TrimSpace(lot.EntryOrderID) == entryOrderID {
+			return i
 		}
 	}
 
-	return msg, err
-
+	return -1
 }
 
 func (t *Trader) currentSpareBaseLocked(ctx context.Context) (float64, float64, error) {

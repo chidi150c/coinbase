@@ -1230,11 +1230,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					if stopLossExit {
 
 						cand := exitCandidate{
-							side:   side,
-							idx:    i,
-							reason: "threshold_stop_loss",
-							net:    net,
+							side:         side,
+							idx:          i,
+							entryOrderID: lot.EntryOrderID,
+							reason:       "threshold_stop_loss",
+							net:          net,
 						}
+
 						if deepLossExit {
 							exitD.ExitClass = "L2_DEEP_LOSS"
 							cand.decision = decisionFlatReason(exitD)
@@ -1378,10 +1380,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					}
 
 					cand := exitCandidate{
-						side:   side,
-						idx:    i,
-						reason: exitReason,
-						net:    net,
+						side:         side,
+						idx:          i,
+						entryOrderID: lot.EntryOrderID,
+						reason:       exitReason,
+						net:          net,
 					}
 
 					if strongProfitExit {
@@ -1436,65 +1439,102 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			return StepResult{Msg: msg, Raw: d.Raw, Signal: d.Signal}, err
 		}
 
-		closeAll := func(cands []exitCandidate) (string, bool, error) {
-			if len(cands) == 0 {
-				return "", false, nil
-			}
+		// Build the fan-out set while preserving the existing selection policy:
+		//
+		// - all L2 deep losses
+		// - all L2 strong profits
+		// - worst L1 warning loss
+		// - best L1 AI profit
+		var selected []exitCandidate
 
-			sort.Slice(cands, func(a, b int) bool {
-				if cands[a].side != cands[b].side {
-					return string(cands[a].side) < string(cands[b].side)
-				}
-				return cands[a].idx > cands[b].idx
+		selected = append(selected, stopL2...)
+		selected = append(selected, profitL2...)
+
+		if len(stopL1) > 0 {
+			sort.Slice(stopL1, func(i, j int) bool {
+				// Most negative L1 loss first.
+				return stopL1[i].net < stopL1[j].net
 			})
 
-			var msgs []string
-			for _, cand := range cands {
-				msg, err := t.closeLot(ctx, livePrice, cand.side, cand.idx, cand.reason, cand.decision)
-				if err != nil {
-					return strings.Join(msgs, "\n"), true, err
-				}
-				if strings.TrimSpace(msg) != "" {
-					msgs = append(msgs, msg)
-				}
-			}
-
-			return strings.Join(msgs, "\n"), true, nil
+			selected = append(selected, stopL1[0])
 		}
-		closeOne := func(cands []exitCandidate, worst bool) (string, bool, error) {
-			if len(cands) == 0 {
-				return "", false, nil
-			}
 
-			sort.Slice(cands, func(i, j int) bool {
-				if worst {
-					return cands[i].net < cands[j].net
-				}
-				return cands[i].net > cands[j].net
+		if len(profitL1) > 0 {
+			sort.Slice(profitL1, func(i, j int) bool {
+				// Highest L1 profit first.
+				return profitL1[i].net > profitL1[j].net
 			})
 
-			c := cands[0]
-
-			msg, err := t.closeLot(ctx, livePrice, c.side, c.idx, c.reason, c.decision)
-
-			return msg, true, err
+			selected = append(selected, profitL1[0])
 		}
 
-		if msg, done, err := closeAll(stopL2); done || err != nil {
+		if len(selected) > 0 {
+			log.Printf(
+				"[TRACE] exit.fanout.batch candidates=%d stop_l2=%d profit_l2=%d stop_l1=%d profit_l1=%d",
+				len(selected),
+				len(stopL2),
+				len(profitL2),
+				len(stopL1),
+				len(profitL1),
+			)
+
+			// Workers acquire t.mu individually.
+			// Never wait for them while step() still holds the trader lock.
 			t.mu.Unlock()
-			return StepResult{Msg: msg, Raw: d.Raw, Signal: d.Signal}, err
-		}
-		if msg, done, err := closeAll(profitL2); done || err != nil {
-			t.mu.Unlock()
-			return StepResult{Msg: msg, Raw: d.Raw, Signal: d.Signal}, err
-		}
-		if msg, done, err := closeOne(stopL1, true); done || err != nil {
-			t.mu.Unlock()
-			return StepResult{Msg: msg, Raw: d.Raw, Signal: d.Signal}, err
-		}
-		if msg, done, err := closeOne(profitL1, false); done || err != nil {
-			t.mu.Unlock()
-			return StepResult{Msg: msg, Raw: d.Raw, Signal: d.Signal}, err
+
+			results := t.fanOutExits(
+				ctx,
+				livePrice,
+				selected,
+			)
+
+			var (
+				msgs      []string
+				succeeded int
+				failed    int
+			)
+
+			for _, res := range results {
+				if res.Err != nil {
+					failed++
+
+					log.Printf(
+						"[TRACE] exit.fanout.failed side=%s entry_id=%s reason=%s err=%v",
+						res.Side,
+						res.EntryOrderID,
+						res.Reason,
+						res.Err,
+					)
+
+					continue
+				}
+
+				succeeded++
+
+				log.Printf(
+					"[TRACE] exit.fanout.done side=%s entry_id=%s reason=%s msg=%q",
+					res.Side,
+					res.EntryOrderID,
+					res.Reason,
+					res.Msg,
+				)
+
+				if strings.TrimSpace(res.Msg) != "" {
+					msgs = append(msgs, res.Msg)
+				}
+			}
+
+			return StepResult{
+				Msg: fmt.Sprintf(
+					"EXIT-FANOUT total=%d succeeded=%d failed=%d\n%s",
+					len(results),
+					succeeded,
+					failed,
+					strings.Join(msgs, "\n"),
+				),
+				Raw:    d.Raw,
+				Signal: d.Signal,
+			}, nil
 		}
 
 		// single-pass enriched summary (collected in-loop; no extra scans)
@@ -1549,7 +1589,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-124",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-125",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -3422,11 +3462,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 }
 
 type exitCandidate struct {
-	side     OrderSide
-	idx      int
-	reason   string
-	decision string
-	net      float64
+	side         OrderSide
+	idx          int
+	entryOrderID string
+	reason       string
+	decision     string
+	net          float64
 }
 
 // consolidateDust collapses tiny (notional < minNotional) lots on a side.
