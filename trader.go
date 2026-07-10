@@ -2779,16 +2779,18 @@ func (t *Trader) closeLot(
 	net := gross - lot.EntryFee - estExitFee
 
 	if lot.Side == SideSell &&
-		strings.HasPrefix(exitReason, "threshold_stop_loss") &&
-		t.MarketRegime == RegimeDown {
+		strings.HasPrefix(exitReason, "threshold_stop_loss") {
 
 		// =============================================================================
-		// CASE 3B - DOWN-Regime SELL Recovery
+		// CASE 3B - SELL Stop-Loss Recovery
 		// -----------------------------------
 		// Trigger:
 		//     SELL threshold_stop_loss with loss
 		//             ↓
-		//     MarketRegime == DOWN
+		//     Recovery Mode A:
+		//         Any regime with sufficient spare base.
+		//     Recovery Mode B:
+		//         DOWN regime when Mode A is not possible.
 		// Philosophy:
 		//    The SELL thesis may still be correct. Instead of abandoning the position,
 		//    immediately attempt a structured recovery.
@@ -2834,95 +2836,106 @@ func (t *Trader) closeLot(
 					feeRate := t.cfg.FeeRatePct / 100.0
 					netPerBase := priceMove - (replacementEntryPrice * feeRate) - (recoveryExitPrice * feeRate)
 
-					extraBase := 0.0
-					if netPerBase > 0 {
-						extraBase = recoveryNetUSD / netPerBase
+					if netPerBase <= 0 {
+						log.Printf(
+							"[TRACE] case3B.net_per_base.skip side=%s regime=%s recovery_net=%.6f price_move=%.8f net_per_base=%.8f reason=non_positive_net_per_base",
+							lot.Side,
+							t.MarketRegime,
+							recoveryNetUSD,
+							priceMove,
+							netPerBase,
+						)
+					} else {
+						extraBase := recoveryNetUSD / netPerBase
 						if t.cfg.BaseStep > 0 {
 							extraBase = math.Ceil(extraBase/t.cfg.BaseStep) * t.cfg.BaseStep
 						}
+
+						normalBase := baseRequested
+
+						freshSpareBase, freshBaseStep, err := t.currentSpareBaseLocked(ctx)
+						if err != nil {
+							log.Printf("[TRACE] case3B.spare_base.failed err=%v", err)
+							freshSpareBase = 0
+						}
+
+						if freshBaseStep > 0 {
+							normalBase = math.Floor(normalBase/freshBaseStep) * freshBaseStep
+							extraBase = math.Ceil(extraBase/freshBaseStep) * freshBaseStep
+						}
+
+						modeARequiredBase := normalBase + extraBase
+
+						switch {
+						case freshSpareBase >= modeARequiredBase:
+							// Mode A is permitted in every regime, including UP.
+							repl = ReplacementRequest{
+								Enabled:        true,
+								Side:           SideSell,
+								EntryPrice:     replacementEntryPrice,
+								Base:           modeARequiredBase,
+								RecoveryNetUSD: recoveryNetUSD,
+								Method:         RecoveryByPositionSize,
+								ProfitGateUSD:  t.cfg.ProfitGateUSD,
+								Reason: fmt.Sprintf(
+									"case3B_replacement method=%s recovery=%.6f regime=%s usePendingMakerExit=%v",
+									RecoveryByPositionSize.String(),
+									recoveryNetUSD,
+									t.MarketRegime,
+									usePendingMakerExit,
+								),
+							}
+
+						case t.MarketRegime == RegimeDown:
+							// Mode B remains the insufficient-spare fallback only in DOWN regime.
+							repl = ReplacementRequest{
+								Enabled:        true,
+								Side:           SideSell,
+								EntryPrice:     replacementEntryPrice,
+								Base:           normalBase,
+								RecoveryNetUSD: recoveryNetUSD,
+								Method:         RecoveryByProfitTarget,
+								ProfitGateUSD:  t.cfg.ProfitGateUSD + recoveryNetUSD,
+								Reason: fmt.Sprintf(
+									"case3B_replacement method=%s recovery=%.6f regime=%s usePendingMakerExit=%v",
+									RecoveryByProfitTarget.String(),
+									recoveryNetUSD,
+									t.MarketRegime,
+									usePendingMakerExit,
+								),
+							}
+
+						default:
+							// UP/NORMAL with insufficient spare cannot safely run Mode A.
+							// Do not fabricate an oversized replacement request.
+							log.Printf(
+								"[TRACE] case3B.modeA.blocked side=%s regime=%s spare_base=%.8f required_base=%.8f normal_base=%.8f extra_base=%.8f recovery=%.6f",
+								lot.Side,
+								t.MarketRegime,
+								freshSpareBase,
+								modeARequiredBase,
+								normalBase,
+								extraBase,
+								recoveryNetUSD,
+							)
+						}
+
+						if repl.Enabled {
+							log.Printf(
+								"[TRACE] case3B.recovery_mode side=%s spare_base=%.8f normal_base=%.8f extra_base=%.8f method=%s replacement_base=%.8f replacement_notional=%.2f profit_gate=%.6f reason=%s",
+								lot.Side,
+								freshSpareBase,
+								normalBase,
+								extraBase,
+								repl.Method.String(),
+								repl.Base,
+								repl.Base*repl.EntryPrice,
+								repl.ProfitGateUSD,
+								repl.Reason,
+							)
+						}
 					}
 
-					normalBase := baseRequested
-
-					freshSpareBase, freshBaseStep, err := t.currentSpareBaseLocked(ctx)
-					if err != nil {
-						log.Printf("[TRACE] case3B.spare_base.failed err=%v", err)
-						freshSpareBase = 0
-					}
-
-					if freshBaseStep > 0 {
-						normalBase = math.Floor(normalBase/freshBaseStep) * freshBaseStep
-						extraBase = math.Ceil(extraBase/freshBaseStep) * freshBaseStep
-					}
-
-					method := RecoveryByPositionSize
-					replacementBase := normalBase + extraBase
-
-					if freshSpareBase >= replacementBase {
-						// -----------------------------------------------------------------------------
-						// Recovery Mode A (RecoveryByPositionSize)
-						// -----------------------------------------------------------------------------
-						// Keep the normal exit target. Recovery is achieved by increasing position size with available
-						// spare fund.
-						// Compute:
-						//     RecoveryNetUSD
-						//     extraBase
-						// Then:
-						//     replacementBase = normalBase + extraBase
-						// 	   spare >= replacementBase must be true
-						// 	   the replacement SELL is opened at the stop-loss BUY price.
-						// The intended profit exit remains the original SELL entry price.
-						// extraBase is calculated so that:
-						//     if price moves back from the stop-loss price to the original SELL entry price,
-						// 	   the extraBase portion recovers the full loss.
-						method = RecoveryByPositionSize
-					} else {
-
-						// -----------------------------------------------------------------------------
-						// Recovery Mode B (RecoveryByProfitTarget)
-						// -----------------------------------------------------------------------------
-						// Keep the normal entry size.
-						// Recovery is achieved by increasing the future required net profit target.
-						//     Profit Target = normalNetProfit + RecoveryDebtUSD
-						//     replacementBase = normalBase
-						// This is the existing recovery mechanism.
-						method = RecoveryByProfitTarget
-						replacementBase = normalBase
-					}
-
-					profitGateUSD := t.cfg.ProfitGateUSD
-					if method == RecoveryByProfitTarget {
-						profitGateUSD = t.cfg.ProfitGateUSD + recoveryNetUSD
-					}
-
-					repl = ReplacementRequest{
-						Enabled:        true,
-						Side:           SideSell,
-						EntryPrice:     replacementEntryPrice,
-						Base:           replacementBase,
-						RecoveryNetUSD: recoveryNetUSD,
-						Method:         method,
-						ProfitGateUSD:  profitGateUSD,
-						Reason: fmt.Sprintf(
-							"case3B_replacement method=%s recovery=%.6f usePendingMakerExit=%v",
-							method.String(),
-							recoveryNetUSD,
-							usePendingMakerExit,
-						),
-					}
-
-					log.Printf(
-						"[TRACE] case3B.recovery_mode side=%s spare_base=%.8f normal_base=%.8f extra_base=%.8f method=%s replacement_base=%.8f replacement_notional=%.2f profit_gate=%.6f reason=%s",
-						lot.Side,
-						freshSpareBase,
-						normalBase,
-						extraBase,
-						repl.Method.String(),
-						repl.Base,
-						repl.Base*repl.EntryPrice,
-						repl.ProfitGateUSD,
-						repl.Reason,
-					)
 				} else {
 					log.Printf(
 						"[TRACE] case3B.extra_base.skip side=%s recovery_net=%.6f stop_entry=%.8f recovery_exit=%.8f reason=no_positive_sell_recovery_move",
@@ -2941,8 +2954,32 @@ func (t *Trader) closeLot(
 		// Sufficient spare for normalBase + extraBase.
 		// Post replacement first, then continue to loss-exit.
 		if err := t.startCase3BReplacement(ctx, repl); err != nil {
-			return "", err
+			log.Printf(
+				"[TRACE] case3B.modeA.replacement_failed side=%s entry_id=%s base=%.8f entry_price=%.8f recovery=%.6f err=%v",
+				lot.Side,
+				lot.EntryOrderID,
+				repl.Base,
+				repl.EntryPrice,
+				repl.RecoveryNetUSD,
+				err,
+			)
+
+			return "", fmt.Errorf(
+				"case3B modeA replacement failed; loss exit aborted entry_id=%s: %w",
+				lot.EntryOrderID,
+				err,
+			)
 		}
+
+		log.Printf(
+			"[TRACE] case3B.modeA.replacement_started side=%s entry_id=%s base=%.8f entry_price=%.8f recovery=%.6f",
+			lot.Side,
+			lot.EntryOrderID,
+			repl.Base,
+			repl.EntryPrice,
+			repl.RecoveryNetUSD,
+		)
+
 	}
 
 	if usePendingMakerExit && strings.TrimSpace(lot.FixedTPOrderID) != "" {
