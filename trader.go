@@ -2618,7 +2618,7 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 
 	case3BLossUSD := 0.0
 	var repl ReplacementRequest
-
+	var net float64
 	if lot.Side == SideSell &&
 		exitReason == "threshold_stop_loss" &&
 		t.MarketRegime == RegimeDown {
@@ -2639,7 +2639,7 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		//===============================================================================
 		estExitFee := quote * (t.cfg.FeeRatePct / 100.0)
 		gross := (lot.OpenPrice - livePrice) * baseRequested
-		net := gross - lot.EntryFee - estExitFee
+		net = gross - lot.EntryFee - estExitFee
 
 		if net < 0 {
 			case3BLossUSD = -net
@@ -2867,11 +2867,26 @@ func (t *Trader) closeLot(ctx context.Context, livePrice float64, side OrderSide
 		return fmt.Sprintf("PENDING_EXIT %s side=%s entry_id=%s limit=%.2f base=%.8f reason=%s", exitTime.Format(time.RFC3339), lot.Side, lot.EntryOrderID, limitPx, baseRequested, exitReason), nil
 	}
 
+	log.Printf(
+		"[TRACE] order.close.request lotSide=%s closeSide=%s idx=%d entry_id=%s reason=%s decision=%s net=%.6f gate=%.6f baseReq=%.8f quoteEst=%.2f livePrice=%.8f mode=%s",
+		lot.Side,
+		closeSide,
+		localIdx,
+		lot.EntryOrderID,
+		exitReason,
+		exitDecision,
+		net,
+		t.lotProfitGateUSD(lot),
+		baseRequested,
+		quote,
+		livePrice,
+		lot.ExitMode,
+	)
+
 	var err error
 	placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote)
 
-	log.Printf("[TRACE] order.close request side=%s baseReq=%.8f quoteEst=%.2f priceSnap=%.8f", closeSide, baseRequested, quote, livePrice)
-	log.Printf("[KPI] taker.exit side=%s base=%.8f quote_est=%.2f reason=market_now", closeSide, baseRequested, quote)
+	log.Printf("[KPI] taker.exit.done side=%s base=%.8f quote_est=%.2f reason=%s", closeSide, baseRequested, quote, exitReason)
 
 	if err != nil {
 		if t.cfg.UseDirectSlack {

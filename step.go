@@ -385,6 +385,19 @@ func (t *Trader) maybeRepriceOnce(
 	return newID, newLimitPx, repriceCount + 1, true
 }
 
+// Return this lot's effective profit gate.
+//
+// Normal AI-confirmed lots use cfg.ProfitGateUSD.
+// Reduced-confidence AI-FLAT lots may carry a smaller ProfitGateUSD.
+// Older lots fall back to cfg.ProfitGateUSD.
+func (t *Trader) lotProfitGateUSD(lot *Position) float64 {
+	gate := lot.ProfitGateUSD
+	if gate <= 0 {
+		gate = t.cfg.ProfitGateUSD
+	}
+	return gate
+}
+
 // step consumes the current candle history and may place/close a position.
 // It returns a human-readable status string for logging.
 func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory []Candle, livePrice float64, hotStart time.Time) (StepResult, error) {
@@ -1064,19 +1077,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 		}
 
-		// Return this lot's effective profit gate.
-		//
-		// Normal AI-confirmed lots use cfg.ProfitGateUSD.
-		// Reduced-confidence AI-FLAT lots may carry a smaller ProfitGateUSD.
-		// Older lots fall back to cfg.ProfitGateUSD.
-		lotProfitGateUSD := func(lot *Position) float64 {
-			gate := lot.ProfitGateUSD
-			if gate <= 0 {
-				gate = t.cfg.ProfitGateUSD
-			}
-			return gate
-		}
-
 		// Compute fee-aware unrealized net PnL and gate pass/fail.
 		//
 		// Net PnL includes:
@@ -1096,7 +1096,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 			net := gross - lot.EntryFee - estExit
 			lot.UnrealizedPnLUSD = net
-			gateUSD := lotProfitGateUSD(lot)
+			gateUSD := t.lotProfitGateUSD(lot)
 			return net, net >= gateUSD
 		}
 
@@ -1124,7 +1124,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 			// ScalpFixedTP: Take = fee-aware profit-gate price (preview);
 			// when gate passes you’ll arm FixedTPWorking and use this for post-only exits.
-			gateUSD := lotProfitGateUSD(lot)
+			gateUSD := t.lotProfitGateUSD(lot)
 			lot.ExitMode = ExitModeScalpFixedTP
 			lot.TrailDistancePct = 0
 			lot.TrailActivateGateUSD = gateUSD
@@ -1176,7 +1176,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// gather nearest TAKE/mode/net while we're already here (no extra loops later)
 				updateNearest(book, side, i, lot, net, price)
 
-				gateUSD := lotProfitGateUSD(lot)
+				gateUSD := t.lotProfitGateUSD(lot)
 				strongProfitExit := net >= gateUSD*strongProfitMult
 
 				if lot.ExitMode == ExitModeScalpFixedTP {
@@ -1273,10 +1273,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// Winning trades are held while AI/logic still supports them.
 				aiANDlogicExit := shouldExitByAILogic(lot, d)
 
+				exitReason := ""
+
 				// Profit gate passed.
 				// Apply exit-mode-specific behavior.
 				switch lot.ExitMode {
 				case ExitModeRunnerTrailing:
+					exitReason = "trailing_stop"
 					// Runner path.
 					// Managed by trailing activation/stop behavior.
 					if trigger, _ := t.updateRunnerTrail(lot, price); trigger {
@@ -1308,11 +1311,15 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 					if !aiANDlogicExit && !strongProfitExit {
 						log.Printf(
-							"[TRACE] ai.exit.hold side=%s idx=%d signal=%s net=%.4f",
+							"[TRACE] exit.hold lot_side=%s idx=%d signal=%s net=%.4f gate=%.6f entry_id=%s livePrice=%.8f mode=%s",
 							lot.Side,
 							i,
 							d.Signal,
 							net,
+							t.lotProfitGateUSD(lot),
+							lot.EntryOrderID,
+							livePrice,
+							lot.ExitMode,
 						)
 						i++
 						continue
@@ -1327,14 +1334,20 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					// if not filled by timeout, fallback market
 					//-------------------------------------------------------
 
-					// Opposite AI/logic appeared while profitable.
-					// Allow maker-friendly exit.
+					exitReason = "take_profit"
 					log.Printf(
-						"[TRACE] ai.exit.allow side=%s idx=%d signal=%s net=%.4f",
+						"[TRACE] exit.allow lot_side=%s idx=%d signal=%s net=%.4f gate=%.6f entry_id=%s livePrice=%.8f mode=%s exitReason=%s strongProfit=%t aiExit=%t",
 						lot.Side,
 						i,
 						d.Signal,
 						net,
+						t.lotProfitGateUSD(lot),
+						lot.EntryOrderID,
+						livePrice,
+						lot.ExitMode,
+						exitReason,
+						strongProfitExit,
+						aiANDlogicExit,
 					)
 
 					// Arm/update maker-friendly exit limit price to be near current mark price.
@@ -1346,59 +1359,24 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					if lot.Side == SideSell && offBps > 0 {
 						makerExitPx = price * (1.0 - offBps/10000.0)
 					}
-					// place/re-post every tick while gate holds (minimal emulation)
+
 					if !lot.FixedTPWorking || (lot.Side == SideBuy && makerExitPx < lot.Take) || (lot.Side == SideSell && makerExitPx > lot.Take) {
 						lot.Take = makerExitPx
 						lot.FixedTPWorking = true
-						log.Printf("[TRACE] tp.post side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
+						log.Printf("[TRACE] tp.post side=%s idx=%d price=%.8f net=%.6f entry_id=%s",
+							lot.Side, i, lot.Take, net, lot.EntryOrderID)
 					} else {
-						log.Printf("[TRACE] tp.repost side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
+						log.Printf("[TRACE] tp.repost side=%s idx=%d price=%.8f net=%.6f entry_id=%s",
+							lot.Side, i, lot.Take, net, lot.EntryOrderID)
 					}
-				}
 
-				// Final trigger check.
-				// Scalp exits require:
-				// - ProfitGate already passed
-				// - AI/logic exit approval
-				// - maker exit armed with lot.Take
-				// - valid notional
-				//
-				// We do NOT wait for price to cross Take here.
-				// closeLot() uses lot.Take as the post-only limit price.
-				trigger := false
-				exitReason := ""
-				if lot.ExitMode == ExitModeScalpFixedTP {
-					exitReason = "take_profit"
-				} else if lot.ExitMode == ExitModeRunnerTrailing {
-					exitReason = "trailing_stop"
-				}
-
-				//--------------------information----------------------------
-				// Take = post-only exit price
-				// FixedTPWorking = maker exit armed
-				// trigger = send maker exit attempt now
-				//----------------------------------------------------------
-
-				// FixedTPWorking means the lot has passed ProfitGate + AI/logic exit approval,
-				// and lot.Take has been set as the intended post-only exit limit.
-				// We call closeLot immediately so the maker order is placed before price crosses it.
-				if lot.ExitMode == ExitModeScalpFixedTP && lot.FixedTPWorking && (aiANDlogicExit || strongProfitExit) {
-					trigger = true
-				}
-
-				// ⬇️ ADD THIS dust guard for Fixed-TP before calling closeLot:
-				if trigger && lot.ExitMode == ExitModeScalpFixedTP {
 					notional := lot.SizeBase * price
 					if notional < minNotional {
-						// skip attempting a broker close; leave it armed or quiet it if you prefer
-						// (optional) quiet the spam:
 						lot.FixedTPWorking = false
 						i++
 						continue
 					}
-				}
 
-				if trigger {
 					cand := exitCandidate{
 						side:   side,
 						idx:    i,
@@ -1406,19 +1384,30 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						net:    net,
 					}
 
-					if lot.ExitMode == ExitModeScalpFixedTP && strongProfitExit {
+					if strongProfitExit {
 						d.ExitClass = "L2_STRONG_PROFIT"
 						cand.decision = decisionFlatReason(d)
 						profitL2 = append(profitL2, cand)
-					} else if lot.ExitMode == ExitModeScalpFixedTP {
+					} else {
 						d.ExitClass = "L1_AI_PROFIT"
 						cand.decision = decisionFlatReason(d)
 						profitL1 = append(profitL1, cand)
 					}
 
+					log.Printf(
+						"[TRACE] tp.queue side=%s idx=%d price=%.8f net=%.6f exit_class=%s entry_id=%s",
+						lot.Side, i, lot.Take, net, d.ExitClass, lot.EntryOrderID,
+					)
+
 					i++
 					continue
 				}
+
+				//--------------------information----------------------------
+				// Take = post-only exit price
+				// FixedTPWorking = maker exit armed
+				// trigger = send maker exit attempt now
+				//----------------------------------------------------------
 
 				// nearest summary (unchanged)
 				if lot.Side == SideBuy {
