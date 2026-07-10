@@ -1696,7 +1696,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-127",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-128",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1740,7 +1740,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		last := t.lastExits[len(t.lastExits)-1]
 
 		if last.Side == SideBuy &&
-			last.Reason == "threshold_stop_loss" &&
+			strings.HasPrefix(last.Reason, "threshold_stop_loss") &&
 			last.PNLUSD < 0 &&
 			price > last.ClosePrice {
 
@@ -1770,7 +1770,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		last := t.lastExits[len(t.lastExits)-1]
 
 		if last.Side == SideSell &&
-			last.Reason == "threshold_stop_loss" &&
+			strings.HasPrefix(last.Reason, "threshold_stop_loss") &&
 			last.PNLUSD < 0 &&
 			price < last.ClosePrice {
 
