@@ -2742,7 +2742,7 @@ func (t *Trader) closeLot(
 		return fmt.Sprintf("EXIT-SKIP %s side=%s→%s notional=%.2f < min=%.2f reason=%s", exitTime.Format(time.RFC3339), lot.Side, closeSide, quote, minNotional, exitReason), nil
 	}
 
-	isL2DeepLoss := exitReason == "threshold_stop_loss" &&
+	isL2DeepLoss := strings.HasPrefix(exitReason, "threshold_stop_loss") &&
 		strings.Contains(exitDecision, "L2_DEEP_LOSS")
 
 	usePendingMakerExit := lot.ExitMode == ExitModeScalpFixedTP &&
@@ -2779,7 +2779,7 @@ func (t *Trader) closeLot(
 	net := gross - lot.EntryFee - estExitFee
 
 	if lot.Side == SideSell &&
-		exitReason == "threshold_stop_loss" &&
+		strings.HasPrefix(exitReason, "threshold_stop_loss") &&
 		t.MarketRegime == RegimeDown {
 
 		// =============================================================================
