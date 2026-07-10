@@ -724,24 +724,62 @@ func toPlacedOrder(j placedOrderJSON) *PlacedOrder {
 		out.ID = j.OrderID
 	}
 
-	// Prefer sidecar fields when present
+	// Prefer sidecar execution fields when present.
 	if out.BaseSize == 0 && strings.TrimSpace(j.FilledSize) != "" {
 		out.BaseSize = parseFloat(j.FilledSize)
 	}
 	if out.QuoteSpent == 0 && strings.TrimSpace(j.ExecutedValue) != "" {
 		out.QuoteSpent = parseFloat(j.ExecutedValue)
 	}
-	if out.CommissionUSD == 0 && strings.TrimSpace(j.FillFees) != "" {
-		out.CommissionUSD = parseFloat(j.FillFees)
-	}
 
-	// If the API provided only fills, sum commission best-effort if CommissionUSD remains empty.
-	if out.CommissionUSD == 0 && len(j.Fills) > 0 {
-		var sum float64
+	// Prefer fill-level commission data because it includes CommissionAsset.
+	if len(j.Fills) > 0 {
+		var sumUSD float64
+
 		for _, f := range j.Fills {
-			sum += parseFloat(f.Commission)
+			commission := parseFloat(f.Commission)
+			if commission <= 0 {
+				continue
+			}
+
+			fillPrice := parseFloat(f.Price)
+			commissionAsset := strings.ToUpper(strings.TrimSpace(f.CommissionAsset))
+
+			switch commissionAsset {
+			case "USDT", "USD":
+				sumUSD += commission
+
+			case "BTC":
+				if fillPrice <= 0 {
+					fillPrice = out.Price
+				}
+				if fillPrice <= 0 {
+					log.Printf(
+						"[WARN] commission conversion skipped asset=%s commission=%.8f reason=missing_price",
+						commissionAsset,
+						commission,
+					)
+					continue
+				}
+
+				sumUSD += commission * fillPrice
+
+			default:
+				log.Printf(
+					"[WARN] unsupported commission asset=%s commission=%.8f",
+					commissionAsset,
+					commission,
+				)
+			}
 		}
-		out.CommissionUSD = sum
+
+		out.CommissionUSD = sumUSD
+	} else {
+		out.CommissionUSD = parseFloat(j.CommissionUSD)
+
+		if out.CommissionUSD == 0 && strings.TrimSpace(j.FillFees) != "" {
+			out.CommissionUSD = parseFloat(j.FillFees)
+		}
 	}
 
 	// Map side if provided (tolerant; relies on external OrderSide parsing elsewhere)

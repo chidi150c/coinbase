@@ -2767,7 +2767,15 @@ func (t *Trader) closeLot(
 
 	case3BLossUSD := 0.0
 	var repl ReplacementRequest
-	var net float64
+	estExitFee := quote * (t.cfg.FeeRatePct / 100.0)
+
+	gross := (livePrice - lot.OpenPrice) * baseRequested
+	if lot.Side == SideSell {
+		gross = (lot.OpenPrice - livePrice) * baseRequested
+	}
+
+	net := gross - lot.EntryFee - estExitFee
+
 	if lot.Side == SideSell &&
 		exitReason == "threshold_stop_loss" &&
 		t.MarketRegime == RegimeDown {
@@ -2786,9 +2794,6 @@ func (t *Trader) closeLot(
 		//	  *  Recovery Mode A (RecoveryByPositionSize)
 		//	  *  Recovery Mode B (RecoveryByProfitTarget)
 		//===============================================================================
-		estExitFee := quote * (t.cfg.FeeRatePct / 100.0)
-		gross := (lot.OpenPrice - livePrice) * baseRequested
-		net = gross - lot.EntryFee - estExitFee
 
 		if net < 0 {
 			case3BLossUSD = -net
