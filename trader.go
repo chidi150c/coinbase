@@ -82,7 +82,9 @@ type Position struct {
 	RefundPortionUSD float64 `json:"refund_portion_usd"`
 
 	// --- NEW: stable lot identifier & entry order id (persisted) ---
-	EntryOrderID string `json:"entry_order_id,omitempty"`
+	EntryOrderID      string  `json:"entry_order_id,omitempty"`
+	ProfitTrailActive bool    `json:"profit_trail_active,omitempty"`
+	ProfitPeakUSD     float64 `json:"profit_peak_usd,omitempty"`
 }
 
 // --- NEW: per-side book (authoritative store) ---

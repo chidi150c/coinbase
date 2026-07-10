@@ -1157,6 +1157,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			deepLossMult := 1.4
 			strongProfitMult := 1.5
 
+			profitGivebackUSD := 0.20
+			case4Exit := false
+			protectedFloor := 0.0
+
 			for i := 0; i < len(book.Lots); {
 				lot := book.Lots[i]
 
@@ -1177,6 +1181,108 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				updateNearest(book, side, i, lot, net, price)
 
 				gateUSD := t.lotProfitGateUSD(lot)
+
+				// Case 4: once the lot reaches its profit gate, protect the gain.
+				case4Exit = false
+				protectedFloor = 0.0
+
+				if lot.ExitMode == ExitModeScalpFixedTP {
+					if net >= gateUSD {
+						if !lot.ProfitTrailActive {
+							lot.ProfitTrailActive = true
+							lot.ProfitPeakUSD = net
+
+							log.Printf(
+								"[TRACE] case4.armed side=%s idx=%d entry_id=%s net=%.6f gate=%.6f",
+								lot.Side,
+								i,
+								lot.EntryOrderID,
+								net,
+								gateUSD,
+							)
+						}
+
+						if net > lot.ProfitPeakUSD {
+							lot.ProfitPeakUSD = net
+						}
+					}
+
+					if lot.ProfitTrailActive {
+						protectedFloor = math.Max(
+							gateUSD,
+							lot.ProfitPeakUSD-profitGivebackUSD,
+						)
+
+						case4Exit = net > 0 && net < protectedFloor
+					}
+				}
+
+				if case4Exit {
+					// Exit as L2_PROFIT_PROTECTION.
+					// Guaranteed still profitable at decision time.
+					exitD := d
+					exitD.ExitClass = "L2_PROFIT_PROTECTION"
+					exitD.ExitNetPNLUSD = net
+
+					exitReason := "profit_protection"
+
+					// Set a maker-friendly exit price near the current market price.
+					offBps := t.cfg.TPMakerOffsetBps
+					makerExitPx := price
+
+					if lot.Side == SideBuy && offBps > 0 {
+						makerExitPx = price * (1.0 + offBps/10000.0)
+					}
+					if lot.Side == SideSell && offBps > 0 {
+						makerExitPx = price * (1.0 - offBps/10000.0)
+					}
+
+					lot.Take = makerExitPx
+					lot.FixedTPWorking = true
+
+					cand := exitCandidate{
+						side:         side,
+						idx:          i,
+						entryOrderID: lot.EntryOrderID,
+						reason:       exitReason,
+						decision:     decisionFlatReason(exitD),
+						net:          net,
+					}
+
+					profitL2 = append(profitL2, cand)
+
+					log.Printf(
+						"[TRACE] case4.protection_exit side=%s idx=%d entry_id=%s net=%.6f gate=%.6f peak=%.6f floor=%.6f take=%.8f",
+						lot.Side,
+						i,
+						lot.EntryOrderID,
+						net,
+						gateUSD,
+						lot.ProfitPeakUSD,
+						protectedFloor,
+						lot.Take,
+					)
+					lot.ProfitTrailActive = false
+					lot.ProfitPeakUSD = 0
+					i++
+					continue
+
+				} else if lot.ProfitTrailActive && net <= 0 {
+					// Protection was armed, but price moved through the protected positive
+					// range before an exit could be scheduled. Do not classify this as profit.
+					// Continue into the ordinary stop-loss path below.
+					log.Printf(
+						"[TRACE] case4.protection_missed side=%s idx=%d entry_id=%s net=%.6f gate=%.6f peak=%.6f floor=%.6f",
+						lot.Side,
+						i,
+						lot.EntryOrderID,
+						net,
+						gateUSD,
+						lot.ProfitPeakUSD,
+						protectedFloor,
+					)
+				}
+
 				strongProfitExit := net >= gateUSD*strongProfitMult
 
 				if lot.ExitMode == ExitModeScalpFixedTP {
@@ -1311,7 +1417,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 					// Hold winner; do not exit yet.
 
-					if !aiANDlogicExit && !strongProfitExit {
+					if !aiANDlogicExit && !strongProfitExit && !case4Exit {
 						log.Printf(
 							"[TRACE] exit.hold lot_side=%s idx=%d signal=%s net=%.4f gate=%.6f entry_id=%s livePrice=%.8f mode=%s",
 							lot.Side,
@@ -1338,7 +1444,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 					exitReason = "take_profit"
 					log.Printf(
-						"[TRACE] exit.allow lot_side=%s idx=%d signal=%s net=%.4f gate=%.6f entry_id=%s livePrice=%.8f mode=%s exitReason=%s strongProfit=%t aiExit=%t",
+						"[TRACE] exit.allow lot_side=%s idx=%d signal=%s net=%.4f gate=%.6f entry_id=%s livePrice=%.8f mode=%s exitReason=%s strongProfit=%t aiExit=%t && case4Exit=%t",
 						lot.Side,
 						i,
 						d.Signal,
@@ -1350,6 +1456,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						exitReason,
 						strongProfitExit,
 						aiANDlogicExit,
+						case4Exit,
 					)
 
 					// Arm/update maker-friendly exit limit price to be near current mark price.
@@ -1589,7 +1696,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-126",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-127",
 		totalLots,
 		d.Raw,
 		d.Signal,
