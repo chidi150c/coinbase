@@ -223,13 +223,13 @@ func (t *Trader) applyLogicGate(d Decision, execHistory []Candle) Decision {
 		}
 		if d.Raw == Sell {
 			// Trend SELL → easier
-			regimeEPS = baseEPS * trendMult
+			regimeEPS = baseEPS * trendMult * 0.8
 		}
 
 	case RegimeUp:
 		if d.Raw == Sell {
 			// Counter-trend SELL → stricter
-			regimeEPS = baseEPS * regimeMult
+			regimeEPS = baseEPS * regimeMult * 0.8
 		}
 		if d.Raw == Buy {
 			// Trend BUY → easier
