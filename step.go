@@ -1787,60 +1787,95 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 	}
 
-	//Required spare inventory
+	// Required spare inventory.
+	//
+	// Case 1G hot-path rule:
+	// - The background refresher is the sole writer of the authoritative
+	//   exchange-balance snapshot.
+	// - step() reads that snapshot only; it never performs broker balance I/O.
+	// - Existing lot and pending-order reservations are subtracted separately.
 	var spare float64
 	var symB string
 	var availBase, baseStep float64
-	var errB error
 	var symQ string
 	var availQuote, quoteStep float64
-	var errQ error
 
 	log.Printf("[TRACE] hotpath.before_balance elapsed_ms=%d side=%s",
 		time.Since(hotStart).Milliseconds(), side)
 
-	// If BUY, required spare quote inventory
-	if side == SideBuy {
-		// Reserve quote needed to close shorts (includes fees).
-		// Release lock for broker I/O to avoid stalls.
+	snapshot, cacheOK := t.getBalanceSnapshot(balanceSnapshotMaxAge)
+	if !cacheOK {
+		ageMS := int64(-1)
+		if !snapshot.UpdatedAt.IsZero() {
+			ageMS = time.Since(snapshot.UpdatedAt).Milliseconds()
+		}
+
+		log.Printf(
+			"[WARN] balance.cache.unavailable side=%s age_ms=%d",
+			side,
+			ageMS,
+		)
+
 		t.mu.Unlock()
-		symQ, availQuote, quoteStep, errQ = t.broker.GetAvailableQuote(ctx, t.cfg.ProductID)
-		t.mu.Lock()
-		if errQ != nil || strings.TrimSpace(symQ) == "" {
+		return StepResult{
+			Msg:    "HOLD balance cache unavailable or stale",
+			Raw:    d.Raw,
+			Signal: d.Signal,
+		}, nil
+	}
+
+	symQ = snapshot.SymQuote
+	availQuote = snapshot.AvailQuote
+	quoteStep = snapshot.QuoteStep
+
+	symB = snapshot.SymBase
+	availBase = snapshot.AvailBase
+	baseStep = snapshot.BaseStep
+
+	log.Printf(
+		"[TRACE] balance.cache.hit side=%s age_ms=%d quote=%.8f base=%.8f",
+		side,
+		time.Since(snapshot.UpdatedAt).Milliseconds(),
+		availQuote,
+		availBase,
+	)
+
+	if side == SideBuy {
+		if strings.TrimSpace(symQ) == "" || quoteStep <= 0 {
+			log.Printf(
+				"[WARN] balance.cache.invalid_quote symbol=%q step=%.8f",
+				symQ,
+				quoteStep,
+			)
 			t.mu.Unlock()
-			log.Fatalf("BUY blocked: GetAvailableQuote failed: error %v, symQ %s", errQ, symQ)
+			return StepResult{
+				Msg:    "HOLD invalid cached quote metadata",
+				Raw:    d.Raw,
+				Signal: d.Signal,
+			}, nil
 		}
-		if quoteStep <= 0 {
-			t.mu.Unlock()
-			log.Fatalf("BUY blocked: missing/invalid QUOTE step for %s (step=%.8f)", t.cfg.ProductID, quoteStep)
-		}
+
 		spare = availQuote - reservedShortQuoteWithFee
 	}
 
-	// If SELL, required spare base inventory (spot safe)
 	if side == SideSell {
-		// Ask broker for base balance/step (release lock for I/O).
-		t.mu.Unlock()
-		symB, availBase, baseStep, errB = t.broker.GetAvailableBase(ctx, t.cfg.ProductID)
-		t.mu.Lock()
-		if errB != nil || strings.TrimSpace(symB) == "" {
+		if strings.TrimSpace(symB) == "" || baseStep <= 0 {
+			log.Printf(
+				"[WARN] balance.cache.invalid_base symbol=%q step=%.8f",
+				symB,
+				baseStep,
+			)
 			t.mu.Unlock()
-			log.Fatalf("SELL blocked: GetAvailableBase failed: error %v, symB %s", errB, symB)
+			return StepResult{
+				Msg:    "HOLD invalid cached base metadata",
+				Raw:    d.Raw,
+				Signal: d.Signal,
+			}, nil
 		}
-		if baseStep <= 0 {
-			t.mu.Unlock()
-			log.Fatalf("SELL blocked: missing/invalid BASE step for %s (step=%.8f)", t.cfg.ProductID, baseStep)
-		}
-		// Only enforce spare-base gating if we actually require base to short.
-		if t.cfg.RequireBaseForShort {
-			spare = availBase - reservedLongBase
-		} else {
-			// When shorting without spot requirement, "spare" for equity-trigger SELL
-			// can be computed as available base (for step snapping) but we don't gate on it.
-			spare = availBase - reservedLongBase
-			if spare < 0 {
-				spare = 0
-			}
+
+		spare = availBase - reservedLongBase
+		if !t.cfg.RequireBaseForShort && spare < 0 {
+			spare = 0
 		}
 	}
 
@@ -3368,6 +3403,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			log.Printf("[TRACE] order.open placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
 				placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
 		}
+
 	}
 
 	// Re-lock to mutate state (append new lot to THIS SIDE).
@@ -3739,4 +3775,222 @@ func (t *Trader) archiveOrphanDust(book *SideBook, px float64, minNotional float
 		minNotional,
 		wallNow.Format(time.RFC3339),
 	)
+}
+
+type balanceSnapshot struct {
+	SymQuote string
+	SymBase  string
+
+	AvailQuote float64
+	QuoteStep  float64
+
+	AvailBase float64
+	BaseStep  float64
+
+	UpdatedAt time.Time
+}
+
+const balanceSnapshotMaxAge = 3 * time.Second
+
+func (t *Trader) setBalanceSnapshot(snapshot balanceSnapshot) {
+	t.balanceMu.Lock()
+	t.balanceSnapshot = snapshot
+	t.balanceMu.Unlock()
+}
+
+func (t *Trader) getBalanceSnapshot(maxAge time.Duration) (balanceSnapshot, bool) {
+	t.balanceMu.RLock()
+	snapshot := t.balanceSnapshot
+	t.balanceMu.RUnlock()
+
+	if snapshot.UpdatedAt.IsZero() {
+		return balanceSnapshot{}, false
+	}
+
+	if maxAge > 0 && time.Since(snapshot.UpdatedAt) > maxAge {
+		return snapshot, false
+	}
+
+	if snapshot.SymQuote == "" ||
+		snapshot.SymBase == "" ||
+		snapshot.QuoteStep <= 0 ||
+		snapshot.BaseStep <= 0 {
+
+		return snapshot, false
+	}
+
+	return snapshot, true
+}
+
+func (t *Trader) invalidateBalanceSnapshot() {
+	t.balanceMu.Lock()
+	t.balanceSnapshot.UpdatedAt = time.Time{}
+	t.balanceMu.Unlock()
+}
+
+func (t *Trader) refreshBalanceSnapshot(ctx context.Context) error {
+	type quoteResult struct {
+		symbol string
+		avail  float64
+		step   float64
+		err    error
+	}
+
+	type baseResult struct {
+		symbol string
+		avail  float64
+		step   float64
+		err    error
+	}
+
+	quoteCh := make(chan quoteResult, 1)
+	baseCh := make(chan baseResult, 1)
+
+	// Fetch quote and base concurrently outside the trading mutex.
+	go func() {
+		symbol, avail, step, err :=
+			t.broker.GetAvailableQuote(ctx, t.cfg.ProductID)
+
+		quoteCh <- quoteResult{
+			symbol: symbol,
+			avail:  avail,
+			step:   step,
+			err:    err,
+		}
+	}()
+
+	go func() {
+		symbol, avail, step, err :=
+			t.broker.GetAvailableBase(ctx, t.cfg.ProductID)
+
+		baseCh <- baseResult{
+			symbol: symbol,
+			avail:  avail,
+			step:   step,
+			err:    err,
+		}
+	}()
+
+	quote := <-quoteCh
+	base := <-baseCh
+
+	if quote.err != nil {
+		return fmt.Errorf(
+			"GetAvailableQuote failed: %w",
+			quote.err,
+		)
+	}
+
+	if base.err != nil {
+		return fmt.Errorf(
+			"GetAvailableBase failed: %w",
+			base.err,
+		)
+	}
+
+	if strings.TrimSpace(quote.symbol) == "" {
+		return fmt.Errorf("GetAvailableQuote returned empty symbol")
+	}
+
+	if strings.TrimSpace(base.symbol) == "" {
+		return fmt.Errorf("GetAvailableBase returned empty symbol")
+	}
+
+	if quote.step <= 0 {
+		return fmt.Errorf(
+			"invalid quote step %.8f",
+			quote.step,
+		)
+	}
+
+	if base.step <= 0 {
+		return fmt.Errorf(
+			"invalid base step %.8f",
+			base.step,
+		)
+	}
+
+	t.setBalanceSnapshot(balanceSnapshot{
+		SymQuote: quote.symbol,
+		SymBase:  base.symbol,
+
+		AvailQuote: quote.avail,
+		QuoteStep:  quote.step,
+
+		AvailBase: base.avail,
+		BaseStep:  base.step,
+
+		UpdatedAt: time.Now(),
+	})
+
+	return nil
+}
+
+func (t *Trader) startBalanceRefresher(ctx context.Context) {
+	t.balanceRefreshOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					log.Printf("[TRACE] balance.cache.refresher.stopped")
+					return
+
+				case <-ticker.C:
+					refreshCtx, cancel := context.WithTimeout(
+						ctx,
+						2*time.Second,
+					)
+
+					started := time.Now()
+					err := t.refreshBalanceSnapshot(refreshCtx)
+					cancel()
+
+					if err != nil {
+						log.Printf(
+							"[WARN] balance.cache.refresh.failed elapsed_ms=%d err=%v",
+							time.Since(started).Milliseconds(),
+							err,
+						)
+						continue
+					}
+
+					log.Printf(
+						"[TRACE] balance.cache.refreshed elapsed_ms=%d",
+						time.Since(started).Milliseconds(),
+					)
+				}
+			}
+		}()
+	})
+}
+
+func (t *Trader) reserveCachedQuote(amount float64) {
+	if amount <= 0 {
+		return
+	}
+
+	t.balanceMu.Lock()
+	defer t.balanceMu.Unlock()
+
+	t.balanceSnapshot.AvailQuote -= amount
+	if t.balanceSnapshot.AvailQuote < 0 {
+		t.balanceSnapshot.AvailQuote = 0
+	}
+}
+
+func (t *Trader) reserveCachedBase(amount float64) {
+	if amount <= 0 {
+		return
+	}
+
+	t.balanceMu.Lock()
+	defer t.balanceMu.Unlock()
+
+	t.balanceSnapshot.AvailBase -= amount
+	if t.balanceSnapshot.AvailBase < 0 {
+		t.balanceSnapshot.AvailBase = 0
+	}
 }

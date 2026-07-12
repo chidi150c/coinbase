@@ -330,6 +330,21 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 		// and are cancelable via this ctx on shutdown.
 		lastCandleSync := time.Now().UTC()
 
+		// Warm the balance cache once before the trading loop.
+		// This delay occurs only during startup, not in the order hot path.
+		ctxBalanceWarm, cancelBalanceWarm := context.WithTimeout(ctx, 3*time.Second)
+
+		if err := trader.refreshBalanceSnapshot(ctxBalanceWarm); err != nil {
+			log.Printf("[WARN] balance.cache.initial_warm_failed err=%v", err)
+		} else {
+			log.Printf("[TRACE] balance.cache.initial_warm_complete")
+		}
+
+		cancelBalanceWarm()
+
+		// Continue refreshing independently of the trading tick loop.
+		trader.startBalanceRefresher(ctx)
+
 		for {
 			select {
 			case <-ctx.Done():

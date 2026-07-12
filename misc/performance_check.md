@@ -546,3 +546,19 @@ grep 'aiRaw=BUY' /opt/coinbase/logs/audit/binance_audit.log \
  
 =[^|]*|
 =[^|]*
+
+==========================================================
+
+the highest elapsed time recorded by the Case 1G instrumentation:
+
+grep '\[TRACE\] hotpath\.' \
+/opt/coinbase/logs/audit/binance_audit.log \
+| sort -t= -k2 -n \
+| tail -1
+
+
+==============================================================
+
+Inspect the complete sequence around that order:
+
+ zgrep -E '2026/07/11 23:28:5[0-2].*(hotpath\.|64433006847|order\.|postonly|entry|exit)' /opt/coinbase/logs/audit/binance_audit.log*

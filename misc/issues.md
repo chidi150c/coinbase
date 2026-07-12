@@ -345,3 +345,27 @@ Verifying retry behavior across exchange responses (fills, cancellations, timeou
 Confirming that the replacement logic consistently improves realized performance without introducing unintended exposure.
 
 At this point, the project has evolved from primarily tuning entry signals (Case 1) into improving execution quality (Case 2) and intelligent loss management with adaptive recovery (Case 3).
+
+====================================================================
+new case 4:
+
+Important: you already fetch balances again after step()
+
+This block performs another balance request:
+
+if trader.cfg.UseLiveEquity() {
+	...
+	bal, err = fetchBridgeAccounts(...)
+	...
+	bal, err = fetchBrokerBalances(...)
+}
+
+Therefore the bot may now perform:
+
+background balance refresh every second
++
+live-equity balance refresh every tick
+
+That is duplicate exchange/bridge I/O.
+
+It does not delay the approved order because your equity refresh happens after step(), but it adds unnecessary API traffic.

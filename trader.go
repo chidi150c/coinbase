@@ -288,6 +288,12 @@ type Trader struct {
 	dustBuyLots             []*Position
 	dustSellLots            []*Position
 	PendingReplacementRetry PendingReplacementRetry
+	balanceMu               sync.RWMutex
+
+	balanceSnapshot balanceSnapshot
+
+	balanceRefreshOnce sync.Once
+	balanceRefreshStop chan struct{}
 }
 
 func NewTrader(cfg Config, broker Broker) *Trader {
