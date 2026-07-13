@@ -426,7 +426,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	//
 	// This keeps the main loop non-blocking while ensuring completed exits are
 	// reflected before evaluating new entries, exits, or pyramiding decisions.
-	t.drainPendingExits(ctx, execHistory, livePrice)
+	t.drainPendingExitCh(ctx, execHistory, livePrice)
 
 	// -------------------------------------------------------------------------------------------------
 	// Drain completed BUY maker-first order result, if any.
@@ -1696,7 +1696,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-134",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-135",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -1789,7 +1789,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	// Required spare inventory.
 	//
-	// Case 1G hot-path rule:
+	// Case 2A hot-path rule:
 	// - The background refresher is the sole writer of the authoritative
 	//   exchange-balance snapshot.
 	// - step() reads that snapshot only; it never performs broker balance I/O.

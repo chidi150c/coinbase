@@ -89,6 +89,10 @@ order submit
 broker response
 
 The goal is to minimize latency in the critical path.
+Case 2 – Hot path optimization (decision → order placement latency)
+Case 2A 1.0 – Remove synchronous broker balance retrieval from the hot path using a background balance cache. ✅ (the work you just completed)
+Case 2A 1.1 – Eliminate any remaining blocking operations between final=BUY/SELL and PlaceLimitPostOnly.
+Case 2A 1.2 – Profile and optimize broker submission latency and any remaining serialization or lock contention.
 
 2B. Reprice logic
 
@@ -369,3 +373,6 @@ live-equity balance refresh every tick
 That is duplicate exchange/bridge I/O.
 
 It does not delay the approved order because your equity refresh happens after step(), but it adds unnecessary API traffic.
+
+=====================================================
+Case 1 – Entry decision quality (thresholds, confidence, AI/logic agreement, etc.)

@@ -562,3 +562,12 @@ grep '\[TRACE\] hotpath\.' \
 Inspect the complete sequence around that order:
 
  zgrep -E '2026/07/11 23:28:5[0-2].*(hotpath\.|64433006847|order\.|postonly|entry|exit)' /opt/coinbase/logs/audit/binance_audit.log*
+
+
+same above for case3B:
+
+zgrep -h -E \
+'2026/07/12 20:06:2[8-9]|2026/07/12 20:06:3[0-5]' \
+/opt/coinbase/logs/audit/binance_audit.log* \
+| grep -E \
+'case3B\.|64441906575|pending_exit\.|replacement|threshold_stop_loss|order\.close'

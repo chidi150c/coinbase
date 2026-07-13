@@ -2694,8 +2694,15 @@ func (t *Trader) closeLot(
 	exitDecision string,
 ) (string, error) {
 
+	//Prepare and validate the lot for closing
+
+	// 	Locate the correct position book
+	// 		* Retrieve the BUY or SELL book corresponding to the side being closed.
 	book := t.book(side)
 
+	// 	Validate the lot index
+	// 		* Ensure the requested lot index exists.
+	// 		* Fail immediately if the index is out of range.
 	if localIdx < 0 || localIdx >= len(book.Lots) {
 		return "", fmt.Errorf(
 			"close lot invalid index side=%s idx=%d lots=%d",
@@ -2705,6 +2712,10 @@ func (t *Trader) closeLot(
 		)
 	}
 
+	// 	Validate the lot itself
+	// 		* Ensure the lot pointer is not nil.
+	// 		* Ensure the lot has a valid EntryOrderID.
+	// 		* Fail immediately if either check fails.
 	lot := book.Lots[localIdx]
 	if lot == nil {
 		return "", fmt.Errorf(
@@ -2723,65 +2734,90 @@ func (t *Trader) closeLot(
 		)
 	}
 
+	// 	Determine the closing direction
+	// 		* BUY positions close with a SELL.
+	// 		* SELL positions close with a BUY.
 	closeSide := SideSell
 	if lot.Side == SideSell {
 		closeSide = SideBuy
 	}
 
+	//Record the current UTC time for the exit.
 	exitTime := time.Now().UTC()
-	baseRequestedRaw := lot.SizeBase
-	baseRequested := floorToStep(baseRequestedRaw, t.cfg.BaseStep)
 
+	// 	Determine the amount to close:
+	// Read the lot size.
+	baseRequestedRaw := lot.SizeBase
+	// Round it down to the exchange's allowed base step.
+	baseRequested := floorToStep(baseRequestedRaw, t.cfg.BaseStep)
+	// Skip the exit if nothing remains after rounding.
 	if baseRequested <= 0 {
 		log.Printf("[CLOSE-SKIP] lotSide=%s closeSide=%s baseRaw=%.8f baseRounded=%.8f step=%.8f reason=%s", lot.Side, closeSide, baseRequestedRaw, baseRequested, t.cfg.BaseStep, exitReason)
 		return "", nil
 	}
 
+	// 	Verify minimum exchange notional:
+	// Compute the USD value of the exit.
 	quote := baseRequested * livePrice
+
+	// If the order would be below the exchange minimum, defer the exit instead of submitting an invalid order.
 	minNotional := t.cfg.MinNotional
 	if minNotional <= 0 {
 		minNotional = t.cfg.OrderMinUSD
 	}
-
 	if quote < minNotional {
 		log.Printf("[CLOSE-SKIP] lotSide=%s closeSide=%s base=%.8f livePrice=%.2f notional=%.2f < min %.2f; deferring", lot.Side, closeSide, baseRequested, livePrice, quote, minNotional)
 		return fmt.Sprintf("EXIT-SKIP %s side=%s→%s notional=%.2f < min=%.2f reason=%s", exitTime.Format(time.RFC3339), lot.Side, closeSide, quote, minNotional, exitReason), nil
 	}
 
+	// Determine whether this is a deep-loss stop
+	// Check whether the exit decision classified it as L2_DEEP_LOSS.
+	// Check whether the exit reason is threshold_stop_loss.
 	isL2DeepLoss := strings.HasPrefix(exitReason, "threshold_stop_loss") &&
 		strings.Contains(exitDecision, "L2_DEEP_LOSS")
 
+	//----------------------------------------------------------------
+	// 	Select the exit mechanism
+	//----------------------------------------------------------------
+	// Use the normal maker-first pending exit only if:
+	// the lot is in ScalpFixedTP mode,
+	// the exit is not an L2 deep-loss emergency,
+	// and maker exits are enabled (LimitTimeoutSec > 0).
+	// Otherwise, the lot will use the immediate (taker) exit path.
 	usePendingMakerExit := lot.ExitMode == ExitModeScalpFixedTP &&
 		!isL2DeepLoss &&
 		t.cfg.LimitTimeoutSec > 0
 
 	// =============================================================================
 	// CASE 3 - SELL LOSS RECOVERY & PROTECTION
-	// Motivation
-	// ----------
-	// Observed behavior:
-	// 		SELL(add maker)
-	// 		     ↓
-	// 		SELL threshold_stop_loss (BUY exit)
-	// 		     ↓
-	// 		New SELL entered below the previous loss-exit BUY price
-	// 		     ↓
-	// 		Repeated losses with little opportunity to recover.
 	//
 	// Case 3 introduces two complementary strategies:
 	//   • Case 3A - Prevent repeating weak SELLs in an UP regime.
-	//   • Case 3B - Recover intelligently in a continuing DOWN regime.
+	//   • Case 3B - Recover intelligently in a continuing DOWN regime
+	//
+	// Sufficient spare base
+	// 		→ Case 3B Mode A in any regime
+	// 		→ replacement SELL should start before closing the losing SELL
+	// Insufficient spare + regime DOWN
+	// 		→ Case 3B Mode B
+	// Insufficient spare + regime UP/NORMAL
+	// 		→ case3B.modeA.blocked
+	// 		→ no replacement
 	// =============================================================================
 
 	case3BLossUSD := 0.0
+	// Prepare an empty ReplacementRequest in case Case 3B recovery becomes necessary.
 	var repl ReplacementRequest
+	// Estimate the exit fee
 	estExitFee := quote * (t.cfg.FeeRatePct / 100.0)
-
+	// Estimate the commission that would be paid if the position were closed at the current price.
+	// Calculate the gross trading P&L (before fees)
 	gross := (livePrice - lot.OpenPrice) * baseRequested
 	if lot.Side == SideSell {
 		gross = (lot.OpenPrice - livePrice) * baseRequested
 	}
 
+	// Calculate the estimated net P&L
 	net := gross - lot.EntryFee - estExitFee
 
 	if lot.Side == SideSell &&
@@ -2839,20 +2875,23 @@ func (t *Trader) closeLot(
 				priceMove := replacementEntryPrice - recoveryExitPrice
 
 				if priceMove > 0 {
-					feeRate := t.cfg.FeeRatePct / 100.0
-					netPerBase := priceMove - (replacementEntryPrice * feeRate) - (recoveryExitPrice * feeRate)
 
-					if netPerBase <= 0 {
+					// Mode A sizing:
+					// The extra SELL position must recover the realized stop-loss when price
+					// falls from the replacement entry price back to the original SELL entry price.
+					recoveryPerBase := priceMove
+
+					if recoveryPerBase <= 0 {
 						log.Printf(
-							"[TRACE] case3B.net_per_base.skip side=%s regime=%s recovery_net=%.6f price_move=%.8f net_per_base=%.8f reason=non_positive_net_per_base",
+							"[TRACE] case3B.recovery_per_base.skip side=%s regime=%s recovery_net=%.6f price_move=%.8f recovery_per_base=%.8f reason=non_positive_recovery_move",
 							lot.Side,
 							t.MarketRegime,
 							recoveryNetUSD,
 							priceMove,
-							netPerBase,
+							recoveryPerBase,
 						)
 					} else {
-						extraBase := recoveryNetUSD / netPerBase
+						extraBase := recoveryNetUSD / recoveryPerBase
 						if t.cfg.BaseStep > 0 {
 							extraBase = math.Ceil(extraBase/t.cfg.BaseStep) * t.cfg.BaseStep
 						}
@@ -3759,18 +3798,18 @@ func (t *Trader) watchPendingExit(ctx context.Context, p *PendingExit) {
 	emit(orderID)
 }
 
-func (t *Trader) drainPendingExits(ctx context.Context, candles []Candle, livePrice float64) {
+func (t *Trader) drainPendingExitCh(ctx context.Context, candles []Candle, livePrice float64) {
 	for {
 		select {
 		case res := <-t.pendingExitCh:
-			t.applyPendingExitResult(ctx, candles, livePrice, res)
+			t.completePendingExit(ctx, candles, livePrice, res)
 		default:
 			return
 		}
 	}
 }
 
-func (t *Trader) applyPendingExitResult(ctx context.Context, candles []Candle, livePrice float64, res ExitResult) {
+func (t *Trader) completePendingExit(ctx context.Context, candles []Candle, livePrice float64, res ExitResult) {
 	_ = ctx
 	_ = candles
 
