@@ -1155,9 +1155,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			previousAIRaw := t.previousAIRaw
 
 			deepLossMult := 1.4
-			strongProfitMult := 1.5
+			strongProfitMult := 1.4
 
-			profitGivebackUSD := 0.20
+			profitGivebackUSD := 0.15
 			case4Exit := false
 			protectedFloor := 0.0
 
@@ -1696,7 +1696,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-135",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-136",
 		totalLots,
 		d.Raw,
 		d.Signal,
