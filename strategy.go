@@ -302,7 +302,7 @@ func (t *Trader) evaluateAI(
 	snap, ok := BuildFeatureSnapshot(
 		signalHistory,
 		idx,
-		t.cfg.AIFeatureDim,
+		t.cfg.MACDLineEPS, t.cfg.AIFeatureDim,
 	)
 	if !ok {
 		result.Err = fmt.Errorf(
@@ -444,6 +444,7 @@ func (t *Trader) evaluateEMAPatternSnapshot(
 	snap, ok := BuildFeatureSnapshot(
 		execHistory,
 		len(execHistory)-1,
+		t.cfg.MACDLineEPS,
 		t.cfg.AIFeatureDim,
 	)
 	if !ok {
@@ -696,6 +697,7 @@ func (t *Trader) evaluateMACDSnapshot(
 	snap, ok := BuildFeatureSnapshot(
 		execHistory,
 		len(execHistory)-1,
+		t.cfg.MACDLineEPS,
 		t.cfg.AIFeatureDim,
 	)
 	if !ok {
