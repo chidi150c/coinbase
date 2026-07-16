@@ -108,8 +108,6 @@ type FeatureSnapshot struct {
 	MACDHistDeltaSmooth float64
 	MACDMomentumDown    bool
 	MACDMomentumUp      bool
-	MACDStrongPositive  bool
-	MACDStrongNegative  bool
 
 	// Medium/long EMA trend context
 	EMA20           float64
@@ -157,7 +155,7 @@ type FeatureSnapshot struct {
 //	23 MACD low-bottom shape
 //
 // Feature count: 24
-func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim int) (FeatureSnapshot, bool) {
+func BuildFeatureSnapshot(c []Candle, idx int, FeatureDim int) (FeatureSnapshot, bool) {
 	var out FeatureSnapshot
 
 	if len(c) < 60 || idx < 50 || idx >= len(c) || idx-6 < 0 {
@@ -250,10 +248,6 @@ func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim i
 	macdMomentumDown := histDeltaNow < 0 && histNow > 0
 	macdMomentumUp := histDeltaNow > 0 && histNow < 0
 
-	// Strength / turning evidence
-	macdStrongPositive := macdTurningPoint >= macdLineEPS
-	macdStrongNegative := macdTurningPoint <= -macdLineEPS
-
 	ret1 := safeRatio(c[idx].Close-c[idx-1].Close, c[idx-1].Close)
 	ret5 := safeRatio(c[idx].Close-c[idx-5].Close, c[idx-5].Close)
 	atrPct := safeRatio(atr[idx], c[idx].Close)
@@ -304,8 +298,6 @@ func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim i
 		boolToFloat(emaLowBottom),
 		boolToFloat(emaPriceDownGoingUp),
 		boolToFloat(emaPriceUpGoingDown),
-		boolToFloat(macdStrongPositive),
-		boolToFloat(macdStrongNegative),
 	}
 
 	if len(x) != FeatureDim || hasBadFloat(x) {
@@ -331,8 +323,6 @@ func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim i
 		MACDHistDeltaSmooth: histDeltaSmooth,
 		MACDMomentumDown:    macdMomentumDown,
 		MACDMomentumUp:      macdMomentumUp,
-		MACDStrongPositive:  macdStrongPositive,
-		MACDStrongNegative:  macdStrongNegative,
 		EMA20:               mid,
 		EMA50:               long,
 		EMA20Prev3:          midPrev3,
@@ -349,7 +339,7 @@ func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim i
 
 // BuildFeatures returns only the numeric vector for model training/prediction.
 func BuildFeatures(c []Candle, idx int, macdLineEPS float64, FeatureDim int) ([]float64, bool) {
-	snap, ok := BuildFeatureSnapshot(c, idx, macdLineEPS, FeatureDim)
+	snap, ok := BuildFeatureSnapshot(c, idx, FeatureDim)
 	if !ok {
 		return nil, false
 	}

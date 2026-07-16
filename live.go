@@ -1393,7 +1393,7 @@ func debugPUp(history []Candle, mdl *LogisticModel, MACDLineEPS float64, Feature
 
 	i := len(history) - 1
 
-	snap, ok := BuildFeatureSnapshot(history, i, MACDLineEPS, FeatureDim)
+	snap, ok := BuildFeatureSnapshot(history, i, FeatureDim)
 	if !ok || len(snap.X) == 0 {
 		return 0.5
 	}

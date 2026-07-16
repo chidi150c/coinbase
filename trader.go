@@ -1080,20 +1080,26 @@ func exitCSVRow(e ExitRecord) []string {
 	}
 }
 
-func decisionFlatReason(d Decision) string {
+func decisionEntryReason(d EntryDecision) string {
 	parts := []string{
-		// AI/model decision
+		// AI / model summary.
 		fmt.Sprintf("pUp=%.5f", d.PUp),
-		// Threshold context
+
+		// Threshold context.
 		fmt.Sprintf("buyTh=%.5f", d.BuyThreshold),
 		fmt.Sprintf("sellTh=%.5f", d.SellThreshold),
 
+		// Market context.
 		fmt.Sprintf("regime=%s", d.MarketRegime),
 		fmt.Sprintf("regimeMult=%.2f", d.RegimeMult),
+
+		// Confidence.
 		fmt.Sprintf("confidence=%.2f", d.Confidence),
+
+		// MACD interpretation context.
 		fmt.Sprintf("logicEPS=%.5f", d.LogicEPS),
 
-		// MACD decision evidence
+		// MACD evidence.
 		fmt.Sprintf("logic_macd_line=%.5f", d.LogicMACDLine),
 		fmt.Sprintf("logic_macd_turn=%.5f", d.LogicMACDTurn),
 		fmt.Sprintf("logic_macd_hist=%.5f", d.LogicMACDHist),
@@ -1104,7 +1110,7 @@ func decisionFlatReason(d Decision) string {
 		fmt.Sprintf("logic_macd_momentum_down=%t", d.LogicMACDMomentumDown),
 		fmt.Sprintf("logic_macd_momentum_up=%t", d.LogicMACDMomentumUp),
 
-		// EMA/pattern evidence
+		// EMA / Pattern evidence.
 		fmt.Sprintf("logic_ema_spread=%.6f", d.LogicEMASpread),
 		fmt.Sprintf("logic_ema2050=%.6f", d.LogicEMA2050),
 		fmt.Sprintf("logic_pattern_high_peak=%t", d.LogicPatternHighPeak),
@@ -1114,24 +1120,10 @@ func decisionFlatReason(d Decision) string {
 		fmt.Sprintf("logic_pattern_buy=%t", d.LogicPatternBuy),
 		fmt.Sprintf("logic_pattern_sell=%t", d.LogicPatternSell),
 
-		// Decision flow
+		// Decision flow.
 		fmt.Sprintf("aiRaw=%s", d.Raw),
 		fmt.Sprintf("logicOpinion=%s", d.LogicOpinion),
 		fmt.Sprintf("final=%s", d.Signal),
-	}
-
-	// Exit-only fields
-	if d.PreviousAIRaw != Flat {
-		parts = append(parts, fmt.Sprintf("previousAIRaw=%s", d.PreviousAIRaw))
-	}
-	if d.ExitNetPNLUSD != 0 {
-		parts = append(parts, fmt.Sprintf("exitNetPNL=%.5f", d.ExitNetPNLUSD))
-	}
-	if d.StopLossLimitUSD != 0 {
-		parts = append(parts, fmt.Sprintf("stopLossLimit=%.5f", d.StopLossLimitUSD))
-	}
-	if strings.TrimSpace(d.ExitClass) != "" {
-		parts = append(parts, fmt.Sprintf("exitClass=%s", strings.TrimSpace(d.ExitClass)))
 	}
 
 	return strings.Join(parts, "|")

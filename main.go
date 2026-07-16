@@ -83,11 +83,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if csvBacktest != "" && !live {
-		runBacktest(ctx, csvBacktest, trader)
-	} else {
-		runLive(ctx, trader, intervalSec)
-	}
+	runLive(ctx, trader, intervalSec)
 
 	shutdownCtx, c := context.WithTimeout(context.Background(), 2*time.Second)
 	defer c()
