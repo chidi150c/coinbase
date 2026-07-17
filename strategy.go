@@ -668,6 +668,14 @@ func interpretEquityRaw(
 		result.SellTrigger,
 	)
 
+	log.Printf(
+		"[DEBUG] EQUITY Trading: equityUSD=%.2f baseline=%.2f BUY trigger at<=%.2f SELL trigger at>=%.2f",
+		raw.EquityUSD,
+		raw.BaselineUSD,
+		raw.BuyTriggerUSD,
+		raw.SellTriggerUSD,
+	)
+
 	return result
 }
 
@@ -1175,13 +1183,25 @@ func (t *Trader) applyPyramidRawTransitions(
 	state PyramidStateTransitions,
 ) {
 	if state.Buy.UpdateLastAdd {
-		log.Printf("[TRACE] pyramid.latch_extend side=BUY elapsedResetAtHr=%.2f", state.Buy.ElapsedBeforeResetHr)
+		log.Printf(
+			"[TRACE] pyramid.latch_extend side=BUY recentLow=%.2f prevRecentLow=%.2f elapsedResetAtHr=%.2f",
+			t.RecentLow,
+			t.PreviousRecentLow,
+			state.Buy.ElapsedBeforeResetHr,
+		)
+
 		t.lastAddBuy =
 			state.Buy.NextLastAdd
 	}
 
 	if state.Sell.UpdateLastAdd {
-		log.Printf("[TRACE] pyramid.latch_extend side=SELL elapsedResetAtHr=%.2f", state.Sell.ElapsedBeforeResetHr)
+		log.Printf(
+			"[TRACE] pyramid.latch_extend side=SELL recentHigh=%.2f prevRecentHigh=%.2f elapsedResetAtHr=%.2f",
+			t.RecentHigh,
+			t.PreviousRecentHigh,
+			state.Sell.ElapsedBeforeResetHr,
+		)
+
 		t.lastAddSell =
 			state.Sell.NextLastAdd
 	}
@@ -1202,6 +1222,7 @@ func (t *Trader) applyPyramidRawTransitions(
 func (t *Trader) applyPyramidDecisionTransitions(
 	state PyramidStateTransitions,
 	finalSignal Signal,
+	price float64,
 ) {
 	switch finalSignal {
 	case Buy:
@@ -1216,11 +1237,27 @@ func (t *Trader) applyPyramidDecisionTransitions(
 		}
 
 		if state.RebaseSellOnBuy {
+			oldLatch := t.latchedGateSell
+			oldWin := t.winHighSell
+			sellLatchAgeHr :=
+				time.Since(t.lastAddSell).Hours()
+
 			t.latchedGateSell =
 				state.NextSellLatch
 
 			t.winHighSell =
 				state.NextSellWin
+
+			log.Printf(
+				"[DEBUG] LATCH REBASE SELL: ageHr=%.2f logic=%s old_latched=%.2f old_winHigh=%.2f new_latched=%.2f new_winHigh=%.2f price=%.2f",
+				sellLatchAgeHr,
+				finalSignal,
+				oldLatch,
+				oldWin,
+				t.latchedGateSell,
+				t.winHighSell,
+				price,
+			)
 		}
 
 	case Sell:
@@ -1235,11 +1272,27 @@ func (t *Trader) applyPyramidDecisionTransitions(
 		}
 
 		if state.RebaseBuyOnSell {
+			oldLatch := t.latchedGateBuy
+			oldWin := t.winLowBuy
+			buyLatchAgeHr :=
+				time.Since(t.lastAddBuy).Hours()
+
 			t.latchedGateBuy =
 				state.NextBuyLatch
 
 			t.winLowBuy =
 				state.NextBuyWin
+
+			log.Printf(
+				"[DEBUG] LATCH REBASE BUY: ageHr=%.2f logic=%s old_latched=%.2f old_winLow=%.2f new_latched=%.2f new_winLow=%.2f price=%.2f",
+				buyLatchAgeHr,
+				finalSignal,
+				oldLatch,
+				oldWin,
+				t.latchedGateBuy,
+				t.winLowBuy,
+				price,
+			)
 		}
 	}
 }

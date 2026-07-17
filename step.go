@@ -1963,6 +1963,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	t.applyPyramidDecisionTransitions(
 		pyramidResult.State,
 		legacySignal,
+		price,
 	)
 
 	// Case 5 may retain or override the legacy AI + Logic decision using
@@ -1975,6 +1976,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		equityResult,
 		legacySignal,
 		logicOpinion,
+	)
+
+	log.Printf(
+		"[TRACE] hotpath.after_decision elapsed_ms=%d",
+		time.Since(hotStart).Milliseconds(),
 	)
 
 	// 8. Copy Pyramid audit fields for the selected side
@@ -2067,7 +2073,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-138",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-139",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -2111,6 +2117,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	case SideSell:
 		spare = equityResult.SpareBase
 	}
+
+	// Existing execution classification.
+	isAdd :=
+		len(book.Lots) > 0 &&
+			t.cfg.AllowPyramiding &&
+			(d.Signal == Buy || d.Signal == Sell)
+
+	skipPyramidGates :=
+		equityTriggerSell ||
+			equityTriggerBuy
 
 	// Prevent duplicate opens while pending on this side (exits already ran) ---
 	// Extra belt-and-suspenders: if a pending exists and we haven't hit its Deadline, keep waiting.
@@ -2214,7 +2230,59 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
 	}
 
-	//====== block deleted ========
+	if isAdd && !skipPyramidGates {
+		var pyramidSide PyramidSideResult
+
+		switch legacySignal {
+		case Buy:
+			pyramidSide = pyramidResult.Buy
+
+		case Sell:
+			pyramidSide = pyramidResult.Sell
+
+		default:
+			pyramidSide = PyramidSideResult{}
+		}
+
+		if legacySignal == Buy || legacySignal == Sell {
+			log.Printf(
+				"[TRACE] pyramid.spacing since_last=%.1fs need>=%ds",
+				pyramidSide.ElapsedSec,
+				pyramidSide.Raw.SpacingNeed,
+			)
+
+			if !pyramidSide.SpacingPass {
+				log.Printf(
+					"[DEBUG] GATE2 pyramid: blocked by spacing; since_last=%vHours need>=%ds",
+					fmt.Sprintf("%.1f", pyramidSide.ElapsedHr),
+					pyramidSide.Raw.SpacingNeed,
+				)
+			}
+
+			// The legacy conf_gate log was emitted only when decay was enabled.
+			if pyramidSide.Raw.DecayLambda > 0 {
+				log.Printf(
+					"[TRACE] pyramid.conf_gate side=%s confidence=%.4f gateMult=%.4f decayedPct=%.4f effPct=%.4f",
+					pyramidSide.Side,
+					pyramidSide.Confidence,
+					pyramidSide.GateMult,
+					pyramidSide.DecayedPct,
+					pyramidSide.EffPct,
+				)
+			}
+
+			log.Printf(
+				"[TRACE] pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
+				pyramidSide.Side,
+				pyramidSide.ElapsedMin,
+				pyramidSide.BasePct,
+				pyramidSide.EffPct,
+				pyramidSide.Raw.DecayLambda,
+				pyramidSide.Raw.DecayFloor,
+				pyramidSide.TFloorMin,
+			)
+		}
+	}
 
 	log.Printf("[TRACE] hotpath.before_sizing elapsed_ms=%d",
 		time.Since(hotStart).Milliseconds())
