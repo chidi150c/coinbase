@@ -947,25 +947,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// 	log.Printf("[TRACE] consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
 	// }
 
-	//-------------------------------------------------------------
-	//2. Fan out only AI, MACD and EMA
-	//-----------------------------------------------------------
-	aiCh := make(chan AIResult, 1)
-	macdSnapCh := make(chan MACDSnapshotResult, 1)
-	emaCh := make(chan EMAPatternResult, 1)
-
-	go func() {
-		aiCh <- t.evaluateAI(signalHistory)
-	}()
-
-	go func() {
-		macdSnapCh <- t.evaluateMACDSnapshot(execHistory)
-	}()
-
-	go func() {
-		emaCh <- t.evaluateEMAPatternSnapshot(execHistory)
-	}()
-
 	if msg, done, err := t.maybeCloseDustBasket(ctx, SideBuy, price); done || err != nil {
 		t.mu.Unlock()
 		return StepResult{Msg: msg}, err
@@ -1658,6 +1639,25 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		reservedShortQuoteWithFee += t.pendingBuy.Quote * feeMult
 	}
 
+	//-------------------------------------------------------------
+	//2. Fan out only AI, MACD and EMA
+	//-----------------------------------------------------------
+	aiCh := make(chan AIResult, 1)
+	macdSnapCh := make(chan MACDSnapshotResult, 1)
+	emaCh := make(chan EMAPatternResult, 1)
+
+	go func() {
+		aiCh <- t.evaluateAI(signalHistory)
+	}()
+
+	go func() {
+		macdSnapCh <- t.evaluateMACDSnapshot(execHistory)
+	}()
+
+	go func() {
+		emaCh <- t.evaluateEMAPatternSnapshot(execHistory)
+	}()
+
 	// -------------------------------------------------------------
 	// 3. Evaluate Pyramid on the main thread
 	// While those three goroutines run:
@@ -2082,7 +2082,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-141",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-142",
 		totalLots,
 		d.Raw,
 		d.Signal,
