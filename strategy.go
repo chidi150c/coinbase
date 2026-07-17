@@ -359,7 +359,6 @@ func (t *Trader) evaluateAI(
 			)
 
 	default:
-
 		result.Raw = Flat
 		result.Confidence = 0
 	}
@@ -1811,7 +1810,6 @@ func (t *Trader) combineEntryRawMaterials(
 
 	default:
 		d.Signal = Flat
-		d.Confidence = 0
 	}
 
 	return d
