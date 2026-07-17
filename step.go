@@ -1193,6 +1193,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					// Exit as L2_PROFIT_PROTECTION.
 					// Guaranteed still profitable at decision time.
 					exitD := ExitDecision{
+						Side:          lot.Side,
+						MarketRegime:  t.MarketRegime,
+						RegimeMult:    t.RegimeMultiplier,
 						ExitReason:    "profit_protection",
 						ExitClass:     "L2_PROFIT_PROTECTION",
 						ExitNetPNLUSD: net,
@@ -1276,6 +1279,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					}
 
 					exitD := ExitDecision{
+						Side:             lot.Side,
+						MarketRegime:     t.MarketRegime,
+						RegimeMult:       t.RegimeMultiplier,
 						ExitReason:       "threshold_stop_loss",
 						ExitNetPNLUSD:    net,
 						StopLossPNLUSD:   t.cfg.StopLossPnLUSD,
@@ -1336,6 +1342,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				switch lot.ExitMode {
 				case ExitModeRunnerTrailing:
 					exitD := ExitDecision{
+						Side:          lot.Side,
+						MarketRegime:  t.MarketRegime,
+						RegimeMult:    t.RegimeMultiplier,
 						ExitReason:    "trailing_stop",
 						ExitClass:     "L1_TRAILING_STOP",
 						ExitNetPNLUSD: net,
@@ -1372,6 +1381,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					//-------------------------------------------------------
 
 					exitD := ExitDecision{
+						Side:          lot.Side,
+						MarketRegime:  t.MarketRegime,
+						RegimeMult:    t.RegimeMultiplier,
 						ExitReason:    "take_profit",
 						ExitNetPNLUSD: net,
 					}
