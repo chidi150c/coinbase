@@ -1768,7 +1768,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		pyramidRaw,
 		aiResult.Confidence,
 	)
-
 	if pyramidResult.Err != nil {
 		log.Printf(
 			"[TRACE] case5.pyramid_interpret.failed elapsed_ms=%d err=%v",
@@ -1784,7 +1783,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			Signal: Flat,
 		}, nil
 	}
-
 	// Only timer-extension maintenance from raw evaluation.
 	t.applyPyramidRawTransitions(
 		pyramidRaw.State,
@@ -1820,6 +1818,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	legacySignal := finalSignalFromAILogic(
 		aiResult.Raw,
 		logicOpinion,
+	)
+
+	// Preserve the original selected-side Pyramid state behavior using
+	// the decision that existed before the Case 5 override stage.
+	t.applyPyramidDecisionTransitions(
+		pyramidResult,
+		legacySignal,
 	)
 
 	// -----------------------------------------------------------------
@@ -1970,14 +1975,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		equityResult.Reason,
 	)
 
-	// Preserve the original selected-side Pyramid state behavior using
-	// the decision that existed before the Case 5 override stage.
-	t.applyPyramidDecisionTransitions(
-		pyramidResult.State,
-		legacySignal,
-		price,
-	)
-
 	// Case 5 may retain or override the legacy AI + Logic decision using
 	// the complete AI, MACD, EMA and Pyramid materials.
 	entryDecision := t.combineEntryRawMaterials(
@@ -2085,7 +2082,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-140",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-141",
 		totalLots,
 		d.Raw,
 		d.Signal,
@@ -2251,9 +2248,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 		case Sell:
 			pyramidSide = pyramidResult.Sell
-
-		default:
-			pyramidSide = PyramidSideResult{}
 		}
 
 		if legacySignal == Buy || legacySignal == Sell {
@@ -2271,28 +2265,113 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				)
 			}
 
-			// The legacy conf_gate log was emitted only when decay was enabled.
-			if pyramidSide.Raw.DecayLambda > 0 {
-				log.Printf(
-					"[TRACE] pyramid.conf_gate side=%s confidence=%.4f gateMult=%.4f decayedPct=%.4f effPct=%.4f",
-					pyramidSide.Side,
-					pyramidSide.Confidence,
-					pyramidSide.GateMult,
-					pyramidSide.DecayedPct,
-					pyramidSide.EffPct,
-				)
-			}
+			if pyramidSide.SpacingPass {
+				if pyramidSide.Raw.DecayLambda > 0 {
+					log.Printf(
+						"[TRACE] pyramid.conf_gate side=%s confidence=%.4f gateMult=%.4f decayedPct=%.4f effPct=%.4f",
+						pyramidSide.Side,
+						pyramidSide.Confidence,
+						pyramidSide.GateMult,
+						pyramidSide.DecayedPct,
+						pyramidSide.EffPct,
+					)
+				}
 
-			log.Printf(
-				"[TRACE] pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
-				pyramidSide.Side,
-				pyramidSide.ElapsedMin,
-				pyramidSide.BasePct,
-				pyramidSide.EffPct,
-				pyramidSide.Raw.DecayLambda,
-				pyramidSide.Raw.DecayFloor,
-				pyramidSide.TFloorMin,
-			)
+				log.Printf(
+					"[TRACE] pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
+					pyramidSide.Side,
+					pyramidSide.ElapsedMin,
+					pyramidSide.BasePct,
+					pyramidSide.EffPct,
+					pyramidSide.Raw.DecayLambda,
+					pyramidSide.Raw.DecayFloor,
+					pyramidSide.TFloorMin,
+				)
+
+				if pyramidSide.UsedSoftGate {
+					switch legacySignal {
+					case Buy:
+						log.Printf(
+							"[DEBUG] SOFT GATE BUY: elapsedMin=%.1f tFloorMin=%.2f old_gate=%.2f recentLow=%.2f soft_gate=%.2f winLow=%.2f price=%.2f",
+							pyramidSide.ElapsedMin,
+							pyramidSide.TFloorMin,
+							pyramidSide.BaselineGatePrice,
+							pyramidSide.Raw.RecentExtreme,
+							pyramidSide.SoftGatePrice,
+							pyramidSide.WinExtreme,
+							pyramidSide.CurrentPrice,
+						)
+
+					case Sell:
+						log.Printf(
+							"[DEBUG] SOFT GATE SELL: elapsedMin=%.1f tFloorMin=%.2f old_gate=%.2f recentHigh=%.2f soft_gate=%.2f winHigh=%.2f price=%.2f",
+							pyramidSide.ElapsedMin,
+							pyramidSide.TFloorMin,
+							pyramidSide.BaselineGatePrice,
+							pyramidSide.Raw.RecentExtreme,
+							pyramidSide.SoftGatePrice,
+							pyramidSide.WinExtreme,
+							pyramidSide.CurrentPrice,
+						)
+					}
+				}
+
+				if pyramidSide.GatePassed {
+					switch legacySignal {
+					case Buy:
+						log.Printf(
+							"[DEBUG] pyramid: BUY baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
+							pyramidSide.CurrentPrice,
+							pyramidSide.EffectiveGatePrice,
+							pyramidSide.LastAnchor,
+							pyramidSide.EffPct,
+							pyramidSide.ElapsedMin,
+						)
+
+					case Sell:
+						log.Printf(
+							"[DEBUG] pyramid: SELL baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
+							pyramidSide.CurrentPrice,
+							pyramidSide.EffectiveGatePrice,
+							pyramidSide.LastAnchor,
+							pyramidSide.EffPct,
+							pyramidSide.ElapsedMin,
+						)
+					}
+				} else {
+					switch legacySignal {
+					case Buy:
+						log.Printf(
+							"[DEBUG] pyramid: blocked by last gate (BUY): price=%.2f gatePrice=%.2f",
+							pyramidSide.CurrentPrice,
+							pyramidSide.EffectiveGatePrice,
+						)
+
+						log.Printf(
+							"[TRACE] pyramid.block.buy price=%.8f gate=%.8f last=%.8f effPct=%.4f",
+							pyramidSide.CurrentPrice,
+							pyramidSide.EffectiveGatePrice,
+							pyramidSide.LastAnchor,
+							pyramidSide.EffPct,
+						)
+
+					case Sell:
+						log.Printf(
+							"[DEBUG] pyramid: blocked by last gate (SELL): price=%.2f gatePrice=%.2f",
+							pyramidSide.CurrentPrice,
+							pyramidSide.EffectiveGatePrice,
+						)
+
+						log.Printf(
+							"[TRACE] pyramid.block.sell price=%.8f gate=%.8f last=%.8f effPct=%.4f",
+							pyramidSide.CurrentPrice,
+							pyramidSide.EffectiveGatePrice,
+							pyramidSide.LastAnchor,
+							pyramidSide.EffPct,
+						)
+					}
+				}
+			}
 		}
 	}
 

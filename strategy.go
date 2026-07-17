@@ -902,8 +902,11 @@ type PyramidSideResult struct {
 	EffectiveGatePrice float64
 
 	// Existing/proposed latch evidence.
-	WinExtreme float64
-	Latched    float64
+	WinExtreme        float64
+	Latched           float64
+	LatchBeforeClamp  float64
+	LatchAfterClamp   float64
+	LatchClampApplied bool
 
 	LatchBufferPrice float64
 
@@ -1220,10 +1223,11 @@ func (t *Trader) applyPyramidRawTransitions(
 //
 // --------------------------------------------------------------------------
 func (t *Trader) applyPyramidDecisionTransitions(
-	state PyramidStateTransitions,
+	pyramid PyramidResult,
 	finalSignal Signal,
-	price float64,
 ) {
+	state := pyramid.State
+
 	switch finalSignal {
 	case Buy:
 		if state.Buy.UpdateWin {
@@ -1234,13 +1238,30 @@ func (t *Trader) applyPyramidDecisionTransitions(
 		if state.Buy.UpdateLatched {
 			t.latchedGateBuy =
 				state.Buy.NextLatched
+
+			if pyramid.Buy.HardLatchEligible {
+				log.Printf(
+					"[DEBUG] LATCH SET BUY: latchedGate=%.2f winLow=%.2f elapsedMin=%.1f tFloorMin=%.2f",
+					pyramid.Buy.LatchBeforeClamp,
+					t.winLowBuy,
+					pyramid.Buy.ElapsedMin,
+					pyramid.Buy.TFloorMin,
+				)
+			}
+
+			if pyramid.Buy.LatchClampApplied {
+				log.Printf(
+					"[TRACE] pyramid.latch_clamp.buy old=%.8f last=%.8f new=%.8f",
+					pyramid.Buy.LatchBeforeClamp,
+					pyramid.Buy.LastAnchor,
+					pyramid.Buy.LatchAfterClamp,
+				)
+			}
 		}
 
 		if state.RebaseSellOnBuy {
 			oldLatch := t.latchedGateSell
 			oldWin := t.winHighSell
-			sellLatchAgeHr :=
-				time.Since(t.lastAddSell).Hours()
 
 			t.latchedGateSell =
 				state.NextSellLatch
@@ -1250,13 +1271,13 @@ func (t *Trader) applyPyramidDecisionTransitions(
 
 			log.Printf(
 				"[DEBUG] LATCH REBASE SELL: ageHr=%.2f logic=%s old_latched=%.2f old_winHigh=%.2f new_latched=%.2f new_winHigh=%.2f price=%.2f",
-				sellLatchAgeHr,
+				pyramid.Sell.ElapsedHr,
 				finalSignal,
 				oldLatch,
 				oldWin,
 				t.latchedGateSell,
 				t.winHighSell,
-				price,
+				pyramid.Buy.CurrentPrice,
 			)
 		}
 
@@ -1269,13 +1290,30 @@ func (t *Trader) applyPyramidDecisionTransitions(
 		if state.Sell.UpdateLatched {
 			t.latchedGateSell =
 				state.Sell.NextLatched
+
+			if pyramid.Sell.HardLatchEligible {
+				log.Printf(
+					"[DEBUG] LATCH SET SELL: latchedGate=%.2f winHigh=%.2f elapsedMin=%.1f tFloorMin=%.2f",
+					pyramid.Sell.LatchBeforeClamp,
+					t.winHighSell,
+					pyramid.Sell.ElapsedMin,
+					pyramid.Sell.TFloorMin,
+				)
+			}
+
+			if pyramid.Sell.LatchClampApplied {
+				log.Printf(
+					"[TRACE] pyramid.latch_clamp.sell old=%.8f last=%.8f new=%.8f",
+					pyramid.Sell.LatchBeforeClamp,
+					pyramid.Sell.LastAnchor,
+					pyramid.Sell.LatchAfterClamp,
+				)
+			}
 		}
 
 		if state.RebaseBuyOnSell {
 			oldLatch := t.latchedGateBuy
 			oldWin := t.winLowBuy
-			buyLatchAgeHr :=
-				time.Since(t.lastAddBuy).Hours()
 
 			t.latchedGateBuy =
 				state.NextBuyLatch
@@ -1285,13 +1323,13 @@ func (t *Trader) applyPyramidDecisionTransitions(
 
 			log.Printf(
 				"[DEBUG] LATCH REBASE BUY: ageHr=%.2f logic=%s old_latched=%.2f old_winLow=%.2f new_latched=%.2f new_winLow=%.2f price=%.2f",
-				buyLatchAgeHr,
+				pyramid.Buy.ElapsedHr,
 				finalSignal,
 				oldLatch,
 				oldWin,
 				t.latchedGateBuy,
 				t.winLowBuy,
-				price,
+				pyramid.Sell.CurrentPrice,
 			)
 		}
 	}
@@ -1509,9 +1547,10 @@ func interpretPyramidSideRaw(
 		}
 
 		if nextLatched > 0 {
+			result.LatchBeforeClamp = nextLatched
+
 			finalLatch := nextLatched
 
-			// Preserve the original regime-sensitive clamp.
 			if raw.MarketRegime != RegimeUp {
 				finalLatch =
 					math.Min(
@@ -1521,12 +1560,15 @@ func interpretPyramidSideRaw(
 			}
 
 			if finalLatch != nextLatched {
+				result.LatchClampApplied = true
+
 				nextLatched = finalLatch
 
 				transition.UpdateLatched = true
 				transition.NextLatched = nextLatched
 			}
 
+			result.LatchAfterClamp = nextLatched
 			result.EffectiveGatePrice = nextLatched
 			result.UsedLatchedGate = true
 		}
@@ -1602,9 +1644,10 @@ func interpretPyramidSideRaw(
 		}
 
 		if nextLatched > 0 {
+			result.LatchBeforeClamp = nextLatched
+
 			finalLatch := nextLatched
 
-			// Preserve the original regime-sensitive clamp.
 			if raw.MarketRegime != RegimeDown {
 				finalLatch =
 					math.Max(
@@ -1614,12 +1657,15 @@ func interpretPyramidSideRaw(
 			}
 
 			if finalLatch != nextLatched {
+				result.LatchClampApplied = true
+
 				nextLatched = finalLatch
 
 				transition.UpdateLatched = true
 				transition.NextLatched = nextLatched
 			}
 
+			result.LatchAfterClamp = nextLatched
 			result.EffectiveGatePrice = nextLatched
 			result.UsedLatchedGate = true
 		}
