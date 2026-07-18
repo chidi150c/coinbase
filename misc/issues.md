@@ -84,3 +84,102 @@ Completion Criteria
 ✅ Live testing confirms no regressions after consolidation.
 
 These completion criteria have a common philosophy: a case is complete only when (1) the implementation is finished, (2) it has been verified under live trading, and (3) it demonstrably achieves its intended objective without introducing regressions. This gives you a clear definition of "done" for every case.
+
+
+==============================
+
+
+Case 7 definition
+
+Case 7 — BUY Hold/Recovery Strategy: For BTC spot BUY positions, disable the normal per-trade threshold_stop_loss exit while retaining take-profit, profit protection, trailing-profit exits, account-level risk controls, and all SELL stop-loss behavior. Record every occasion where the former BUY stop threshold is crossed and track subsequent maximum drawdown, recovery time, and eventual exit result.
+
+Do not swap stop-loss and take-profit yet. Do not invert AI yet. Case 7 changes one variable only: BUY threshold-stop execution.
+
+Paste the function or code block that generates threshold_stop_loss; I’ll mark the exact lines to replace without affecting SELL exits.
+
+case 8: swap stop-loss and take-profit
+case 9: invert AI
+
+Those are good additions to the experimental roadmap. I'd define them so each changes only one variable, making the results interpretable.
+
+Case 8 — Swap Stop-Loss and Take-Profit Geometry
+
+Objective: Determine whether the current risk/reward geometry is inverted.
+
+Behavior
+
+For every new trade:
+
+Keep the AI decision unchanged.
+Keep BUY/SELL direction unchanged.
+Keep all entry filters unchanged.
+Swap the stop-loss distance and take-profit distance.
+
+Example:
+
+Current:
+
+Take Profit = +1.50 USD
+Stop Loss   = -0.80 USD
+
+Case 8:
+
+Take Profit = +0.80 USD
+Stop Loss   = -1.50 USD
+
+Everything else remains identical:
+
+AI
+confidence
+regime
+profit protection
+trailing
+maker logic
+sizing
+
+Goal: Determine whether a wider loss allowance and earlier profit-taking improve expectancy.
+
+Case 9 — Invert AI Direction
+
+Objective: Determine whether the AI has learned the opposite polarity.
+
+Behavior
+
+Before any logic fusion:
+
+AI BUY  → AI SELL
+AI SELL → AI BUY
+AI FLAT → AI FLAT
+
+Important:
+
+Recompute the corresponding thresholds and confidence for the new interpreted direction, rather than simply renaming BUY to SELL. The decision should be internally consistent with the inverted hypothesis.
+Keep:
+logic filters,
+regime,
+stop-loss,
+take-profit,
+profit protection,
+sizing,
+maker execution
+unchanged.
+
+The only variable under test is:
+
+AI direction polarity.
+
+Recommended execution order
+Case 7: Disable BUY threshold stop-loss.
+Case 8: Swap stop-loss/take-profit distances.
+Case 9: Invert AI direction.
+
+Each experiment should be run independently against the same historical period. Avoid combining them initially, because if performance changes, you won't know which modification caused it.
+
+After you've measured each one separately, you can test combinations such as:
+
+Case 7 + Case 8
+Case 7 + Case 9
+Case 8 + Case 9
+Case 7 + Case 8 + Case 9
+
+That progression will tell you not only whether an individual idea works, but also whether combinations produce additive improvements.

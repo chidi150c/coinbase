@@ -77,6 +77,8 @@ import (
 	"time"
 )
 
+const Version = 142
+
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
 	if book == nil || len(book.RunnerIDs) == 0 {
@@ -560,7 +562,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					OpenNotionalUSD: quoteSpent,
 					Reason:          "async postonly filled",
 					Take:            0,
-					Version:         1,
+					Version:         Version,
 					EntryOrderID:    res.OrderID,
 				}
 
@@ -785,7 +787,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					OpenNotionalUSD: quoteSpent,
 					Reason:          "async postonly filled",
 					Take:            0,
-					Version:         1,
+					Version:         Version,
 					EntryOrderID:    res.OrderID,
 				}
 
@@ -1272,7 +1274,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					deepLossLimit := lossLimit * deepLossMult
 					deepLossExit := net <= deepLossLimit
 
-					if enableStopLoss && net <= lossLimit {
+					// ============================================================================
+					// CASE7 - Disable BUY threshold_stop_loss
+					// Revert Case 7 by restoring:
+					// if enableStopLoss && net <= lossLimit {
+					// ============================================================================
+					if enableStopLoss && lot.Side == SideSell && net <= lossLimit {
 						exitD.ExitNetPNLUSD = net
 						exitD.StopLossLimitUSD = lossLimit
 						cand := exitCandidate{
@@ -2082,13 +2089,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	totalLots := lsb + lss
 
 	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver-142",
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver=%d",
 		totalLots,
 		d.Raw,
 		d.Signal,
 		price,
 		decisionEntryReason(d),
 		t.cfg.LongOnly,
+		Version,
 	)
 
 	// Determine the side and its book
@@ -3573,7 +3581,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		OpenNotionalUSD:  actualQuote, // <<< USD PERSISTENCE: notional in USD at open
 		Reason:           gatesReason, // side-biased; no winLow
 		Take:             take,
-		Version:          1,
+		Version:          Version,
 		EntryOrderID:     placedOrderID(placed),
 		RefundPortionUSD: refundFromOpposite,
 		ConfidenceMult:   confMult,
