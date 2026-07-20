@@ -183,3 +183,112 @@ Case 8 + Case 9
 Case 7 + Case 8 + Case 9
 
 That progression will tell you not only whether an individual idea works, but also whether combinations produce additive improvements.
+
+==========================================
+
+Case 10 — Stabilize RegimeNormal
+
+Problem observed
+
+Current transition logic allows:
+
+UP
+↓ (expired + freshLow)
+NORMAL
+↓ (next tick freshLow)
+DOWN
+
+and similarly:
+
+DOWN
+↓ (expired + freshHigh)
+NORMAL
+↓ (next tick freshHigh)
+UP
+
+As a result, RegimeNormal often exists for only one tick and has little practical influence on the bot's behavior.
+
+Goal
+
+Redesign the state machine so RegimeNormal represents a meaningful neutral period rather than an immediate relay between UP and DOWN. The exact confirmation rule (e.g., persistence, second breakout, minimum dwell time, or another criterion) will be determined later.
+
+For now, the roadmap is:
+
+✅ Case 7: Disable BUY threshold_stop_loss (implemented)
+⏳ Case 8: Swap stop-loss and take-profit
+⏳ Case 9: Invert AI direction
+⏳ Case 10: Stabilize RegimeNormal transitions
+
+That keeps the experiments isolated so you can attribute any performance changes to the correct modification.
+
+
+================================
+
+
+Case 3B – Mode C (Regime == UP)
+Trigger
+
+A recovery intent is created when all of the following are true:
+
+A SELL position exits via threshold_stop_loss.
+Case 3B Mode A cannot be funded (insufficient spare base).
+Case 3B Mode B is not applicable because MarketRegime != DOWN (i.e., the market is in an UP regime).
+Recovery Signal
+
+Wait for a favorable SELL setup:
+
+(emaHighPeakPattern || emaUpGoingDown) &&
+StrongPositiveMACD
+Behavior
+If the recovery signal is already true, immediately submit a post-only maker SELL using RecoveryByProfitTarget.
+Otherwise:
+Store a pending Mode C recovery intent.
+Re-evaluate the recovery signal on each market update.
+Submit the replacement immediately once the signal becomes true.
+Cancel the pending recovery if the signal does not occur before the configured Signal Timeout (approximately the normal order timeout).
+Recovery Method
+Entry type: Post-only maker SELL.
+Entry price: Current live BBO (not the original stop-loss price).
+Position size: Normal trade base.
+Profit target: ProfitGateUSD + RecoveryDebtUSD.
+Decision Flow
+SELL threshold_stop_loss
+        │
+        ▼
+Case 3B Mode A
+(Sufficient spare?)
+        │
+   Yes ─────────► RecoveryByPositionSize
+        │
+       No
+        ▼
+Regime == DOWN?
+        │
+   Yes ─────────► Case 3B Mode B
+                  Immediate RecoveryByProfitTarget
+        │
+       No (UP)
+        ▼
+Case 3B Mode C
+        │
+Recovery signal true?
+        │
+   Yes ─────────► Immediate RecoveryByProfitTarget
+        │
+       No
+        ▼
+Store pending recovery
+        │
+Signal becomes true before timeout?
+        │
+   Yes ─────────► Submit replacement
+        │
+       No
+        ▼
+Cancel pending recovery
+
+This keeps the Case 3B family well organized:
+
+Mode A → Preferred recovery using additional capital (RecoveryByPositionSize).
+Mode B → Immediate profit-target recovery in a DOWN regime.
+Mode C → Deferred profit-target recovery in an UP regime, waiting for a technically favorable SELL setup.

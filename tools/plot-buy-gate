@@ -1,5 +1,4 @@
-
-chidi@localhost:~$ cat /usr/local/bin/plot-buy-gate
+sudo tee /usr/local/bin/plot-buy-gate >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -9,14 +8,17 @@ OUT_DIR="${2:-/tmp/buy_sell_gate_debug}"
 mkdir -p "$OUT_DIR"
 
 python3 - "$LOG_FILE" "$OUT_DIR" <<'PY'
-import sys, re
+import sys
+import re
 from pathlib import Path
 from datetime import datetime
+
 import pandas as pd
 import matplotlib.pyplot as plt
 
 log_file = Path(sys.argv[1])
 out_dir = Path(sys.argv[2])
+
 
 def parse_side(side):
     rows = []
@@ -25,125 +27,318 @@ def parse_side(side):
         if f"aiRaw={side}" not in line or "logicEPS=" not in line:
             continue
 
-        mt = re.search(r'(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})', line)
+        mt = re.search(
+            r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})",
+            line,
+        )
         if not mt:
             continue
 
         def f(name):
-            m = re.search(fr'{name}=([-+]?\d*\.?\d+)', line)
+            m = re.search(
+                fr"\b{re.escape(name)}=([-+]?\d*\.?\d+)",
+                line,
+            )
             return float(m.group(1)) if m else None
 
+        def first_float(*names):
+            for name in names:
+                value = f(name)
+                if value is not None:
+                    return value
+            return None
+
         def b(name):
-            m = re.search(fr'{name}=(true|false)', line)
+            m = re.search(
+                fr"\b{re.escape(name)}=(true|false)",
+                line,
+            )
             return m.group(1) == "true" if m else None
 
         def s(name):
-            m = re.search(fr'{name}=([A-Z]+)', line)
+            m = re.search(
+                fr"\b{re.escape(name)}=([A-Z]+)",
+                line,
+            )
             return m.group(1) if m else None
 
         eps = f("logicEPS")
         turn = f("logic_macd_turn")
+
         if eps is None or turn is None:
             continue
+
+        # Try the most likely audit-log price field names.
+        price = first_float(
+            "price",
+            "livePrice",
+            "markPrice",
+            "tickPrice",
+            "lastPrice",
+            "close",
+        )
 
         if side == "BUY":
             threshold = -eps
             gap = abs(turn - threshold)
+
             ready = (
-                b("logic_macd_strong_negative") is True and
-                b("logic_macd_momentum_up") is True and
-                b("logic_pattern_buy") is True
+                b("logic_macd_strong_negative") is True
+                and b("logic_macd_momentum_up") is True
+                and b("logic_pattern_buy") is True
             )
         else:
             threshold = eps
             gap = abs(turn - threshold)
+
             ready = (
-                b("logic_macd_strong_positive") is True and
-                b("logic_macd_momentum_down") is True and
-                b("logic_pattern_sell") is True
+                b("logic_macd_strong_positive") is True
+                and b("logic_macd_momentum_down") is True
+                and b("logic_pattern_sell") is True
             )
 
-        rows.append({
-            "time": datetime.strptime(mt.group(1), "%Y/%m/%d %H:%M:%S"),
-            "pUp": f("pUp"),
-            "buyTh": f("buyTh"),
-            "sellTh": f("sellTh"),
-            "threshold": threshold,
-            "logicEPS": eps,
-            "logic_macd_turn": turn,
-            "gap": gap,
-            "strong_negative": b("logic_macd_strong_negative"),
-            "strong_positive": b("logic_macd_strong_positive"),
-            "momentum_up": b("logic_macd_momentum_up"),
-            "momentum_down": b("logic_macd_momentum_down"),
-            "pattern_buy": b("logic_pattern_buy"),
-            "pattern_sell": b("logic_pattern_sell"),
-            "ready": ready,
-            "logicOpinion": s("logicOpinion"),
-            "final": s("final"),
-        })
+        rows.append(
+            {
+                "time": datetime.strptime(
+                    mt.group(1),
+                    "%Y/%m/%d %H:%M:%S",
+                ),
+                "price": price,
+                "pUp": f("pUp"),
+                "buyTh": f("buyTh"),
+                "sellTh": f("sellTh"),
+                "threshold": threshold,
+                "logicEPS": eps,
+                "logic_macd_turn": turn,
+                "gap": gap,
+                "strong_negative": b("logic_macd_strong_negative"),
+                "strong_positive": b("logic_macd_strong_positive"),
+                "momentum_up": b("logic_macd_momentum_up"),
+                "momentum_down": b("logic_macd_momentum_down"),
+                "pattern_buy": b("logic_pattern_buy"),
+                "pattern_sell": b("logic_pattern_sell"),
+                "ready": ready,
+                "logicOpinion": s("logicOpinion"),
+                "final": s("final"),
+            }
+        )
 
     return pd.DataFrame(rows)
+
+
+def add_price_axis(ax, frame):
+    if "price" not in frame.columns:
+        return None
+
+    price_rows = frame.dropna(subset=["price"])
+
+    if price_rows.empty:
+        return None
+
+    ax_price = ax.twinx()
+
+    price_line = ax_price.plot(
+        price_rows["time"],
+        price_rows["price"],
+        color="red",
+        linewidth=1.4,
+        alpha=0.75,
+        label="BTC price",
+    )
+
+    ax_price.set_ylabel("BTC price (USDT)")
+
+    return ax_price, price_line
+
+
+def combine_legends(ax_signal, price_axis_result):
+    signal_lines, signal_labels = ax_signal.get_legend_handles_labels()
+
+    if price_axis_result is None:
+        ax_signal.legend(signal_lines, signal_labels, loc="best")
+        return
+
+    ax_price, price_lines = price_axis_result
+    price_labels = [line.get_label() for line in price_lines]
+
+    ax_signal.legend(
+        signal_lines + price_lines,
+        signal_labels + price_labels,
+        loc="best",
+    )
+
 
 def make_plots(side, df):
     if df.empty:
         (out_dir / f"{side.lower()}_gate_summary.txt").write_text(
-            f"No aiRaw={side} rows with logicEPS and logic_macd_turn found.\n"
+            f"No aiRaw={side} rows with logicEPS and "
+            "logic_macd_turn found.\n"
         )
         return
 
     closest = df.loc[df["gap"].idxmin()]
+
     start = closest["time"] - pd.Timedelta(minutes=45)
     end = closest["time"] + pd.Timedelta(minutes=45)
-    zoom = df[(df["time"] >= start) & (df["time"] <= end)].copy()
 
-    # Full chart
-    plt.figure(figsize=(12,4.5))
-    plt.plot(df["time"], df["threshold"], label=("-logicEPS" if side == "BUY" else "+logicEPS"))
-    plt.plot(df["time"], df["logic_macd_turn"], label="logic_macd_turn")
-    plt.axvspan(start, end, alpha=0.15)
-    plt.title(f"{side} gate debug: full period")
-    plt.xlabel("Time")
-    plt.ylabel("Value")
-    plt.grid(True)
-    plt.legend()
-    plt.gcf().autofmt_xdate()
-    plt.tight_layout()
-    plt.savefig(out_dir / f"{side.lower()}_gate_full.png", dpi=160)
-    plt.close()
+    zoom = df[
+        (df["time"] >= start)
+        & (df["time"] <= end)
+    ].copy()
 
-    # Zoom chart
-    plt.figure(figsize=(12,5))
-    plt.plot(zoom["time"], zoom["threshold"], label=("-logicEPS" if side == "BUY" else "+logicEPS"))
-    plt.plot(zoom["time"], zoom["logic_macd_turn"], label="logic_macd_turn")
+    threshold_label = (
+        "-logicEPS"
+        if side == "BUY"
+        else "+logicEPS"
+    )
+
+    # ============================================================
+    # Full chart with BTC price on right axis
+    # ============================================================
+    fig, ax_signal = plt.subplots(figsize=(13, 5.5))
+
+    ax_signal.plot(
+        df["time"],
+        df["threshold"],
+        label=threshold_label,
+    )
+
+    ax_signal.plot(
+        df["time"],
+        df["logic_macd_turn"],
+        label="logic_macd_turn",
+    )
+
+    ax_signal.axvspan(
+        start,
+        end,
+        alpha=0.15,
+        label="zoom window",
+    )
+
+    price_axis_result = add_price_axis(ax_signal, df)
+
+    ax_signal.set_title(
+        f"{side} gate debug: full period with BTC price"
+    )
+    ax_signal.set_xlabel("Time")
+    ax_signal.set_ylabel("EPS / MACD turn")
+    ax_signal.grid(True)
+
+    combine_legends(
+        ax_signal,
+        price_axis_result,
+    )
+
+    fig.autofmt_xdate()
+    fig.tight_layout()
+
+    fig.savefig(
+        out_dir / f"{side.lower()}_gate_full.png",
+        dpi=160,
+    )
+
+    plt.close(fig)
+
+    # ============================================================
+    # Zoom chart with BTC price on right axis
+    # ============================================================
+    fig, ax_signal = plt.subplots(figsize=(13, 6))
+
+    ax_signal.plot(
+        zoom["time"],
+        zoom["threshold"],
+        label=threshold_label,
+    )
+
+    ax_signal.plot(
+        zoom["time"],
+        zoom["logic_macd_turn"],
+        label="logic_macd_turn",
+    )
 
     ready_zoom = zoom[zoom["ready"] == True]
+
     if not ready_zoom.empty:
-        plt.scatter(ready_zoom["time"], ready_zoom["logic_macd_turn"], label=f"{side} logic ready")
+        ax_signal.scatter(
+            ready_zoom["time"],
+            ready_zoom["logic_macd_turn"],
+            label=f"{side} logic ready",
+        )
 
     closest_zoom = zoom.loc[zoom["gap"].idxmin()]
-    plt.scatter([closest_zoom["time"]], [closest_zoom["logic_macd_turn"]], marker="x", s=90, label="closest approach")
 
-    plt.title(f"{side} gate debug: zoom around closest approach")
-    plt.xlabel("Time")
-    plt.ylabel("Value")
-    plt.grid(True)
-    plt.legend()
-    plt.gcf().autofmt_xdate()
-    plt.tight_layout()
-    plt.savefig(out_dir / f"{side.lower()}_gate_zoom.png", dpi=160)
-    plt.close()
+    ax_signal.scatter(
+        [closest_zoom["time"]],
+        [closest_zoom["logic_macd_turn"]],
+        marker="x",
+        s=90,
+        label="closest approach",
+    )
+
+    price_axis_result = add_price_axis(
+        ax_signal,
+        zoom,
+    )
+
+    # Mark the price at the closest gate approach, if available.
+    if (
+        price_axis_result is not None
+        and pd.notna(closest_zoom["price"])
+    ):
+        ax_price, _ = price_axis_result
+
+        ax_price.scatter(
+            [closest_zoom["time"]],
+            [closest_zoom["price"]],
+            marker="o",
+            s=55,
+            label="price at closest approach",
+        )
+
+    ax_signal.set_title(
+        f"{side} gate debug: zoom around closest approach "
+        "with BTC price"
+    )
+    ax_signal.set_xlabel("Time")
+    ax_signal.set_ylabel("EPS / MACD turn")
+    ax_signal.grid(True)
+
+    combine_legends(
+        ax_signal,
+        price_axis_result,
+    )
+
+    fig.autofmt_xdate()
+    fig.tight_layout()
+
+    fig.savefig(
+        out_dir / f"{side.lower()}_gate_zoom.png",
+        dpi=160,
+    )
+
+    plt.close(fig)
 
     if side == "BUY":
-        condition_text = "BUY requires strong_negative=true AND momentum_up=true AND pattern_buy=true."
+        condition_text = (
+            "BUY requires strong_negative=true AND "
+            "momentum_up=true AND pattern_buy=true."
+        )
     else:
-        condition_text = "SELL requires strong_positive=true AND momentum_down=true AND pattern_sell=true."
+        condition_text = (
+            "SELL requires strong_positive=true AND "
+            "momentum_down=true AND pattern_sell=true."
+        )
+
+    price_count = df["price"].notna().sum()
 
     summary = out_dir / f"{side.lower()}_gate_summary.txt"
+
     summary.write_text(
 f"""{side} gate debug summary
 
 Records parsed: {len(df)}
+Records with price: {price_count}
 Time range: {df['time'].min()} to {df['time'].max()}
 
 Closest approach:
@@ -151,6 +346,7 @@ Closest approach:
   threshold: {closest['threshold']:.5f}
   logic_macd_turn: {closest['logic_macd_turn']:.5f}
   gap: {closest['gap']:.5f}
+  price: {closest['price'] if pd.notna(closest['price']) else 'not logged'}
 
 Counts:
   strong_negative=true: {(df['strong_negative'] == True).sum()}
@@ -165,14 +361,18 @@ Counts:
 
 Main interpretation:
   {condition_text}
-  If all {side} logic conditions true is 0, the missing condition is the blocker.
-""")
+  If all {side} logic conditions true is 0,
+  the missing condition is the blocker.
+"""
+    )
+
 
 for side in ["BUY", "SELL"]:
     df = parse_side(side)
     make_plots(side, df)
 
 print("Created:")
+
 for name in [
     "buy_gate_full.png",
     "buy_gate_zoom.png",
@@ -183,4 +383,6 @@ for name in [
 ]:
     print(f"  {out_dir / name}")
 PY
-chidi@localhost:~$
+EOF
+
+sudo chmod +x /usr/local/bin/plot-buy-gate

@@ -82,9 +82,12 @@ type Position struct {
 	RefundPortionUSD float64 `json:"refund_portion_usd"`
 
 	// --- NEW: stable lot identifier & entry order id (persisted) ---
-	EntryOrderID      string  `json:"entry_order_id,omitempty"`
-	ProfitTrailActive bool    `json:"profit_trail_active,omitempty"`
-	ProfitPeakUSD     float64 `json:"profit_peak_usd,omitempty"`
+	EntryOrderID             string  `json:"entry_order_id,omitempty"`
+	ProfitTrailActive        bool    `json:"profit_trail_active,omitempty"`
+	ProfitPeakUSD            float64 `json:"profit_peak_usd,omitempty"`
+	Case3BReplacementStarted bool    `json:"case3_b_replacement_started"`
+
+	Case3BReplacementOrderID string `json:"case3_b_replacement_order_id"`
 }
 
 // --- NEW: per-side book (authoritative store) ---
@@ -294,8 +297,24 @@ type Trader struct {
 
 	balanceRefreshOnce sync.Once
 	balanceRefreshStop chan struct{}
+	// Case 3B replacements
+    pendingCase3B []*PendingEntrySession
 }
+type PendingEntrySession struct {
+    Pending            *PendingOpen
+    Ch                 chan OpenResult
+    Ctx                context.Context
+    Cancel             context.CancelFunc
+    Side               OrderSide
+    Kind               PendingEntryKind
+    SourceEntryOrderID string
+}
+type PendingEntryKind int
 
+const (
+    PendingEntryNormal PendingEntryKind = iota
+    PendingEntryCase3B
+)
 func NewTrader(cfg Config, broker Broker) *Trader {
 	t := &Trader{
 		cfg:        cfg,
@@ -1253,135 +1272,6 @@ func (t *Trader) saveStateNoLock() error {
 	return t.saveStateFrom(st)
 }
 
-//
-// CASE 3A - UP-Regime SELL Protection
-// -----------------------------------
-//
-// Trigger:
-//
-//     Immediately previous exit
-//             ↓
-//     SELL threshold_stop_loss with loss
-//             ↓
-//     Current MarketRegime == UP
-//             ↓
-//     New SELL entry price < previous loss-exit BUY price
-//
-// Action:
-//
-//     BLOCK the SELL.
-//
-// Rationale:
-//
-// If the previous SELL already failed and the market is now in an UP regime,
-// opening another SELL even lower weakens the trading position and increases
-// the probability of repeated losses.
-//
-
-//
-// CASE 3B MODE A
-// --------------
-//
-// Condition:
-//
-//     spareBase >= replacementBase
-//
-// Use:
-//
-//     Recovery Method 2.
-//
-// Sequence:
-//
-//     Current Tick
-//
-//     1. Post replacement SELL (post-only)
-//            using replacementBase.
-//
-//     2. Spawn replacement watcher.
-//
-//     3. Post loss-exit BUY.
-//
-//     4. Spawn exit watcher.
-//
-//     5. Return.
-//
-// Subsequent ticks:
-//
-//     Independently drain:
-//
-//         replacement
-//         exit
-//
-// =============================================================================
-//
-// CASE 3B MODE B
-// --------------
-//
-// Condition:
-//
-//     spareBase < replacementBase
-//
-// Use:
-//
-//     Recovery Method 1.
-//
-// Sequence:
-//
-//     Current Tick
-//
-//     1. Post loss-exit BUY (post-only).
-//
-//     2. Spawn exit watcher.
-//
-//     3. Immediately attempt replacement SELL
-//            using Recovery Method 1
-//            (normalBase + increased profit target).
-//
-//     4. Spawn replacement watcher.
-//
-//     5. Return.
-//
-// Subsequent ticks:
-//
-//     Drain both pending lifecycles independently.
-//
-// If replacement:
-//
-//     fills
-//         → continue normally.
-//
-//     remains pending
-//         → continue monitoring.
-//
-//     cancels / times out / exchange rejects
-//         → memorize retry request.
-//
-// After funds become available
-// (typically after loss-exit releases inventory),
-// retry the replacement SELL.
-//
-// =============================================================================
-//
-// Summary
-// -------
-//
-// UP regime:
-//
-//     Protect capital.
-//     Do not repeat weaker SELL entries.
-//
-// DOWN regime:
-//
-//     Recover aggressively.
-//
-//     Prefer Recovery Method 2 when spare inventory permits.
-//
-//     Otherwise,
-//     immediately attempt Recovery Method 1,
-//     and retry later if the initial replacement cannot survive.
-//
-// =============================================================================
-
 // snapshotStateLocked builds the BotState assuming the caller already holds t.mu (write or read if immutable reads).
 func (t *Trader) snapshotStateLocked() BotState {
 	return BotState{
@@ -2025,14 +1915,15 @@ func (m RecoveryMethod) String() string {
 }
 
 type ReplacementRequest struct {
-	Enabled        bool
-	Side           OrderSide
-	EntryPrice     float64
-	Base           float64
-	RecoveryNetUSD float64
-	Method         RecoveryMethod
-	ProfitGateUSD  float64
-	Reason         string
+	Enabled            bool
+	Side               OrderSide
+	EntryPrice         float64
+	Base               float64
+	RecoveryNetUSD     float64
+	Method             RecoveryMethod
+	ProfitGateUSD      float64
+	Reason             string
+	SourceEntryOrderID string
 }
 type PendingReplacementRetry struct {
 	Enabled            bool
@@ -2068,7 +1959,7 @@ func (t *Trader) markCase3BReplacementRetryLocked(repl ReplacementRequest, waitF
 	_ = t.saveStateNoLock()
 }
 
-func (t *Trader) startCase3BReplacement(ctx context.Context, repl ReplacementRequest) error {
+func (t *Trader) startCase3BReplacement(ctx context.Context, repl ReplacementRequest) (string, error) {
 	if !repl.Enabled {
 		log.Printf(
 			"[TRACE] case3B.replacement.disabled side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
@@ -2078,7 +1969,7 @@ func (t *Trader) startCase3BReplacement(ctx context.Context, repl ReplacementReq
 			repl.EntryPrice,
 			repl.Base*repl.EntryPrice,
 		)
-		return nil
+		return "", nil
 	}
 
 	log.Printf(
@@ -2092,7 +1983,9 @@ func (t *Trader) startCase3BReplacement(ctx context.Context, repl ReplacementReq
 
 	defer log.Printf("[TRACE] case3B.replacement.leave")
 
-	if err := t.startPendingReplacementEntry(ctx, repl); err != nil {
+	var oid string
+	var err error
+	if oid, err = t.startPendingReplacementEntry(ctx, repl); err != nil {
 		log.Printf(
 			"[TRACE] case3B.replacement.failed side=%s price=%.8f base=%.8f method=%s err=%v",
 			repl.Side,
@@ -2101,7 +1994,7 @@ func (t *Trader) startCase3BReplacement(ctx context.Context, repl ReplacementReq
 			repl.Method.String(),
 			err,
 		)
-		return err
+		return oid, err
 	}
 
 	log.Printf(
@@ -2112,23 +2005,23 @@ func (t *Trader) startCase3BReplacement(ctx context.Context, repl ReplacementReq
 		repl.Method.String(),
 	)
 
-	return nil
+	return oid, nil
 }
 
 func (t *Trader) startPendingReplacementEntry(
 	ctx context.Context,
 	repl ReplacementRequest,
-) error {
+) (orderID string, err error) {
 	if !repl.Enabled {
-		return nil
+		return "", nil
 	}
 
 	if repl.Side != SideSell && repl.Side != SideBuy {
-		return fmt.Errorf("replacement unsupported side=%s", repl.Side)
+		return "", fmt.Errorf("replacement unsupported side=%s", repl.Side)
 	}
 
 	if repl.EntryPrice <= 0 || repl.Base <= 0 {
-		return fmt.Errorf(
+		return "", fmt.Errorf(
 			"invalid replacement entry price/base price=%.8f base=%.8f",
 			repl.EntryPrice,
 			repl.Base,
@@ -2136,10 +2029,10 @@ func (t *Trader) startPendingReplacementEntry(
 	}
 
 	if repl.Side == SideSell && t.pendingSell != nil {
-		return fmt.Errorf("replacement blocked: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
+		return "", fmt.Errorf("replacement blocked: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
 	}
 	if repl.Side == SideBuy && t.pendingBuy != nil {
-		return fmt.Errorf("replacement blocked: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
+		return "", fmt.Errorf("replacement blocked: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
 	}
 
 	limitPx := repl.EntryPrice
@@ -2152,11 +2045,11 @@ func (t *Trader) startPendingReplacementEntry(
 	}
 
 	if limitPx <= 0 {
-		return fmt.Errorf("invalid replacement limit price after tick snap: %.8f", limitPx)
+		return "", fmt.Errorf("invalid replacement limit price after tick snap: %.8f", limitPx)
 	}
 
 	if repl.Base*limitPx < t.cfg.MinNotional {
-		return fmt.Errorf(
+		return "", fmt.Errorf(
 			"replacement below min notional side=%s notional=%.2f min=%.2f base=%.8f limit=%.8f",
 			repl.Side,
 			repl.Base*limitPx,
@@ -2187,21 +2080,21 @@ func (t *Trader) startPendingReplacementEntry(
 	)
 
 	if err != nil {
-		return err
+		return orderID, err
 	}
 
 	orderID = strings.TrimSpace(orderID)
 	if orderID == "" {
-		return fmt.Errorf("empty replacement order id")
+		return orderID, fmt.Errorf("empty replacement order id")
 	}
 
 	if repl.Side == SideSell && t.pendingSell != nil {
 		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, orderID)
-		return fmt.Errorf("replacement blocked after post: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
+		return orderID, fmt.Errorf("replacement blocked after post: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
 	}
 	if repl.Side == SideBuy && t.pendingBuy != nil {
 		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, orderID)
-		return fmt.Errorf("replacement blocked after post: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
+		return orderID, fmt.Errorf("replacement blocked after post: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
 	}
 
 	if repl.ProfitGateUSD <= 0 {
@@ -2558,7 +2451,7 @@ func (t *Trader) startPendingReplacementEntry(
 		repl.Reason,
 	)
 
-	return nil
+	return orderID, nil
 }
 
 type exitFanoutResult struct {
@@ -2907,19 +2800,19 @@ func (t *Trader) closeLot(
 						case freshSpareBase >= modeARequiredBase:
 							// Mode A is permitted in every regime, including UP.
 							repl = ReplacementRequest{
-								Enabled:        true,
-								Side:           SideSell,
-								EntryPrice:     replacementEntryPrice,
-								Base:           modeARequiredBase,
-								RecoveryNetUSD: recoveryNetUSD,
-								Method:         RecoveryByPositionSize,
-								ProfitGateUSD:  t.cfg.ProfitGateUSD,
+								Enabled:            true,
+								Side:               SideSell,
+								EntryPrice:         replacementEntryPrice,
+								Base:               modeARequiredBase,
+								RecoveryNetUSD:     recoveryNetUSD,
+								Method:             RecoveryByPositionSize,
+								ProfitGateUSD:      t.cfg.ProfitGateUSD,
+								SourceEntryOrderID: lot.EntryOrderID,
 								Reason: fmt.Sprintf(
-									"case3B_replacement method=%s recovery=%.6f regime=%s usePendingMakerExit=%v",
+									"case3B_replacement method=%s recovery=%.6f regime=%s",
 									RecoveryByPositionSize.String(),
 									recoveryNetUSD,
 									t.MarketRegime,
-									usePendingMakerExit,
 								),
 							}
 
@@ -2990,33 +2883,49 @@ func (t *Trader) closeLot(
 		// Case 3B Mode A:
 		// Sufficient spare for normalBase + extraBase.
 		// Post replacement first, then continue to loss-exit.
-		if err := t.startCase3BReplacement(ctx, repl); err != nil {
+
+		if lot.Case3BReplacementStarted {
 			log.Printf(
-				"[TRACE] case3B.modeA.replacement_failed side=%s entry_id=%s base=%.8f entry_price=%.8f recovery=%.6f err=%v",
+				"[TRACE] case3B.modeA.replacement_already_started side=%s source_entry_id=%s replacement_order_id=%s",
+				lot.Side,
+				lot.EntryOrderID,
+				lot.Case3BReplacementOrderID,
+			)
+		} else {
+			if orderID, err := t.startCase3BReplacement(ctx, repl); err != nil {
+				log.Printf(
+					"[TRACE] case3B.modeA.replacement_failed side=%s entry_id=%s base=%.8f entry_price=%.8f recovery=%.6f err=%v",
+					lot.Side,
+					lot.EntryOrderID,
+					repl.Base,
+					repl.EntryPrice,
+					repl.RecoveryNetUSD,
+					err,
+				)
+
+				return "", fmt.Errorf(
+					"case3B modeA replacement failed; loss exit aborted entry_id=%s: %w",
+					lot.EntryOrderID,
+					err,
+				)
+			}
+
+			log.Printf(
+				"[TRACE] case3B.modeA.replacement_started side=%s entry_id=%s base=%.8f entry_price=%.8f recovery=%.6f",
 				lot.Side,
 				lot.EntryOrderID,
 				repl.Base,
 				repl.EntryPrice,
 				repl.RecoveryNetUSD,
-				err,
 			)
 
-			return "", fmt.Errorf(
-				"case3B modeA replacement failed; loss exit aborted entry_id=%s: %w",
-				lot.EntryOrderID,
-				err,
-			)
+			lot.Case3BReplacementStarted = true
+			lot.Case3BReplacementOrderID = orderID
+
+			if err := t.saveStateNoLock(); err != nil {
+				log.Printf("[WARN] saveState case3B source flag: %v", err)
+			}
 		}
-
-		log.Printf(
-			"[TRACE] case3B.modeA.replacement_started side=%s entry_id=%s base=%.8f entry_price=%.8f recovery=%.6f",
-			lot.Side,
-			lot.EntryOrderID,
-			repl.Base,
-			repl.EntryPrice,
-			repl.RecoveryNetUSD,
-		)
-
 	}
 
 	if usePendingMakerExit && strings.TrimSpace(lot.FixedTPOrderID) != "" {
