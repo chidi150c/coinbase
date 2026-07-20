@@ -1946,574 +1946,6 @@ func (t *Trader) markCase3BReplacementRetryLocked(repl ReplacementRequest, waitF
 	_ = t.saveStateNoLock()
 }
 
-func (t *Trader) startCase3BReplacement(ctx context.Context, repl ReplacementRequest) (string, error) {
-	if !repl.Enabled {
-		log.Printf(
-			"[TRACE] case3B.replacement.disabled side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
-			repl.Side,
-			repl.Method.String(),
-			repl.Base,
-			repl.EntryPrice,
-			repl.Base*repl.EntryPrice,
-		)
-		return "", nil
-	}
-
-	log.Printf(
-		"[TRACE] case3B.replacement.enter side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
-		repl.Side,
-		repl.Method.String(),
-		repl.Base,
-		repl.EntryPrice,
-		repl.Base*repl.EntryPrice,
-	)
-
-	defer log.Printf("[TRACE] case3B.replacement.leave")
-
-	started, err := t.startPendingReplacementEntry(ctx, repl)
-	if err != nil {
-		log.Printf(
-			"[TRACE] case3B.replacement.failed side=%s price=%.8f base=%.8f method=%s err=%v",
-			repl.Side,
-			repl.EntryPrice,
-			repl.Base,
-			repl.Method.String(),
-			err,
-		)
-		return "", err
-	}
-	if started == nil {
-		return "", fmt.Errorf("startPendingReplacementEntry returned nil StartedPendingEntry")
-	}
-	if strings.TrimSpace(repl.SourceEntryOrderID) == "" {
-		return t.cancelCase3BAttempt(
-			ctx,
-			started,
-			nil,
-			"missing SourceEntryOrderID",
-		)
-	}
-	if started.Pending == nil {
-		return t.cancelCase3BAttempt(
-			ctx,
-			started,
-			nil,
-			"startPendingReplacementEntry returned nil PendingOpen",
-		)
-	}
-	_, err = t.registerCase3BPendingEntry(
-		started.Pending,
-		started.ResultC,
-		started.Cancel,
-		repl.SourceEntryOrderID,
-	)
-
-	if err != nil {
-		return t.cancelCase3BAttempt(
-			ctx,
-			started,
-			err,
-			"register Case3B replacement",
-		)
-	}
-
-	log.Printf(
-		"[TRACE] case3B.replacement.started order_id=%s side=%s price=%.8f base=%.8f method=%s",
-		started.OrderID,
-		repl.Side,
-		repl.EntryPrice,
-		repl.Base,
-		repl.Method.String(),
-	)
-
-	return started.OrderID, nil
-}
-
-
-func (t *Trader) cancelCase3BAttempt(
-	ctx context.Context,
-	started *StartedPendingEntry,
-	cause error,
-	msg string,
-) (string, error) {
-	if started != nil && started.Cancel != nil {
-		started.Cancel()
-	}
-
-	if started != nil && started.OrderID != "" {
-		_ = t.broker.CancelOrder(
-			ctx,
-			t.cfg.ProductID,
-			started.OrderID,
-		)
-	}
-
-	if cause != nil {
-		return "", fmt.Errorf("%s: %w", msg, cause)
-	}
-
-	return "", fmt.Errorf("%s", msg)
-}
-
-type StartedPendingEntry struct {
-	OrderID string
-
-	Pending *PendingOpen
-	ResultC <-chan OpenResult
-	Cancel  context.CancelFunc
-}
-
-func (t *Trader) startPendingReplacementEntry(
-	ctx context.Context,
-	repl ReplacementRequest,
-) (*StartedPendingEntry, error) {
-	if !repl.Enabled {
-		return nil, nil
-	}
-
-	if repl.Side != SideSell && repl.Side != SideBuy {
-		return nil, fmt.Errorf("replacement unsupported side=%s", repl.Side)
-	}
-
-	if repl.EntryPrice <= 0 || repl.Base <= 0 {
-		return nil, fmt.Errorf(
-			"invalid replacement entry price/base price=%.8f base=%.8f",
-			repl.EntryPrice,
-			repl.Base,
-		)
-	}
-
-	if repl.Side == SideSell && t.pendingSell != nil {
-		return nil, fmt.Errorf("replacement blocked: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
-	}
-	if repl.Side == SideBuy && t.pendingBuy != nil {
-		return nil, fmt.Errorf("replacement blocked: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
-	}
-
-	limitPx := repl.EntryPrice
-	if t.cfg.PriceTick > 0 {
-		if repl.Side == SideSell {
-			limitPx = math.Ceil(limitPx/t.cfg.PriceTick) * t.cfg.PriceTick
-		} else {
-			limitPx = math.Floor(limitPx/t.cfg.PriceTick) * t.cfg.PriceTick
-		}
-	}
-
-	if limitPx <= 0 {
-		return nil, fmt.Errorf("invalid replacement limit price after tick snap: %.8f", limitPx)
-	}
-
-	if repl.Base*limitPx < t.cfg.MinNotional {
-		return nil, fmt.Errorf(
-			"replacement below min notional side=%s notional=%.2f min=%.2f base=%.8f limit=%.8f",
-			repl.Side,
-			repl.Base*limitPx,
-			t.cfg.MinNotional,
-			repl.Base,
-			limitPx,
-		)
-	}
-
-	log.Printf(
-		"[TRACE] case3B.replacement.before_postonly side=%s limit=%.8f base=%.8f notional=%.2f method=%s",
-		repl.Side,
-		limitPx,
-		repl.Base,
-		repl.Base*limitPx,
-		repl.Method.String(),
-	)
-
-	t.mu.Unlock()
-	orderID, err := t.broker.PlaceLimitPostOnly(ctx, t.cfg.ProductID, repl.Side, limitPx, repl.Base)
-	t.mu.Lock()
-
-	log.Printf(
-		"[TRACE] case3B.replacement.after_postonly side=%s order_id=%s err=%v",
-		repl.Side,
-		orderID,
-		err,
-	)
-
-	if err != nil {
-		return &StartedPendingEntry{OrderID: orderID}, err
-	}
-
-	orderID = strings.TrimSpace(orderID)
-	if orderID == "" {
-		return nil, fmt.Errorf("empty replacement order id")
-	}
-
-	if repl.Side == SideSell && t.pendingSell != nil {
-		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, orderID)
-		return nil, fmt.Errorf("replacement blocked after post: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
-	}
-	if repl.Side == SideBuy && t.pendingBuy != nil {
-		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, orderID)
-		return nil, fmt.Errorf("replacement blocked after post: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
-	}
-
-	if repl.ProfitGateUSD <= 0 {
-		repl.ProfitGateUSD = t.cfg.ProfitGateUSD
-	}
-
-	now := time.Now().UTC()
-	deadline := now.Add(time.Duration(t.cfg.LimitTimeoutSec) * time.Second)
-
-	pctx, cancel := context.WithCancel(ctx)
-
-	pend := &PendingOpen{
-		Side:             repl.Side,
-		LimitPx:          limitPx,
-		BaseAtLimit:      repl.Base,
-		Quote:            repl.Base * limitPx,
-		Take:             0,
-		Reason:           repl.Reason,
-		ProductID:        t.cfg.ProductID,
-		CreatedAt:        now,
-		Deadline:         deadline,
-		OrderID:          orderID,
-		History:          make([]string, 0, 5),
-		ConfidenceMult:   1.0,
-		ProfitGateUSD:    repl.ProfitGateUSD,
-		EntryAIMode:      repl.Method.String(),
-		RefundPortionUSD: 0,
-	}
-
-	var ch chan OpenResult
-
-	if repl.Side == SideSell {
-		if t.pendingSellCh == nil {
-			t.pendingSellCh = make(chan OpenResult, 1)
-		}
-		t.pendingSellCtx = pctx
-		t.pendingSellCancel = cancel
-		t.pendingSell = pend
-		ch = t.pendingSellCh
-	} else {
-		if t.pendingBuyCh == nil {
-			t.pendingBuyCh = make(chan OpenResult, 1)
-		}
-		t.pendingBuyCtx = pctx
-		t.pendingBuyCancel = cancel
-		t.pendingBuy = pend
-		ch = t.pendingBuyCh
-	}
-
-	log.Printf(
-		"[TRACE] postonly.pending.set side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f dl=%s reason=%s",
-		repl.Side,
-		orderID,
-		limitPx,
-		repl.Base,
-		repl.Base*limitPx,
-		deadline.Format(time.RFC3339),
-		repl.Reason,
-	)
-
-	if err := t.saveStateNoLock(); err != nil {
-		log.Printf("[WARN] saveState replacement pending: %v", err)
-	}
-
-	offsetBps := t.cfg.LimitPriceOffsetBps
-	initOrderID := orderID
-	initLimitPx := limitPx
-	initBaseAtLimit := repl.Base
-	side := repl.Side
-
-	go func(
-		initOrderID string,
-		side OrderSide,
-		deadline time.Time,
-		initLimitPx float64,
-		initBaseAtLimit float64,
-		pend *PendingOpen,
-		ch chan OpenResult,
-		pctx context.Context,
-	) {
-		log.Printf(
-			"[TRACE] postonly.poll.start side=%s init_id=%s init_limit=%.8f init_base=%.8f deadline=%s offset_bps=%.3f",
-			side,
-			initOrderID,
-			initLimitPx,
-			initBaseAtLimit,
-			deadline.Format(time.RFC3339),
-			offsetBps,
-		)
-		defer func() {
-			log.Printf("[TRACE] postonly.poll.stopped side=%s initial_id=%s", side, initOrderID)
-		}()
-
-		orderID := initOrderID
-		lastLimitPx := initLimitPx
-		lastReprice := time.Now()
-
-		var sessBase, sessQuote, sessFee float64
-		var lastSeenBase, lastSeenQuote, lastSeenFee float64
-		var repriceCount int
-
-	poll:
-		for time.Now().Before(deadline) {
-			select {
-			case <-pctx.Done():
-				log.Printf("[TRACE] postonly.poll.cancelled side=%s last_id=%s", side, orderID)
-				break poll
-			default:
-			}
-
-			ord, gErr := t.broker.GetOrder(pctx, t.cfg.ProductID, orderID)
-			if gErr == nil && ord != nil {
-				dBase := ord.BaseSize - lastSeenBase
-				dQuote := ord.QuoteSpent - lastSeenQuote
-				dFee := ord.CommissionUSD - lastSeenFee
-
-				if dBase < 0 {
-					dBase = 0
-				}
-				if dQuote < 0 {
-					dQuote = 0
-				}
-				if dFee < 0 {
-					dFee = 0
-				}
-
-				sessBase += dBase
-				sessQuote += dQuote
-				sessFee += dFee
-
-				lastSeenBase = ord.BaseSize
-				lastSeenQuote = ord.QuoteSpent
-				lastSeenFee = ord.CommissionUSD
-
-				status := strings.ToUpper(strings.TrimSpace(ord.Status))
-
-				log.Printf(
-					"[TRACE] postonly.poll.tick side=%s order_id=%s status=%s price=%.8f base=%.8f quote=%.2f fee=%.6f sess_agg[base=%.8f quote=%.2f fee=%.6f] reprices=%d",
-					side,
-					orderID,
-					status,
-					ord.Price,
-					ord.BaseSize,
-					ord.QuoteSpent,
-					ord.CommissionUSD,
-					sessBase,
-					sessQuote,
-					sessFee,
-					repriceCount,
-				)
-
-				switch status {
-				case "FILLED":
-					vwap := 0.0
-					if sessBase > 0 {
-						vwap = sessQuote / sessBase
-					}
-
-					placed := &PlacedOrder{
-						Price:         vwap,
-						BaseSize:      sessBase,
-						QuoteSpent:    sessQuote,
-						CommissionUSD: sessFee,
-					}
-
-					log.Printf("[TRACE] postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
-						orderID, ord.Price, ord.BaseSize, ord.QuoteSpent, ord.CommissionUSD)
-
-					log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
-						side, orderID, true, sessBase, sessQuote, sessFee)
-
-					log.Printf("[KPI] maker.open.filled side=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f order_id=%s",
-						side, placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD, orderID)
-
-					safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
-					return
-
-				case "PARTIALLY_FILLED":
-					if t.pendingCancelRequested(side) {
-						log.Printf("[TRACE] postonly.reprice.skip.cancel_requested side=%s order_id=%s", side, orderID)
-						lastReprice = time.Now()
-						break
-					}
-
-					if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
-						log.Printf("[TRACE] postonly.reprice.try.partially side=%s order_id=%s last_limit=%.8f reprice_count=%d",
-							side, orderID, lastLimitPx, repriceCount)
-
-						newID, newLastLimitPx, newRepriceCount, did := t.maybeRepriceOnce(
-							pctx,
-							side,
-							orderID,
-							initLimitPx,
-							initBaseAtLimit,
-							lastLimitPx,
-							offsetBps,
-							pend,
-							repriceCount,
-						)
-
-						if did && newID != orderID {
-							log.Printf("[TRACE] postonly.reprice.swap.partially side=%s old_id=%s new_id=%s new_limit=%.8f count=%d",
-								side, orderID, newID, newLastLimitPx, newRepriceCount)
-							orderID = newID
-							lastLimitPx = newLastLimitPx
-							repriceCount = newRepriceCount
-							lastSeenBase, lastSeenQuote, lastSeenFee = 0, 0, 0
-						} else {
-							log.Printf("[TRACE] postonly.reprice.skip.partially side=%s order_id=%s reason=no_guard_or_no_improve last_limit=%.8f count=%d",
-								side, orderID, lastLimitPx, repriceCount)
-							lastLimitPx = newLastLimitPx
-							repriceCount = newRepriceCount
-						}
-
-						lastReprice = time.Now()
-					}
-
-				case "NEW", "PENDING_CANCEL":
-					if t.pendingCancelRequested(side) {
-						log.Printf("[TRACE] postonly.reprice.skip.cancel_requested side=%s order_id=%s", side, orderID)
-						lastReprice = time.Now()
-						break
-					}
-
-					if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
-						log.Printf("[TRACE] postonly.reprice.try.new side=%s order_id=%s last_limit=%.8f reprice_count=%d",
-							side, orderID, lastLimitPx, repriceCount)
-
-						newID, newLastLimitPx, newRepriceCount, did := t.maybeRepriceOnce(
-							pctx,
-							side,
-							orderID,
-							initLimitPx,
-							initBaseAtLimit,
-							lastLimitPx,
-							offsetBps,
-							pend,
-							repriceCount,
-						)
-
-						if did && newID != orderID {
-							log.Printf("[TRACE] postonly.reprice.swap.new side=%s old_id=%s new_id=%s new_limit=%.8f count=%d",
-								side, orderID, newID, newLastLimitPx, newRepriceCount)
-							orderID = newID
-							lastLimitPx = newLastLimitPx
-							repriceCount = newRepriceCount
-							lastSeenBase, lastSeenQuote, lastSeenFee = 0, 0, 0
-						} else {
-							log.Printf("[TRACE] postonly.reprice.skip.new side=%s order_id=%s reason=no_guard_or_no_improve last_limit=%.8f count=%d",
-								side, orderID, lastLimitPx, repriceCount)
-							lastLimitPx = newLastLimitPx
-							repriceCount = newRepriceCount
-						}
-
-						lastReprice = time.Now()
-					}
-
-				case "CANCELED", "REJECTED", "EXPIRED":
-					if sessBase > 0 || sessQuote > 0 {
-						vwap := 0.0
-						if sessBase > 0 {
-							vwap = sessQuote / sessBase
-						}
-
-						placed := &PlacedOrder{
-							Price:         vwap,
-							BaseSize:      sessBase,
-							QuoteSpent:    sessQuote,
-							CommissionUSD: sessFee,
-						}
-
-						log.Printf("[KPI] maker.open.filled side=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f order_id=%s status=%s",
-							side, vwap, sessBase, sessQuote, sessFee, orderID, status)
-
-						log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
-							side, orderID, true, sessBase, sessQuote, sessFee)
-
-						safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
-					} else {
-						log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
-							side, orderID, false, sessBase, sessQuote, sessFee)
-
-						safeSend(ch, OpenResult{Filled: false, Placed: nil, OrderID: orderID})
-					}
-
-					log.Printf("[TRACE] postonly.poll.done side=%s order_id=%s final=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f",
-						side,
-						orderID,
-						status,
-						func() float64 {
-							if sessBase > 0 {
-								return sessQuote / sessBase
-							}
-							return 0
-						}(),
-						sessBase,
-						sessQuote,
-						sessFee,
-					)
-
-					return
-				}
-			}
-
-			select {
-			case <-pctx.Done():
-				log.Printf("[TRACE] postonly.poll.cancelled side=%s last_id=%s", side, orderID)
-				break poll
-			case <-time.After(200 * time.Millisecond):
-			}
-		}
-
-		_ = t.broker.CancelOrder(pctx, t.cfg.ProductID, orderID)
-
-		log.Printf("[TRACE] postonly.poll.timeout side=%s last_id=%s sess_base=%.8f sess_quote=%.2f sess_fee=%.6f",
-			side, orderID, sessBase, sessQuote, sessFee)
-
-		log.Printf("[TRACE] postonly.timeout order_id=%s", orderID)
-
-		if sessBase > 0 || sessQuote > 0 {
-			vwap := 0.0
-			if sessBase > 0 {
-				vwap = sessQuote / sessBase
-			}
-
-			placed := &PlacedOrder{
-				Price:         vwap,
-				BaseSize:      sessBase,
-				QuoteSpent:    sessQuote,
-				CommissionUSD: sessFee,
-			}
-
-			log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
-				side, orderID, true, sessBase, sessQuote, sessFee)
-
-			safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
-		} else {
-			log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
-				side, orderID, false, sessBase, sessQuote, sessFee)
-
-			safeSend(ch, OpenResult{Filled: false, Placed: nil, OrderID: orderID})
-		}
-	}(initOrderID, side, deadline, initLimitPx, initBaseAtLimit, pend, ch, pctx)
-
-	log.Printf(
-		"[TRACE] case3B.replacement.posted side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f method=%s gate=%.6f reason=%s",
-		repl.Side,
-		orderID,
-		limitPx,
-		repl.Base,
-		repl.Base*limitPx,
-		repl.Method.String(),
-		repl.ProfitGateUSD,
-		repl.Reason,
-	)
-
-	return &StartedPendingEntry{
-		OrderID: orderID,
-		Pending: pend,
-		ResultC: ch,
-		Cancel:  cancel,
-	}, nil
-}
-
 type exitFanoutResult struct {
 	Side         OrderSide
 	EntryOrderID string
@@ -4052,7 +3484,13 @@ type PendingEntry struct {
 	SourceEntryOrderID string
 	Completed          bool
 
-	clearOwner func()
+	// Retains a broker result that has already been consumed from ResultC
+	// but cannot yet be committed.
+	//
+	// This is used by Case3B replacement entries when the replacement fills
+	// before the originating exit has successfully committed.
+	DeferredResult *OpenResult
+	clearOwner     func()
 }
 
 type EntrySource string
@@ -4604,7 +4042,30 @@ func (t *Trader) commitEntryFill(
 
 	return nil
 }
+func (t *Trader) case3BCommitEligible(
+	entry *PendingEntry,
+) bool {
+	if t == nil || entry == nil {
+		return false
+	}
 
+	if entry.Source != EntrySourceCase3B {
+		return true
+	}
+
+	sourceEntryOrderID :=
+		strings.TrimSpace(entry.SourceEntryOrderID)
+
+	if sourceEntryOrderID == "" {
+		return false
+	}
+
+	// The originating exit is considered successfully committed only after
+	// the source lot has been removed from the live position books.
+	return !t.positionExistsByEntryOrderID(
+		sourceEntryOrderID,
+	)
+}
 func (t *Trader) positionExistsByEntryOrderID(orderID string) bool {
 	if t == nil || orderID == "" {
 		return false
@@ -4753,4 +4214,595 @@ func (t *Trader) drainPendingCase3BEntries(
 			wallNow,
 		)
 	}
+}
+func (t *Trader) startCase3BReplacement(
+	ctx context.Context,
+	repl ReplacementRequest,
+) (string, error) {
+	if !repl.Enabled {
+		log.Printf(
+			"[TRACE] case3B.replacement.disabled side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
+			repl.Side,
+			repl.Method.String(),
+			repl.Base,
+			repl.EntryPrice,
+			repl.Base*repl.EntryPrice,
+		)
+		return "", nil
+	}
+
+	log.Printf(
+		"[TRACE] case3B.replacement.enter side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
+		repl.Side,
+		repl.Method.String(),
+		repl.Base,
+		repl.EntryPrice,
+		repl.Base*repl.EntryPrice,
+	)
+
+	defer log.Printf("[TRACE] case3B.replacement.leave")
+
+	started, err := t.startPendingReplacementEntry(ctx, repl)
+	if err != nil {
+		log.Printf(
+			"[TRACE] case3B.replacement.failed side=%s price=%.8f base=%.8f method=%s err=%v",
+			repl.Side,
+			repl.EntryPrice,
+			repl.Base,
+			repl.Method.String(),
+			err,
+		)
+		return "", err
+	}
+	if started == nil {
+		return "", fmt.Errorf(
+			"startPendingReplacementEntry returned nil StartedPendingEntry",
+		)
+	}
+	if strings.TrimSpace(repl.SourceEntryOrderID) == "" {
+		return t.cancelCase3BAttempt(
+			ctx,
+			started,
+			nil,
+			"missing SourceEntryOrderID",
+		)
+	}
+	if started.Pending == nil {
+		return t.cancelCase3BAttempt(
+			ctx,
+			started,
+			nil,
+			"startPendingReplacementEntry returned nil PendingOpen",
+		)
+	}
+
+	if started.ResultC == nil {
+		return t.cancelCase3BAttempt(
+			ctx,
+			started,
+			nil,
+			"startPendingReplacementEntry returned nil ResultC",
+		)
+	}
+
+	if strings.TrimSpace(started.OrderID) == "" {
+		return t.cancelCase3BAttempt(
+			ctx,
+			started,
+			nil,
+			"startPendingReplacementEntry returned empty OrderID",
+		)
+	}
+
+	_, err = t.registerCase3BPendingEntry(
+		started.Pending,
+		started.ResultC,
+		started.Cancel,
+		repl.SourceEntryOrderID,
+	)
+
+	if err != nil {
+		return t.cancelCase3BAttempt(
+			ctx,
+			started,
+			err,
+			"register Case3B replacement",
+		)
+	}
+
+	log.Printf(
+		"[TRACE] case3B.replacement.started order_id=%s source_entry_order_id=%s side=%s price=%.8f base=%.8f method=%s",
+		started.OrderID,
+		repl.SourceEntryOrderID,
+		repl.Side,
+		repl.EntryPrice,
+		repl.Base,
+		repl.Method.String(),
+	)
+
+	return started.OrderID, nil
+}
+
+func (t *Trader) cancelCase3BAttempt(
+	ctx context.Context,
+	started *StartedPendingEntry,
+	cause error,
+	msg string,
+) (string, error) {
+	if started != nil && started.Cancel != nil {
+		started.Cancel()
+	}
+
+	if started != nil && started.OrderID != "" {
+		_ = t.broker.CancelOrder(
+			ctx,
+			t.cfg.ProductID,
+			started.OrderID,
+		)
+	}
+
+	if cause != nil {
+		return "", fmt.Errorf("%s: %w", msg, cause)
+	}
+
+	return "", fmt.Errorf("%s", msg)
+}
+
+type StartedPendingEntry struct {
+	OrderID string
+
+	Pending *PendingOpen
+	ResultC <-chan OpenResult
+	Cancel  context.CancelFunc
+}
+
+func (t *Trader) startPendingReplacementEntry(
+	ctx context.Context,
+	repl ReplacementRequest,
+) (*StartedPendingEntry, error) {
+	if !repl.Enabled {
+		return nil, nil
+	}
+
+	if repl.Side != SideSell && repl.Side != SideBuy {
+		return nil, fmt.Errorf("replacement unsupported side=%s", repl.Side)
+	}
+
+	if repl.EntryPrice <= 0 || repl.Base <= 0 {
+		return nil, fmt.Errorf(
+			"invalid replacement entry price/base price=%.8f base=%.8f",
+			repl.EntryPrice,
+			repl.Base,
+		)
+	}
+
+	if repl.Side == SideSell && t.pendingSell != nil {
+		return nil, fmt.Errorf("replacement blocked: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
+	}
+	if repl.Side == SideBuy && t.pendingBuy != nil {
+		return nil, fmt.Errorf("replacement blocked: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
+	}
+
+	limitPx := repl.EntryPrice
+	if t.cfg.PriceTick > 0 {
+		if repl.Side == SideSell {
+			limitPx = math.Ceil(limitPx/t.cfg.PriceTick) * t.cfg.PriceTick
+		} else {
+			limitPx = math.Floor(limitPx/t.cfg.PriceTick) * t.cfg.PriceTick
+		}
+	}
+
+	if limitPx <= 0 {
+		return nil, fmt.Errorf("invalid replacement limit price after tick snap: %.8f", limitPx)
+	}
+
+	if repl.Base*limitPx < t.cfg.MinNotional {
+		return nil, fmt.Errorf(
+			"replacement below min notional side=%s notional=%.2f min=%.2f base=%.8f limit=%.8f",
+			repl.Side,
+			repl.Base*limitPx,
+			t.cfg.MinNotional,
+			repl.Base,
+			limitPx,
+		)
+	}
+
+	log.Printf(
+		"[TRACE] case3B.replacement.before_postonly side=%s limit=%.8f base=%.8f notional=%.2f method=%s",
+		repl.Side,
+		limitPx,
+		repl.Base,
+		repl.Base*limitPx,
+		repl.Method.String(),
+	)
+
+	t.mu.Unlock()
+	orderID, err := t.broker.PlaceLimitPostOnly(ctx, t.cfg.ProductID, repl.Side, limitPx, repl.Base)
+	t.mu.Lock()
+
+	log.Printf(
+		"[TRACE] case3B.replacement.after_postonly side=%s order_id=%s err=%v",
+		repl.Side,
+		orderID,
+		err,
+	)
+
+	if err != nil {
+		return &StartedPendingEntry{OrderID: orderID}, err
+	}
+
+	orderID = strings.TrimSpace(orderID)
+	if orderID == "" {
+		return nil, fmt.Errorf("empty replacement order id")
+	}
+
+	if repl.Side == SideSell && t.pendingSell != nil {
+		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, orderID)
+		return nil, fmt.Errorf("replacement blocked after post: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
+	}
+	if repl.Side == SideBuy && t.pendingBuy != nil {
+		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, orderID)
+		return nil, fmt.Errorf("replacement blocked after post: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
+	}
+
+	if repl.ProfitGateUSD <= 0 {
+		repl.ProfitGateUSD = t.cfg.ProfitGateUSD
+	}
+
+	now := time.Now().UTC()
+	deadline := now.Add(time.Duration(t.cfg.LimitTimeoutSec) * time.Second)
+
+	pctx, cancel := context.WithCancel(ctx)
+
+	pend := &PendingOpen{
+		Side:             repl.Side,
+		LimitPx:          limitPx,
+		BaseAtLimit:      repl.Base,
+		Quote:            repl.Base * limitPx,
+		Take:             0,
+		Reason:           repl.Reason,
+		ProductID:        t.cfg.ProductID,
+		CreatedAt:        now,
+		Deadline:         deadline,
+		OrderID:          orderID,
+		History:          make([]string, 0, 5),
+		ConfidenceMult:   1.0,
+		ProfitGateUSD:    repl.ProfitGateUSD,
+		EntryAIMode:      repl.Method.String(),
+		RefundPortionUSD: 0,
+	}
+
+	var ch chan OpenResult
+
+	if repl.Side == SideSell {
+		if t.pendingSellCh == nil {
+			t.pendingSellCh = make(chan OpenResult, 1)
+		}
+		t.pendingSellCtx = pctx
+		t.pendingSellCancel = cancel
+		t.pendingSell = pend
+		ch = t.pendingSellCh
+	} else {
+		if t.pendingBuyCh == nil {
+			t.pendingBuyCh = make(chan OpenResult, 1)
+		}
+		t.pendingBuyCtx = pctx
+		t.pendingBuyCancel = cancel
+		t.pendingBuy = pend
+		ch = t.pendingBuyCh
+	}
+
+	log.Printf(
+		"[TRACE] postonly.pending.set side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f dl=%s reason=%s",
+		repl.Side,
+		orderID,
+		limitPx,
+		repl.Base,
+		repl.Base*limitPx,
+		deadline.Format(time.RFC3339),
+		repl.Reason,
+	)
+
+	if err := t.saveStateNoLock(); err != nil {
+		log.Printf("[WARN] saveState replacement pending: %v", err)
+	}
+
+	offsetBps := t.cfg.LimitPriceOffsetBps
+	initOrderID := orderID
+	initLimitPx := limitPx
+	initBaseAtLimit := repl.Base
+	side := repl.Side
+
+	go func(
+		initOrderID string,
+		side OrderSide,
+		deadline time.Time,
+		initLimitPx float64,
+		initBaseAtLimit float64,
+		pend *PendingOpen,
+		ch chan OpenResult,
+		pctx context.Context,
+	) {
+		log.Printf(
+			"[TRACE] postonly.poll.start side=%s init_id=%s init_limit=%.8f init_base=%.8f deadline=%s offset_bps=%.3f",
+			side,
+			initOrderID,
+			initLimitPx,
+			initBaseAtLimit,
+			deadline.Format(time.RFC3339),
+			offsetBps,
+		)
+		defer func() {
+			log.Printf("[TRACE] postonly.poll.stopped side=%s initial_id=%s", side, initOrderID)
+		}()
+
+		orderID := initOrderID
+		lastLimitPx := initLimitPx
+		lastReprice := time.Now()
+
+		var sessBase, sessQuote, sessFee float64
+		var lastSeenBase, lastSeenQuote, lastSeenFee float64
+		var repriceCount int
+
+	poll:
+		for time.Now().Before(deadline) {
+			select {
+			case <-pctx.Done():
+				log.Printf("[TRACE] postonly.poll.cancelled side=%s last_id=%s", side, orderID)
+				break poll
+			default:
+			}
+
+			ord, gErr := t.broker.GetOrder(pctx, t.cfg.ProductID, orderID)
+			if gErr == nil && ord != nil {
+				dBase := ord.BaseSize - lastSeenBase
+				dQuote := ord.QuoteSpent - lastSeenQuote
+				dFee := ord.CommissionUSD - lastSeenFee
+
+				if dBase < 0 {
+					dBase = 0
+				}
+				if dQuote < 0 {
+					dQuote = 0
+				}
+				if dFee < 0 {
+					dFee = 0
+				}
+
+				sessBase += dBase
+				sessQuote += dQuote
+				sessFee += dFee
+
+				lastSeenBase = ord.BaseSize
+				lastSeenQuote = ord.QuoteSpent
+				lastSeenFee = ord.CommissionUSD
+
+				status := strings.ToUpper(strings.TrimSpace(ord.Status))
+
+				log.Printf(
+					"[TRACE] postonly.poll.tick side=%s order_id=%s status=%s price=%.8f base=%.8f quote=%.2f fee=%.6f sess_agg[base=%.8f quote=%.2f fee=%.6f] reprices=%d",
+					side,
+					orderID,
+					status,
+					ord.Price,
+					ord.BaseSize,
+					ord.QuoteSpent,
+					ord.CommissionUSD,
+					sessBase,
+					sessQuote,
+					sessFee,
+					repriceCount,
+				)
+
+				switch status {
+				case "FILLED":
+					vwap := 0.0
+					if sessBase > 0 {
+						vwap = sessQuote / sessBase
+					}
+
+					placed := &PlacedOrder{
+						Price:         vwap,
+						BaseSize:      sessBase,
+						QuoteSpent:    sessQuote,
+						CommissionUSD: sessFee,
+					}
+
+					log.Printf("[TRACE] postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
+						orderID, ord.Price, ord.BaseSize, ord.QuoteSpent, ord.CommissionUSD)
+
+					log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
+						side, orderID, true, sessBase, sessQuote, sessFee)
+
+					log.Printf("[KPI] maker.open.filled side=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f order_id=%s",
+						side, placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD, orderID)
+
+					safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
+					return
+
+				case "PARTIALLY_FILLED":
+					if t.pendingCancelRequested(side) {
+						log.Printf("[TRACE] postonly.reprice.skip.cancel_requested side=%s order_id=%s", side, orderID)
+						lastReprice = time.Now()
+						break
+					}
+
+					if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
+						log.Printf("[TRACE] postonly.reprice.try.partially side=%s order_id=%s last_limit=%.8f reprice_count=%d",
+							side, orderID, lastLimitPx, repriceCount)
+
+						newID, newLastLimitPx, newRepriceCount, did := t.maybeRepriceOnce(
+							pctx,
+							side,
+							orderID,
+							initLimitPx,
+							initBaseAtLimit,
+							lastLimitPx,
+							offsetBps,
+							pend,
+							repriceCount,
+						)
+
+						if did && newID != orderID {
+							log.Printf("[TRACE] postonly.reprice.swap.partially side=%s old_id=%s new_id=%s new_limit=%.8f count=%d",
+								side, orderID, newID, newLastLimitPx, newRepriceCount)
+							orderID = newID
+							lastLimitPx = newLastLimitPx
+							repriceCount = newRepriceCount
+							lastSeenBase, lastSeenQuote, lastSeenFee = 0, 0, 0
+						} else {
+							log.Printf("[TRACE] postonly.reprice.skip.partially side=%s order_id=%s reason=no_guard_or_no_improve last_limit=%.8f count=%d",
+								side, orderID, lastLimitPx, repriceCount)
+							lastLimitPx = newLastLimitPx
+							repriceCount = newRepriceCount
+						}
+
+						lastReprice = time.Now()
+					}
+
+				case "NEW", "PENDING_CANCEL":
+					if t.pendingCancelRequested(side) {
+						log.Printf("[TRACE] postonly.reprice.skip.cancel_requested side=%s order_id=%s", side, orderID)
+						lastReprice = time.Now()
+						break
+					}
+
+					if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
+						log.Printf("[TRACE] postonly.reprice.try.new side=%s order_id=%s last_limit=%.8f reprice_count=%d",
+							side, orderID, lastLimitPx, repriceCount)
+
+						newID, newLastLimitPx, newRepriceCount, did := t.maybeRepriceOnce(
+							pctx,
+							side,
+							orderID,
+							initLimitPx,
+							initBaseAtLimit,
+							lastLimitPx,
+							offsetBps,
+							pend,
+							repriceCount,
+						)
+
+						if did && newID != orderID {
+							log.Printf("[TRACE] postonly.reprice.swap.new side=%s old_id=%s new_id=%s new_limit=%.8f count=%d",
+								side, orderID, newID, newLastLimitPx, newRepriceCount)
+							orderID = newID
+							lastLimitPx = newLastLimitPx
+							repriceCount = newRepriceCount
+							lastSeenBase, lastSeenQuote, lastSeenFee = 0, 0, 0
+						} else {
+							log.Printf("[TRACE] postonly.reprice.skip.new side=%s order_id=%s reason=no_guard_or_no_improve last_limit=%.8f count=%d",
+								side, orderID, lastLimitPx, repriceCount)
+							lastLimitPx = newLastLimitPx
+							repriceCount = newRepriceCount
+						}
+
+						lastReprice = time.Now()
+					}
+
+				case "CANCELED", "REJECTED", "EXPIRED":
+					if sessBase > 0 || sessQuote > 0 {
+						vwap := 0.0
+						if sessBase > 0 {
+							vwap = sessQuote / sessBase
+						}
+
+						placed := &PlacedOrder{
+							Price:         vwap,
+							BaseSize:      sessBase,
+							QuoteSpent:    sessQuote,
+							CommissionUSD: sessFee,
+						}
+
+						log.Printf("[KPI] maker.open.filled side=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f order_id=%s status=%s",
+							side, vwap, sessBase, sessQuote, sessFee, orderID, status)
+
+						log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
+							side, orderID, true, sessBase, sessQuote, sessFee)
+
+						safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
+					} else {
+						log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
+							side, orderID, false, sessBase, sessQuote, sessFee)
+
+						safeSend(ch, OpenResult{Filled: false, Placed: nil, OrderID: orderID})
+					}
+
+					log.Printf("[TRACE] postonly.poll.done side=%s order_id=%s final=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f",
+						side,
+						orderID,
+						status,
+						func() float64 {
+							if sessBase > 0 {
+								return sessQuote / sessBase
+							}
+							return 0
+						}(),
+						sessBase,
+						sessQuote,
+						sessFee,
+					)
+
+					return
+				}
+			}
+
+			select {
+			case <-pctx.Done():
+				log.Printf("[TRACE] postonly.poll.cancelled side=%s last_id=%s", side, orderID)
+				break poll
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+
+		_ = t.broker.CancelOrder(pctx, t.cfg.ProductID, orderID)
+
+		log.Printf("[TRACE] postonly.poll.timeout side=%s last_id=%s sess_base=%.8f sess_quote=%.2f sess_fee=%.6f",
+			side, orderID, sessBase, sessQuote, sessFee)
+
+		log.Printf("[TRACE] postonly.timeout order_id=%s", orderID)
+
+		if sessBase > 0 || sessQuote > 0 {
+			vwap := 0.0
+			if sessBase > 0 {
+				vwap = sessQuote / sessBase
+			}
+
+			placed := &PlacedOrder{
+				Price:         vwap,
+				BaseSize:      sessBase,
+				QuoteSpent:    sessQuote,
+				CommissionUSD: sessFee,
+			}
+
+			log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
+				side, orderID, true, sessBase, sessQuote, sessFee)
+
+			safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
+		} else {
+			log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
+				side, orderID, false, sessBase, sessQuote, sessFee)
+
+			safeSend(ch, OpenResult{Filled: false, Placed: nil, OrderID: orderID})
+		}
+	}(initOrderID, side, deadline, initLimitPx, initBaseAtLimit, pend, ch, pctx)
+
+	log.Printf(
+		"[TRACE] case3B.replacement.posted side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f method=%s gate=%.6f reason=%s",
+		repl.Side,
+		orderID,
+		limitPx,
+		repl.Base,
+		repl.Base*limitPx,
+		repl.Method.String(),
+		repl.ProfitGateUSD,
+		repl.Reason,
+	)
+
+	return &StartedPendingEntry{
+		OrderID: orderID,
+		Pending: pend,
+		ResultC: ch,
+		Cancel:  cancel,
+	}, nil
 }
