@@ -298,23 +298,24 @@ type Trader struct {
 	balanceRefreshOnce sync.Once
 	balanceRefreshStop chan struct{}
 	// Case 3B replacements
-    pendingCase3B []*PendingEntrySession
+	pendingCase3B []*PendingEntrySession
 }
 type PendingEntrySession struct {
-    Pending            *PendingOpen
-    Ch                 chan OpenResult
-    Ctx                context.Context
-    Cancel             context.CancelFunc
-    Side               OrderSide
-    Kind               PendingEntryKind
-    SourceEntryOrderID string
+	Pending            *PendingOpen
+	Ch                 chan OpenResult
+	Ctx                context.Context
+	Cancel             context.CancelFunc
+	Side               OrderSide
+	Kind               PendingEntryKind
+	SourceEntryOrderID string
 }
 type PendingEntryKind int
 
 const (
-    PendingEntryNormal PendingEntryKind = iota
-    PendingEntryCase3B
+	PendingEntryNormal PendingEntryKind = iota
+	PendingEntryCase3B
 )
+
 func NewTrader(cfg Config, broker Broker) *Trader {
 	t := &Trader{
 		cfg:        cfg,
@@ -3967,4 +3968,353 @@ func (t *Trader) maybeCloseDustBasket(ctx context.Context, side OrderSide, liveP
 
 	_ = t.saveStateNoLock()
 	return msg, true, nil
+}
+
+func (t *Trader) drainPendingEntry(
+	entry PendingEntry,
+	now time.Time,
+	wallNow time.Time,
+) {
+	var (
+		pending         *PendingOpen
+		pendingCh       chan OpenResult
+		pendingCancel   context.CancelFunc
+		book            *SideBook
+		pendingRecheck  *bool
+		spare           *float64
+		lastAdd         *time.Time
+		winExtreme      *float64
+		latchedGate     *float64
+		equityTriggered bool
+	)
+
+	switch side {
+
+	case SideBuy:
+		pending = t.pendingBuy
+		pendingCh = t.pendingBuyCh
+		pendingCancel = t.pendingBuyCancel
+
+		book = t.book(side)
+
+		pendingRecheck = &t.pendingRecheckBuy
+
+		spare = &t.SpareBuyUSD
+
+		lastAdd = &t.lastAddBuy
+		winExtreme = &t.winLowBuy
+		latchedGate = &t.latchedGateBuy
+
+		if pending != nil {
+			equityTriggered = pending.EquityBuy
+		}
+
+	case SideSell:
+		pending = t.pendingSell
+		pendingCh = t.pendingSellCh
+		pendingCancel = t.pendingSellCancel
+
+		book = t.book(side)
+
+		pendingRecheck = &t.pendingRecheckSell
+
+		spare = &t.SpareSellUSD
+
+		lastAdd = &t.lastAddSell
+		winExtreme = &t.winHighSell
+		latchedGate = &t.latchedGateSell
+
+		if pending != nil {
+			equityTriggered = pending.EquitySell
+		}
+
+	default:
+		return
+	}
+
+	if pendingCh == nil {
+		return
+	}
+
+	select {
+
+	case res := <-pendingCh:
+		log.Printf("[TRACE] postonly.drain.recv side=%s order_id=%s filled=%v placed_nil=%v",
+			side, res.OrderID, res.Filled, res.Placed == nil)
+
+		// Decide whether this async result is safe to apply to state.
+		// Repricing can create multiple order IDs, so we accept:
+		// 1) the current pending order ID, or
+		// 2) any historical replaced order ID recorded in PendingOpen.History.
+		accept := false
+		if res.Filled && res.Placed != nil {
+			log.Printf("[TRACE] postonly.drain.placed side=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f",
+				side, res.OrderID, res.Placed.Price, res.Placed.BaseSize, res.Placed.QuoteSpent, res.Placed.CommissionUSD)
+
+			if pending != nil {
+				if res.OrderID == pending.OrderID {
+					accept = true
+				} else {
+					for _, hid := range pending.History {
+						if res.OrderID == hid {
+							accept = true
+							break
+						}
+					}
+				}
+			} else {
+				// A real fill without in-memory pending state is safer to accept than ignore.
+				// This can happen after restart/state mismatch/channel timing.
+				accept = true
+				log.Printf("[WARN] postonly.fill.without_pending side=%s order_id=%s", side, res.OrderID)
+			}
+		}
+
+		if accept {
+			// Convert the broker fill into a BUY lot using actual execution data.
+			// Prefer broker-reported commission; if unavailable, estimate from FeeRatePct.
+			priceToUse := res.Placed.Price
+			baseToUse := res.Placed.BaseSize
+			quoteSpent := res.Placed.QuoteSpent
+			entryFee := res.Placed.CommissionUSD
+			if entryFee <= 0 {
+				entryFee = quoteSpent * (t.cfg.FeeRatePct / 100.0)
+			}
+
+			// Diagnostic: was the fill accepted by current ID or repriced-history ID?
+			matchHistory := false
+			if pending != nil {
+				for _, id := range pending.History {
+					if id == res.OrderID {
+						matchHistory = true
+						break
+					}
+				}
+			}
+
+			log.Printf("[TRACE] postonly.drain.accept side=%s match_current=%v match_history=%v pending_nil=%v",
+				side,
+				pending != nil && res.OrderID == pending.OrderID,
+				matchHistory,
+				pending == nil,
+			)
+
+			// Refund-service adjustment:
+			// If part of the fill was intended to restore opposite-side inventory/spare,
+			// remove that portion from the open lot and credit it to the appropriate spare bucket.
+			if pending != nil && pending.RefundPortionUSD > 0 {
+				origBase := baseToUse
+				origQuote := quoteSpent
+				origFee := entryFee
+
+				refundBase := pending.RefundPortionUSD / priceToUse
+				if refundBase > baseToUse {
+					refundBase = baseToUse
+				}
+
+				keptBase := baseToUse - refundBase
+				if keptBase < 0 {
+					keptBase = 0
+				}
+
+				keptQuote := quoteSpent
+				keptFee := entryFee
+				refundQuote := pending.RefundPortionUSD
+				refundFee := refundQuote * (t.cfg.FeeRatePct / 100.0)
+
+				if origBase > 0 {
+					keptQuote = origQuote * (keptBase / origBase)
+					keptFee = origFee * (keptBase / origBase)
+					refundQuote = origQuote * (refundBase / origBase)
+					refundFee = origFee * (refundBase / origBase)
+				}
+
+				t.creditRefundService(side, refundQuote, refundFee)
+
+				baseToUse = keptBase
+				quoteSpent = keptQuote
+				entryFee = keptFee
+			}
+
+			// Build the open BUY lot.
+			//
+			// ConfidenceMult / EntryAIMode / ProfitGateUSD should come from PendingOpen,
+			// because this fill may occur many ticks after the decision that created it.
+			// Do not rely on current d/confMult here unless this block is guaranteed to run
+			// in the same tick as placement.
+			newLot := &Position{
+				OpenPrice:       priceToUse,
+				Side:            side,
+				SizeBase:        baseToUse,
+				OpenTime:        now,
+				EntryFee:        entryFee,
+				OpenNotionalUSD: quoteSpent,
+				Reason:          "async postonly filled",
+				Take:            0,
+				Version:         Version,
+				EntryOrderID:    res.OrderID,
+			}
+
+			// Restore decision-time metadata from pending state.
+			if pending != nil {
+				newLot.Reason = pending.Reason
+				newLot.RefundPortionUSD = pending.RefundPortionUSD
+				newLot.Take = pending.Take
+				newLot.ConfidenceMult = pending.ConfidenceMult
+				newLot.EntryAIMode = pending.EntryAIMode
+				newLot.ProfitGateUSD = pending.ProfitGateUSD
+			}
+			if newLot.ConfidenceMult <= 0 {
+				newLot.ConfidenceMult = 0.0
+			}
+			if newLot.EntryAIMode == "" {
+				newLot.EntryAIMode = "UNKNOWN"
+			}
+			if newLot.ProfitGateUSD <= 0 {
+				newLot.ProfitGateUSD = t.cfg.ProfitGateUSD
+			}
+
+			log.Printf(
+				"[KPI] lot.created side=%s mode=%s conf=%.2f gate=%.2f",
+				newLot.Side,
+				newLot.EntryAIMode,
+				newLot.ConfidenceMult,
+				newLot.ProfitGateUSD,
+			)
+
+			book.Lots = append(book.Lots, newLot)
+
+			// Clean up any dust created by partial fills/refund service.
+			t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
+			t.archiveOrphanDust(book, priceToUse, t.cfg.MinNotional)
+			t.didConsolidateStartup = false
+
+			// Deduct quote actually kept as open BUY exposure.
+			*spare -= quoteSpent
+			if *spare < 0 {
+				*spare = 0
+			}
+
+			// Equity-triggered BUY fills are promoted to runner status.
+			if equityTriggered {
+				newIdx := len(book.Lots) - 1
+				addRunner(book, newIdx)
+
+				r := book.Lots[newIdx]
+				r.TrailActive = false
+				r.TrailPeak = r.OpenPrice
+				r.TrailStop = 0
+				t.applyRunnerTargets(r)
+
+				log.Printf("[TRACE] runner.assign idx=%d side=%s open=%.8f take=%.8f",
+					newIdx, side, r.OpenPrice, r.Take)
+			}
+
+			// Reset BUY-side add anchors after accepted fill.
+			*lastAdd = wallNow
+			*winExtreme = priceToUse
+			*latchedGate = 0
+
+			old := t.lastAddEquity
+			t.lastAddEquity = t.equityUSD
+			log.Printf("[TRACE] equity.baseline.set side=%s old=%.2f new=%.2f",
+				side, old, t.lastAddEquity)
+
+			msg := fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
+				side, quoteSpent, newLot.Take, entryFee, newLot.Reason, "async postonly filled")
+
+			if t.cfg.UseDirectSlack {
+				postSlack(msg)
+			}
+
+			if err := t.saveStateNoLock(); err != nil {
+				log.Printf("[WARN] saveState (filled %s): %v", side, err)
+			}
+		} else {
+			// Non-fill result: allow the normal entry path to re-check and possibly fallback.
+			cancelRequested := pending != nil && pending.CancelRequested
+
+			if cancelRequested {
+				*pendingRecheck = false
+				log.Printf(
+					"[TRACE] postonly.cancel.ack side=%s order_id=%s fallback=false reason=signal_changed",
+					side,
+					res.OrderID,
+				)
+			} else {
+				*pendingRecheck = true
+				log.Printf(
+					"[TRACE] postonly.recheck side=%s set=true reason=timeout_or_error order_id=%s",
+					side,
+					res.OrderID,
+				)
+			}
+		}
+
+		// cleanup
+		if pendingCancel != nil {
+			pendingCancel()
+		}
+
+		switch side {
+
+		case SideBuy:
+			t.pendingBuy = nil
+			t.pendingBuyCtx = nil
+			t.pendingBuyCancel = nil
+
+		case SideSell:
+			t.pendingSell = nil
+			t.pendingSellCtx = nil
+			t.pendingSellCancel = nil
+		}
+
+		if err := t.saveStateNoLock(); err != nil {
+			log.Printf("[WARN] saveState (drain %s): %v", side, err)
+		}
+
+	default:
+		// nothing this tick
+	}
+}
+
+type EntrySource string
+
+const (
+	EntrySourceNormalBuy  EntrySource = "normal_buy"
+	EntrySourceNormalSell EntrySource = "normal_sell"
+	EntrySourceCase3B     EntrySource = "case3b"
+)
+
+type PendingEntry struct {
+	Side   OrderSide
+	Source EntrySource
+	// Source lot that caused this entry, primarily for Case3B.
+	SourceEntryOrderID string
+
+	Pending *PendingOpen
+
+	ResultC <-chan OpenResult
+
+	Cancel context.CancelFunc
+
+	Book *SideBook
+
+	PendingRecheck *bool
+
+	Spare *float64
+
+	LastAdd *time.Time
+
+	WinExtreme *float64
+
+	LatchedGate *float64
+
+	EquityTriggered bool
+	// Prevents repeated processing after a terminal result.
+	Completed bool
+}
+
+func pendingEntryID(side OrderSide, orderID string) string {
+	return fmt.Sprintf("%s:%s", side, orderID)
 }
