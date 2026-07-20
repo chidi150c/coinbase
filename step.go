@@ -430,6 +430,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// reflected before evaluating new entries, exits, or pyramiding decisions.
 	t.drainPendingExitCh(ctx, execHistory, livePrice)
 
+	// Case3B fills are committed only after source exits have had a chance
+	// to commit during this tick.
+	t.drainPendingCase3BEntries(
+		now,
+		wallNow,
+	)
+
 	// -------------------------------------------------------------------------------------------------
 	// Drain: Unified pending-entry drain.
 	// The unified drain handles the complete asynchronous maker-first entry lifecycle:
@@ -461,7 +468,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		repl := t.PendingReplacementRetry.Replacement
 
 		if t.pendingSell == nil {
-			err := t.startCase3BReplacement(ctx, repl)
+			started, err := t.startCase3BReplacement(ctx, repl)
 			if err != nil {
 				log.Printf("[TRACE] case3B.retry.failed method=%s err=%v", repl.Method.String(), err)
 			} else {

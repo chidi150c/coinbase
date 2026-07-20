@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -298,23 +299,8 @@ type Trader struct {
 	balanceRefreshOnce sync.Once
 	balanceRefreshStop chan struct{}
 	// Case 3B replacements
-	pendingCase3B []*PendingEntrySession
+	pendingCase3B map[string]*PendingEntry
 }
-type PendingEntrySession struct {
-	Pending            *PendingOpen
-	Ch                 chan OpenResult
-	Ctx                context.Context
-	Cancel             context.CancelFunc
-	Side               OrderSide
-	Kind               PendingEntryKind
-	SourceEntryOrderID string
-}
-type PendingEntryKind int
-
-const (
-	PendingEntryNormal PendingEntryKind = iota
-	PendingEntryCase3B
-)
 
 func NewTrader(cfg Config, broker Broker) *Trader {
 	t := &Trader{
@@ -1984,9 +1970,8 @@ func (t *Trader) startCase3BReplacement(ctx context.Context, repl ReplacementReq
 
 	defer log.Printf("[TRACE] case3B.replacement.leave")
 
-	var oid string
-	var err error
-	if oid, err = t.startPendingReplacementEntry(ctx, repl); err != nil {
+	started, err := t.startPendingReplacementEntry(ctx, repl)
+	if err != nil {
 		log.Printf(
 			"[TRACE] case3B.replacement.failed side=%s price=%.8f base=%.8f method=%s err=%v",
 			repl.Side,
@@ -1995,34 +1980,103 @@ func (t *Trader) startCase3BReplacement(ctx context.Context, repl ReplacementReq
 			repl.Method.String(),
 			err,
 		)
-		return oid, err
+		return "", err
+	}
+	if started == nil {
+		return "", fmt.Errorf("startPendingReplacementEntry returned nil StartedPendingEntry")
+	}
+	if strings.TrimSpace(repl.SourceEntryOrderID) == "" {
+		return t.cancelCase3BAttempt(
+			ctx,
+			started,
+			nil,
+			"missing SourceEntryOrderID",
+		)
+	}
+	if started.Pending == nil {
+		return t.cancelCase3BAttempt(
+			ctx,
+			started,
+			nil,
+			"startPendingReplacementEntry returned nil PendingOpen",
+		)
+	}
+	_, err = t.registerCase3BPendingEntry(
+		started.Pending,
+		started.ResultC,
+		started.Cancel,
+		repl.SourceEntryOrderID,
+	)
+
+	if err != nil {
+		return t.cancelCase3BAttempt(
+			ctx,
+			started,
+			err,
+			"register Case3B replacement",
+		)
 	}
 
 	log.Printf(
-		"[TRACE] case3B.replacement.started side=%s price=%.8f base=%.8f method=%s",
+		"[TRACE] case3B.replacement.started order_id=%s side=%s price=%.8f base=%.8f method=%s",
+		started.OrderID,
 		repl.Side,
 		repl.EntryPrice,
 		repl.Base,
 		repl.Method.String(),
 	)
 
-	return oid, nil
+	return started.OrderID, nil
+}
+
+
+func (t *Trader) cancelCase3BAttempt(
+	ctx context.Context,
+	started *StartedPendingEntry,
+	cause error,
+	msg string,
+) (string, error) {
+	if started != nil && started.Cancel != nil {
+		started.Cancel()
+	}
+
+	if started != nil && started.OrderID != "" {
+		_ = t.broker.CancelOrder(
+			ctx,
+			t.cfg.ProductID,
+			started.OrderID,
+		)
+	}
+
+	if cause != nil {
+		return "", fmt.Errorf("%s: %w", msg, cause)
+	}
+
+	return "", fmt.Errorf("%s", msg)
+}
+
+type StartedPendingEntry struct {
+	OrderID string
+
+	Pending *PendingOpen
+	ResultC <-chan OpenResult
+	Cancel  context.CancelFunc
 }
 
 func (t *Trader) startPendingReplacementEntry(
 	ctx context.Context,
 	repl ReplacementRequest,
-) (orderID string, err error) {
+) (*StartedPendingEntry, error) {
 	if !repl.Enabled {
-		return "", nil
+		return nil, nil
 	}
 
 	if repl.Side != SideSell && repl.Side != SideBuy {
-		return "", fmt.Errorf("replacement unsupported side=%s", repl.Side)
+		return nil, fmt.Errorf("replacement unsupported side=%s", repl.Side)
 	}
 
 	if repl.EntryPrice <= 0 || repl.Base <= 0 {
-		return "", fmt.Errorf(
+		return nil, fmt.Errorf(
 			"invalid replacement entry price/base price=%.8f base=%.8f",
 			repl.EntryPrice,
 			repl.Base,
@@ -2030,10 +2084,10 @@ func (t *Trader) startPendingReplacementEntry(
 	}
 
 	if repl.Side == SideSell && t.pendingSell != nil {
-		return "", fmt.Errorf("replacement blocked: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
+		return nil, fmt.Errorf("replacement blocked: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
 	}
 	if repl.Side == SideBuy && t.pendingBuy != nil {
-		return "", fmt.Errorf("replacement blocked: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
+		return nil, fmt.Errorf("replacement blocked: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
 	}
 
 	limitPx := repl.EntryPrice
@@ -2046,11 +2100,11 @@ func (t *Trader) startPendingReplacementEntry(
 	}
 
 	if limitPx <= 0 {
-		return "", fmt.Errorf("invalid replacement limit price after tick snap: %.8f", limitPx)
+		return nil, fmt.Errorf("invalid replacement limit price after tick snap: %.8f", limitPx)
 	}
 
 	if repl.Base*limitPx < t.cfg.MinNotional {
-		return "", fmt.Errorf(
+		return nil, fmt.Errorf(
 			"replacement below min notional side=%s notional=%.2f min=%.2f base=%.8f limit=%.8f",
 			repl.Side,
 			repl.Base*limitPx,
@@ -2081,21 +2135,21 @@ func (t *Trader) startPendingReplacementEntry(
 	)
 
 	if err != nil {
-		return orderID, err
+		return &StartedPendingEntry{OrderID: orderID}, err
 	}
 
 	orderID = strings.TrimSpace(orderID)
 	if orderID == "" {
-		return orderID, fmt.Errorf("empty replacement order id")
+		return nil, fmt.Errorf("empty replacement order id")
 	}
 
 	if repl.Side == SideSell && t.pendingSell != nil {
 		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, orderID)
-		return orderID, fmt.Errorf("replacement blocked after post: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
+		return nil, fmt.Errorf("replacement blocked after post: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
 	}
 	if repl.Side == SideBuy && t.pendingBuy != nil {
 		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, orderID)
-		return orderID, fmt.Errorf("replacement blocked after post: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
+		return nil, fmt.Errorf("replacement blocked after post: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
 	}
 
 	if repl.ProfitGateUSD <= 0 {
@@ -2452,7 +2506,12 @@ func (t *Trader) startPendingReplacementEntry(
 		repl.Reason,
 	)
 
-	return orderID, nil
+	return &StartedPendingEntry{
+		OrderID: orderID,
+		Pending: pend,
+		ResultC: ch,
+		Cancel:  cancel,
+	}, nil
 }
 
 type exitFanoutResult struct {
@@ -2893,7 +2952,9 @@ func (t *Trader) closeLot(
 				lot.Case3BReplacementOrderID,
 			)
 		} else {
-			if orderID, err := t.startCase3BReplacement(ctx, repl); err != nil {
+			var err error
+			var started *StartedPendingEntry
+			if started, err = t.startCase3BReplacement(ctx, repl); err != nil {
 				log.Printf(
 					"[TRACE] case3B.modeA.replacement_failed side=%s entry_id=%s base=%.8f entry_price=%.8f recovery=%.6f err=%v",
 					lot.Side,
@@ -2921,7 +2982,7 @@ func (t *Trader) closeLot(
 			)
 
 			lot.Case3BReplacementStarted = true
-			lot.Case3BReplacementOrderID = orderID
+			lot.Case3BReplacementOrderID = started.OrderID
 
 			if err := t.saveStateNoLock(); err != nil {
 				log.Printf("[WARN] saveState case3B source flag: %v", err)
@@ -2999,7 +3060,7 @@ func (t *Trader) closeLot(
 			// Case 3B Mode B:
 			// Post loss-exit first, then attempt replacement in same tick.
 			// If replacement fails later, retry waits until loss-exit fill.
-			if err := t.startCase3BReplacement(ctx, repl); err != nil {
+			if started, err := t.startCase3BReplacement(ctx, repl); err != nil {
 				t.markCase3BReplacementRetryLocked(
 					repl,
 					waitID,
@@ -3970,312 +4031,28 @@ func (t *Trader) maybeCloseDustBasket(ctx context.Context, side OrderSide, liveP
 	return msg, true, nil
 }
 
-func (t *Trader) drainPendingEntry(
-	entry PendingEntry,
-	now time.Time,
-	wallNow time.Time,
-) {
-	var (
-		pending         *PendingOpen
-		pendingCh       chan OpenResult
-		pendingCancel   context.CancelFunc
-		book            *SideBook
-		pendingRecheck  *bool
-		spare           *float64
-		lastAdd         *time.Time
-		winExtreme      *float64
-		latchedGate     *float64
-		equityTriggered bool
-	)
+type PendingEntry struct {
+	ID     string
+	Side   OrderSide
+	Source EntrySource
 
-	switch side {
+	Pending *PendingOpen
+	ResultC <-chan OpenResult
+	Cancel  context.CancelFunc
 
-	case SideBuy:
-		pending = t.pendingBuy
-		pendingCh = t.pendingBuyCh
-		pendingCancel = t.pendingBuyCancel
+	Book           *SideBook
+	PendingRecheck *bool
+	SpareUSD       *float64
+	LastAdd        *time.Time
+	WinExtreme     *float64
+	LatchedGate    *float64
 
-		book = t.book(side)
+	EquityTriggered bool
 
-		pendingRecheck = &t.pendingRecheckBuy
+	SourceEntryOrderID string
+	Completed          bool
 
-		spare = &t.SpareBuyUSD
-
-		lastAdd = &t.lastAddBuy
-		winExtreme = &t.winLowBuy
-		latchedGate = &t.latchedGateBuy
-
-		if pending != nil {
-			equityTriggered = pending.EquityBuy
-		}
-
-	case SideSell:
-		pending = t.pendingSell
-		pendingCh = t.pendingSellCh
-		pendingCancel = t.pendingSellCancel
-
-		book = t.book(side)
-
-		pendingRecheck = &t.pendingRecheckSell
-
-		spare = &t.SpareSellUSD
-
-		lastAdd = &t.lastAddSell
-		winExtreme = &t.winHighSell
-		latchedGate = &t.latchedGateSell
-
-		if pending != nil {
-			equityTriggered = pending.EquitySell
-		}
-
-	default:
-		return
-	}
-
-	if pendingCh == nil {
-		return
-	}
-
-	select {
-
-	case res := <-pendingCh:
-		log.Printf("[TRACE] postonly.drain.recv side=%s order_id=%s filled=%v placed_nil=%v",
-			side, res.OrderID, res.Filled, res.Placed == nil)
-
-		// Decide whether this async result is safe to apply to state.
-		// Repricing can create multiple order IDs, so we accept:
-		// 1) the current pending order ID, or
-		// 2) any historical replaced order ID recorded in PendingOpen.History.
-		accept := false
-		if res.Filled && res.Placed != nil {
-			log.Printf("[TRACE] postonly.drain.placed side=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f",
-				side, res.OrderID, res.Placed.Price, res.Placed.BaseSize, res.Placed.QuoteSpent, res.Placed.CommissionUSD)
-
-			if pending != nil {
-				if res.OrderID == pending.OrderID {
-					accept = true
-				} else {
-					for _, hid := range pending.History {
-						if res.OrderID == hid {
-							accept = true
-							break
-						}
-					}
-				}
-			} else {
-				// A real fill without in-memory pending state is safer to accept than ignore.
-				// This can happen after restart/state mismatch/channel timing.
-				accept = true
-				log.Printf("[WARN] postonly.fill.without_pending side=%s order_id=%s", side, res.OrderID)
-			}
-		}
-
-		if accept {
-			// Convert the broker fill into a BUY lot using actual execution data.
-			// Prefer broker-reported commission; if unavailable, estimate from FeeRatePct.
-			priceToUse := res.Placed.Price
-			baseToUse := res.Placed.BaseSize
-			quoteSpent := res.Placed.QuoteSpent
-			entryFee := res.Placed.CommissionUSD
-			if entryFee <= 0 {
-				entryFee = quoteSpent * (t.cfg.FeeRatePct / 100.0)
-			}
-
-			// Diagnostic: was the fill accepted by current ID or repriced-history ID?
-			matchHistory := false
-			if pending != nil {
-				for _, id := range pending.History {
-					if id == res.OrderID {
-						matchHistory = true
-						break
-					}
-				}
-			}
-
-			log.Printf("[TRACE] postonly.drain.accept side=%s match_current=%v match_history=%v pending_nil=%v",
-				side,
-				pending != nil && res.OrderID == pending.OrderID,
-				matchHistory,
-				pending == nil,
-			)
-
-			// Refund-service adjustment:
-			// If part of the fill was intended to restore opposite-side inventory/spare,
-			// remove that portion from the open lot and credit it to the appropriate spare bucket.
-			if pending != nil && pending.RefundPortionUSD > 0 {
-				origBase := baseToUse
-				origQuote := quoteSpent
-				origFee := entryFee
-
-				refundBase := pending.RefundPortionUSD / priceToUse
-				if refundBase > baseToUse {
-					refundBase = baseToUse
-				}
-
-				keptBase := baseToUse - refundBase
-				if keptBase < 0 {
-					keptBase = 0
-				}
-
-				keptQuote := quoteSpent
-				keptFee := entryFee
-				refundQuote := pending.RefundPortionUSD
-				refundFee := refundQuote * (t.cfg.FeeRatePct / 100.0)
-
-				if origBase > 0 {
-					keptQuote = origQuote * (keptBase / origBase)
-					keptFee = origFee * (keptBase / origBase)
-					refundQuote = origQuote * (refundBase / origBase)
-					refundFee = origFee * (refundBase / origBase)
-				}
-
-				t.creditRefundService(side, refundQuote, refundFee)
-
-				baseToUse = keptBase
-				quoteSpent = keptQuote
-				entryFee = keptFee
-			}
-
-			// Build the open BUY lot.
-			//
-			// ConfidenceMult / EntryAIMode / ProfitGateUSD should come from PendingOpen,
-			// because this fill may occur many ticks after the decision that created it.
-			// Do not rely on current d/confMult here unless this block is guaranteed to run
-			// in the same tick as placement.
-			newLot := &Position{
-				OpenPrice:       priceToUse,
-				Side:            side,
-				SizeBase:        baseToUse,
-				OpenTime:        now,
-				EntryFee:        entryFee,
-				OpenNotionalUSD: quoteSpent,
-				Reason:          "async postonly filled",
-				Take:            0,
-				Version:         Version,
-				EntryOrderID:    res.OrderID,
-			}
-
-			// Restore decision-time metadata from pending state.
-			if pending != nil {
-				newLot.Reason = pending.Reason
-				newLot.RefundPortionUSD = pending.RefundPortionUSD
-				newLot.Take = pending.Take
-				newLot.ConfidenceMult = pending.ConfidenceMult
-				newLot.EntryAIMode = pending.EntryAIMode
-				newLot.ProfitGateUSD = pending.ProfitGateUSD
-			}
-			if newLot.ConfidenceMult <= 0 {
-				newLot.ConfidenceMult = 0.0
-			}
-			if newLot.EntryAIMode == "" {
-				newLot.EntryAIMode = "UNKNOWN"
-			}
-			if newLot.ProfitGateUSD <= 0 {
-				newLot.ProfitGateUSD = t.cfg.ProfitGateUSD
-			}
-
-			log.Printf(
-				"[KPI] lot.created side=%s mode=%s conf=%.2f gate=%.2f",
-				newLot.Side,
-				newLot.EntryAIMode,
-				newLot.ConfidenceMult,
-				newLot.ProfitGateUSD,
-			)
-
-			book.Lots = append(book.Lots, newLot)
-
-			// Clean up any dust created by partial fills/refund service.
-			t.consolidateDust(book, priceToUse, t.cfg.MinNotional)
-			t.archiveOrphanDust(book, priceToUse, t.cfg.MinNotional)
-			t.didConsolidateStartup = false
-
-			// Deduct quote actually kept as open BUY exposure.
-			*spare -= quoteSpent
-			if *spare < 0 {
-				*spare = 0
-			}
-
-			// Equity-triggered BUY fills are promoted to runner status.
-			if equityTriggered {
-				newIdx := len(book.Lots) - 1
-				addRunner(book, newIdx)
-
-				r := book.Lots[newIdx]
-				r.TrailActive = false
-				r.TrailPeak = r.OpenPrice
-				r.TrailStop = 0
-				t.applyRunnerTargets(r)
-
-				log.Printf("[TRACE] runner.assign idx=%d side=%s open=%.8f take=%.8f",
-					newIdx, side, r.OpenPrice, r.Take)
-			}
-
-			// Reset BUY-side add anchors after accepted fill.
-			*lastAdd = wallNow
-			*winExtreme = priceToUse
-			*latchedGate = 0
-
-			old := t.lastAddEquity
-			t.lastAddEquity = t.equityUSD
-			log.Printf("[TRACE] equity.baseline.set side=%s old=%.2f new=%.2f",
-				side, old, t.lastAddEquity)
-
-			msg := fmt.Sprintf("[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
-				side, quoteSpent, newLot.Take, entryFee, newLot.Reason, "async postonly filled")
-
-			if t.cfg.UseDirectSlack {
-				postSlack(msg)
-			}
-
-			if err := t.saveStateNoLock(); err != nil {
-				log.Printf("[WARN] saveState (filled %s): %v", side, err)
-			}
-		} else {
-			// Non-fill result: allow the normal entry path to re-check and possibly fallback.
-			cancelRequested := pending != nil && pending.CancelRequested
-
-			if cancelRequested {
-				*pendingRecheck = false
-				log.Printf(
-					"[TRACE] postonly.cancel.ack side=%s order_id=%s fallback=false reason=signal_changed",
-					side,
-					res.OrderID,
-				)
-			} else {
-				*pendingRecheck = true
-				log.Printf(
-					"[TRACE] postonly.recheck side=%s set=true reason=timeout_or_error order_id=%s",
-					side,
-					res.OrderID,
-				)
-			}
-		}
-
-		// cleanup
-		if pendingCancel != nil {
-			pendingCancel()
-		}
-
-		switch side {
-
-		case SideBuy:
-			t.pendingBuy = nil
-			t.pendingBuyCtx = nil
-			t.pendingBuyCancel = nil
-
-		case SideSell:
-			t.pendingSell = nil
-			t.pendingSellCtx = nil
-			t.pendingSellCancel = nil
-		}
-
-		if err := t.saveStateNoLock(); err != nil {
-			log.Printf("[WARN] saveState (drain %s): %v", side, err)
-		}
-
-	default:
-		// nothing this tick
-	}
+	clearOwner func()
 }
 
 type EntrySource string
@@ -4286,35 +4063,694 @@ const (
 	EntrySourceCase3B     EntrySource = "case3b"
 )
 
-type PendingEntry struct {
-	Side   OrderSide
-	Source EntrySource
-	// Source lot that caused this entry, primarily for Case3B.
-	SourceEntryOrderID string
+func (t *Trader) pendingEntryForSide(side OrderSide) *PendingEntry {
+	switch side {
 
-	Pending *PendingOpen
+	case SideBuy:
+		if t.pendingBuy == nil && t.pendingBuyCh == nil {
+			return nil
+		}
 
-	ResultC <-chan OpenResult
+		entry := &PendingEntry{
+			ID:     pendingEntryID(side, ""),
+			Side:   SideBuy,
+			Source: EntrySourceNormalBuy,
 
-	Cancel context.CancelFunc
+			Pending: t.pendingBuy,
+			ResultC: t.pendingBuyCh,
+			Cancel:  t.pendingBuyCancel,
 
-	Book *SideBook
+			Book:            t.book(SideBuy),
+			PendingRecheck:  &t.pendingRecheckBuy,
+			SpareUSD:        &t.SpareBuyUSD,
+			LastAdd:         &t.lastAddBuy,
+			WinExtreme:      &t.winLowBuy,
+			LatchedGate:     &t.latchedGateBuy,
+			EquityTriggered: t.pendingBuy != nil && t.pendingBuy.EquityBuy,
+		}
 
-	PendingRecheck *bool
+		if t.pendingBuy != nil {
+			entry.ID = pendingEntryID(side, t.pendingBuy.OrderID)
+		}
 
-	Spare *float64
+		entry.clearOwner = func() {
+			t.pendingBuy = nil
+			t.pendingBuyCh = nil
+			t.pendingBuyCtx = nil
+			t.pendingBuyCancel = nil
+		}
 
-	LastAdd *time.Time
+		return entry
 
-	WinExtreme *float64
+	case SideSell:
+		if t.pendingSell == nil && t.pendingSellCh == nil {
+			return nil
+		}
 
-	LatchedGate *float64
+		entry := &PendingEntry{
+			ID:     pendingEntryID(side, ""),
+			Side:   SideSell,
+			Source: EntrySourceNormalSell,
 
-	EquityTriggered bool
-	// Prevents repeated processing after a terminal result.
-	Completed bool
+			Pending: t.pendingSell,
+			ResultC: t.pendingSellCh,
+			Cancel:  t.pendingSellCancel,
+
+			Book:            t.book(SideSell),
+			PendingRecheck:  &t.pendingRecheckSell,
+			SpareUSD:        &t.SpareSellUSD,
+			LastAdd:         &t.lastAddSell,
+			WinExtreme:      &t.winHighSell,
+			LatchedGate:     &t.latchedGateSell,
+			EquityTriggered: t.pendingSell != nil && t.pendingSell.EquitySell,
+		}
+
+		if t.pendingSell != nil {
+			entry.ID = pendingEntryID(side, t.pendingSell.OrderID)
+		}
+
+		entry.clearOwner = func() {
+			t.pendingSell = nil
+			t.pendingSellCh = nil
+			t.pendingSellCtx = nil
+			t.pendingSellCancel = nil
+		}
+
+		return entry
+	}
+
+	return nil
+}
+
+func (t *Trader) drainPendingEntry(
+	entry *PendingEntry,
+	now time.Time,
+	wallNow time.Time,
+) {
+	if entry == nil || entry.Completed {
+		return
+	}
+
+	if entry.ResultC == nil {
+		return
+	}
+
+	side := entry.Side
+	pending := entry.Pending
+	book := entry.Book
+
+	/*
+		Finish the pending lifecycle after a terminal broker result.
+
+		The owner-specific cleanup is supplied when the PendingEntry is
+		constructed, so this generic drain does not need to know whether
+		the entry came from normal BUY, normal SELL, Case3B, or another
+		entry source.
+	*/
+	finish := func() {
+		if entry.Cancel != nil {
+			entry.Cancel()
+		}
+
+		if entry.clearOwner != nil {
+			entry.clearOwner()
+		}
+
+		entry.Pending = nil
+		entry.ResultC = nil
+		entry.Cancel = nil
+		entry.Completed = true
+
+		if err := t.saveStateNoLock(); err != nil {
+			log.Printf(
+				"[WARN] saveState (drain %s source=%s id=%s): %v",
+				side,
+				entry.Source,
+				entry.ID,
+				err,
+			)
+		}
+	}
+
+	select {
+	case res, ok := <-entry.ResultC:
+		if !ok {
+			log.Printf(
+				"[WARN] postonly.drain.channel_closed side=%s source=%s id=%s",
+				side,
+				entry.Source,
+				entry.ID,
+			)
+
+			finish()
+			return
+		}
+
+		log.Printf(
+			"[TRACE] postonly.drain.recv side=%s source=%s id=%s order_id=%s filled=%v placed_nil=%v",
+			side,
+			entry.Source,
+			entry.ID,
+			res.OrderID,
+			res.Filled,
+			res.Placed == nil,
+		)
+
+		// Decide whether this asynchronous result is safe to apply.
+		//
+		// Repricing may create several exchange order IDs. Accept a fill
+		// when it matches:
+		//   1. the current pending order ID; or
+		//   2. an order ID recorded in PendingOpen.History.
+		//
+		// When pending state is missing but the broker reports a real fill,
+		// accept it rather than orphaning an exchange position.
+		accept := false
+
+		if res.Filled && res.Placed != nil {
+			log.Printf(
+				"[TRACE] postonly.drain.placed side=%s source=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f",
+				side,
+				entry.Source,
+				res.OrderID,
+				res.Placed.Price,
+				res.Placed.BaseSize,
+				res.Placed.QuoteSpent,
+				res.Placed.CommissionUSD,
+			)
+
+			if pending != nil {
+				if res.OrderID == pending.OrderID {
+					accept = true
+				} else {
+					for _, historicalID := range pending.History {
+						if res.OrderID == historicalID {
+							accept = true
+							break
+						}
+					}
+				}
+			} else {
+				accept = true
+
+				log.Printf(
+					"[WARN] postonly.fill.without_pending side=%s source=%s order_id=%s",
+					side,
+					entry.Source,
+					res.OrderID,
+				)
+			}
+		}
+
+		if accept {
+			if book == nil {
+				/*
+					A real fill exists, so silently discarding it would be
+					dangerous. Do not mark the PendingEntry completed.
+
+					This requires reconciliation because the exchange fill
+					cannot currently be committed into a position book.
+				*/
+				log.Printf(
+					"[ERROR] postonly.fill.book_nil side=%s source=%s id=%s order_id=%s reconciliation_required=true",
+					side,
+					entry.Source,
+					entry.ID,
+					res.OrderID,
+				)
+
+				return
+			}
+
+			if err := t.commitEntryFill(
+				entry,
+				res,
+				now,
+				wallNow,
+			); err != nil {
+
+				log.Printf(
+					"[ERROR] postonly.commit side=%s source=%s order_id=%s: %v",
+					side,
+					entry.Source,
+					res.OrderID,
+					err,
+				)
+
+				return
+			}
+		} else {
+			/*
+				A non-fill terminal result allows the normal entry path to
+				reconsider the order unless cancellation was requested because
+				the signal changed.
+			*/
+			cancelRequested :=
+				pending != nil &&
+					pending.CancelRequested
+
+			if entry.PendingRecheck == nil {
+				log.Printf(
+					"[WARN] postonly.recheck.pointer_nil side=%s source=%s order_id=%s cancel_requested=%v",
+					side,
+					entry.Source,
+					res.OrderID,
+					cancelRequested,
+				)
+			} else if cancelRequested {
+				*entry.PendingRecheck = false
+
+				log.Printf(
+					"[TRACE] postonly.cancel.ack side=%s source=%s order_id=%s fallback=false reason=signal_changed",
+					side,
+					entry.Source,
+					res.OrderID,
+				)
+			} else {
+				*entry.PendingRecheck = true
+
+				log.Printf(
+					"[TRACE] postonly.recheck side=%s source=%s set=true reason=timeout_or_error order_id=%s",
+					side,
+					entry.Source,
+					res.OrderID,
+				)
+			}
+		}
+
+		finish()
+
+	default:
+		// No asynchronous result is available for this entry this tick.
+	}
+}
+
+func (t *Trader) commitEntryFill(
+	entry *PendingEntry,
+	res OpenResult,
+	now time.Time,
+	wallNow time.Time,
+) error {
+
+	if entry == nil {
+		return fmt.Errorf("nil pending entry")
+	}
+
+	if entry.Pending == nil {
+		return fmt.Errorf("nil PendingOpen")
+	}
+
+	if entry.Book == nil {
+		return fmt.Errorf("nil position book")
+	}
+
+	if res.Placed == nil {
+		return fmt.Errorf("filled result missing execution")
+	}
+
+	side := entry.Side
+	pending := entry.Pending
+	book := entry.Book
+
+	priceToUse := res.Placed.Price
+	baseToUse := res.Placed.BaseSize
+	quoteSpent := res.Placed.QuoteSpent
+	entryFee := res.Placed.CommissionUSD
+
+	if priceToUse <= 0 {
+		return fmt.Errorf("invalid execution price %.8f", priceToUse)
+	}
+
+	if baseToUse <= 0 {
+		return fmt.Errorf("invalid execution base %.8f", baseToUse)
+	}
+
+	if t.positionExistsByEntryOrderID(res.OrderID) {
+		log.Printf(
+			"[TRACE] postonly.commit.duplicate side=%s source=%s order_id=%s",
+			side,
+			entry.Source,
+			res.OrderID,
+		)
+		return nil
+	}
+
+	if entryFee <= 0 {
+		entryFee = quoteSpent * (t.cfg.FeeRatePct / 100.0)
+	}
+
+	/*
+		Refund-service adjustment.
+	*/
+	if pending.RefundPortionUSD > 0 {
+
+		originalBase := baseToUse
+		originalQuote := quoteSpent
+		originalFee := entryFee
+
+		refundBase := pending.RefundPortionUSD / priceToUse
+
+		if refundBase > baseToUse {
+			refundBase = baseToUse
+		}
+
+		if refundBase < 0 {
+			refundBase = 0
+		}
+
+		keptBase := baseToUse - refundBase
+
+		if keptBase < 0 {
+			keptBase = 0
+		}
+
+		keptQuote := quoteSpent
+		keptFee := entryFee
+		refundQuote := pending.RefundPortionUSD
+		refundFee := refundQuote * (t.cfg.FeeRatePct / 100.0)
+
+		if originalBase > 0 {
+
+			keptRatio := keptBase / originalBase
+			refundRatio := refundBase / originalBase
+
+			keptQuote = originalQuote * keptRatio
+			keptFee = originalFee * keptRatio
+			refundQuote = originalQuote * refundRatio
+			refundFee = originalFee * refundRatio
+		}
+
+		t.creditRefundService(
+			side,
+			refundQuote,
+			refundFee,
+		)
+
+		baseToUse = keptBase
+		quoteSpent = keptQuote
+		entryFee = keptFee
+	}
+
+	if baseToUse <= 0 || quoteSpent <= 0 {
+
+		log.Printf(
+			"[TRACE] postonly.fill.refund_consumed_all side=%s source=%s order_id=%s",
+			side,
+			entry.Source,
+			res.OrderID,
+		)
+
+		return nil
+	}
+
+	newLot := &Position{
+		OpenPrice:       priceToUse,
+		Side:            side,
+		SizeBase:        baseToUse,
+		OpenTime:        now,
+		EntryFee:        entryFee,
+		OpenNotionalUSD: quoteSpent,
+		Reason:          pending.Reason,
+		Take:            pending.Take,
+		Version:         Version,
+		EntryOrderID:    res.OrderID,
+
+		RefundPortionUSD: pending.RefundPortionUSD,
+		ConfidenceMult:   pending.ConfidenceMult,
+		EntryAIMode:      pending.EntryAIMode,
+		ProfitGateUSD:    pending.ProfitGateUSD,
+	}
+
+	if newLot.ConfidenceMult <= 0 {
+		newLot.ConfidenceMult = 0
+	}
+
+	if newLot.EntryAIMode == "" {
+		newLot.EntryAIMode = "UNKNOWN"
+	}
+
+	if newLot.ProfitGateUSD <= 0 {
+		newLot.ProfitGateUSD = t.cfg.ProfitGateUSD
+	}
+
+	log.Printf(
+		"[KPI] lot.created side=%s source=%s mode=%s conf=%.2f gate=%.2f order_id=%s",
+		newLot.Side,
+		entry.Source,
+		newLot.EntryAIMode,
+		newLot.ConfidenceMult,
+		newLot.ProfitGateUSD,
+		newLot.EntryOrderID,
+	)
+
+	book.Lots = append(book.Lots, newLot)
+
+	t.consolidateDust(
+		book,
+		priceToUse,
+		t.cfg.MinNotional,
+	)
+
+	t.archiveOrphanDust(
+		book,
+		priceToUse,
+		t.cfg.MinNotional,
+	)
+
+	t.didConsolidateStartup = false
+
+	if entry.SpareUSD != nil {
+
+		*entry.SpareUSD -= quoteSpent
+
+		if *entry.SpareUSD < 0 {
+			*entry.SpareUSD = 0
+		}
+
+	} else {
+
+		log.Printf(
+			"[WARN] postonly.fill.spare_pointer_nil side=%s source=%s order_id=%s",
+			side,
+			entry.Source,
+			res.OrderID,
+		)
+	}
+
+	if entry.EquityTriggered {
+
+		newIndex := len(book.Lots) - 1
+
+		addRunner(book, newIndex)
+
+		runner := book.Lots[newIndex]
+
+		runner.TrailActive = false
+		runner.TrailPeak = runner.OpenPrice
+		runner.TrailStop = 0
+
+		t.applyRunnerTargets(runner)
+
+		log.Printf(
+			"[TRACE] runner.assign idx=%d side=%s source=%s open=%.8f take=%.8f",
+			newIndex,
+			side,
+			entry.Source,
+			runner.OpenPrice,
+			runner.Take,
+		)
+	}
+
+	if entry.LastAdd != nil {
+		*entry.LastAdd = wallNow
+	}
+
+	if entry.WinExtreme != nil {
+		*entry.WinExtreme = priceToUse
+	}
+
+	if entry.LatchedGate != nil {
+		*entry.LatchedGate = 0
+	}
+
+	oldEquityBaseline := t.lastAddEquity
+	t.lastAddEquity = t.equityUSD
+
+	log.Printf(
+		"[TRACE] equity.baseline.set side=%s source=%s old=%.2f new=%.2f",
+		side,
+		entry.Source,
+		oldEquityBaseline,
+		t.lastAddEquity,
+	)
+
+	message := fmt.Sprintf(
+		"[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
+		side,
+		quoteSpent,
+		newLot.Take,
+		entryFee,
+		newLot.Reason,
+		"async postonly filled",
+	)
+
+	if t.cfg.UseDirectSlack {
+		postSlack(message)
+	}
+
+	if err := t.saveStateNoLock(); err != nil {
+		return fmt.Errorf("saveStateNoLock: %w", err)
+	}
+
+	return nil
+}
+
+func (t *Trader) positionExistsByEntryOrderID(orderID string) bool {
+	if t == nil || orderID == "" {
+		return false
+	}
+
+	for _, side := range []OrderSide{SideBuy, SideSell} {
+		book := t.book(side)
+		if book == nil {
+			continue
+		}
+
+		for _, lot := range book.Lots {
+			if lot == nil {
+				continue
+			}
+
+			if lot.EntryOrderID == orderID {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func pendingEntryID(side OrderSide, orderID string) string {
+	if orderID == "" {
+		return string(side)
+	}
 	return fmt.Sprintf("%s:%s", side, orderID)
+}
+func (t *Trader) ensurePendingEntryMaps() {
+	if t.pendingCase3B == nil {
+		t.pendingCase3B = make(map[string]*PendingEntry)
+	}
+}
+func (t *Trader) registerCase3BPendingEntry(
+	pending *PendingOpen,
+	resultC <-chan OpenResult,
+	cancel context.CancelFunc,
+	sourceEntryOrderID string,
+) (*PendingEntry, error) {
+	if t == nil {
+		return nil, errors.New("register Case3B entry: nil Trader")
+	}
+
+	if pending == nil {
+		return nil, errors.New("register Case3B entry: nil PendingOpen")
+	}
+
+	if resultC == nil {
+		return nil, errors.New("register Case3B entry: nil result channel")
+	}
+
+	if sourceEntryOrderID == "" {
+		return nil, errors.New(
+			"register Case3B entry: missing source entry order ID",
+		)
+	}
+
+	if pending.OrderID == "" {
+		return nil, errors.New(
+			"register Case3B entry: missing replacement order ID",
+		)
+	}
+
+	if pending.Side != SideBuy && pending.Side != SideSell {
+		return nil, fmt.Errorf(
+			"register Case3B entry: invalid side %q",
+			pending.Side,
+		)
+	}
+
+	t.ensurePendingEntryMaps()
+
+	id := pendingEntryID(
+		pending.Side,
+		pending.OrderID,
+	)
+
+	if _, exists := t.pendingCase3B[id]; exists {
+		return nil, fmt.Errorf(
+			"Case3B pending entry already exists: %s",
+			id,
+		)
+	}
+
+	entry := &PendingEntry{
+		ID:                 id,
+		Side:               pending.Side,
+		Source:             EntrySourceCase3B,
+		Pending:            pending,
+		ResultC:            resultC,
+		Cancel:             cancel,
+		Book:               t.book(pending.Side),
+		SourceEntryOrderID: sourceEntryOrderID,
+	}
+
+	entry.clearOwner = func() {
+		delete(t.pendingCase3B, id)
+	}
+
+	t.pendingCase3B[id] = entry
+
+	log.Printf(
+		"[TRACE] case3b.pending.register id=%s side=%s source_entry_order_id=%s replacement_order_id=%s",
+		entry.ID,
+		entry.Side,
+		entry.SourceEntryOrderID,
+		pending.OrderID,
+	)
+
+	return entry, nil
+}
+
+func (t *Trader) drainPendingCase3BEntries(
+	now time.Time,
+	wallNow time.Time,
+) {
+	if t == nil || len(t.pendingCase3B) == 0 {
+		return
+	}
+
+	/*
+		Take a snapshot before draining.
+
+		drainPendingEntry may call entry.clearOwner(), which removes the
+		entry from pendingCase3B. A snapshot keeps iteration independent
+		of those map mutations and ensures entries registered during this
+		drain wait until the next tick.
+	*/
+	entries := make([]*PendingEntry, 0, len(t.pendingCase3B))
+
+	for _, entry := range t.pendingCase3B {
+		if entry == nil {
+			continue
+		}
+
+		entries = append(entries, entry)
+	}
+
+	for _, entry := range entries {
+		t.drainPendingEntry(
+			entry,
+			now,
+			wallNow,
+		)
+	}
 }
