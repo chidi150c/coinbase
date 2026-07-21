@@ -77,7 +77,7 @@ import (
 	"time"
 )
 
-const Version = 142
+const Version = 143
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -464,20 +464,37 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		t.drainPendingEntry(entry, now, wallNow)
 	}
 
-	if t.PendingReplacementRetry.Enabled {
-		repl := t.PendingReplacementRetry.Replacement
+if t.PendingReplacementRetry.Enabled {
+	repl := t.PendingReplacementRetry.Replacement
 
-		if t.pendingSell == nil {
-			started, err := t.startCase3BReplacement(ctx, repl)
-			if err != nil {
-				log.Printf("[TRACE] case3B.retry.failed method=%s err=%v", repl.Method.String(), err)
-			} else {
-				log.Printf("[TRACE] case3B.retry.started method=%s", repl.Method.String())
-				t.PendingReplacementRetry.Enabled = false
-				_ = t.saveStateNoLock()
-			}
+	OrderID, err := t.startCase3BReplacement(
+		ctx,
+		repl,
+	)
+	if err != nil {
+		log.Printf(
+			"[TRACE] case3B.retry.failed method=%s err=%v",
+			repl.Method.String(),
+			err,
+		)
+	} else {
+		log.Printf(
+			"[TRACE] case3B.retry.started method=%s replacement_order_id=%s",
+			repl.Method.String(),
+			OrderID,
+		)
+
+		t.PendingReplacementRetry.Enabled = false
+
+		if err := t.saveStateNoLock(); err != nil {
+			log.Printf(
+				"[TRACE] case3B.retry.state_save_failed replacement_order_id=%s err=%v",
+				OrderID,
+				err,
+			)
 		}
 	}
+}
 
 	// --- NEW: walk-forward (re)fit guard hook (no-op other than the guard) ---
 	_ = t.shouldRefit(len(execHistory)) // intentionally unused here (guard only)

@@ -2385,8 +2385,8 @@ func (t *Trader) closeLot(
 			)
 		} else {
 			var err error
-			var started *StartedPendingEntry
-			if started, err = t.startCase3BReplacement(ctx, repl); err != nil {
+			var oid string 
+			if oid, err = t.startCase3BReplacement(ctx, repl); err != nil {
 				log.Printf(
 					"[TRACE] case3B.modeA.replacement_failed side=%s entry_id=%s base=%.8f entry_price=%.8f recovery=%.6f err=%v",
 					lot.Side,
@@ -2414,7 +2414,7 @@ func (t *Trader) closeLot(
 			)
 
 			lot.Case3BReplacementStarted = true
-			lot.Case3BReplacementOrderID = started.OrderID
+			lot.Case3BReplacementOrderID = oid
 
 			if err := t.saveStateNoLock(); err != nil {
 				log.Printf("[WARN] saveState case3B source flag: %v", err)
@@ -2492,7 +2492,7 @@ func (t *Trader) closeLot(
 			// Case 3B Mode B:
 			// Post loss-exit first, then attempt replacement in same tick.
 			// If replacement fails later, retry waits until loss-exit fill.
-			if started, err := t.startCase3BReplacement(ctx, repl); err != nil {
+			if _, err := t.startCase3BReplacement(ctx, repl); err != nil {
 				t.markCase3BReplacementRetryLocked(
 					repl,
 					waitID,
@@ -2577,7 +2577,7 @@ func (t *Trader) closeLot(
 	// The loss exit has been accepted by the exchange.
 	// Submit the replacement immediately before heavier exit bookkeeping.
 	if repl.Enabled && repl.Method == RecoveryByProfitTarget {
-		if rerr := t.startCase3BReplacement(ctx, repl); rerr != nil {
+		if _, rerr := t.startCase3BReplacement(ctx, repl); rerr != nil {
 			t.markCase3BReplacementRetryLocked(
 				repl,
 				placedOrderID(placed),
@@ -3483,13 +3483,6 @@ type PendingEntry struct {
 
 	SourceEntryOrderID string
 	Completed          bool
-
-	// Retains a broker result that has already been consumed from ResultC
-	// but cannot yet be committed.
-	//
-	// This is used by Case3B replacement entries when the replacement fills
-	// before the originating exit has successfully committed.
-	DeferredResult *OpenResult
 	clearOwner     func()
 }
 
@@ -4189,25 +4182,23 @@ func (t *Trader) drainPendingCase3BEntries(
 		return
 	}
 
-	/*
-		Take a snapshot before draining.
-
-		drainPendingEntry may call entry.clearOwner(), which removes the
-		entry from pendingCase3B. A snapshot keeps iteration independent
-		of those map mutations and ensures entries registered during this
-		drain wait until the next tick.
-	*/
+	// Snapshot because drainPendingEntry() may remove entries.
 	entries := make([]*PendingEntry, 0, len(t.pendingCase3B))
 
 	for _, entry := range t.pendingCase3B {
-		if entry == nil {
-			continue
+		if entry != nil {
+			entries = append(entries, entry)
 		}
-
-		entries = append(entries, entry)
 	}
 
 	for _, entry := range entries {
+
+		// Do not consume the broker result until the
+		// originating exit has committed.
+		if !t.case3BCommitEligible(entry) {
+			continue
+		}
+
 		t.drainPendingEntry(
 			entry,
 			now,
@@ -4215,6 +4206,9 @@ func (t *Trader) drainPendingCase3BEntries(
 		)
 	}
 }
+
+
+
 func (t *Trader) startCase3BReplacement(
 	ctx context.Context,
 	repl ReplacementRequest,
