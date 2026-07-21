@@ -1,45 +1,73 @@
-Currently I have the followings configured[
-	// Process completed asynchronous maker exits before making any new decisions.
-	//
-	// Poller goroutines only report completion through pendingExitCh.
-	// All state mutation (lot removal, partial handling, P/L, exit records,
-	// runner updates, state save, etc.) is performed here on the main trading
-	// thread so Trader state remains single-writer and deterministic.
-	//
-	// This keeps the main loop non-blocking while ensuring completed exits are
-	// reflected before evaluating new entries, exits, or pyramiding decisions.
-	t.drainPendingExitCh(ctx, execHistory, livePrice)
 
-	// Case3B fills are committed only after source exits have had a chance
-	// to commit during this tick.
+
+
+
+
+
+
+
+
+
+
+
+
+Scan SELL lots
+    ↓
+Lot A qualifies for threshold stop-loss
+    ↓
+Case3BReplacementStarted == false
+    ↓
+Post 3B Mode A replacement
+    ↓
+Store dedicated Case 3B pending session
+    ↓
+Set Lot A.Case3BReplacementStarted = true
+    ↓
+Start Lot A exit
+    ↓
+Subsequent scans see flag=true
+    ↓
+No second replacement is posted
+    ↓
+Replacement may fill at Binance
+    ↓
+Result waits in dedicated buffered channel
+    ↓
+Exit result is drained
+    ↓
+Lot A is removed and EXIT record is written
+    ↓
+Case 3B drain sees source lot no longer exists
+    ↓
+Replacement result is committed as a new SELL lot
+
+
+Entry Producer
+        ↓
+Pending Entry
+        ↓
+Exchange
+        ↓
+OpenResult
+        ↓
+Commit Entry
+
+
+Currently I have the followings configured[
+    //OpenResult wrappers:
+
+	// Exit result is drained
+	t.drainPendingExitCh(ctx, execHistory, livePrice)
+	// Case 3B drain sees source lot no longer exists
 	t.drainPendingCase3BEntries(
 		now,
 		wallNow,
 	)
-
-	// -------------------------------------------------------------------------------------------------
-	// Drain: Unified pending-entry drain.
-	// The unified drain handles the complete asynchronous maker-first entry lifecycle:
-	//   - receive async broker result
-	//   - validate current/history order IDs
-	//   - apply refund-service adjustments
-	//   - restore PendingOpen decision metadata
-	//   - create Position from actual execution
-	//   - update inventory/accounting
-	//   - assign runner (if applicable)
-	//   - reset entry gates
-	//   - update equity baseline
-	//   - persist state
-	//   - clear pending lifecycle
-	//
-	// BUY and SELL now simply invoke the common implementation with the appropriate side.
-	// This also provides the foundation for Case3B replacement entries to reuse
-	// the exact same lifecycle instead of maintaining a third copy.
-	// -------------------------------------------------------------------------------------------------
+    //Normal Buy Entry Drain
 	if entry := t.pendingEntryForSide(SideBuy); entry != nil {
 		t.drainPendingEntry(entry, now, wallNow)
 	}
-
+    //Normal Sell Entry Drain
 	if entry := t.pendingEntryForSide(SideSell); entry != nil {
 		t.drainPendingEntry(entry, now, wallNow)
 	}] ... [
@@ -63,8 +91,7 @@ type PendingEntry struct {
 
 	SourceEntryOrderID string
 	Completed          bool
-
-	clearOwner func()
+	clearOwner     func()
 }
 
 type EntrySource string
@@ -74,6 +101,8 @@ const (
 	EntrySourceNormalSell EntrySource = "normal_sell"
 	EntrySourceCase3B     EntrySource = "case3b"
 )
+
+//Entry Producers:
 
 func (t *Trader) pendingEntryForSide(side OrderSide) *PendingEntry {
 	switch side {
@@ -153,7 +182,86 @@ func (t *Trader) pendingEntryForSide(side OrderSide) *PendingEntry {
 
 	return nil
 }
+func (t *Trader) registerCase3BPendingEntry(
+	pending *PendingOpen,
+	resultC <-chan OpenResult,
+	cancel context.CancelFunc,
+	sourceEntryOrderID string,
+) (*PendingEntry, error) {
+	if t == nil {
+		return nil, errors.New("register Case3B entry: nil Trader")
+	}
 
+	if pending == nil {
+		return nil, errors.New("register Case3B entry: nil PendingOpen")
+	}
+
+	if resultC == nil {
+		return nil, errors.New("register Case3B entry: nil result channel")
+	}
+
+	if sourceEntryOrderID == "" {
+		return nil, errors.New(
+			"register Case3B entry: missing source entry order ID",
+		)
+	}
+
+	if pending.OrderID == "" {
+		return nil, errors.New(
+			"register Case3B entry: missing replacement order ID",
+		)
+	}
+
+	if pending.Side != SideBuy && pending.Side != SideSell {
+		return nil, fmt.Errorf(
+			"register Case3B entry: invalid side %q",
+			pending.Side,
+		)
+	}
+
+	t.ensurePendingEntryMaps()
+
+	id := pendingEntryID(
+		pending.Side,
+		pending.OrderID,
+	)
+
+	if _, exists := t.pendingCase3B[id]; exists {
+		return nil, fmt.Errorf(
+			"Case3B pending entry already exists: %s",
+			id,
+		)
+	}
+
+	entry := &PendingEntry{
+		ID:                 id,
+		Side:               pending.Side,
+		Source:             EntrySourceCase3B,
+		Pending:            pending,
+		ResultC:            resultC,
+		Cancel:             cancel,
+		Book:               t.book(pending.Side),
+		SourceEntryOrderID: sourceEntryOrderID,
+	}
+
+	entry.clearOwner = func() {
+		delete(t.pendingCase3B, id)
+	}
+
+	t.pendingCase3B[id] = entry
+
+	log.Printf(
+		"[TRACE] case3b.pending.register id=%s side=%s source_entry_order_id=%s replacement_order_id=%s",
+		entry.ID,
+		entry.Side,
+		entry.SourceEntryOrderID,
+		pending.OrderID,
+	)
+
+	return entry, nil
+}
+
+//OpenResult Generic:
 func (t *Trader) drainPendingEntry(
 	entry *PendingEntry,
 	now time.Time,
@@ -356,6 +464,7 @@ func (t *Trader) drainPendingEntry(
 		// No asynchronous result is available for this entry this tick.
 	}
 }
+
 
 func (t *Trader) commitEntryFill(
 	entry *PendingEntry,
@@ -616,6 +725,30 @@ func (t *Trader) commitEntryFill(
 
 	return nil
 }
+func (t *Trader) case3BCommitEligible(
+	entry *PendingEntry,
+) bool {
+	if t == nil || entry == nil {
+		return false
+	}
+
+	if entry.Source != EntrySourceCase3B {
+		return true
+	}
+
+	sourceEntryOrderID :=
+		strings.TrimSpace(entry.SourceEntryOrderID)
+
+	if sourceEntryOrderID == "" {
+		return false
+	}
+
+	// The originating exit is considered successfully committed only after
+	// the source lot has been removed from the live position books.
+	return !t.positionExistsByEntryOrderID(
+		sourceEntryOrderID,
+	)
+}
 
 func (t *Trader) positionExistsByEntryOrderID(orderID string) bool {
 	if t == nil || orderID == "" {
@@ -652,84 +785,6 @@ func (t *Trader) ensurePendingEntryMaps() {
 	if t.pendingCase3B == nil {
 		t.pendingCase3B = make(map[string]*PendingEntry)
 	}
-}
-func (t *Trader) registerCase3BPendingEntry(
-	pending *PendingOpen,
-	resultC <-chan OpenResult,
-	cancel context.CancelFunc,
-	sourceEntryOrderID string,
-) (*PendingEntry, error) {
-	if t == nil {
-		return nil, errors.New("register Case3B entry: nil Trader")
-	}
-
-	if pending == nil {
-		return nil, errors.New("register Case3B entry: nil PendingOpen")
-	}
-
-	if resultC == nil {
-		return nil, errors.New("register Case3B entry: nil result channel")
-	}
-
-	if sourceEntryOrderID == "" {
-		return nil, errors.New(
-			"register Case3B entry: missing source entry order ID",
-		)
-	}
-
-	if pending.OrderID == "" {
-		return nil, errors.New(
-			"register Case3B entry: missing replacement order ID",
-		)
-	}
-
-	if pending.Side != SideBuy && pending.Side != SideSell {
-		return nil, fmt.Errorf(
-			"register Case3B entry: invalid side %q",
-			pending.Side,
-		)
-	}
-
-	t.ensurePendingEntryMaps()
-
-	id := pendingEntryID(
-		pending.Side,
-		pending.OrderID,
-	)
-
-	if _, exists := t.pendingCase3B[id]; exists {
-		return nil, fmt.Errorf(
-			"Case3B pending entry already exists: %s",
-			id,
-		)
-	}
-
-	entry := &PendingEntry{
-		ID:                 id,
-		Side:               pending.Side,
-		Source:             EntrySourceCase3B,
-		Pending:            pending,
-		ResultC:            resultC,
-		Cancel:             cancel,
-		Book:               t.book(pending.Side),
-		SourceEntryOrderID: sourceEntryOrderID,
-	}
-
-	entry.clearOwner = func() {
-		delete(t.pendingCase3B, id)
-	}
-
-	t.pendingCase3B[id] = entry
-
-	log.Printf(
-		"[TRACE] case3b.pending.register id=%s side=%s source_entry_order_id=%s replacement_order_id=%s",
-		entry.ID,
-		entry.Side,
-		entry.SourceEntryOrderID,
-		pending.OrderID,
-	)
-
-	return entry, nil
 }
 
 func (t *Trader) drainPendingCase3BEntries(

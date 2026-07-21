@@ -3803,6 +3803,8 @@ func (t *Trader) commitEntryFill(
 	pending := entry.Pending
 	book := entry.Book
 
+	policy := entryPolicyForSide(side)
+
 	priceToUse := res.Placed.Price
 	baseToUse := res.Placed.BaseSize
 	quoteSpent := res.Placed.QuoteSpent
@@ -3968,41 +3970,43 @@ func (t *Trader) commitEntryFill(
 		)
 	}
 
-	if entry.EquityTriggered {
+	if policy.AllowRunner && entry.EquityTriggered {
 
-		newIndex := len(book.Lots) - 1
+	newIndex := len(book.Lots) - 1
 
-		addRunner(book, newIndex)
+	addRunner(book, newIndex)
 
-		runner := book.Lots[newIndex]
+	runner := book.Lots[newIndex]
 
-		runner.TrailActive = false
-		runner.TrailPeak = runner.OpenPrice
-		runner.TrailStop = 0
+	runner.TrailActive = false
+	runner.TrailPeak = runner.OpenPrice
+	runner.TrailStop = 0
 
-		t.applyRunnerTargets(runner)
+	t.applyRunnerTargets(runner)
 
-		log.Printf(
-			"[TRACE] runner.assign idx=%d side=%s source=%s open=%.8f take=%.8f",
-			newIndex,
-			side,
-			entry.Source,
-			runner.OpenPrice,
-			runner.Take,
-		)
-	}
+	log.Printf(
+		"[TRACE] runner.assign idx=%d side=%s source=%s open=%.8f take=%.8f",
+		newIndex,
+		side,
+		entry.Source,
+		runner.OpenPrice,
+		runner.Take,
+	)
+}
 
-	if entry.LastAdd != nil {
-		*entry.LastAdd = wallNow
-	}
+if policy.ResetLastAdd && entry.LastAdd != nil {
+	*entry.LastAdd = wallNow
+}
 
-	if entry.WinExtreme != nil {
-		*entry.WinExtreme = priceToUse
-	}
+if policy.ResetWinExtreme && entry.WinExtreme != nil {
+	*entry.WinExtreme = priceToUse
+}
 
-	if entry.LatchedGate != nil {
-		*entry.LatchedGate = 0
-	}
+if policy.ResetLatchedGate && entry.LatchedGate != nil {
+	*entry.LatchedGate = 0
+}
+
+if policy.UpdateEquityBaseline {
 
 	oldEquityBaseline := t.lastAddEquity
 	t.lastAddEquity = t.equityUSD
@@ -4014,6 +4018,7 @@ func (t *Trader) commitEntryFill(
 		oldEquityBaseline,
 		t.lastAddEquity,
 	)
+}
 
 	message := fmt.Sprintf(
 		"[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
@@ -4799,4 +4804,27 @@ func (t *Trader) startPendingReplacementEntry(
 		ResultC: ch,
 		Cancel:  cancel,
 	}, nil
+}
+
+type EntryPolicy struct {
+    ResetLastAdd         bool
+    ResetWinExtreme      bool
+    ResetLatchedGate     bool
+    AllowRunner          bool
+    UpdateEquityBaseline bool
+}
+
+func entryPolicyForSide(side OrderSide) EntryPolicy {
+	switch side {
+	case SideBuy, SideSell:
+		return EntryPolicy{
+			ResetLastAdd:         true,
+			ResetWinExtreme:      true,
+			ResetLatchedGate:     true,
+			AllowRunner:          true,
+			UpdateEquityBaseline: true,
+		}
+	default:
+		panic(fmt.Sprintf("entryPolicyForSide: unsupported side %q", side))
+	}
 }
