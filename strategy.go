@@ -2300,3 +2300,85 @@ func (t *Trader) applyRecoveryDebtFromExit(pnl float64) {
 		)
 	}
 }
+
+func (t *Trader) toNormal(reason string) {
+
+	if t.MarketRegime == RegimeNormal {
+		return
+	}
+
+	old := t.MarketRegime
+	oldMult := t.RegimeMultiplier
+
+	t.MarketRegime = RegimeNormal
+	t.RegimeMultiplier = 1.0
+	t.RegimeUntil = time.Time{}
+
+	log.Printf(
+		"[TRACE] regime.normal old=%s new=%s reason=%s oldMult=%.2f mult=%.2f recentLow=%.2f previousRecentLow=%.2f recentHigh=%.2f previousRecentHigh=%.2f",
+		old,
+		t.MarketRegime,
+		reason,
+		oldMult,
+		t.RegimeMultiplier,
+		t.RecentLow,
+		t.PreviousRecentLow,
+		t.RecentHigh,
+		t.PreviousRecentHigh,
+	)
+}
+
+func (t *Trader) shouldResetRegime(side OrderSide) bool {
+
+	switch {
+
+	case t.MarketRegime == RegimeUp &&
+		side == SideBuy:
+
+		return true
+
+	case t.MarketRegime == RegimeDown &&
+		side == SideSell:
+
+		return true
+	}
+
+	return false
+}
+
+type EntryPolicy struct {
+	ResetLastAdd         bool
+	ResetWinExtreme      bool
+	ResetLatchedGate     bool
+	AllowRunner          bool
+	UpdateEquityBaseline bool
+	ResetRegime          bool
+}
+
+func entryPolicyForSource(source EntrySource) EntryPolicy {
+	switch source {
+
+	case EntrySourceNormal:
+		return EntryPolicy{
+			ResetLastAdd:         true,
+			ResetWinExtreme:      true,
+			ResetLatchedGate:     true,
+			AllowRunner:          true,
+			UpdateEquityBaseline: true,
+			ResetRegime:          true,
+		}
+
+	case EntrySourceCase3B:
+		return EntryPolicy{
+			ResetLastAdd:         true,
+			ResetWinExtreme:      true,
+			ResetLatchedGate:     true,
+			AllowRunner:          true,
+			UpdateEquityBaseline: true,
+			ResetRegime:          false,
+		}
+
+	default:
+		panic(fmt.Sprintf("entryPolicyForSource: unsupported source %q", source))
+	}
+}

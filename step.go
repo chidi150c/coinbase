@@ -464,37 +464,37 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		t.drainPendingEntry(entry, now, wallNow)
 	}
 
-if t.PendingReplacementRetry.Enabled {
-	repl := t.PendingReplacementRetry.Replacement
+	if t.PendingReplacementRetry.Enabled {
+		repl := t.PendingReplacementRetry.Replacement
 
-	OrderID, err := t.startCase3BReplacement(
-		ctx,
-		repl,
-	)
-	if err != nil {
-		log.Printf(
-			"[TRACE] case3B.retry.failed method=%s err=%v",
-			repl.Method.String(),
-			err,
+		OrderID, err := t.startCase3BReplacement(
+			ctx,
+			repl,
 		)
-	} else {
-		log.Printf(
-			"[TRACE] case3B.retry.started method=%s replacement_order_id=%s",
-			repl.Method.String(),
-			OrderID,
-		)
-
-		t.PendingReplacementRetry.Enabled = false
-
-		if err := t.saveStateNoLock(); err != nil {
+		if err != nil {
 			log.Printf(
-				"[TRACE] case3B.retry.state_save_failed replacement_order_id=%s err=%v",
-				OrderID,
+				"[TRACE] case3B.retry.failed method=%s err=%v",
+				repl.Method.String(),
 				err,
 			)
+		} else {
+			log.Printf(
+				"[TRACE] case3B.retry.started method=%s replacement_order_id=%s",
+				repl.Method.String(),
+				OrderID,
+			)
+
+			t.PendingReplacementRetry.Enabled = false
+
+			if err := t.saveStateNoLock(); err != nil {
+				log.Printf(
+					"[TRACE] case3B.retry.state_save_failed replacement_order_id=%s err=%v",
+					OrderID,
+					err,
+				)
+			}
 		}
 	}
-}
 
 	// --- NEW: walk-forward (re)fit guard hook (no-op other than the guard) ---
 	_ = t.shouldRefit(len(execHistory)) // intentionally unused here (guard only)
