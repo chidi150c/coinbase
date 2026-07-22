@@ -31,15 +31,51 @@ Case 3B drain sees source lot no longer exists
 Replacement result is committed as a new SELL lot
 
 Abstration flow:
+
+Decision Engine
+        │
+        ▼
 Entry Producer
-        ↓
-Pending Entry
-        ↓
-Exchange
-        ↓
+        │
+        ▼
+pendingEntries[OrderID]
+        │
+        ▼
+Exchange Events
+(fill / partial fill / cancel / reject / expire)
+        │
+        ▼
 OpenResult
-        ↓
+        │
+        ▼
 Commit Entry
+        │
+        ▼
+Position
+
+
+Entry Producer:
+
+PendingIntent
+       │
+       ▼
+submitOrder()
+       │
+       ├── placement failed
+       │       │
+       │       ▼
+       │    discard
+       │
+       └── placement succeeded
+               │
+               ▼
+      OrderID assigned
+               │
+               ▼
+Build PendingEntry
+               │
+               ▼
+Return PendingEntry
 
 
 Currently I have the followings configured[
@@ -111,8 +147,7 @@ type PendingEntry struct {
 type EntrySource string
 
 const (
-	EntrySourceNormalBuy  EntrySource = "normal_buy"
-	EntrySourceNormalSell EntrySource = "normal_sell"
+	EntrySourceNormal EntrySource = "normal"
 	EntrySourceCase3B     EntrySource = "case3b"
 )
 
@@ -724,7 +759,7 @@ func (t *Trader) registerCase3BPendingEntry(
 
 	return entry, nil
 }
-// Entry Producer Wrapper
+// Entry Producer Wrapper wrapping startPendingReplacementEntry & registerCase3BPendingEntry above
 func (t *Trader) startCase3BReplacement(
 	ctx context.Context,
 	repl ReplacementRequest,

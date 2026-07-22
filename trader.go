@@ -128,8 +128,6 @@ type BotState struct {
 	Exits           []ExitRecord
 
 	// --- NEW (persist pending maker-first opens & recheck flags) ---
-	PendingBuy              *PendingOpen
-	PendingSell             *PendingOpen
 	PendingRecheckBuy       bool
 	PendingRecheckSell      bool
 	RefundBuyUSD            float64
@@ -147,34 +145,6 @@ type BotState struct {
 	DustBuyLots             []*Position
 	DustSellLots            []*Position
 	PendingReplacementRetry PendingReplacementRetry
-}
-
-// --- NEW (Phase 1): pending async maker-first open support ---
-type PendingOpen struct {
-	Side             OrderSide
-	LimitPx          float64
-	BaseAtLimit      float64
-	Quote            float64
-	Take             float64
-	Reason           string
-	RefundPortionUSD float64 `json:"refund_portion_usd"`
-	ProductID        string
-	CreatedAt        time.Time
-	Deadline         time.Time
-	EquityBuy        bool // whether this was equityTriggerBuy
-	EquitySell       bool // whether this was equityTriggerSell
-	// --- NEW: persisted working order id to allow rehydration ---
-	OrderID string
-	// NEW: keep last few order IDs so we accept late fills after a cancel/reprice.
-	History []string `json:"history,omitempty"` // capped (e.g., last 5)
-	// NEW: accumulate fills across reprices
-	AccumBase       float64 // sum of executed base over all prior order IDs
-	AccumQuote      float64 // sum of executed quote
-	AccumFeeUSD     float64 // sum of fees (if provided)
-	ConfidenceMult  float64 `json:"confidence_mult,omitempty"`
-	ProfitGateUSD   float64 `json:"profit_gate_usd,omitempty"`
-	EntryAIMode     string  `json:"entry_ai_mode,omitempty"` // AI_MATCH or AI_FLAT
-	CancelRequested bool    `json:"cancel_requested,omitempty"`
 }
 
 type OpenResult struct {
@@ -252,8 +222,6 @@ type Trader struct {
 	lastExits  []ExitRecord
 
 	// --- NEW (Phase 4): async maker-first open state per-side ---
-	pendingBuy        *PendingOpen
-	pendingSell       *PendingOpen
 	pendingBuyCh      chan OpenResult
 	pendingSellCh     chan OpenResult
 	pendingBuyCtx     context.Context
@@ -299,7 +267,7 @@ type Trader struct {
 	balanceRefreshOnce sync.Once
 	balanceRefreshStop chan struct{}
 	// Case 3B replacements
-	pendingCase3B map[string]*PendingEntry
+	pendingEntries map[string]*PendingEntry
 }
 
 func NewTrader(cfg Config, broker Broker) *Trader {
@@ -1902,17 +1870,6 @@ func (m RecoveryMethod) String() string {
 	}
 }
 
-type ReplacementRequest struct {
-	Enabled            bool
-	Side               OrderSide
-	EntryPrice         float64
-	Base               float64
-	RecoveryNetUSD     float64
-	Method             RecoveryMethod
-	ProfitGateUSD      float64
-	Reason             string
-	SourceEntryOrderID string
-}
 type PendingReplacementRetry struct {
 	Enabled            bool
 	Replacement        ReplacementRequest
@@ -3471,7 +3428,7 @@ type PendingEntry struct {
 	Side   OrderSide
 	Source EntrySource
 
-	Pending *PendingOpen
+	Intent  *PendingIntent
 	ResultC <-chan OpenResult
 	Cancel  context.CancelFunc
 
@@ -3489,92 +3446,53 @@ type PendingEntry struct {
 	clearOwner         func()
 }
 
+type PendingIntent struct {
+	Source EntrySource
+
+	Side        OrderSide
+	LimitPx     float64
+	BaseAtLimit float64
+	Quote       float64
+	Take        float64
+	Reason      string
+
+	RefundPortionUSD float64 `json:"refund_portion_usd"`
+
+	ProductID string
+
+	CreatedAt time.Time
+	Deadline  time.Time
+
+	EquityBuy  bool
+	EquitySell bool
+
+	// Current live exchange order ID.
+	OrderID string
+
+	// Late-fill/reprice tracking.
+	History []string `json:"history,omitempty"`
+
+	AccumBase   float64
+	AccumQuote  float64
+	AccumFeeUSD float64
+
+	ConfidenceMult float64 `json:"confidence_mult,omitempty"`
+	ProfitGateUSD  float64 `json:"profit_gate_usd,omitempty"`
+	EntryAIMode    string  `json:"entry_ai_mode,omitempty"`
+
+	CancelRequested bool `json:"cancel_requested,omitempty"`
+
+	// Empty for normal entries.
+	// Case3B uses this to identify the entry that caused the replacement.
+	SourceEntryOrderID string `json:"source_entry_order_id,omitempty"`
+}
+
 type EntrySource string
 
 const (
-	EntrySourceNormalBuy  EntrySource = "normal_buy"
-	EntrySourceNormalSell EntrySource = "normal_sell"
-	EntrySourceCase3B     EntrySource = "case3b"
+	EntrySourceNormal EntrySource = "normal"
+	EntrySourceCase3B EntrySource = "case3b"
 )
-
-func (t *Trader) pendingEntryForSide(side OrderSide) *PendingEntry {
-	switch side {
-
-	case SideBuy:
-		if t.pendingBuy == nil && t.pendingBuyCh == nil {
-			return nil
-		}
-
-		entry := &PendingEntry{
-			ID:     pendingEntryID(side, ""),
-			Side:   SideBuy,
-			Source: EntrySourceNormalBuy,
-
-			Pending: t.pendingBuy,
-			ResultC: t.pendingBuyCh,
-			Cancel:  t.pendingBuyCancel,
-
-			Book:            t.book(SideBuy),
-			PendingRecheck:  &t.pendingRecheckBuy,
-			SpareUSD:        &t.SpareBuyUSD,
-			LastAdd:         &t.lastAddBuy,
-			WinExtreme:      &t.winLowBuy,
-			LatchedGate:     &t.latchedGateBuy,
-			EquityTriggered: t.pendingBuy != nil && t.pendingBuy.EquityBuy,
-		}
-
-		if t.pendingBuy != nil {
-			entry.ID = pendingEntryID(side, t.pendingBuy.OrderID)
-		}
-
-		entry.clearOwner = func() {
-			t.pendingBuy = nil
-			t.pendingBuyCh = nil
-			t.pendingBuyCtx = nil
-			t.pendingBuyCancel = nil
-		}
-
-		return entry
-
-	case SideSell:
-		if t.pendingSell == nil && t.pendingSellCh == nil {
-			return nil
-		}
-
-		entry := &PendingEntry{
-			ID:     pendingEntryID(side, ""),
-			Side:   SideSell,
-			Source: EntrySourceNormalSell,
-
-			Pending: t.pendingSell,
-			ResultC: t.pendingSellCh,
-			Cancel:  t.pendingSellCancel,
-
-			Book:            t.book(SideSell),
-			PendingRecheck:  &t.pendingRecheckSell,
-			SpareUSD:        &t.SpareSellUSD,
-			LastAdd:         &t.lastAddSell,
-			WinExtreme:      &t.winHighSell,
-			LatchedGate:     &t.latchedGateSell,
-			EquityTriggered: t.pendingSell != nil && t.pendingSell.EquitySell,
-		}
-
-		if t.pendingSell != nil {
-			entry.ID = pendingEntryID(side, t.pendingSell.OrderID)
-		}
-
-		entry.clearOwner = func() {
-			t.pendingSell = nil
-			t.pendingSellCh = nil
-			t.pendingSellCtx = nil
-			t.pendingSellCancel = nil
-		}
-
-		return entry
-	}
-
-	return nil
-}
 
 func (t *Trader) drainPendingEntry(
 	entry *PendingEntry,
@@ -4024,13 +3942,25 @@ func (t *Trader) commitEntryFill(
 		)
 	}
 
-	if policy.ResetRegime &&
-		t.shouldResetRegime(side) {
+	/*
+		Case 10 — Stabilize RegimeNormal.
 
+		A successful normal entry consumes the currently active
+		directional opportunity only when the entry agrees with it:
+
+			UP   + BUY  -> NORMAL
+			DOWN + SELL -> NORMAL
+
+		Case3B replacements leave the regime unchanged because their
+		source policy sets ResetRegime=false.
+	*/
+	if policy.ResetRegime && t.shouldResetRegime(side) {
 		t.toNormal(
 			fmt.Sprintf(
-				"entry_commit_%s",
+				"successful_entry_fill source=%s side=%s order_id=%s",
 				entry.Source,
+				side,
+				res.OrderID,
 			),
 		)
 	}
@@ -4103,95 +4033,16 @@ func (t *Trader) positionExistsByEntryOrderID(orderID string) bool {
 
 	return false
 }
-
 func pendingEntryID(side OrderSide, orderID string) string {
 	if orderID == "" {
 		return string(side)
 	}
 	return fmt.Sprintf("%s:%s", side, orderID)
 }
-func (t *Trader) ensurePendingEntryMaps() {
-	if t.pendingCase3B == nil {
-		t.pendingCase3B = make(map[string]*PendingEntry)
+func (t *Trader) ensurePendingEntries() {
+	if t.pendingEntries == nil {
+		t.pendingEntries = make(map[string]*PendingEntry)
 	}
-}
-func (t *Trader) registerCase3BPendingEntry(
-	pending *PendingOpen,
-	resultC <-chan OpenResult,
-	cancel context.CancelFunc,
-	sourceEntryOrderID string,
-) (*PendingEntry, error) {
-	if t == nil {
-		return nil, errors.New("register Case3B entry: nil Trader")
-	}
-
-	if pending == nil {
-		return nil, errors.New("register Case3B entry: nil PendingOpen")
-	}
-
-	if resultC == nil {
-		return nil, errors.New("register Case3B entry: nil result channel")
-	}
-
-	if sourceEntryOrderID == "" {
-		return nil, errors.New(
-			"register Case3B entry: missing source entry order ID",
-		)
-	}
-
-	if pending.OrderID == "" {
-		return nil, errors.New(
-			"register Case3B entry: missing replacement order ID",
-		)
-	}
-
-	if pending.Side != SideBuy && pending.Side != SideSell {
-		return nil, fmt.Errorf(
-			"register Case3B entry: invalid side %q",
-			pending.Side,
-		)
-	}
-
-	t.ensurePendingEntryMaps()
-
-	id := pendingEntryID(
-		pending.Side,
-		pending.OrderID,
-	)
-
-	if _, exists := t.pendingCase3B[id]; exists {
-		return nil, fmt.Errorf(
-			"Case3B pending entry already exists: %s",
-			id,
-		)
-	}
-
-	entry := &PendingEntry{
-		ID:                 id,
-		Side:               pending.Side,
-		Source:             EntrySourceCase3B,
-		Pending:            pending,
-		ResultC:            resultC,
-		Cancel:             cancel,
-		Book:               t.book(pending.Side),
-		SourceEntryOrderID: sourceEntryOrderID,
-	}
-
-	entry.clearOwner = func() {
-		delete(t.pendingCase3B, id)
-	}
-
-	t.pendingCase3B[id] = entry
-
-	log.Printf(
-		"[TRACE] case3b.pending.register id=%s side=%s source_entry_order_id=%s replacement_order_id=%s",
-		entry.ID,
-		entry.Side,
-		entry.SourceEntryOrderID,
-		pending.OrderID,
-	)
-
-	return entry, nil
 }
 
 func (t *Trader) drainPendingCase3BEntries(
@@ -4227,24 +4078,130 @@ func (t *Trader) drainPendingCase3BEntries(
 	}
 }
 
+// Entry Production:
+/*
+	source wrapper
+		↓
+	construct PendingIntent
+		↓
+	produceEntry
+		↓
+	submit maker order
+		↓
+	construct PendingEntry
+		↓
+	pendingEntries[OrderID]
+		↓
+	generic poll/reprice lifecycle
+		↓
+	OpenResult
+		↓
+	generic commit
+*/
+// Buy Source Wrapper
+func (t *Trader) startNormalBuyEntry(
+	ctx context.Context,
+	limitPx float64,
+	baseAtLimit float64,
+	take float64,
+	reason string,
+	refundPortionUSD float64,
+	confidenceMult float64,
+	profitGateUSD float64,
+	entryAIMode string,
+	equityTriggered bool,
+) (*PendingEntry, error) {
+	intent := &PendingIntent{
+		Source: EntrySourceNormalBuy,
+
+		Side:        SideBuy,
+		LimitPx:     limitPx,
+		BaseAtLimit: baseAtLimit,
+		Quote:       baseAtLimit * limitPx,
+		Take:        take,
+		Reason:      reason,
+
+		RefundPortionUSD: refundPortionUSD,
+
+		ProductID: t.cfg.ProductID,
+
+		EquityBuy:  equityTriggered,
+		EquitySell: false,
+
+		History: make([]string, 0, 5),
+
+		ConfidenceMult: confidenceMult,
+		ProfitGateUSD:  profitGateUSD,
+		EntryAIMode:    entryAIMode,
+	}
+
+	return t.produceEntry(ctx, intent)
+}
+
+// Sell Source Wrapper
+func (t *Trader) startNormalSellEntry(
+	ctx context.Context,
+	limitPx float64,
+	baseAtLimit float64,
+	take float64,
+	reason string,
+	refundPortionUSD float64,
+	confidenceMult float64,
+	profitGateUSD float64,
+	entryAIMode string,
+	equityTriggered bool,
+) (*PendingEntry, error) {
+	intent := &PendingIntent{
+		Source: EntrySourceNormalSell,
+
+		Side:        SideSell,
+		LimitPx:     limitPx,
+		BaseAtLimit: baseAtLimit,
+		Quote:       baseAtLimit * limitPx,
+		Take:        take,
+		Reason:      reason,
+
+		RefundPortionUSD: refundPortionUSD,
+
+		ProductID: t.cfg.ProductID,
+
+		EquityBuy:  false,
+		EquitySell: equityTriggered,
+
+		History: make([]string, 0, 5),
+
+		ConfidenceMult: confidenceMult,
+		ProfitGateUSD:  profitGateUSD,
+		EntryAIMode:    entryAIMode,
+	}
+
+	return t.produceEntry(ctx, intent)
+}
+
+// Case3B Source Wrapper
 func (t *Trader) startCase3BReplacement(
 	ctx context.Context,
 	repl ReplacementRequest,
 ) (string, error) {
 	if !repl.Enabled {
 		log.Printf(
-			"[TRACE] case3B.replacement.disabled side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
+			"[TRACE] case3B.replacement.disabled "+
+				"side=%s method=%s base=%.8f "+
+				"entry=%.8f notional=%.2f",
 			repl.Side,
 			repl.Method.String(),
 			repl.Base,
 			repl.EntryPrice,
 			repl.Base*repl.EntryPrice,
 		)
+
 		return "", nil
 	}
 
 	log.Printf(
-		"[TRACE] case3B.replacement.enter side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
+		"[TRACE] case3B.replacement.enter "+
+			"side=%s method=%s base=%.8f "+
+			"entry=%.8f notional=%.2f",
 		repl.Side,
 		repl.Method.String(),
 		repl.Base,
@@ -4252,569 +4209,1272 @@ func (t *Trader) startCase3BReplacement(
 		repl.Base*repl.EntryPrice,
 	)
 
-	defer log.Printf("[TRACE] case3B.replacement.leave")
+	defer log.Printf(
+		"[TRACE] case3B.replacement.leave",
+	)
 
-	started, err := t.startPendingReplacementEntry(ctx, repl)
+	sourceEntryOrderID := strings.TrimSpace(
+		repl.SourceEntryOrderID,
+	)
+
+	if sourceEntryOrderID == "" {
+		return "", errors.New(
+			"Case3B replacement: missing SourceEntryOrderID",
+		)
+	}
+
+	intent := &PendingIntent{
+		Source: EntrySourceCase3B,
+
+		Side:        repl.Side,
+		LimitPx:     repl.EntryPrice,
+		BaseAtLimit: repl.Base,
+		Quote:       repl.Base * repl.EntryPrice,
+		Take:        0,
+		Reason:      repl.Reason,
+
+		RefundPortionUSD: 0,
+
+		ProductID: t.cfg.ProductID,
+
+		EquityBuy:  false,
+		EquitySell: false,
+
+		History: make([]string, 0, 5),
+
+		ConfidenceMult: 1.0,
+		ProfitGateUSD:  repl.ProfitGateUSD,
+		EntryAIMode:    repl.Method.String(),
+
+		SourceEntryOrderID: sourceEntryOrderID,
+	}
+
+	entry, err := t.produceEntry(ctx, intent)
 	if err != nil {
 		log.Printf(
-			"[TRACE] case3B.replacement.failed side=%s price=%.8f base=%.8f method=%s err=%v",
+			"[TRACE] case3B.replacement.failed "+
+				"side=%s price=%.8f base=%.8f "+
+				"method=%s err=%v",
 			repl.Side,
 			repl.EntryPrice,
 			repl.Base,
 			repl.Method.String(),
 			err,
 		)
+
 		return "", err
 	}
-	if started == nil {
-		return "", fmt.Errorf(
-			"startPendingReplacementEntry returned nil StartedPendingEntry",
-		)
-	}
-	if strings.TrimSpace(repl.SourceEntryOrderID) == "" {
-		return t.cancelCase3BAttempt(
-			ctx,
-			started,
-			nil,
-			"missing SourceEntryOrderID",
-		)
-	}
-	if started.Pending == nil {
-		return t.cancelCase3BAttempt(
-			ctx,
-			started,
-			nil,
-			"startPendingReplacementEntry returned nil PendingOpen",
+
+	if entry == nil {
+		return "", errors.New(
+			"Case3B replacement: produceEntry returned nil entry",
 		)
 	}
 
-	if started.ResultC == nil {
-		return t.cancelCase3BAttempt(
-			ctx,
-			started,
-			nil,
-			"startPendingReplacementEntry returned nil ResultC",
-		)
-	}
-
-	if strings.TrimSpace(started.OrderID) == "" {
-		return t.cancelCase3BAttempt(
-			ctx,
-			started,
-			nil,
-			"startPendingReplacementEntry returned empty OrderID",
-		)
-	}
-
-	_, err = t.registerCase3BPendingEntry(
-		started.Pending,
-		started.ResultC,
-		started.Cancel,
-		repl.SourceEntryOrderID,
+	log.Printf(
+		"[TRACE] case3B.replacement.started "+
+			"order_id=%s source_entry_order_id=%s "+
+			"side=%s price=%.8f base=%.8f method=%s",
+		entry.OrderID,
+		sourceEntryOrderID,
+		entry.Side,
+		entry.Intent.LimitPx,
+		entry.Intent.BaseAtLimit,
+		repl.Method.String(),
 	)
 
+	return entry.OrderID, nil
+}
+
+//Entry Producer:
+/*validatePendingIntent()
+		↓
+submitPendingIntent()
+		↓
+buildPendingEntry()
+		↓
+registerPendingEntry()
+		↓
+startEntryPoller()
+*/
+func (t *Trader) produceEntry(
+	ctx context.Context,
+	intent *PendingIntent,
+) (*PendingEntry, error) {
+	if err := t.validatePendingIntent(intent); err != nil {
+		return nil, err
+	}
+
+	orderID, err := t.submitPendingIntent(ctx, intent)
 	if err != nil {
-		return t.cancelCase3BAttempt(
-			ctx,
-			started,
-			err,
-			"register Case3B replacement",
-		)
+		return nil, err
 	}
 
-	log.Printf(
-		"[TRACE] case3B.replacement.started order_id=%s source_entry_order_id=%s side=%s price=%.8f base=%.8f method=%s",
-		started.OrderID,
-		repl.SourceEntryOrderID,
-		repl.Side,
-		repl.EntryPrice,
-		repl.Base,
-		repl.Method.String(),
-	)
-
-	return started.OrderID, nil
-}
-
-func (t *Trader) cancelCase3BAttempt(
-	ctx context.Context,
-	started *StartedPendingEntry,
-	cause error,
-	msg string,
-) (string, error) {
-	if started != nil && started.Cancel != nil {
-		started.Cancel()
-	}
-
-	if started != nil && started.OrderID != "" {
-		_ = t.broker.CancelOrder(
-			ctx,
-			t.cfg.ProductID,
-			started.OrderID,
-		)
-	}
-
-	if cause != nil {
-		return "", fmt.Errorf("%s: %w", msg, cause)
-	}
-
-	return "", fmt.Errorf("%s", msg)
-}
-
-type StartedPendingEntry struct {
-	OrderID string
-
-	Pending *PendingOpen
-	ResultC <-chan OpenResult
-	Cancel  context.CancelFunc
-}
-
-func (t *Trader) startPendingReplacementEntry(
-	ctx context.Context,
-	repl ReplacementRequest,
-) (*StartedPendingEntry, error) {
-	if !repl.Enabled {
-		return nil, nil
-	}
-
-	if repl.Side != SideSell && repl.Side != SideBuy {
-		return nil, fmt.Errorf("replacement unsupported side=%s", repl.Side)
-	}
-
-	if repl.EntryPrice <= 0 || repl.Base <= 0 {
-		return nil, fmt.Errorf(
-			"invalid replacement entry price/base price=%.8f base=%.8f",
-			repl.EntryPrice,
-			repl.Base,
-		)
-	}
-
-	if repl.Side == SideSell && t.pendingSell != nil {
-		return nil, fmt.Errorf("replacement blocked: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
-	}
-	if repl.Side == SideBuy && t.pendingBuy != nil {
-		return nil, fmt.Errorf("replacement blocked: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
-	}
-
-	limitPx := repl.EntryPrice
-	if t.cfg.PriceTick > 0 {
-		if repl.Side == SideSell {
-			limitPx = math.Ceil(limitPx/t.cfg.PriceTick) * t.cfg.PriceTick
-		} else {
-			limitPx = math.Floor(limitPx/t.cfg.PriceTick) * t.cfg.PriceTick
-		}
-	}
-
-	if limitPx <= 0 {
-		return nil, fmt.Errorf("invalid replacement limit price after tick snap: %.8f", limitPx)
-	}
-
-	if repl.Base*limitPx < t.cfg.MinNotional {
-		return nil, fmt.Errorf(
-			"replacement below min notional side=%s notional=%.2f min=%.2f base=%.8f limit=%.8f",
-			repl.Side,
-			repl.Base*limitPx,
-			t.cfg.MinNotional,
-			repl.Base,
-			limitPx,
-		)
-	}
-
-	log.Printf(
-		"[TRACE] case3B.replacement.before_postonly side=%s limit=%.8f base=%.8f notional=%.2f method=%s",
-		repl.Side,
-		limitPx,
-		repl.Base,
-		repl.Base*limitPx,
-		repl.Method.String(),
-	)
-
-	t.mu.Unlock()
-	orderID, err := t.broker.PlaceLimitPostOnly(ctx, t.cfg.ProductID, repl.Side, limitPx, repl.Base)
-	t.mu.Lock()
-
-	log.Printf(
-		"[TRACE] case3B.replacement.after_postonly side=%s order_id=%s err=%v",
-		repl.Side,
+	entry, err := t.buildPendingEntry(
+		ctx,
+		intent,
 		orderID,
-		err,
 	)
-
 	if err != nil {
-		return &StartedPendingEntry{OrderID: orderID}, err
+		return nil, err
+	}
+
+	if err := t.registerPendingEntry(entry); err != nil {
+		return nil, err
+	}
+
+	if err := t.saveStateNoLock(); err != nil {
+		return nil, err
+	}
+
+	t.startEntryPoller(entry)
+
+	return entry, nil
+}
+
+// Entry Producer Main Helpers
+func (t *Trader) validatePendingIntent(
+	intent *PendingIntent,
+) error {
+	if t == nil {
+		return errors.New("validate pending intent: nil Trader")
+	}
+
+	if intent == nil {
+		return errors.New("validate pending intent: nil PendingIntent")
+	}
+
+	if intent.Source == EntrySourceUnknown {
+		return errors.New("validate pending intent: missing Source")
+	}
+
+	switch intent.Side {
+	case SideBuy, SideSell:
+		// valid
+	default:
+		return fmt.Errorf(
+			"validate pending intent: invalid Side=%q",
+			intent.Side,
+		)
+	}
+
+	if strings.TrimSpace(intent.ProductID) == "" {
+		return errors.New(
+			"validate pending intent: missing ProductID",
+		)
+	}
+
+	if intent.LimitPx <= 0 {
+		return fmt.Errorf(
+			"validate pending intent: invalid LimitPx=%.8f",
+			intent.LimitPx,
+		)
+	}
+
+	if intent.BaseAtLimit <= 0 {
+		return fmt.Errorf(
+			"validate pending intent: invalid BaseAtLimit=%.8f",
+			intent.BaseAtLimit,
+		)
+	}
+
+	if intent.Quote < 0 {
+		return fmt.Errorf(
+			"validate pending intent: invalid Quote=%.8f",
+			intent.Quote,
+		)
+	}
+
+	if intent.Take < 0 {
+		return fmt.Errorf(
+			"validate pending intent: invalid Take=%.8f",
+			intent.Take,
+		)
+	}
+
+	if intent.RefundPortionUSD < 0 {
+		return fmt.Errorf(
+			"validate pending intent: invalid RefundPortionUSD=%.8f",
+			intent.RefundPortionUSD,
+		)
+	}
+
+	if intent.ConfidenceMult < 0 {
+		return fmt.Errorf(
+			"validate pending intent: invalid ConfidenceMult=%.8f",
+			intent.ConfidenceMult,
+		)
+	}
+
+	if intent.ProfitGateUSD < 0 {
+		return fmt.Errorf(
+			"validate pending intent: invalid ProfitGateUSD=%.8f",
+			intent.ProfitGateUSD,
+		)
+	}
+
+	if strings.TrimSpace(intent.Reason) == "" {
+		return errors.New(
+			"validate pending intent: missing Reason",
+		)
+	}
+
+	return nil
+}
+func (t *Trader) submitPendingIntent(
+	ctx context.Context,
+	intent *PendingIntent,
+) (string, error) {
+	if t == nil {
+		return "", errors.New(
+			"submit pending intent: nil Trader",
+		)
+	}
+
+	if ctx == nil {
+		return "", errors.New(
+			"submit pending intent: nil context",
+		)
+	}
+
+	if intent == nil {
+		return "", errors.New(
+			"submit pending intent: nil PendingIntent",
+		)
+	}
+
+	if t.broker == nil {
+		return "", errors.New(
+			"submit pending intent: nil broker",
+		)
+	}
+
+	/*
+		Use the values already established by the wrapper and validated
+		by validatePendingIntent().
+
+		This function does not:
+		  - apply strategy rules;
+		  - inspect the entry source;
+		  - change price or size;
+		  - register pending state;
+		  - start a poller;
+		  - persist Trader state.
+	*/
+	orderID, err := t.broker.PlaceLimitPostOnly(
+		ctx,
+		intent.ProductID,
+		intent.Side,
+		intent.LimitPx,
+		intent.BaseAtLimit,
+	)
+	if err != nil {
+		return "", fmt.Errorf(
+			"submit pending intent: place post-only order: "+
+				"product=%s side=%s limit=%.8f base=%.8f: %w",
+			intent.ProductID,
+			intent.Side,
+			intent.LimitPx,
+			intent.BaseAtLimit,
+			err,
+		)
 	}
 
 	orderID = strings.TrimSpace(orderID)
 	if orderID == "" {
-		return nil, fmt.Errorf("empty replacement order id")
+		return "", fmt.Errorf(
+			"submit pending intent: broker returned empty order ID: "+
+				"product=%s side=%s limit=%.8f base=%.8f",
+			intent.ProductID,
+			intent.Side,
+			intent.LimitPx,
+			intent.BaseAtLimit,
+		)
 	}
 
-	if repl.Side == SideSell && t.pendingSell != nil {
-		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, orderID)
-		return nil, fmt.Errorf("replacement blocked after post: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
-	}
-	if repl.Side == SideBuy && t.pendingBuy != nil {
-		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, orderID)
-		return nil, fmt.Errorf("replacement blocked after post: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
+	return orderID, nil
+}
+func (t *Trader) buildPendingEntry(
+	ctx context.Context,
+	intent *PendingIntent,
+	orderID string,
+) (*PendingEntry, error) {
+	if t == nil {
+		return nil, errors.New("build pending entry: nil Trader")
 	}
 
-	if repl.ProfitGateUSD <= 0 {
-		repl.ProfitGateUSD = t.cfg.ProfitGateUSD
+	if ctx == nil {
+		return nil, errors.New("build pending entry: nil context")
+	}
+
+	if intent == nil {
+		return nil, errors.New("build pending entry: nil PendingIntent")
+	}
+
+	orderID = strings.TrimSpace(orderID)
+	if orderID == "" {
+		return nil, errors.New("build pending entry: empty orderID")
 	}
 
 	now := time.Now().UTC()
-	deadline := now.Add(time.Duration(t.cfg.LimitTimeoutSec) * time.Second)
 
-	pctx, cancel := context.WithCancel(ctx)
-
-	pend := &PendingOpen{
-		Side:             repl.Side,
-		LimitPx:          limitPx,
-		BaseAtLimit:      repl.Base,
-		Quote:            repl.Base * limitPx,
-		Take:             0,
-		Reason:           repl.Reason,
-		ProductID:        t.cfg.ProductID,
-		CreatedAt:        now,
-		Deadline:         deadline,
-		OrderID:          orderID,
-		History:          make([]string, 0, 5),
-		ConfidenceMult:   1.0,
-		ProfitGateUSD:    repl.ProfitGateUSD,
-		EntryAIMode:      repl.Method.String(),
-		RefundPortionUSD: 0,
-	}
-
-	var ch chan OpenResult
-
-	if repl.Side == SideSell {
-		if t.pendingSellCh == nil {
-			t.pendingSellCh = make(chan OpenResult, 1)
-		}
-		t.pendingSellCtx = pctx
-		t.pendingSellCancel = cancel
-		t.pendingSell = pend
-		ch = t.pendingSellCh
-	} else {
-		if t.pendingBuyCh == nil {
-			t.pendingBuyCh = make(chan OpenResult, 1)
-		}
-		t.pendingBuyCtx = pctx
-		t.pendingBuyCancel = cancel
-		t.pendingBuy = pend
-		ch = t.pendingBuyCh
-	}
-
-	log.Printf(
-		"[TRACE] postonly.pending.set side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f dl=%s reason=%s",
-		repl.Side,
-		orderID,
-		limitPx,
-		repl.Base,
-		repl.Base*limitPx,
-		deadline.Format(time.RFC3339),
-		repl.Reason,
+	intent.OrderID = orderID
+	intent.CreatedAt = now
+	intent.Deadline = now.Add(
+		time.Duration(t.cfg.LimitTimeoutSec) * time.Second,
 	)
 
-	if err := t.saveStateNoLock(); err != nil {
-		log.Printf("[WARN] saveState replacement pending: %v", err)
+	if intent.History == nil {
+		intent.History = make([]string, 0, 5)
 	}
 
-	offsetBps := t.cfg.LimitPriceOffsetBps
-	initOrderID := orderID
-	initLimitPx := limitPx
-	initBaseAtLimit := repl.Base
-	side := repl.Side
+	pollCtx, cancel := context.WithCancel(ctx)
 
-	go func(
-		initOrderID string,
-		side OrderSide,
-		deadline time.Time,
-		initLimitPx float64,
-		initBaseAtLimit float64,
-		pend *PendingOpen,
-		ch chan OpenResult,
-		pctx context.Context,
-	) {
-		log.Printf(
-			"[TRACE] postonly.poll.start side=%s init_id=%s init_limit=%.8f init_base=%.8f deadline=%s offset_bps=%.3f",
-			side,
-			initOrderID,
-			initLimitPx,
-			initBaseAtLimit,
-			deadline.Format(time.RFC3339),
-			offsetBps,
+	entry := &PendingEntry{
+		Side:    intent.Side,
+		Source:  intent.Source,
+		OrderID: orderID,
+		Intent:  intent,
+
+		ResultC: make(chan OpenResult, 1),
+		Cancel:  cancel,
+
+		Completed: false,
+	}
+
+	switch intent.Side {
+
+	case SideBuy:
+		entry.Book = &t.buyBook
+		entry.PendingRecheck = &t.pendingRecheckBuy
+		entry.SpareUSD = &t.SpareBuyUSD
+		entry.LastAdd = &t.lastAddBuy
+		entry.WinExtreme = &t.winLowBuy
+		entry.LatchedGate = &t.latchedGateBuy
+		entry.EquityTriggered = intent.EquityBuy
+
+	case SideSell:
+		entry.Book = &t.sellBook
+		entry.PendingRecheck = &t.pendingRecheckSell
+		entry.SpareUSD = &t.SpareSellUSD
+		entry.LastAdd = &t.lastAddSell
+		entry.WinExtreme = &t.winHighSell
+		entry.LatchedGate = &t.latchedGateSell
+		entry.EquityTriggered = intent.EquitySell
+
+	default:
+		cancel()
+		return nil, fmt.Errorf(
+			"build pending entry: unsupported side=%v",
+			intent.Side,
 		)
-		defer func() {
-			log.Printf("[TRACE] postonly.poll.stopped side=%s initial_id=%s", side, initOrderID)
-		}()
+	}
 
-		orderID := initOrderID
-		lastLimitPx := initLimitPx
-		lastReprice := time.Now()
+	entry.clearOwner = func() {
+		current, ok := t.pendingEntries[entry.OrderID]
+		if ok && current == entry {
+			delete(t.pendingEntries, entry.OrderID)
+		}
+	}
 
-		var sessBase, sessQuote, sessFee float64
-		var lastSeenBase, lastSeenQuote, lastSeenFee float64
-		var repriceCount int
+	return entry, nil
+}
+func (t *Trader) registerPendingEntry(
+	entry *PendingEntry,
+) error {
+	if t == nil {
+		return errors.New(
+			"register pending entry: nil Trader",
+		)
+	}
 
-	poll:
-		for time.Now().Before(deadline) {
-			select {
-			case <-pctx.Done():
-				log.Printf("[TRACE] postonly.poll.cancelled side=%s last_id=%s", side, orderID)
-				break poll
-			default:
+	if entry == nil {
+		return errors.New(
+			"register pending entry: nil PendingEntry",
+		)
+	}
+
+	if entry.Intent == nil {
+		return errors.New(
+			"register pending entry: nil PendingIntent",
+		)
+	}
+
+	orderID := strings.TrimSpace(entry.OrderID)
+	if orderID == "" {
+		return errors.New(
+			"register pending entry: empty OrderID",
+		)
+	}
+
+	if t.pendingEntries == nil {
+		t.pendingEntries = make(map[string]*PendingEntry)
+	}
+
+	if _, exists := t.pendingEntries[orderID]; exists {
+		return fmt.Errorf(
+			"register pending entry: order %q already registered",
+			orderID,
+		)
+	}
+
+	t.pendingEntries[orderID] = entry
+
+	log.Printf(
+		"[TRACE] pending.register "+
+			"source=%s side=%s order_id=%s "+
+			"limit=%.8f base=%.8f quote=%.8f",
+		entry.Source,
+		entry.Side,
+		orderID,
+		entry.Intent.LimitPx,
+		entry.Intent.BaseAtLimit,
+		entry.Intent.Quote,
+	)
+
+	return nil
+}
+func (t *Trader) startEntryPoller(
+	parentCtx context.Context,
+	entry *PendingEntry,
+) {
+	if entry == nil {
+		return
+	}
+
+	if entry.Intent == nil {
+		return
+	}
+
+	pollCtx, cancel := context.WithCancel(parentCtx)
+
+	entry.Cancel = cancel
+
+	if entry.ResultC == nil {
+		entry.ResultC = make(chan OpenResult, 1)
+	}
+
+	go t.runPendingEntryPoller(
+		pollCtx,
+		entry,
+		entry.ResultC,
+		entry.OrderID,
+		entry.Side,
+		entry.Intent.Deadline,
+		entry.Intent.LimitPx,
+		entry.Intent.BaseAtLimit,
+		t.cfg.LimitPriceOffsetBps,
+	)
+}
+
+// Entry Producer Main Helper internal helps
+func (t *Trader) runPendingEntryPoller(
+	pollCtx context.Context,
+	entry *PendingEntry,
+	resultC chan OpenResult,
+	initialOrderID string,
+	side OrderSide,
+	deadline time.Time,
+	initialLimitPx float64,
+	initialBaseAtLimit float64,
+	offsetBps float64,
+) {
+	log.Printf(
+		"[TRACE] postonly.poll.start "+
+			"source=%s side=%s init_id=%s "+
+			"init_limit=%.8f init_base=%.8f "+
+			"deadline=%s offset_bps=%.3f",
+		entry.Source,
+		side,
+		initialOrderID,
+		initialLimitPx,
+		initialBaseAtLimit,
+		deadline.Format(time.RFC3339),
+		offsetBps,
+	)
+
+	defer log.Printf(
+		"[TRACE] postonly.poll.stopped "+
+			"source=%s side=%s initial_id=%s",
+		entry.Source,
+		side,
+		initialOrderID,
+	)
+
+	orderID := initialOrderID
+	lastLimitPx := initialLimitPx
+	lastReprice := time.Now()
+
+	var sessionBase float64
+	var sessionQuote float64
+	var sessionFee float64
+
+	var lastSeenBase float64
+	var lastSeenQuote float64
+	var lastSeenFee float64
+
+	var repriceCount int
+
+poll:
+	for time.Now().Before(deadline) {
+		select {
+		case <-pollCtx.Done():
+			log.Printf(
+				"[TRACE] postonly.poll.cancelled "+
+					"source=%s side=%s last_id=%s",
+				entry.Source,
+				side,
+				orderID,
+			)
+
+			break poll
+
+		default:
+		}
+
+		ord, getErr := t.broker.GetOrder(
+			pollCtx,
+			entry.Intent.ProductID,
+			orderID,
+		)
+
+		if getErr == nil && ord != nil {
+			dBase := ord.BaseSize - lastSeenBase
+			dQuote := ord.QuoteSpent - lastSeenQuote
+			dFee := ord.CommissionUSD - lastSeenFee
+
+			if dBase < 0 {
+				dBase = 0
 			}
 
-			ord, gErr := t.broker.GetOrder(pctx, t.cfg.ProductID, orderID)
-			if gErr == nil && ord != nil {
-				dBase := ord.BaseSize - lastSeenBase
-				dQuote := ord.QuoteSpent - lastSeenQuote
-				dFee := ord.CommissionUSD - lastSeenFee
+			if dQuote < 0 {
+				dQuote = 0
+			}
 
-				if dBase < 0 {
-					dBase = 0
-				}
-				if dQuote < 0 {
-					dQuote = 0
-				}
-				if dFee < 0 {
-					dFee = 0
-				}
+			if dFee < 0 {
+				dFee = 0
+			}
 
-				sessBase += dBase
-				sessQuote += dQuote
-				sessFee += dFee
+			sessionBase += dBase
+			sessionQuote += dQuote
+			sessionFee += dFee
 
-				lastSeenBase = ord.BaseSize
-				lastSeenQuote = ord.QuoteSpent
-				lastSeenFee = ord.CommissionUSD
+			lastSeenBase = ord.BaseSize
+			lastSeenQuote = ord.QuoteSpent
+			lastSeenFee = ord.CommissionUSD
 
-				status := strings.ToUpper(strings.TrimSpace(ord.Status))
+			entry.Intent.AccumBase = sessionBase
+			entry.Intent.AccumQuote = sessionQuote
+			entry.Intent.AccumFeeUSD = sessionFee
+
+			status := strings.ToUpper(
+				strings.TrimSpace(ord.Status),
+			)
+
+			log.Printf(
+				"[TRACE] postonly.poll.tick "+
+					"source=%s side=%s order_id=%s status=%s "+
+					"price=%.8f base=%.8f quote=%.2f fee=%.6f "+
+					"sess_agg[base=%.8f quote=%.2f fee=%.6f] "+
+					"reprices=%d",
+				entry.Source,
+				side,
+				orderID,
+				status,
+				ord.Price,
+				ord.BaseSize,
+				ord.QuoteSpent,
+				ord.CommissionUSD,
+				sessionBase,
+				sessionQuote,
+				sessionFee,
+				repriceCount,
+			)
+
+			switch status {
+			case "FILLED":
+				placed := placedOrderFromAggregate(
+					sessionBase,
+					sessionQuote,
+					sessionFee,
+				)
 
 				log.Printf(
-					"[TRACE] postonly.poll.tick side=%s order_id=%s status=%s price=%.8f base=%.8f quote=%.2f fee=%.6f sess_agg[base=%.8f quote=%.2f fee=%.6f] reprices=%d",
-					side,
+					"[TRACE] postonly.filled "+
+						"source=%s order_id=%s "+
+						"price=%.8f baseFilled=%.8f "+
+						"quoteSpent=%.2f fee=%.4f",
+					entry.Source,
 					orderID,
-					status,
 					ord.Price,
 					ord.BaseSize,
 					ord.QuoteSpent,
 					ord.CommissionUSD,
-					sessBase,
-					sessQuote,
-					sessFee,
+				)
+
+				log.Printf(
+					"[KPI] maker.open.filled "+
+						"source=%s side=%s vwap=%.8f "+
+						"base=%.8f quote=%.2f fee=%.6f "+
+						"order_id=%s",
+					entry.Source,
+					side,
+					placed.Price,
+					placed.BaseSize,
+					placed.QuoteSpent,
+					placed.CommissionUSD,
+					orderID,
+				)
+
+				safeSend(
+					resultC,
+					OpenResult{
+						Filled:  true,
+						Placed:  placed,
+						OrderID: orderID,
+					},
+				)
+
+				return
+
+			case "PARTIALLY_FILLED", "NEW", "PENDING_CANCEL":
+				if t.pendingEntryCancelRequested(entry) {
+					log.Printf(
+						"[TRACE] postonly.reprice.skip.cancel_requested "+
+							"source=%s side=%s order_id=%s",
+						entry.Source,
+						side,
+						orderID,
+					)
+
+					lastReprice = time.Now()
+					break
+				}
+
+				repriceAfter := time.Duration(
+					t.cfg.RepriceIntervalMs,
+				) * time.Millisecond
+
+				if time.Since(lastReprice) < repriceAfter {
+					break
+				}
+
+				log.Printf(
+					"[TRACE] postonly.reprice.try "+
+						"source=%s side=%s order_id=%s "+
+						"status=%s last_limit=%.8f "+
+						"reprice_count=%d",
+					entry.Source,
+					side,
+					orderID,
+					status,
+					lastLimitPx,
 					repriceCount,
 				)
 
-				switch status {
-				case "FILLED":
-					vwap := 0.0
-					if sessBase > 0 {
-						vwap = sessQuote / sessBase
-					}
+				newID,
+					newLastLimitPx,
+					newRepriceCount,
+					didReprice := t.maybeRepriceOnce(
+					pollCtx,
+					entry,
+					orderID,
+					initialLimitPx,
+					initialBaseAtLimit,
+					lastLimitPx,
+					offsetBps,
+					repriceCount,
+				)
 
-					placed := &PlacedOrder{
-						Price:         vwap,
-						BaseSize:      sessBase,
-						QuoteSpent:    sessQuote,
-						CommissionUSD: sessFee,
-					}
-
-					log.Printf("[TRACE] postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
-						orderID, ord.Price, ord.BaseSize, ord.QuoteSpent, ord.CommissionUSD)
-
-					log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
-						side, orderID, true, sessBase, sessQuote, sessFee)
-
-					log.Printf("[KPI] maker.open.filled side=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f order_id=%s",
-						side, placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD, orderID)
-
-					safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
-					return
-
-				case "PARTIALLY_FILLED":
-					if t.pendingCancelRequested(side) {
-						log.Printf("[TRACE] postonly.reprice.skip.cancel_requested side=%s order_id=%s", side, orderID)
-						lastReprice = time.Now()
-						break
-					}
-
-					if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
-						log.Printf("[TRACE] postonly.reprice.try.partially side=%s order_id=%s last_limit=%.8f reprice_count=%d",
-							side, orderID, lastLimitPx, repriceCount)
-
-						newID, newLastLimitPx, newRepriceCount, did := t.maybeRepriceOnce(
-							pctx,
-							side,
-							orderID,
-							initLimitPx,
-							initBaseAtLimit,
-							lastLimitPx,
-							offsetBps,
-							pend,
-							repriceCount,
-						)
-
-						if did && newID != orderID {
-							log.Printf("[TRACE] postonly.reprice.swap.partially side=%s old_id=%s new_id=%s new_limit=%.8f count=%d",
-								side, orderID, newID, newLastLimitPx, newRepriceCount)
-							orderID = newID
-							lastLimitPx = newLastLimitPx
-							repriceCount = newRepriceCount
-							lastSeenBase, lastSeenQuote, lastSeenFee = 0, 0, 0
-						} else {
-							log.Printf("[TRACE] postonly.reprice.skip.partially side=%s order_id=%s reason=no_guard_or_no_improve last_limit=%.8f count=%d",
-								side, orderID, lastLimitPx, repriceCount)
-							lastLimitPx = newLastLimitPx
-							repriceCount = newRepriceCount
-						}
-
-						lastReprice = time.Now()
-					}
-
-				case "NEW", "PENDING_CANCEL":
-					if t.pendingCancelRequested(side) {
-						log.Printf("[TRACE] postonly.reprice.skip.cancel_requested side=%s order_id=%s", side, orderID)
-						lastReprice = time.Now()
-						break
-					}
-
-					if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
-						log.Printf("[TRACE] postonly.reprice.try.new side=%s order_id=%s last_limit=%.8f reprice_count=%d",
-							side, orderID, lastLimitPx, repriceCount)
-
-						newID, newLastLimitPx, newRepriceCount, did := t.maybeRepriceOnce(
-							pctx,
-							side,
-							orderID,
-							initLimitPx,
-							initBaseAtLimit,
-							lastLimitPx,
-							offsetBps,
-							pend,
-							repriceCount,
-						)
-
-						if did && newID != orderID {
-							log.Printf("[TRACE] postonly.reprice.swap.new side=%s old_id=%s new_id=%s new_limit=%.8f count=%d",
-								side, orderID, newID, newLastLimitPx, newRepriceCount)
-							orderID = newID
-							lastLimitPx = newLastLimitPx
-							repriceCount = newRepriceCount
-							lastSeenBase, lastSeenQuote, lastSeenFee = 0, 0, 0
-						} else {
-							log.Printf("[TRACE] postonly.reprice.skip.new side=%s order_id=%s reason=no_guard_or_no_improve last_limit=%.8f count=%d",
-								side, orderID, lastLimitPx, repriceCount)
-							lastLimitPx = newLastLimitPx
-							repriceCount = newRepriceCount
-						}
-
-						lastReprice = time.Now()
-					}
-
-				case "CANCELED", "REJECTED", "EXPIRED":
-					if sessBase > 0 || sessQuote > 0 {
-						vwap := 0.0
-						if sessBase > 0 {
-							vwap = sessQuote / sessBase
-						}
-
-						placed := &PlacedOrder{
-							Price:         vwap,
-							BaseSize:      sessBase,
-							QuoteSpent:    sessQuote,
-							CommissionUSD: sessFee,
-						}
-
-						log.Printf("[KPI] maker.open.filled side=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f order_id=%s status=%s",
-							side, vwap, sessBase, sessQuote, sessFee, orderID, status)
-
-						log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
-							side, orderID, true, sessBase, sessQuote, sessFee)
-
-						safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
-					} else {
-						log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
-							side, orderID, false, sessBase, sessQuote, sessFee)
-
-						safeSend(ch, OpenResult{Filled: false, Placed: nil, OrderID: orderID})
-					}
-
-					log.Printf("[TRACE] postonly.poll.done side=%s order_id=%s final=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f",
+				if didReprice && newID != orderID {
+					log.Printf(
+						"[TRACE] postonly.reprice.swap "+
+							"source=%s side=%s old_id=%s "+
+							"new_id=%s new_limit=%.8f count=%d",
+						entry.Source,
 						side,
 						orderID,
-						status,
-						func() float64 {
-							if sessBase > 0 {
-								return sessQuote / sessBase
-							}
-							return 0
-						}(),
-						sessBase,
-						sessQuote,
-						sessFee,
+						newID,
+						newLastLimitPx,
+						newRepriceCount,
 					)
 
-					return
+					oldID := orderID
+
+					orderID = newID
+					lastLimitPx = newLastLimitPx
+					repriceCount = newRepriceCount
+
+					lastSeenBase = 0
+					lastSeenQuote = 0
+					lastSeenFee = 0
+
+					t.rekeyPendingEntry(
+						entry,
+						oldID,
+						newID,
+					)
+				} else {
+					log.Printf(
+						"[TRACE] postonly.reprice.skip "+
+							"source=%s side=%s order_id=%s "+
+							"reason=no_guard_or_no_improve "+
+							"last_limit=%.8f count=%d",
+						entry.Source,
+						side,
+						orderID,
+						newLastLimitPx,
+						newRepriceCount,
+					)
+
+					lastLimitPx = newLastLimitPx
+					repriceCount = newRepriceCount
 				}
-			}
 
-			select {
-			case <-pctx.Done():
-				log.Printf("[TRACE] postonly.poll.cancelled side=%s last_id=%s", side, orderID)
-				break poll
-			case <-time.After(200 * time.Millisecond):
+				lastReprice = time.Now()
+
+			case "CANCELED", "REJECTED", "EXPIRED":
+				if sessionBase > 0 || sessionQuote > 0 {
+					placed := placedOrderFromAggregate(
+						sessionBase,
+						sessionQuote,
+						sessionFee,
+					)
+
+					log.Printf(
+						"[KPI] maker.open.filled "+
+							"source=%s side=%s vwap=%.8f "+
+							"base=%.8f quote=%.2f fee=%.6f "+
+							"order_id=%s status=%s",
+						entry.Source,
+						side,
+						placed.Price,
+						placed.BaseSize,
+						placed.QuoteSpent,
+						placed.CommissionUSD,
+						orderID,
+						status,
+					)
+
+					safeSend(
+						resultC,
+						OpenResult{
+							Filled:  true,
+							Placed:  placed,
+							OrderID: orderID,
+						},
+					)
+				} else {
+					safeSend(
+						resultC,
+						OpenResult{
+							Filled:  false,
+							Placed:  nil,
+							OrderID: orderID,
+						},
+					)
+				}
+
+				log.Printf(
+					"[TRACE] postonly.poll.done "+
+						"source=%s side=%s order_id=%s "+
+						"final=%s vwap=%.8f base=%.8f "+
+						"quote=%.2f fee=%.6f",
+					entry.Source,
+					side,
+					orderID,
+					status,
+					vwapFromAggregate(
+						sessionBase,
+						sessionQuote,
+					),
+					sessionBase,
+					sessionQuote,
+					sessionFee,
+				)
+
+				return
 			}
 		}
 
-		_ = t.broker.CancelOrder(pctx, t.cfg.ProductID, orderID)
+		select {
+		case <-pollCtx.Done():
+			log.Printf(
+				"[TRACE] postonly.poll.cancelled "+
+					"source=%s side=%s last_id=%s",
+				entry.Source,
+				side,
+				orderID,
+			)
 
-		log.Printf("[TRACE] postonly.poll.timeout side=%s last_id=%s sess_base=%.8f sess_quote=%.2f sess_fee=%.6f",
-			side, orderID, sessBase, sessQuote, sessFee)
+			break poll
 
-		log.Printf("[TRACE] postonly.timeout order_id=%s", orderID)
-
-		if sessBase > 0 || sessQuote > 0 {
-			vwap := 0.0
-			if sessBase > 0 {
-				vwap = sessQuote / sessBase
-			}
-
-			placed := &PlacedOrder{
-				Price:         vwap,
-				BaseSize:      sessBase,
-				QuoteSpent:    sessQuote,
-				CommissionUSD: sessFee,
-			}
-
-			log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
-				side, orderID, true, sessBase, sessQuote, sessFee)
-
-			safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
-		} else {
-			log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
-				side, orderID, false, sessBase, sessQuote, sessFee)
-
-			safeSend(ch, OpenResult{Filled: false, Placed: nil, OrderID: orderID})
+		case <-time.After(200 * time.Millisecond):
 		}
-	}(initOrderID, side, deadline, initLimitPx, initBaseAtLimit, pend, ch, pctx)
+	}
 
-	log.Printf(
-		"[TRACE] case3B.replacement.posted side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f method=%s gate=%.6f reason=%s",
-		repl.Side,
-		orderID,
-		limitPx,
-		repl.Base,
-		repl.Base*limitPx,
-		repl.Method.String(),
-		repl.ProfitGateUSD,
-		repl.Reason,
+	/*
+		Use a non-cancelled context for the final exchange cancel.
+		The polling context may already be cancelled.
+	*/
+	cancelCtx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
 	)
 
-	return &StartedPendingEntry{
-		OrderID: orderID,
-		Pending: pend,
-		ResultC: ch,
-		Cancel:  cancel,
-	}, nil
+	cancelErr := t.broker.CancelOrder(
+		cancelCtx,
+		entry.Intent.ProductID,
+		orderID,
+	)
+
+	cancel()
+
+	if cancelErr != nil {
+		log.Printf(
+			"[WARN] postonly.poll.timeout_cancel_failed "+
+				"source=%s side=%s order_id=%s err=%v",
+			entry.Source,
+			side,
+			orderID,
+			cancelErr,
+		)
+	}
+
+	log.Printf(
+		"[TRACE] postonly.poll.timeout "+
+			"source=%s side=%s last_id=%s "+
+			"sess_base=%.8f sess_quote=%.2f sess_fee=%.6f",
+		entry.Source,
+		side,
+		orderID,
+		sessionBase,
+		sessionQuote,
+		sessionFee,
+	)
+
+	if sessionBase > 0 || sessionQuote > 0 {
+		placed := placedOrderFromAggregate(
+			sessionBase,
+			sessionQuote,
+			sessionFee,
+		)
+
+		safeSend(
+			resultC,
+			OpenResult{
+				Filled:  true,
+				Placed:  placed,
+				OrderID: orderID,
+			},
+		)
+
+		return
+	}
+
+	safeSend(
+		resultC,
+		OpenResult{
+			Filled:  false,
+			Placed:  nil,
+			OrderID: orderID,
+		},
+	)
+}
+func vwapFromAggregate(
+	base float64,
+	quote float64,
+) float64 {
+	if base <= 0 {
+		return 0
+	}
+
+	return quote / base
+}
+func placedOrderFromAggregate(
+	base float64,
+	quote float64,
+	feeUSD float64,
+) *PlacedOrder {
+	return &PlacedOrder{
+		Price:         vwapFromAggregate(base, quote),
+		BaseSize:      base,
+		QuoteSpent:    quote,
+		CommissionUSD: feeUSD,
+	}
+}
+func (t *Trader) rekeyPendingEntry(
+	entry *PendingEntry,
+	oldOrderID string,
+	newOrderID string,
+) {
+	newOrderID = strings.TrimSpace(newOrderID)
+
+	if entry == nil || newOrderID == "" {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	current, exists := t.pendingEntries[oldOrderID]
+
+	if exists && current == entry {
+		delete(t.pendingEntries, oldOrderID)
+	}
+
+	if oldOrderID != "" {
+		entry.Intent.History = appendOrderHistory(
+			entry.Intent.History,
+			oldOrderID,
+			5,
+		)
+	}
+
+	entry.OrderID = newOrderID
+	entry.Intent.OrderID = newOrderID
+
+	t.pendingEntries[newOrderID] = entry
+}
+func appendOrderHistory(
+	history []string,
+	orderID string,
+	max int,
+) []string {
+	orderID = strings.TrimSpace(orderID)
+
+	if orderID == "" {
+		return history
+	}
+
+	for _, existing := range history {
+		if existing == orderID {
+			return history
+		}
+	}
+
+	history = append(history, orderID)
+
+	if max > 0 && len(history) > max {
+		history = history[len(history)-max:]
+	}
+
+	return history
+}
+func (t *Trader) pendingEntryCancelRequested(
+	entry *PendingEntry,
+) bool {
+	if entry == nil || entry.Intent == nil {
+		return false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return entry.Intent.CancelRequested
+}
+func (t *Trader) maybeRepriceOnce(
+	pctx context.Context,
+	entry *PendingEntry,
+	orderID string,
+	initLimitPx float64,
+	initBaseAtLimit float64,
+	lastLimitPx float64,
+	offsetBps float64,
+	repriceCount int,
+) (
+	newOrderID string,
+	newLastLimitPx float64,
+	newRepriceCount int,
+	didReprice bool,
+) {
+	if entry == nil {
+		return orderID, lastLimitPx, repriceCount, false
+	}
+
+	intent := entry.Intent
+	if intent == nil {
+		return orderID, lastLimitPx, repriceCount, false
+	}
+
+	side := entry.Side
+
+	rpStart := time.Now()
+
+	// Global guards
+	if !t.cfg.RepriceEnable {
+		return orderID, lastLimitPx, repriceCount, false
+	}
+
+	if t.cfg.RepriceMaxCount > 0 &&
+		repriceCount >= t.cfg.RepriceMaxCount {
+		return orderID, lastLimitPx, repriceCount, false
+	}
+
+	bid, ask, bErr := t.broker.GetBBO(
+		pctx,
+		t.cfg.ProductID,
+	)
+
+	useBBO := bErr == nil &&
+		bid > 0 &&
+		ask > bid
+
+	var newLimitPx float64
+
+	if useBBO {
+
+		if side == SideBuy {
+			newLimitPx = bid
+		} else {
+			newLimitPx = ask
+		}
+
+	} else {
+
+		ctxPx, cancelPx := context.WithTimeout(
+			pctx,
+			time.Second,
+		)
+
+		px, gErr := t.broker.GetNowPrice(
+			ctxPx,
+			t.cfg.ProductID,
+		)
+
+		cancelPx()
+
+		if gErr != nil || px <= 0 {
+			return orderID, lastLimitPx, repriceCount, false
+		}
+
+		if side == SideBuy {
+			newLimitPx = px * (1.0 - offsetBps/10000.0)
+		} else {
+			newLimitPx = px * (1.0 + offsetBps/10000.0)
+		}
+	}
+
+	tick := t.cfg.PriceTick
+
+	if tick > 0 {
+
+		if side == SideBuy {
+			newLimitPx =
+				math.Floor(newLimitPx/tick) * tick
+		} else {
+			newLimitPx =
+				math.Ceil(newLimitPx/tick) * tick
+		}
+	}
+
+	if useBBO && tick > 0 {
+
+		if side == SideBuy {
+
+			if newLimitPx >= ask {
+
+				cand := ask - tick
+
+				if cand <= 0 {
+					return orderID, lastLimitPx, repriceCount, false
+				}
+
+				newLimitPx = cand
+			}
+
+		} else {
+
+			if newLimitPx <= bid {
+				newLimitPx = bid + tick
+			}
+		}
+
+	} else if useBBO && tick <= 0 {
+
+		if side == SideBuy &&
+			newLimitPx >= ask {
+
+			newLimitPx =
+				math.Nextafter(ask, 0)
+		}
+
+		if side == SideSell &&
+			newLimitPx <= bid {
+
+			newLimitPx =
+				math.Nextafter(bid, +1)
+		}
+	}
+
+	shouldReprice :=
+		(tick > 0 &&
+			math.Abs(newLimitPx-lastLimitPx) >= tick) ||
+			(tick <= 0 &&
+				newLimitPx != lastLimitPx)
+
+	if shouldReprice &&
+		t.cfg.RepriceMaxDriftBps > 0 {
+
+		drift :=
+			math.Abs(
+				(newLimitPx-initLimitPx)/
+					initLimitPx,
+			) * 10000.0
+
+		if drift > t.cfg.RepriceMaxDriftBps {
+			shouldReprice = false
+		}
+	}
+
+	newBase := initBaseAtLimit
+
+	if intent.Quote > 0 {
+		newBase = intent.Quote / newLimitPx
+	}
+
+	if t.cfg.BaseStep > 0 {
+		newBase =
+			math.Floor(newBase/t.cfg.BaseStep) *
+				t.cfg.BaseStep
+	}
+
+	if shouldReprice &&
+		!(newBase > 0 &&
+			newBase*newLimitPx >= t.cfg.MinNotional) {
+
+		shouldReprice = false
+	}
+
+	driftBps := 0.0
+
+	if initLimitPx > 0 {
+		driftBps =
+			math.Abs(
+				(newLimitPx-initLimitPx)/
+					initLimitPx,
+			) * 10000.0
+	}
+
+	improveTicks := 0.0
+
+	if tick > 0 {
+		improveTicks =
+			math.Abs(newLimitPx-lastLimitPx) /
+				tick
+	}
+
+	notional := newBase * newLimitPx
+
+	notionalOK :=
+		newBase > 0 &&
+			notional >= t.cfg.MinNotional
+
+	log.Printf(
+		"[TRACE] postonly.reprice.eval elapsed_ms=%d side=%s order_id=%s "+
+			"use_bbo=%v bid=%.8f ask=%.8f "+
+			"init_limit=%.8f last_limit=%.8f candidate_limit=%.8f "+
+			"tick=%.8f improve_ticks=%.2f "+
+			"drift_bps=%.4f max_drift_bps=%.4f "+
+			"new_base=%.8f notional=%.2f min_notional=%.2f notional_ok=%v "+
+			"should_reprice=%v reprice_count=%d max_count=%d",
+		time.Since(rpStart).Milliseconds(),
+		side,
+		orderID,
+		useBBO,
+		bid,
+		ask,
+		initLimitPx,
+		lastLimitPx,
+		newLimitPx,
+		tick,
+		improveTicks,
+		driftBps,
+		t.cfg.RepriceMaxDriftBps,
+		newBase,
+		notional,
+		t.cfg.MinNotional,
+		notionalOK,
+		shouldReprice,
+		repriceCount,
+		t.cfg.RepriceMaxCount,
+	)
+
+	if !shouldReprice {
+		return orderID, lastLimitPx, repriceCount, false
+	}
+
+	if useBBO {
+		log.Printf(
+			"[TRACE] postonly.reprice.touch side=%s bid=%.8f ask=%.8f new=%.8f last=%.8f",
+			side,
+			bid,
+			ask,
+			newLimitPx,
+			lastLimitPx,
+		)
+	} else {
+		log.Printf(
+			"[TRACE] postonly.reprice.mark side=%s new=%.8f last=%.8f",
+			side,
+			newLimitPx,
+			lastLimitPx,
+		)
+	}
+
+	_ = t.broker.CancelOrder(
+		pctx,
+		t.cfg.ProductID,
+		orderID,
+	)
+
+	newID, perr :=
+		t.broker.PlaceLimitPostOnly(
+			pctx,
+			t.cfg.ProductID,
+			side,
+			newLimitPx,
+			newBase,
+		)
+
+	if perr != nil ||
+		strings.TrimSpace(newID) == "" {
+
+		return orderID,
+			lastLimitPx,
+			repriceCount,
+			false
+	}
+
+	log.Printf(
+		"[TRACE] postonly.reprice side=%s old_id=%s new_id=%s limit=%.8f baseReq=%.8f",
+		side,
+		orderID,
+		newID,
+		newLimitPx,
+		newBase,
+	)
+
+	// Update pending intent.
+	intent.OrderID = newID
+	intent.LimitPx = newLimitPx
+	intent.BaseAtLimit = newBase
+
+	intent.History = appendOrderHistory(
+		intent.History,
+		orderID,
+		5,
+	)
+
+	// Move registry key.
+	t.rekeyPendingEntry(
+		entry,
+		orderID,
+		newID,
+	)
+
+	return newID,
+		newLimitPx,
+		repriceCount + 1,
+		true
 }
