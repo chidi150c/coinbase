@@ -314,6 +314,26 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 	}
 
+	// Fresh-state initialization for the equity strategy baseline.
+	// Run once after valid live equity is available.
+	if t.lastAddEquity <= 0 && t.equityUSD > 0 {
+		t.lastAddEquity = t.equityUSD
+		t.equityStageBuy = 0
+		t.equityStageSell = 0
+
+		log.Printf(
+			"[TRACE] equity.baseline.initialized equity=%.2f",
+			t.lastAddEquity,
+		)
+
+		if err := t.saveStateNoLock(); err != nil {
+			log.Printf(
+				"[TRACE] equity.baseline.initial_state_save_failed err=%v",
+				err,
+			)
+		}
+	}
+
 	// --- NEW: walk-forward (re)fit guard hook (no-op other than the guard) ---
 	_ = t.shouldRefit(len(execHistory)) // intentionally unused here (guard only)
 
