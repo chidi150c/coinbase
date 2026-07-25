@@ -77,6 +77,25 @@ Build PendingEntry
                ▼
 Return PendingEntry
 
+OpenResult & Commit Entry:
+pendingEntriesSnapshot()
+    ↓
+for each PendingEntry
+    ↓
+drainPendingEntry()
+        │
+        ├── nil/completed/channel checks
+        │
+        ├── CommitEligible?   ← Case3B waits here
+        │
+        ├── receive broker result
+        │
+        ├── validate OrderID / History
+        │
+        ├── commitEntryFill()
+        │
+        └── finish()
+
 
 Currently I have the followings configured[
     //OpenResult wrappers:
@@ -343,7 +362,7 @@ func (t *Trader) startPendingReplacementEntry(
 		History:          make([]string, 0, 5),
 		ConfidenceMult:   1.0,
 		ProfitGateUSD:    repl.ProfitGateUSD,
-		EntryAIMode:      repl.Method.String(),
+		EntryMethod:      repl.Method.String(),
 		RefundPortionUSD: 0,
 	}
 
@@ -1237,7 +1256,7 @@ func (t *Trader) commitEntryFill(
 
 		RefundPortionUSD: pending.RefundPortionUSD,
 		ConfidenceMult:   pending.ConfidenceMult,
-		EntryAIMode:      pending.EntryAIMode,
+		EntryMethod:      pending.EntryMethod,
 		ProfitGateUSD:    pending.ProfitGateUSD,
 	}
 
@@ -1245,8 +1264,8 @@ func (t *Trader) commitEntryFill(
 		newLot.ConfidenceMult = 0
 	}
 
-	if newLot.EntryAIMode == "" {
-		newLot.EntryAIMode = "UNKNOWN"
+	if newLot.EntryMethod == "" {
+		newLot.EntryMethod = "UNKNOWN"
 	}
 
 	if newLot.ProfitGateUSD <= 0 {
@@ -1257,7 +1276,7 @@ func (t *Trader) commitEntryFill(
 		"[KPI] lot.created side=%s source=%s mode=%s conf=%.2f gate=%.2f order_id=%s",
 		newLot.Side,
 		entry.Source,
-		newLot.EntryAIMode,
+		newLot.EntryMethod,
 		newLot.ConfidenceMult,
 		newLot.ProfitGateUSD,
 		newLot.EntryOrderID,

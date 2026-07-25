@@ -1,464 +1,623 @@
-Coinbase Advanced Trade Bot (Go) + Bridge (FastAPI) + Monitoring Stack
-1) Repository Layout (~/coinbase)
-~/coinbase
-├── README.md
-├── backtest.go
-├── bot.log
-├── bot.pid
-├── bridge/
-│   ├── Dockerfile
-│   ├── __pycache__/
-│   ├── app.py
-│   └── requirements.txt
-├── broker.go
-├── broker_bridge.go
-├── broker_paper.go
-├── config.go
-├── data/
-│   └── BTC-USD.csv
-├── env.go
-├── go.mod
-├── go.sum
-├── indicators.go
-├── live.go
-├── main.go
-├── metrics.go
-├── model.go
-├── strategy.go
-├── trader.go
-├── tools/
-│   └── backfill_bridge_paged.go
-├── misc/
-│   ├── README.md
-│   ├── issues.md
-│   ├── prompt1.md
-│   ├── prompt2.md
-│   ├── prompt4A.md
-│   ├── prompt5.md
-│   ├── prompt5B.md
-│   ├── prompt6.md
-│   ├── prompt7_Change_Description.md
-│   ├── prompt7_Change_Proccess.md
-│   └── promtp7_Change_Tiny.md
-├── monitoring/
-│   ├── alertmanager/
-│   ├── docker-compose.yml
-│   ├── grafana/
-│   ├── grafana-data/
-│   └── prometheus/
-│       └── prometheus.yml
-└── verify.txt
+CONTINUATION CONTEXT — BINANCE BTCUSDT GO BOT ENTRY REFACTOR
+Date: 2026-07-23
+
+We are actively refactoring the Go trading bot. The priority is FAST IMPLEMENTATION and getting back to a compiling production build. Do not restart architectural brainstorming or propose endless new abstractions. Preserve behavior unless explicitly asked to change it.
 
+============================================================
+1. MAIN REFACTOR GOAL
+============================================================
 
-Integrated details (current truth):
+We are replacing the old fragmented entry lifecycle:
 
-The repository also contains:
+    pendingBuy  *PendingOpen
+    pendingSell *PendingOpen
+    pendingCase3B map[string]*PendingEntry
+
+with ONE unified registry:
+
+    pendingEntries map[string]*PendingEntry
+
+The map key is the exchange OrderID.
+
+PendingOpen is being REMOVED.
+
+PendingIntent = entry decision/order data.
+PendingEntry = live/runtime asynchronous entry lifecycle.
+
+Architecture:
+
+Decision Engine
+      ↓
+source-specific wrapper
+      ↓
+PendingIntent
+      ↓
+generic produceEntry()
+      ↓
+validatePendingIntent()
+      ↓
+submitPendingIntent()
+      ↓
+buildPendingEntry()
+      ↓
+registerPendingEntry()
+      ↓
+save state
+      ↓
+startEntryPoller()
+      ↓
+Exchange / repricing
+      ↓
+OpenResult
+      ↓
+ResultC
+      ↓
+generic drainPendingEntry()
+      ↓
+commitEntryFill()
+      ↓
+Position
+
+
+============================================================
+2. IMPORTANT STRUCTURE DECISIONS
+============================================================
+
+PendingEntry is generic.
+
+Current direction is approximately:
+
+    type PendingEntry struct {
+        Side    OrderSide
+        Source  EntrySource
+        OrderID string
+
+        Intent *PendingIntent
+
+        ResultC <-chan OpenResult
+        Cancel  context.CancelFunc
+
+        Book           *SideBook
+        PendingRecheck *bool
+        SpareUSD       *float64
+        LastAdd        *time.Time
+        WinExtreme     *float64
+        LatchedGate    *float64
+
+        EquityTriggered bool
+
+        SourceEntryOrderID string
+        Completed          bool
+
+        CommitEligible func(*PendingEntry) bool
+
+        clearOwner func()
+    }
+
+IMPORTANT:
+- Field is `Intent`, capital I. NOT `intent`.
+- Legacy `entry.Pending` is being removed/replaced by `entry.Intent`.
+- Do NOT reintroduce PendingOpen.
+- OrderID is generic and is also the pendingEntries map key.
+- SourceEntryOrderID is different: for Case3B it identifies the source position being recovered.
+
+
+============================================================
+3. PENDING INTENT
+============================================================
+
+PendingIntent contains the actual entry/order metadata such as:
+
+    Side
+    Source
+    LimitPx
+    BaseAtLimit
+    Quote
+    Take
+    Reason
+    RefundPortionUSD
+    ProductID
+    CreatedAt
+    Deadline
+    EquityBuy
+    EquitySell
+    OrderID
+    History
+    AccumBase
+    AccumQuote
+    AccumFeeUSD
+    ConfidenceMult
+    ProfitGateUSD
+    EntryMethod
+    CancelRequested
 
-Root Dockerfile (builds the bot binary at /app/bot using a distroless final stage).
+Do NOT put function callbacks such as CommitEligible inside PendingIntent.
+PendingIntent is data/persistable state.
+PendingEntry owns runtime behavior/callbacks.
 
-.dockerignore
 
-Makefile
+============================================================
+4. GENERIC ENTRY PRODUCER
+============================================================
 
-.github/workflows/ci.yml, .github/workflows/docker.yml, .github/workflows/deploy.yml
+The generic producer now owns:
 
-We sometimes create a local, not committed monitoring/docker-compose.override.yml on the VM only (e.g., to temporarily disable healthchecks). This file is not part of the baseline.
+    validate intent
+        ↓
+    submit maker order
+        ↓
+    create PendingEntry
+        ↓
+    register pendingEntries[OrderID]
+        ↓
+    persist state
+        ↓
+    start poll/reprice goroutine
+        ↓
+    return PendingEntry
 
-2) Runtime directories on the VM (outside the repo)
+Source wrappers construct PendingIntent and call produceEntry().
 
-/opt/coinbase/env/ — holds bot.env and bridge.env (mounted read-only).
+Normal BUY/SELL and Case3B should all eventually use this producer.
 
-/opt/coinbase/state/ — holds persisted bot state.
 
-Persisted state file (env-configured):
-STATE_FILE=/opt/coinbase/state/bot_state.json
+============================================================
+5. REGISTRY / CONCURRENCY
+============================================================
 
-Integrated details (from Text B):
-/opt/coinbase/state/bot_state.json — persisted bot state file (path set by STATE_FILE) used by trader.go.
+pendingEntries is the single source of truth.
 
-3) Services & Networking (~/coinbase/monitoring/docker-compose.yml)
+Registry mutation should be centralized through:
 
-bot
+    registerPendingEntry()
+    rekeyPendingEntry()
+    cleanup/removal via clearOwner or equivalent
 
-Image: ghcr.io/<owner>/coinbase-bot:latest
+registerPendingEntry() was updated to lock t.mu around map initialization/check/insertion.
 
-Command: ["-live","-interval","1"] (image entrypoint is /app/bot)
+Repricing:
+- Do NOT rekey twice.
+- We decided the poller should have one clear owner for rekey behavior.
+- Preserve OrderID/History behavior across reprices.
 
-Volumes:
+Poller context:
+- startEntryPoller(ctx, entry) owns creation of the child poller context.
+- buildPendingEntry() should not create a second unused context.
 
-/opt/coinbase/env:/opt/coinbase/env:ro
 
-/opt/coinbase/state:/opt/coinbase/state
+============================================================
+6. GENERIC DRAIN
+============================================================
 
-Env file: /opt/coinbase/env/bot.env
+step() should no longer drain BUY, SELL and Case3B separately.
 
-Expose: 8080
+We added:
 
-Restart: unless-stopped
+    func (t *Trader) pendingEntriesSnapshot() []*PendingEntry {
+        t.mu.Lock()
+        defer t.mu.Unlock()
 
-Healthcheck (when enabled): wget -qO- http://localhost:8080/healthz >/dev/null 2>&1 || exit 1
+        entries := make([]*PendingEntry, 0, len(t.pendingEntries))
+        for _, entry := range t.pendingEntries {
+            if entry != nil {
+                entries = append(entries, entry)
+            }
+        }
 
-Logging: json-file (max-size=10m, max-file=5)
+        return entries
+    }
 
-Networks: monitoring_network with aliases [bot, coinbase-bot]
+step() uses:
 
-bridge
+    entries := t.pendingEntriesSnapshot()
 
-Image: ghcr.io/<owner>/coinbase-bridge:latest
+    for _, entry := range entries {
+        t.drainPendingEntry(
+            entry,
+            now,
+            wallNow,
+        )
+    }
 
-Env file: /opt/coinbase/env/bridge.env
+The snapshot is intentional:
+- registry is copied under lock;
+- lock is released;
+- drain can remove entries safely.
 
-Expose: 8787
+Do NOT replace this with iteration while holding t.mu.
 
-Restart: unless-stopped
 
-Healthcheck (when enabled): wget -qO- http://localhost:8787/health >/dev/null 2>&1 || exit 1
+============================================================
+7. COMMIT ELIGIBILITY / CASE3B
+============================================================
 
-Networks: monitoring_network with alias bridge
+Old special function:
 
-prometheus
+    drainPendingCase3BEntries()
 
-Image: prom/prometheus:latest
+is being DELETED.
 
-Ports: 9090:9090
+The unique Case3B behavior was:
 
-Volumes:
+Do not consume/commit the replacement fill until the originating loss exit has committed.
 
-./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+That behavior is now attached to PendingEntry:
 
-monitoring_prometheus_data:/prometheus
+    CommitEligible func(*PendingEntry) bool
 
-Restart: unless-stopped
+At top of drainPendingEntry():
 
-Flag present: --storage.tsdb.retention.size=2GB
+    if entry == nil ||
+        entry.Completed ||
+        entry.ResultC == nil {
+        return
+    }
 
-alertmanager
+    if entry.CommitEligible != nil &&
+        !entry.CommitEligible(entry) {
+        return
+    }
 
-Image: prom/alertmanager:latest
+Normal BUY/SELL:
+    CommitEligible == nil
 
-Ports: 9093:9093
+Case3B:
+    CommitEligible = t.case3BCommitEligible
 
-Volumes: ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+Current eligibility function:
 
-Restart: unless-stopped
+    func (t *Trader) case3BCommitEligible(
+        entry *PendingEntry,
+    ) bool {
+        if t == nil || entry == nil {
+            return false
+        }
 
-grafana
+        if entry.Source != EntrySourceCase3B {
+            return true
+        }
 
-Image: grafana/grafana:latest
+        sourceEntryOrderID :=
+            strings.TrimSpace(entry.SourceEntryOrderID)
 
-Ports: 3000:3000
+        if sourceEntryOrderID == "" {
+            return false
+        }
 
-Environment:
+        return !t.positionExistsByEntryOrderID(
+            sourceEntryOrderID,
+        )
+    }
 
-GF_SECURITY_ADMIN_USER=admin
+DO NOT refactor this further right now.
 
-GF_SECURITY_ADMIN_PASSWORD=admin
+The assignment should happen when generic buildPendingEntry() creates a Case3B PendingEntry:
 
-Volumes: monitoring_grafana_data:/var/lib/grafana
+    if intent.Source == EntrySourceCase3B {
+        entry.CommitEligible = t.case3BCommitEligible
+    }
 
-Depends on: prometheus, bot, bridge
+Normal entries naturally leave the callback nil.
 
-Networks
+Do not put the function in PendingIntent.
 
-Single: monitoring_network (bridge driver)
 
-Volumes
+============================================================
+8. ENTRY POLICY / CASE 10
+============================================================
 
-monitoring_prometheus_data
+We introduced source-based EntryPolicy:
 
-monitoring_grafana_data
+    type EntryPolicy struct {
+        ResetLastAdd
+        ResetWinExtreme
+        ResetLatchedGate
+        AllowRunner
+        UpdateEquityBaseline
+        ResetRegime
+    }
 
-Prometheus config (monitoring/prometheus/prometheus.yml):
+Normal entries:
+    ResetRegime = true
 
-global:
-  scrape_interval: 15s
-rule_files:
-  - /etc/prometheus/rules.yml
-alerting:
-  alertmanagers:
-    - static_configs:
-        - targets: ["alertmanager:9093"]
-scrape_configs:
-  - job_name: "prometheus"
-    static_configs:
-      - targets: ["localhost:9090"]
-  - job_name: "coinbase-bot"
-    static_configs:
-      - targets: ["bot:8080"]
+Case3B:
+    ResetRegime = false
 
+Case 10 behavior:
 
-Integrated details (from Text A):
-Ports remain: bot :8080, bridge :8787. Prometheus scrapes bot at http://bot:8080/metrics.
+A successful NORMAL entry resets directional regime only when entry agrees with current regime:
 
-4) Go Bot (core)
-Files & roles
+    UP   + BUY  -> NORMAL
+    DOWN + SELL -> NORMAL
 
-env.go — loads whitelisted env keys into config.
+Case3B replacement DOES NOT reset regime.
 
-config.go — Config with all trading knobs; extended toggles; fee config.
+Reason:
+A DOWN regime + successful SELL means the current directional opportunity was consumed.
+If the market continues making fresh lower lows, normal regime detection can switch it DOWN again.
+Otherwise the downtrend may be exhausted and NORMAL should persist.
 
-metrics.go — Prometheus exposition and counters/gauges on :8080/metrics.
+Current helpers:
 
-trader.go — in-memory state + synchronized step() loop; pyramiding; runner trailing; fees & PnL; persistence to STATE_FILE; daily breaker; partial-fill & commission handling.
+    func (t *Trader) toNormal(reason string)
 
-broker.go / broker_bridge.go — broker interface and Bridge-backed implementation (PlaceMarketQuote(...)); PaperBroker supported.
+    func (t *Trader) shouldResetRegime(side OrderSide) bool
 
-live.go — live loop with tick nudging via bridge.
+Do not reopen Case 10 design right now.
 
-backtest.go — CSV backtest (1m candles), train/test split, warmup pacing, model fit.
 
-strategy.go / model.go / indicators.go — BUY/SELL thresholds and model heads (baseline/extended); SMA/RSI/ZScore.
+============================================================
+9. RESERVATION ACCOUNTING IN step()
+============================================================
 
-HTTP surfaces (bot)
+Old code used:
 
-:8080/healthz
+    t.pendingSell
+    t.pendingBuy
 
-:8080/metrics (Prometheus)
+Those fields are gone.
 
-Metrics (names)
+Behavior MUST remain:
 
-bot_orders_total{mode,side}
+- BUY live lots reserve base.
+- pending SELL reserves base when RequireBaseForShort.
+- SELL live lots reserve quote + fee.
+- pending BUY reserves quote + fee.
 
-bot_decisions_total{signal}
+Use pendingEntriesSnapshot() and entry.Intent.
 
-bot_trades_total{result=open|win|loss}
+Example direction:
 
-bot_equity_usd
+    pendingEntries := t.pendingEntriesSnapshot()
 
-bot_model_mode{mode}
+    for _, entry := range pendingEntries {
+        if entry == nil ||
+            entry.Completed ||
+            entry.Intent == nil {
+            continue
+        }
 
-bot_vol_risk_factor
+        intent := entry.Intent
 
-bot_walk_forward_fits_total
+        switch entry.Side {
+        case SideSell:
+            if t.cfg.RequireBaseForShort {
+                reservedLongBase += intent.BaseAtLimit
+            }
 
-Trading config (env keys; exact names)
-# === Trading target / cadence ===
-PRODUCT_ID=BTC-USD
-GRANULARITY=ONE_MINUTE
-USE_TICK_PRICE=true
-TICK_INTERVAL_SEC=1
-CANDLE_RESYNC_SEC=60
+        case SideBuy:
+            reservedShortQuoteWithFee +=
+                intent.Quote * feeMult
+        }
+    }
 
-# === Risk & sizing ===
-ORDER_MIN_USD=5.00
-MAX_DAILY_LOSS_PCT=2.0
-RISK_PER_TRADE_PCT=20.0
-USD_EQUITY=68.5
-MAX_HISTORY_CANDLES=5000
+IMPORTANT:
+Use `entry.Intent`, NOT `entry.intent`.
+Use `entry.Intent`, NOT legacy `entry.Pending`.
 
-# === Position controls ===
-DRY_RUN=false
-LONG_ONLY=true
-ALLOW_PYRAMIDING=true
-PYRAMID_MIN_ADVERSE_PCT=1.5
-PYRAMID_DECAY_LAMBDA=0.02
-PYRAMID_MIN_SECONDS_BETWEEN=0
-MAX_CONCURRENT_LOTS=20
-PYRAMID_DECAY_MIN_PCT=0.4
 
-# --- optional: per-add TP decay for scalp lots ---
-SCALP_TP_DECAY_ENABLE=true
-SCALP_TP_DEC_MODE=exp
-SCALP_TP_DEC_PCT=0.20
-SCALP_TP_DECAY_FACTOR=0.9802
-SCALP_TP_MIN_PCT=1.55
+============================================================
+10. CURRENT BUILD ERRORS
+============================================================
 
-# === Exits (TP/SL + runner trailing) ===
-TAKE_PROFIT_PCT=1.9
-STOP_LOSS_PCT=1000.00
-TRAIL_ACTIVATE_PCT=1.9
-TRAIL_DISTANCE_PCT=0.4
+Latest:
 
-# === Fees & state ===
-FEE_RATE_PCT=0.75
-STATE_FILE=/opt/coinbase/state/bot_state.json
+    go build .
 
-# === Strategy thresholds ===
-BUY_THRESHOLD=0.45
-SELL_THRESHOLD=0.55
-USE_MA_FILTER=true
-BACKTEST_SLEEP_MS=100
+produced:
 
-# === Ops ===
-PORT=8080
-BRIDGE_URL=http://bridge:8787
-USE_LIVE_EQUITY=true
-MODEL_MODE=extended
-WALK_FORWARD_MIN=1
-VOL_RISK_ADJUST=true
-DAILY_BREAKER_MARK_TO_MARKET=true
-# SLACK_WEBHOOK=https://hooks.slack.com/services/XXX/YYY/ZZZ
+    ./trader.go:1875:21: undefined: ReplacementRequest
+    ./trader.go:1881:56: undefined: ReplacementRequest
+    ./trader.go:3639:7: undefined: ReplacementRequest
 
-Behavior (invariants)
+    ./step.go:1017:9:
+        entry.intent undefined
+        type *PendingEntry has field Intent
 
-Synchronized step() uses latest candle/tick; if candle time is zero, uses time.Now().UTC() for daily accounting.
+    ./step.go:1021:19:
+        entry.Pending undefined
 
-Long-only guard: discretionary SELL entries ignored while lots are open; exits by TP/SL/runner trailing.
+    ./step.go:1441...:
+        t.pendingBuy undefined
 
-Sizing: quote = max(ORDER_MIN_USD, (RISK_PER_TRADE_PCT/100)*equityUSD); base = quote/price.
+    ./step.go:1455...:
+        t.pendingSell undefined
 
-Pyramiding: spacing via PYRAMID_MIN_SECONDS_BETWEEN; adverse move vs last entry with time-decay eff = basePct * exp(-PYRAMID_DECAY_LAMBDA * minutes_since_lastAdd) floored at PYRAMID_DECAY_MIN_PCT; cap MAX_CONCURRENT_LOTS.
+    ...more errors hidden after "too many errors"
 
-Runner: first lot becomes runner (TP stretched ×2, SL baseline); other lots are scalps with optional per-add TP decay (linear or exponential) floored at SCALP_TP_MIN_PCT.
+Immediate fixes:
+- entry.intent -> entry.Intent
+- entry.Pending -> entry.Intent where this is legacy PendingOpen metadata.
+- remaining pendingBuy/pendingSell code must migrate to pendingEntries.
+- ReplacementRequest needs to be resolved next.
 
-Trailing (runner): activates at TRAIL_ACTIVATE_PCT, trails by TRAIL_DISTANCE_PCT. On runner close, newest remaining lot is promoted and its trailing fields reset.
 
-Fees & PnL: prefers broker-provided Price, BaseSize, CommissionUSD; warns on partial fills; subtracts entry + exit fees.
+============================================================
+11. REPLACEMENTREQUEST / CASE3B — WHERE WE STOPPED
+============================================================
 
-Daily breaker: MAX_DAILY_LOSS_PCT enforced.
+We were just starting to fix the Case3B retry flow.
 
-Persistence: atomic save to STATE_FILE (.tmp then rename).
+The uploaded closeLot() still uses ReplacementRequest heavily.
 
-New live-order feature (insufficient funds fallback)
+Current Case3B recovery behavior in closeLot():
 
-In trader.go open-order path, if PlaceMarketQuote(...) fails with “insufficient funds” (case-insensitive match on insufficient/fund or relevant status), the bot logs:
+SELL threshold_stop_loss with actual loss.
 
-[WARN] open order %.2f USD failed (%v); retrying with ORDER_MIN_USD=%.2f
+Mode A:
+- sufficient spare base;
+- allowed in ANY regime;
+- replacement base = normalBase + extraBase;
+- method RecoveryByPositionSize;
+- replacement should start before loss exit.
 
+Mode B CURRENT FILE:
+- insufficient spare;
+- only RegimeDown;
+- normalBase;
+- method RecoveryByProfitTarget;
+- ProfitGateUSD = cfg.ProfitGateUSD + recoveryNetUSD.
 
-…then retries once using quote = ORDER_MIN_USD. On second failure it returns the error.
+The current closeLot file explicitly contains this behavior. Do not accidentally change it while fixing compile errors.
 
-5) Python Bridge (FastAPI) — bridge/app.py
+Mode A flow:
+    startCase3BReplacement(ctx, repl)
+    BEFORE loss exit.
+    If replacement fails, abort loss exit.
 
-Runtime: uvicorn app:app --host 0.0.0.0 --port 8787
-Endpoints:
+Mode B maker-exit flow:
+    start loss exit
+    then startCase3BReplacement(ctx, repl)
+    if replacement fails:
+        markCase3BReplacementRetryLocked(...)
 
-GET /health
+Mode B market-exit flow:
+    market exit accepted
+    then startCase3BReplacement(ctx, repl)
+    if replacement fails:
+        markCase3BReplacementRetryLocked(...)
 
-GET /accounts?limit=
+The file still declares:
 
-GET /product/{product_id}
+    var repl ReplacementRequest
 
-GET /candles?granularity&limit&product_id (limit ≤ 350)
+and constructs ReplacementRequest values.
 
-GET /price?product_id= (uses latest WS tick or marks stale)
+So the current undefined ReplacementRequest build errors must be resolved without losing this behavior.
 
-POST /orders/market_buy
+IMPORTANT HISTORICAL REQUIREMENT:
+There was also a newer desired Case3B Mode B rule discussed:
 
-POST /order/market (BUY/SELL by quote size)
+    Insufficient spare base
+    + UP regime
+    + MACD strong
+    + (EMA high peak || EMA up-down)
+    -> Mode B replacement
 
-WebSocket (optional): subscribes to Advanced Trade WS; caches _last_ticks by product.
+But the currently uploaded closeLot() still implements Mode B only in DOWN.
+Do NOT silently implement the newer UP/MACD/EMA rule while merely fixing compilation.
+That should be handled deliberately afterward.
 
-Bridge env (/opt/coinbase/env/bridge.env):
 
-COINBASE_API_KEY_NAME=organizations/.../apiKeys/...
-COINBASE_API_PRIVATE_KEY=-----BEGIN EC PRIVATE KEY-----\n...\n-----END EC PRIVATE KEY-----\n
-COINBASE_API_BASE=https://api.coinbase.com
-PORT=8787
-# Optional WS
-COINBASE_WS_ENABLE=true
-COINBASE_WS_PRODUCTS=BTC-USD[,ETH-USD,...]
-COINBASE_WS_URL=wss://advanced-trade-ws.coinbase.com
-COINBASE_WS_STALE_SEC=10
+============================================================
+12. CURRENT RETRY BLOCK
+============================================================
 
-6) Metrics & Monitoring
+We had just pasted this retry block and were about to refactor it:
 
-Prometheus scrapes bot at http://bot:8080/metrics.
+    if t.PendingReplacementRetry.Enabled {
+        repl := t.PendingReplacementRetry.Replacement
 
-Grafana (admin/admin) visualizes equity curve, trades, MA overlays, breaker status, PnL/daily changes, volatility factor.
+        OrderID, err := t.startCase3BReplacement(
+            ctx,
+            repl,
+        )
+        if err != nil {
+            log.Printf(
+                "[TRACE] case3B.retry.failed method=%s err=%v",
+                repl.Method.String(),
+                err,
+            )
+        } else {
+            log.Printf(
+                "[TRACE] case3B.retry.started method=%s replacement_order_id=%s",
+                repl.Method.String(),
+                OrderID,
+            )
 
-Alertmanager integrates with Slack; alerts on downtime, “0-decisions” windows, equity drops.
+            t.PendingReplacementRetry.Enabled = false
 
-7) Container Images (GHCR)
+            if err := t.saveStateNoLock(); err != nil {
+                log.Printf(
+                    "[TRACE] case3B.retry.state_save_failed replacement_order_id=%s err=%v",
+                    OrderID,
+                    err,
+                )
+            }
+        }
+    }
 
-Bot: ghcr.io/${{ github.repository_owner }}/coinbase-bot:latest and :${{ github.sha }}
+THIS IS WHERE IMPLEMENTATION SHOULD RESUME.
 
-Bridge: ghcr.io/${{ github.repository_owner }}/coinbase-bridge:latest and :${{ github.sha }}
+Need determine how PendingReplacementRetry.Replacement should evolve now that ReplacementRequest is undefined and Case3B ultimately feeds the generic PendingIntent/PendingEntry producer.
 
-Root Dockerfile (bot)
+Do not invent a new architecture before inspecting the current relevant structs/functions.
 
-Builds statically-linked Go binary at /app/bot; distroless final image; entrypoint /app/bot.
 
-bridge/Dockerfile
+============================================================
+13. IMPORTANT: DO NOT REINTRODUCE OLD FIELDS
+============================================================
 
-FastAPI + Uvicorn; CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8787"].
+Do NOT restore:
 
-8) CI/CD (GitHub Actions)
+    pendingBuy *PendingOpen
+    pendingSell *PendingOpen
+    pendingCase3B map[string]*PendingEntry
 
-.github/workflows/ci.yml — “Go vet & test”
+Do NOT restore PendingOpen merely to make compilation pass.
 
-on: push to main
+The goal is to finish migration to:
 
-Steps: checkout → setup Go → cache modules → go vet ./... → go test -count=1 ./...
+    pendingEntries map[string]*PendingEntry
+    PendingIntent
+    PendingEntry
 
-.github/workflows/docker.yml — “Build & Push Images”
 
-on: push to main
+============================================================
+14. STEP() ENTRY PRODUCTION
+============================================================
 
-Login to GHCR with built-in ${{ secrets.GITHUB_TOKEN }}
+The old huge inline maker-first entry production in step() is being replaced by source wrappers + generic producer.
 
-Build & push both images (bot & bridge) to ghcr.io with tags :latest and :${{ github.sha }} (platform linux/amd64)
+Intended normal flow:
 
-.github/workflows/deploy.yml — “Deploy to Linode”
+    step()
+      ↓
+    startNormalBuyEntry()/startNormalSellEntry()
+      ↓
+    PendingIntent
+      ↓
+    produceEntry()
 
-on: workflow_run of “Build & Push Images” (only on main, only if success)
+Do not recreate inline:
+- PlaceLimitPostOnly
+- PendingOpen
+- custom goroutine
+- side-specific pending channels
 
-Secrets required:
 
-SSH_PRIVATE_KEY (matches a public key in /home/chidi/.ssh/authorized_keys on the VM)
+============================================================
+15. WORKING STYLE REQUIRED
+============================================================
 
-SSH_HOST (e.g., 172.236.14.121)
+User wants implementation instructions in this form:
 
-SSH_USER (e.g., chidi)
+    "Find this function signature:
+        func (...)
 
-Variables:
+     Replace the entire function with:
+        ..."
 
-DEPLOY_DIR (e.g., /home/chidi/coinbase/monitoring)
+or:
 
-Remote rollout script (exact):
+    "Find this exact block:
+        ...
 
-Ensure clone at /home/chidi/coinbase (remote set to HTTPS); if absent, git clone.
+     Replace it with:
+        ..."
 
-git fetch --all && git reset --hard origin/main to sync code.
+Do NOT give vague architecture-only advice when code can be supplied.
 
-cd "$DEPLOY_DIR" and docker compose up -d --pull=always --force-recreate.
+Do NOT keep suggesting further abstractions after the requested fix works.
 
-docker image prune -f.
+Do NOT change trading behavior unless explicitly requested.
 
-9) Dev & Ops Runbook (VM)
+For each compiler error:
+1. identify the old architecture assumption;
+2. give exact replacement;
+3. preserve existing behavior;
+4. rerun `go build .`;
+5. handle the next compiler errors.
 
-Validate compose
-
-docker compose -f /home/chidi/coinbase/monitoring/docker-compose.yml config >/dev/null && echo "compose OK"
-
-
-Bring up stack
-
-cd /home/chidi/coinbase/monitoring
-docker compose up -d --pull=always --force-recreate
-
-
-In-network health checks
-
-docker run --rm --network=monitoring_monitoring_network curlimages/curl:8.8.0 \
-  curl -fsS http://bot:8080/healthz && echo "bot OK"
-
-docker run --rm --network=monitoring_monitoring_network curlimages/curl:8.8.0 \
-  curl -fsS http://bridge:8787/health && echo "bridge OK"
-
-
-Prometheus flags (confirm retention)
-
-docker inspect monitoring-prometheus-1 --format '{{json .Config.Cmd}}' | jq -r .
-
-10) Backtest (backtest.go)
-
-Loads data/BTC-USD.csv (1m candles; ~5000–6000+ supported).
-
-Train/test split (70/30 default; configurable), warmup 50.
-
-Pacing via BACKTEST_SLEEP_MS.
-
-Uses same metric updates as live mode; DRY_RUN disables live order placement.
-
-Runtime configuration uses MAX_HISTORY_CANDLES for historical window sizing.
-
-11) State, Logs, Safety
-
-STATE_FILE=/opt/coinbase/state/bot_state.json must be writable via the bind mount.
-
-Logs include [TICK] and [DEBUG] lines; circuit breaker via MAX_DAILY_LOSS_PCT.
-
-Spot-only LONG mode: LONG_ONLY=true.
-
-ORDER_MIN_USD enforced as absolute floor on quote sizing.
+NEXT TASK:
+Continue from the Case3B retry flow / undefined ReplacementRequest errors.

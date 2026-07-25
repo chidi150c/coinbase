@@ -557,6 +557,80 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 					continue
 				}
 
+				// Cancel stale NORMAL pending opens if the current decision
+				// no longer supports their side.
+				//
+				// Do NOT remove the PendingEntry here.
+				// Do NOT cancel the poller context here.
+				// Let the async poller observe CANCELED/PARTIALLY_FILLED/FILLED
+				// and emit OpenResult.
+				entries := trader.pendingEntriesSnapshot()
+
+				for _, entry := range entries {
+					if entry == nil ||
+						entry.Completed ||
+						entry.Intent == nil {
+						continue
+					}
+
+					// Case3B replacement lifecycle is not controlled by the
+					// current normal entry signal.
+					if entry.Source == EntrySourceCase3B {
+						continue
+					}
+
+					stale := false
+
+					switch entry.Side {
+					case SideBuy:
+						stale = res.Signal != Buy
+
+					case SideSell:
+						stale = res.Signal != Sell
+
+					default:
+						continue
+					}
+
+					if !stale {
+						continue
+					}
+
+					trader.mu.Lock()
+
+					// Re-check while holding the lock in case the poller completed
+					// the entry after the snapshot was taken.
+					if entry.Completed ||
+						entry.Intent == nil ||
+						entry.Intent.CancelRequested {
+						trader.mu.Unlock()
+						continue
+					}
+
+					orderID := entry.Intent.OrderID
+					entry.Intent.CancelRequested = true
+
+					_ = trader.saveStateNoLock()
+
+					trader.mu.Unlock()
+
+					if orderID != "" {
+						_ = trader.broker.CancelOrder(
+							ctx,
+							trader.cfg.ProductID,
+							orderID,
+						)
+					}
+
+					switch entry.Side {
+					case SideBuy:
+						res.Msg = "HOLD pending BUY cancel requested: signal changed"
+
+					case SideSell:
+						res.Msg = "HOLD pending SELL cancel requested: signal changed"
+					}
+				}
+
 				trader.afterStepStateUpdate(time.Now().UTC(), res)
 
 				// -----------------------------------------------------------------
