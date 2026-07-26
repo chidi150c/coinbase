@@ -102,6 +102,7 @@ type FeatureSnapshot struct {
 
 	// MACD state
 	MACDLine            float64
+	MACDLinePrev6       float64
 	MACDTurningPoint    float64
 	MACDHist            float64
 	MACDHistDelta       float64
@@ -202,6 +203,7 @@ func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim i
 	longPrev3 := ema50[idx-3]
 
 	macdLineNow := macdLine[idx]
+	macdLinePrev6 := macdLine[idx-6]
 	macdTurningPoint := macdLine[idx-2]
 	histNow := macdHist[idx]
 	histDeltaNow := d3
@@ -325,6 +327,7 @@ func BuildFeatureSnapshot(c []Candle, idx int, macdLineEPS float64, FeatureDim i
 		EMASpreadPct:        emaSpreadPct,
 		EMAAlignStrength:    emaAlignStrength,
 		MACDLine:            macdLineNow,
+		MACDLinePrev6:       macdLinePrev6,
 		MACDTurningPoint:    macdTurningPoint,
 		MACDHist:            histNow,
 		MACDHistDelta:       histDeltaNow,

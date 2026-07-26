@@ -117,11 +117,14 @@ type EntryDecision struct {
 	LogicPatternSell        bool
 
 	// Logic interpretation context.
-	LogicEPS       float64
-	LogicBaseEPS   float64
-	LogicRegimeEPS float64
-	MarketRegime   MarketRegime
-	RegimeMult     float64
+	LogicEPS           float64
+	LogicBaseEPS       float64
+	LogicRegimeEPS     float64
+	MarketRegime       MarketRegime
+	RegimeMult         float64
+	LogicMACDLinePrev6 float64
+	MACDPrePeakZone    bool
+	PeakReversalSell   bool
 }
 
 // ExitDecision contains only the information required to
@@ -187,6 +190,7 @@ const (
 	EntryDecisionSourceNone          EntryDecisionSource = ""
 	EntryDecisionSourceLegacyPyramid EntryDecisionSource = "LEGACY_PYRAMID"
 	EntryDecisionSourceLegacyEquity  EntryDecisionSource = "LEGACY_EQUITY"
+	EntryDecisionSourcePeakReversal  EntryDecisionSource = "peak_reversal"
 )
 
 // EquityRawResult preserves the complete direction-independent Equity
@@ -385,11 +389,12 @@ type MACDResult struct {
 	Opinion Signal
 	EPS     float64
 
-	Line    float64
-	Turn    float64
-	Hist    float64
-	DHist   float64
-	DSmooth float64
+	Line      float64
+	LinePrev6 float64
+	Turn      float64
+	Hist      float64
+	DHist     float64
+	DSmooth   float64
 
 	StrongPositive bool
 	StrongNegative bool
@@ -1721,6 +1726,16 @@ func interpretPyramidSideRaw(
 //  3. Otherwise, the matching Pyramid gate must pass.
 //  4. Pyramid-only and Equity-only directions are not enabled yet.
 //  5. Sizing, LongOnly, lot caps, pending checks, and placement remain outside.
+//
+// combineEntryRawMaterials is the Case 5 final entry-decision engine.
+//
+// Case 11 adds an independent peak-reversal SELL producer:
+//
+//	MACD[idx-6] >= EPS - 10
+//	AND EMA high-peak
+//	AND Pyramid SELL gate
+//
+// Case 11 does not require AI SELL or legacy SELL.
 func (t *Trader) combineEntryRawMaterials(
 	ai AIResult,
 	macd MACDResult,
@@ -1734,6 +1749,26 @@ func (t *Trader) combineEntryRawMaterials(
 	if regimeMult <= 0 {
 		regimeMult = 1.0
 	}
+
+	// -----------------------------------------------------------------
+	// Case 11 — Peak reversal SELL producer.
+	//
+	// At the observed BTC price peak, MACD may still be below +EPS.
+	// Allow a fixed 10-point pre-EPS zone at idx-6, then require
+	// independent EMA high-peak geometry and the Pyramid SELL gate.
+	// -----------------------------------------------------------------
+	const macdPeakBuffer = 10.0
+
+	macdPrePeakThreshold :=
+		macd.EPS - macdPeakBuffer
+
+	macdPrePeakZone :=
+		macd.LinePrev6 >= macdPrePeakThreshold
+
+	peakReversalSell :=
+		macdPrePeakZone &&
+			ema.HighPeak &&
+			pyramid.Sell.GatePassed
 
 	d := EntryDecision{
 		Signal:         Flat,
@@ -1774,38 +1809,93 @@ func (t *Trader) combineEntryRawMaterials(
 		LogicEPS:     macd.EPS,
 		MarketRegime: t.MarketRegime,
 		RegimeMult:   regimeMult,
+
+		LogicMACDLinePrev6: macd.LinePrev6,
+		MACDPrePeakZone:    macdPrePeakZone,
+		PeakReversalSell:   peakReversalSell,
 	}
 
+	// -------------------------------------------------------------
+	// Case 11 has first priority because it is an independent
+	// directional producer, not an AI/Logic gate.
+	// -------------------------------------------------------------
+	if peakReversalSell {
+		d.Signal = Sell
+		d.DecisionSource =
+			EntryDecisionSourcePeakReversal
+
+		d.PyramidPass =
+			pyramid.Sell.GatePassed
+		d.PyramidReason =
+			pyramid.Sell.Reason
+
+		d.EquityPass =
+			equity.SellTrigger
+		d.EquityReason =
+			equity.Reason
+
+		log.Printf(
+			"[TRACE] case11.peak_reversal_sell "+
+				"macd_idx6=%.6f eps=%.6f buffer=%.2f threshold=%.6f "+
+				"macd_zone=%t ema_high_peak=%t pyramid_sell=%t",
+			macd.LinePrev6,
+			macd.EPS,
+			macdPeakBuffer,
+			macdPrePeakThreshold,
+			macdPrePeakZone,
+			ema.HighPeak,
+			pyramid.Sell.GatePassed,
+		)
+
+		return d
+	}
+
+	// -------------------------------------------------------------
+	// Existing Case 5 / legacy producer.
+	// -------------------------------------------------------------
 	switch legacySignal {
 	case Buy:
-		d.PyramidPass = pyramid.Buy.GatePassed
-		d.PyramidReason = pyramid.Buy.Reason
-		d.EquityPass = equity.BuyTrigger
-		d.EquityReason = equity.Reason
+		d.PyramidPass =
+			pyramid.Buy.GatePassed
+		d.PyramidReason =
+			pyramid.Buy.Reason
+		d.EquityPass =
+			equity.BuyTrigger
+		d.EquityReason =
+			equity.Reason
+
 		switch {
 		case equity.BuyTrigger:
 			d.Signal = Buy
-			d.DecisionSource = EntryDecisionSourceLegacyEquity
+			d.DecisionSource =
+				EntryDecisionSourceLegacyEquity
 
 		case pyramid.Buy.GatePassed:
 			d.Signal = Buy
-			d.DecisionSource = EntryDecisionSourceLegacyPyramid
+			d.DecisionSource =
+				EntryDecisionSourceLegacyPyramid
 		}
 
 	case Sell:
-		d.PyramidPass = pyramid.Sell.GatePassed
-		d.PyramidReason = pyramid.Sell.Reason
-		d.EquityPass = equity.SellTrigger
-		d.EquityReason = equity.Reason
+		d.PyramidPass =
+			pyramid.Sell.GatePassed
+		d.PyramidReason =
+			pyramid.Sell.Reason
+		d.EquityPass =
+			equity.SellTrigger
+		d.EquityReason =
+			equity.Reason
 
 		switch {
 		case equity.SellTrigger:
 			d.Signal = Sell
-			d.DecisionSource = EntryDecisionSourceLegacyEquity
+			d.DecisionSource =
+				EntryDecisionSourceLegacyEquity
 
 		case pyramid.Sell.GatePassed:
 			d.Signal = Sell
-			d.DecisionSource = EntryDecisionSourceLegacyPyramid
+			d.DecisionSource =
+				EntryDecisionSourceLegacyPyramid
 		}
 
 	default:
