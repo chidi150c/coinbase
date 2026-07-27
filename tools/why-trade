@@ -1,449 +1,889 @@
-# sudo rm /usr/local/bin/why-trade
-# sudo nano /usr/local/bin/why-trade 
-# copy and paste everything below before and do not include WHYTRADE_EOF
-
 #!/usr/bin/env bash
-# why-trade — explain trading decision/gates near a price, timestamp, or order-id
-# Default audit log: /opt/coinbase/logs/audit/binance_audit.log
-# Supports: price|ts|oid + optional chunking, rotated .gz audits, and side-aware filtering.
+# why-trade — explain one trading tick near a price, timestamp, or order ID.
+#
+# One tick is normally:
+#   [TRACE] step.start ...
+#       all events belonging to this step
+#   [TRACE] step.start ...   <-- next tick; excluded
+#
+# Historical rotated audits may be missing step.start markers while retaining
+# the per-second trading cycle. In ts mode, hotpath.price_fetched is therefore
+# a fallback tick anchor when it is nearer to the requested time.
+#
+# Behavior:
+#   price -> nearest step.start price
+#   ts    -> nearest usable tick time (step.start preferred on equal distance;
+#            hotpath.price_fetched fallback when step.start is missing)
+#   oid   -> order event, then nearest preceding step.start
+#
+# Default sources:
+#   1. Current audit log only
+#   2. Docker logs as recent/live fallback
+#
+# Rotated logs are NEVER searched automatically. Select one explicitly with -l.
+# why-trade NEVER creates files.
 
 set -euo pipefail
 
 LOG_DEFAULT="/opt/coinbase/logs/audit/binance_audit.log"
 SIDE_DEFAULT="BUY"
 WINDOW_DEFAULT=90
-CHUNK_MODE="none"   # none | raw | filter
+DOCKER_TS_WINDOW_MIN=15
+DOCKER_SOURCE="__WHY_TRADE_DOCKER__"
+
+CHUNK_MODE="none" # none | raw | filter
 AFTER_MODE=false
 AFTER_MIN=60
+LOG_EXPLICIT=false
+DOCKER_SINCE=""
+DOCKER_UNTIL=""
 
 usage() {
-  cat <<EOF
+  cat <<EOF_HELP
 Usage:
   why-trade price <PRICE> [-s BUY|SELL] [-l LOGFILE] [-w LINES] [--chunk | --chunk-filter | --after 60m]
-  why-trade ts    <TIMESTAMP_SUBSTR> [-s BUY|SELL] [-l LOGFILE] [-w LINES] [--chunk | --chunk-filter | --after 60m]
-  why-trade oid   <ORDER_ID> [-s BUY|SELL] [-l LOGFILE] [--chunk | --chunk-filter]
+  why-trade ts    <TIME>  [-s BUY|SELL] [-l LOGFILE] [-w LINES] [--chunk | --chunk-filter | --after 60m]
+  why-trade oid   <ORDER_ID> [-s BUY|SELL] [-l LOGFILE] [-w LINES] [--chunk | --chunk-filter]
 
 Description:
-  why-trade explains what the bot was doing near a price, timestamp, or order ID.
+  why-trade explains one trading tick. Normally a tick starts at
+  [TRACE] step.start and ends immediately before the next tick.
 
-  It searches the Binance audit log, finds the closest trading step, then shows
-  the surrounding decision, gate, order, funding, pyramid, and post-only events.
-
-  Default log:
-    ${LOG_DEFAULT}
+  In historical audits where step.start markers are missing, ts mode can use
+  [TRACE] hotpath.price_fetched as the tick anchor and stop before the next
+  hotpath.price_fetched.
 
 Modes:
   price <PRICE>
-    Finds the [TRACE] step.start line whose price is closest to PRICE.
+    Select the step.start whose livePrice= (or legacy price=) is nearest.
 
-  ts <TIMESTAMP_SUBSTR>
-    Finds the first log line matching the timestamp substring, then shows the
-    nearby trading step.
+  ts <TIME>
+    Select the nearest usable trading-tick time. Exact tick time is not
+    required.
+
+    Primary anchor:
+      [TRACE] step.start ts=2026-07-27T12:03:00Z ...
+
+    Historical fallback when step.start is missing:
+      2026/07/26 23:09:00 [TRACE] hotpath.price_fetched ...
+
+    The fallback uses the UTC log-prefix timestamp so a request such as
+    2026-07-26T23:09 can still select the nearest 23:09:xx trading cycle.
+
+    Examples:
+      why-trade ts 2026-07-27T12:03 --chunk-filter
+      why-trade ts 2026-07-27T12:03:27 -s SELL --chunk-filter
 
   oid <ORDER_ID>
-    Searches current and rotated audit logs for an order ID, then walks backward
-    to the nearest step.start.
+    Find an order event and walk backward to the step.start that owns it.
 
 Flags:
   -s BUY|SELL
-    Side-aware filtering for gate/order patterns.
-    Default: ${SIDE_DEFAULT}
+    Investigation side. Default: ${SIDE_DEFAULT}
 
   -l LOGFILE
-    Use a different audit log.
-    Default: ${LOG_DEFAULT}
+    Search exactly one explicitly selected file. This is how rotated logs
+    are investigated. Plain files and .gz files are supported directly.
+
+    Example:
+      why-trade ts 2026-07-26T23:09 \
+        -l /opt/coinbase/logs/audit/binance_audit.log-20260727.gz \
+        -s SELL \
+        --chunk-filter
+
+    why-trade does not decompress anything to disk and creates no files.
+
+    To create a temporary decompressed file yourself:
+      zcat /opt/coinbase/logs/audit/binance_audit.log-20260727.gz \
+        > /tmp/binance-audit-20260727.log
 
   -w LINES
-    Half-window context around the matched step.
-    Default: ${WINDOW_DEFAULT}
+    Half-window for context mode. Default: ${WINDOW_DEFAULT}
 
   --chunk
-    Show the full raw step chunk from nearest step.start to the next step.start.
+    Show every raw line in the selected tick.
 
   --chunk-filter
-    Show only key lines from the step chunk:
-      decisions
-      gates
-      order opens/closes
-      post-only events
-      funding errors
-      pyramid blocks
-      flat/hold output
+    Show key lines from the selected tick: Case 5, Case 11, decisions,
+    pyramid/latch, equity, regime, entry/exit, recovery, orders, post-only,
+    funding, gates, balance, hot-path timing, HOLD/FLAT.
 
-Examples:
-  why-trade price 74068.07 --chunk-filter
+  --after 60m
+    Show price-path outcome after the selected tick.
 
-  why-trade price 115,303.99 -s SELL --chunk-filter
+Default search policy without -l:
+  1. ${LOG_DEFAULT}
+  2. Docker logs near the requested time for ts mode
 
-  why-trade ts 2026-05-31T09:25 --chunk-filter
+Rotated logs are NOT searched automatically. If historical data is needed,
+why-trade lists available rotations and tells you to choose one with -l.
 
-  why-trade oid 50919131900 -s BUY --chunk-filter
+Behavior summary:
+  price -> nearest price
+  ts    -> nearest time
+  oid   -> owning step
 
-  why-trade price 74068.07 -w 150
-
-Typical workflow:
-  1. Use audit-grep to find a suspicious BUY/SELL/order:
-       audit-grep binance 'Decision=SELL|Decision=BUY|LIVE ORDER|postonly\.filled' -n
-
-  2. Copy the price, timestamp, or order ID.
-
-  3. Use why-trade to explain that moment:
-       why-trade price <PRICE> --chunk-filter
-       why-trade ts <TIME> --chunk-filter
-       why-trade oid <ORDER_ID> --chunk-filter
-
-Notes:
-  Use --chunk-filter first for clean output.
-  Use --chunk when you need the full raw step.
-  Use -s SELL when investigating sell-side gates.
-  Use -s BUY when investigating buy-side gates.
-EOF
+why-trade NEVER creates files.
+EOF_HELP
 }
 
-# --- Arg parse ---
-[[ $# -lt 2 ]] && { usage; exit 1; }
-MODE="$1"; shift
-SIDE="$SIDE_DEFAULT"; LOG="$LOG_DEFAULT"; W="$WINDOW_DEFAULT"
+# ---------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------
 
-POS=()
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -s) SIDE="${2:-}"; shift 2;;
-    -l) LOG="${2:-}"; shift 2;;
-    -w) W="${2:-}"; shift 2;;
-    --chunk) CHUNK_MODE="raw"; shift;;
-    --after) AFTER_MODE=true; AFTER_VAL="${2:-60m}"; AFTER_MIN="${AFTER_VAL%m}"; shift 2;;
-    --chunk-filter) CHUNK_MODE="filter"; shift;;
-    -h|--help) usage; exit 0;;
-    *) POS+=("$1"); shift;;
-  esac
-done
-
-[[ -f "$LOG" || -f "${LOG}.1" || -n "$(compgen -G "${LOG}*.gz" || true)" ]] || { echo "No audit logs at base: $LOG" >&2; exit 1; }
-
-# --- Helpers ---
-nearest_step_line_by_price() {
-  local price="$1" log="$2"
-  nl -ba "$log" | awk -v p="$price" '
-    /\[TRACE\] step.start/ && match($0,/price=([0-9]+\.[0-9]+)/,m) {
-      px=m[1]+0; d=px-p; if (d<0) d=-d; print d "\t" $1
-    }' | sort -n | head -1 | cut -f2
-}
-
-first_line_matching_ts() {
-  local ts="$1" log="$2"
-  nl -ba "$log" | grep -n -- "$ts" | head -1 | cut -d: -f1
-}
-
-next_step_line_after() {
-  local ln="$1" log="$2"
-  sed -n "$((ln+1)),\$p" "$log" | nl -ba -v $((ln+1)) | awk '/\[TRACE\] step.start/ {print $1; exit}'
-}
-
-filter_block() {
-  local side="$1"
-  local SIDE_LC; SIDE_LC=$(echo "$side" | tr '[:upper:]' '[:lower:]')
-  local PENDING="OPEN-PENDING side=${side}"
-  local MFALL="postonly\\.market_fallback\\.blocked side=${side}"
-  local PEND_SET="postonly\\.pending\\.set side=${side}"
-  grep -E "\[TRACE\] step.start|Decision=|${PENDING}|${MFALL}|${PEND_SET}|\
-FUNDS_EXHAUSTED ${side}|${SIDE_LC}\.gate\.(pre|block|post)|\
-pyramid\.(spacing|adverse|block\.${SIDE_LC})|\
-case3A\.|case3B\.|\
-case3A_|case3B_|\
-RecoveryByProfitTarget|RecoveryByPositionSize|\
-recovery|replacement|\
-GATE1 lot cap reached|EQUITY GATE: blocked|^FLAT \[|HOLD$|\
-order\.(open|close)|postonly\."
-}
-
-# Search current audit and rotated .gz for an order id; print "FILE:LINE:matched-line"
-search_oid_in_audit() {
-  local oid="$1" base="$2"
-  # Try plain file if present
-  if [[ -f "$base" ]] && grep -nq "$oid" "$base"; then
-    grep -n "$oid" "$base" | awk -v f="$base" '{print f":"$0}'
-    return 0
-  fi
-  # Try rotated .gz
-  shopt -s nullglob
-  local gz
-  for gz in "$base".*.gz; do
-    if zgrep -nq "$oid" "$gz"; then
-      zgrep -n "$oid" "$gz" | awk -v f="$gz" '{print f":"$0}'
-      return 0
-    fi
-  done
-  # Try .1 (uncompressed rotation)
-  if [[ -f "${base}.1" ]] && grep -nq "$oid" "${base}.1"; then
-    grep -n "$oid" "${base}.1" | awk -v f="${base}.1" '{print f":"$0}'
-    return 0
-  fi
-  return 1
-}
-
-print_chunk_around_line() {
-  local file="$1" line="$2" mode="$3" side="$4"
-  local next; next="$(next_step_line_after "$line" "${file%%.gz}" 2>/dev/null || true)"
-  local end
-  if [[ "$file" == *.gz ]]; then
-    end="$(zcat "$file" | wc -l | awk '{print $1}')"
-  else
-    end="$(wc -l < "$file")"
-  fi
-  local stop="${next:-$end}"
-  if [[ "$file" == *.gz ]]; then
-    if [[ "$mode" == "raw" ]]; then
-      zcat "$file" | sed -n "${line},$(( stop - 1 ))p"
-    else
-      zcat "$file" | sed -n "${line},$(( stop - 1 ))p" | filter_block "$side"
-    fi
-  else
-    if [[ "$mode" == "raw" ]]; then
-      sed -n "${line},$(( stop - 1 ))p" "$file"
-    else
-      sed -n "${line},$(( stop - 1 ))p" "$file" | filter_block "$side"
-    fi
-  fi
-}
-
-# Ensure our primary file has step markers if we’ll use price/ts modes on it
-ensure_has_steps_or_die() {
-  local f="$1"
-  if [[ -f "$f" ]] && grep -q "\[TRACE\] step.start" "$f"; then
-    return 0
-  fi
-  echo "No '\[TRACE\] step.start' in $f; try rotated logs or use OID mode." >&2
+[[ $# -lt 2 ]] && {
+  usage
   exit 1
 }
 
-analyze_after_path() {
-  local log="$1"
-  local start_line="$2"
-  local side="$3"
-  local after_min="$4"
+MODE="$1"
+shift
 
-  local start_row
-  start_row="$(sed -n "${start_line}p" "$log")"
+SIDE="$SIDE_DEFAULT"
+LOG="$LOG_DEFAULT"
+W="$WINDOW_DEFAULT"
+POS=()
 
-  local t0 price raw final pup reason
-  t0="$(echo "$start_row" | sed -n 's/.*ts=\([^ ]*\).*/\1/p')"
-  price="$(echo "$start_row" | sed -n 's/.*price=\([0-9.]*\).*/\1/p')"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s)
+      [[ $# -ge 2 ]] || { echo "Missing value for -s" >&2; exit 1; }
+      SIDE="$2"
+      shift 2
+      ;;
+    -l)
+      [[ $# -ge 2 ]] || { echo "Missing value for -l" >&2; exit 1; }
+      LOG="$2"
+      LOG_EXPLICIT=true
+      shift 2
+      ;;
+    -w)
+      [[ $# -ge 2 ]] || { echo "Missing value for -w" >&2; exit 1; }
+      W="$2"
+      shift 2
+      ;;
+    --chunk)
+      CHUNK_MODE="raw"
+      shift
+      ;;
+    --chunk-filter)
+      CHUNK_MODE="filter"
+      shift
+      ;;
+    --after)
+      [[ $# -ge 2 ]] || { echo "Missing value for --after" >&2; exit 1; }
+      AFTER_MODE=true
+      AFTER_VAL="$2"
+      AFTER_MIN="${AFTER_VAL%m}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      POS+=("$1")
+      shift
+      ;;
+  esac
+done
 
-  local debug_line
-  debug_line="$(sed -n "$((start_line+1)),$((start_line+20))p" "$log" | grep '\[DEBUG\] Total Lots=' | head -1)"
+SIDE="$(printf '%s' "$SIDE" | tr '[:lower:]' '[:upper:]')"
+case "$SIDE" in
+  BUY|SELL) ;;
+  *) echo "Invalid side '$SIDE'; expected BUY or SELL." >&2; exit 1 ;;
+esac
 
-  raw="$(echo "$debug_line" | grep -oE 'Raw=(BUY|SELL|FLAT)' | cut -d= -f2)"
-  final="$(echo "$debug_line" | grep -oE 'Decision=(BUY|SELL|FLAT)' | cut -d= -f2)"
-  pup="$(echo "$debug_line" | grep -oE 'pUp=[0-9.]+' | head -1 | cut -d= -f2)"
-  reason="$(echo "$debug_line" | sed -n 's/.*Reason=\(.*\) buyThresh=.*/\1/p')"
+[[ "$W" =~ ^[0-9]+$ ]] || { echo "Invalid -w value '$W'." >&2; exit 1; }
+[[ "$AFTER_MIN" =~ ^[0-9]+$ ]] || { echo "Invalid --after value '$AFTER_MIN'." >&2; exit 1; }
 
-  awk -v t0="$t0" -v entry="$price" -v side="$side" -v mins="$after_min" \
-      -v raw="$raw" -v final="$final" -v pup="$pup" -v reason="$reason" '
-    function pct(p) { return ((p-entry)/entry)*100.0 }
-    function fav(p) {
-      if (side=="SELL") return ((entry-p)/entry)*100.0
-      return ((p-entry)/entry)*100.0
-    }
-    function adv(p) {
-      if (side=="SELL") return ((p-entry)/entry)*100.0
-      return ((entry-p)/entry)*100.0
-    }
-    BEGIN {
-      print "Decision Snapshot"
-      print "-----------------"
-      print "ts=" t0
-      printf "price=%.2f\n", entry
-      print "Raw=" raw
-      print "Decision=" final
-      print "pUp=" pup
-      print ""
-      print "Reason:"
-      print reason
-      print ""
-      print "Path Outcome (+" mins "m)"
-      print "-------------------"
-    }
-    /\[TRACE\] step.start/ {
-      if (match($0,/ts=([^ ]+)/,tm) && match($0,/price=([0-9.]+)/,pm)) {
-        ts=tm[1]
-        px=pm[1]+0
+if [[ "$LOG_EXPLICIT" == true && ! -f "$LOG" ]]; then
+  echo "Log file not found: $LOG" >&2
+  exit 1
+fi
 
-        gsub("T"," ",ts)
-        gsub("Z","",ts)
-        gsub("T"," ",t0)
-        gsub("Z","",t0)
+# ---------------------------------------------------------------------------
+# Source abstraction — read only; no file creation
+# ---------------------------------------------------------------------------
 
-        cmd="date -u -d \"" ts "\" +%s"
-        cmd | getline now
-        close(cmd)
+read_source() {
+  local source="$1"
 
-        cmd="date -u -d \"" t0 "\" +%s"
-        cmd | getline start
-        close(cmd)
-
-        delta=int((now-start)/60)
-
-        if (delta >= 0 && delta <= mins) {
-          if (!(delta in seen)) {
-            seen[delta]=px
-          }
-
-          f=fav(px)
-          a=adv(px)
-
-          if (n==0 || f>mfe) mfe=f
-          if (n==0 || a>mae) mae=a
-          n++
-        }
-      }
-    }
-    END {
-      split("5 10 15 20 30 45 60", marks, " ")
-      for (i in marks) {
-        m=marks[i]
-        best=-1
-        for (d in seen) {
-          if (d <= m && d > best) best=d
-        }
-        if (best >= 0) {
-          px=seen[best]
-          printf "+%dm  %.2f  %.4f%%\n", m, px, pct(px)
-        }
-      }
-
-      print ""
-      printf "MFE (%s): %.4f%%\n", side, mfe
-      printf "MAE (%s): %.4f%%\n", side, mae
-      print ""
-      print "Verdict:"
-      if (mfe > mae && mfe >= 0.10) {
-        print side " would likely have worked."
-        if (raw==side && final=="FLAT") {
-          print "Gate blocked a favorable " side " setup."
-        }
-      } else if (mae > mfe) {
-        print side " would likely have failed or was risky."
-        if (raw==side && final=="FLAT") {
-          print "Gate may have protected the bot."
-        }
-      } else {
-        print "Outcome was inconclusive."
-      }
-    }
-  ' < <(sed -n "${start_line},\$p" "$log")
+  case "$source" in
+    "$DOCKER_SOURCE")
+      if [[ -n "$DOCKER_SINCE" && -n "$DOCKER_UNTIL" ]]; then
+        docker compose logs --no-color \
+          --since "$DOCKER_SINCE" \
+          --until "$DOCKER_UNTIL" \
+          bot_binance 2>/dev/null
+      else
+        docker compose logs --no-color bot_binance 2>/dev/null
+      fi
+      ;;
+    *.gz)
+      zcat -- "$source"
+      ;;
+    *)
+      cat -- "$source"
+      ;;
+  esac
 }
 
-# --- Main ---
+source_label() {
+  if [[ "$1" == "$DOCKER_SOURCE" ]]; then
+    printf '%s\n' "docker:bot_binance"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+current_sources() {
+  if [[ "$LOG_EXPLICIT" == true ]]; then
+    printf '%s\n' "$LOG"
+    return
+  fi
+
+  [[ -f "$LOG_DEFAULT" ]] && printf '%s\n' "$LOG_DEFAULT"
+  printf '%s\n' "$DOCKER_SOURCE"
+}
+
+show_rotated_help() {
+  local requested="${1:-<VALUE>}"
+  local mode="${2:-ts}"
+  local base="$LOG_DEFAULT"
+
+  echo >&2
+  echo "No suitable match was found in the current audit or Docker search window." >&2
+  echo "Historical data may be in a rotated audit." >&2
+  echo "Rotated audits are NOT searched automatically." >&2
+  echo >&2
+  echo "Available rotated audit files:" >&2
+
+  {
+    [[ -f "${base}.1" ]] && printf '%s\n' "${base}.1"
+    compgen -G "${base}-*.gz" || true
+    compgen -G "${base}.*.gz" || true
+  } | awk '!seen[$0]++' | sort -r | sed 's/^/  /' >&2
+
+  echo >&2
+  echo "Choose the file yourself, then run:" >&2
+  echo >&2
+
+  if [[ "$mode" == "ts" ]]; then
+    echo "  why-trade ts ${requested} \\" >&2
+  elif [[ "$mode" == "price" ]]; then
+    echo "  why-trade price ${requested} \\" >&2
+  else
+    echo "  why-trade oid ${requested} \\" >&2
+  fi
+
+  echo "    -l /opt/coinbase/logs/audit/<ROTATED_FILE> \\" >&2
+  echo "    -s ${SIDE} \\" >&2
+  echo "    --chunk-filter" >&2
+}
+
+# ---------------------------------------------------------------------------
+# Timestamp helpers — portable mawk-compatible epoch conversion
+# ---------------------------------------------------------------------------
+
+normalize_requested_epoch() {
+  date -u -d "$1" +%s 2>/dev/null
+}
+
+nearest_ts_in_source() {
+  local source="$1"
+  local target_epoch="$2"
+
+  read_source "$source" |
+    awk -v target="$target_epoch" '
+      function abs(v) { return v < 0 ? -v : v }
+      function leap_count(y) { return int(y/4) - int(y/100) + int(y/400) }
+
+      function epoch_parts(y,mo,d,h,mi,s,days,i) {
+        days = 365 * (y - 1970)
+        days += leap_count(y - 1) - leap_count(1969)
+
+        mdays[1]=31; mdays[2]=28; mdays[3]=31; mdays[4]=30
+        mdays[5]=31; mdays[6]=30; mdays[7]=31; mdays[8]=31
+        mdays[9]=30; mdays[10]=31; mdays[11]=30; mdays[12]=31
+
+        if ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) mdays[2]=29
+        for (i=1; i<mo; i++) days += mdays[i]
+        days += d - 1
+
+        return days * 86400 + h * 3600 + mi * 60 + s
+      }
+
+      function iso_epoch(ts,y,mo,d,h,mi,s) {
+        y=substr(ts,1,4)+0; mo=substr(ts,6,2)+0; d=substr(ts,9,2)+0
+        h=substr(ts,12,2)+0; mi=substr(ts,15,2)+0; s=substr(ts,18,2)+0
+        return epoch_parts(y,mo,d,h,mi,s)
+      }
+
+      function prefix_epoch(ts,y,mo,d,h,mi,s) {
+        y=substr(ts,1,4)+0; mo=substr(ts,6,2)+0; d=substr(ts,9,2)+0
+        h=substr(ts,12,2)+0; mi=substr(ts,15,2)+0; s=substr(ts,18,2)+0
+        return epoch_parts(y,mo,d,h,mi,s)
+      }
+
+      function consider(epoch,line_no,display_ts,kind,delta) {
+        delta=abs(epoch-target)
+
+        # Nearest time wins. If two anchors are equally near, prefer a real
+        # step.start over the historical hotpath fallback.
+        if (!found || delta < best_delta ||
+            (delta == best_delta && kind == "step_start" && best_kind != "step_start")) {
+          found=1
+          best_delta=delta
+          best_line=line_no
+          best_ts=display_ts
+          best_epoch=epoch
+          best_kind=kind
+        }
+      }
+
+      /\[TRACE\] step.start/ {
+        if (match($0,/ts=[^ ]+/)) {
+          ts=substr($0,RSTART,RLENGTH)
+          sub(/^ts=/,"",ts)
+          consider(iso_epoch(ts),NR,ts,"step_start")
+        }
+      }
+
+      /\[TRACE\] hotpath.price_fetched/ {
+        if (match($0,/[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) {
+          pfx=substr($0,RSTART,RLENGTH)
+          display=pfx
+          gsub(/\//,"-",display)
+          sub(/ /,"T",display)
+          display=display "Z"
+          consider(prefix_epoch(pfx),NR,display,"hotpath_price")
+        }
+      }
+
+      END {
+        if (found)
+          printf "%.0f\t%d\t%s\t%.0f\t%s\n",
+            best_delta,best_line,best_ts,best_epoch,best_kind
+      }
+    '
+}
+
+find_nearest_ts() {
+  local requested="$1"
+  local requested_epoch
+  local source hit delta line matched_ts matched_epoch anchor_kind
+  local best_delta="" best_source="" best_line="" best_ts="" best_epoch="" best_kind=""
+
+  requested_epoch="$(normalize_requested_epoch "$requested" || true)"
+  [[ -n "$requested_epoch" ]] || {
+    echo "Invalid timestamp '$requested'." >&2
+    return 1
+  }
+
+  while IFS= read -r source; do
+    [[ -n "$source" ]] || continue
+
+    hit="$(nearest_ts_in_source "$source" "$requested_epoch" || true)"
+    [[ -n "$hit" ]] || continue
+
+    IFS=$'\t' read -r delta line matched_ts matched_epoch anchor_kind <<< "$hit"
+
+    if [[ -z "$best_delta" ]] ||
+       awk -v a="$delta" -v b="$best_delta" \
+         -v ak="$anchor_kind" -v bk="$best_kind" \
+         'BEGIN { exit !((a < b) || (a == b && ak == "step_start" && bk != "step_start")) }'; then
+      best_delta="$delta"
+      best_source="$source"
+      best_line="$line"
+      best_ts="$matched_ts"
+      best_epoch="$matched_epoch"
+      best_kind="$anchor_kind"
+    fi
+  done < <(current_sources)
+
+  [[ -n "$best_source" ]] || return 1
+
+  # Without -l, do not substitute a distant current/Docker tick for an
+  # historical request. The user chooses rotated archives manually.
+  if [[ "$LOG_EXPLICIT" == false ]]; then
+    local max_delta=$((DOCKER_TS_WINDOW_MIN * 60))
+    if awk -v d="$best_delta" -v m="$max_delta" 'BEGIN { exit !(d > m) }'; then
+      return 1
+    fi
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$requested_epoch" "$best_delta" "$best_source" "$best_line" \
+    "$best_ts" "$best_epoch" "$best_kind"
+}
+
+# ---------------------------------------------------------------------------
+# Price helpers
+# ---------------------------------------------------------------------------
+
+nearest_price_in_source() {
+  local source="$1"
+  local target="$2"
+
+  read_source "$source" |
+    awk -v target="$target" '
+      function abs(v) { return v < 0 ? -v : v }
+
+      /\[TRACE\] step.start/ {
+        px=""
+
+        if (match($0,/livePrice=[0-9]+(\.[0-9]+)?/)) {
+          v=substr($0,RSTART,RLENGTH)
+          sub(/^livePrice=/,"",v)
+          px=v+0
+        } else if (match($0,/price=[0-9]+(\.[0-9]+)?/)) {
+          v=substr($0,RSTART,RLENGTH)
+          sub(/^price=/,"",v)
+          px=v+0
+        }
+
+        if (px != "") {
+          delta=abs(px-target)
+          if (!found || delta < best_delta) {
+            found=1
+            best_delta=delta
+            best_line=NR
+            best_price=px
+          }
+        }
+      }
+
+      END {
+        if (found) printf "%.10f\t%d\t%.8f\n", best_delta, best_line, best_price
+      }
+    '
+}
+
+find_nearest_price() {
+  local target="$1"
+  local source hit delta line matched_price
+  local best_delta="" best_source="" best_line="" best_price=""
+
+  while IFS= read -r source; do
+    [[ -n "$source" ]] || continue
+
+    hit="$(nearest_price_in_source "$source" "$target" || true)"
+    [[ -n "$hit" ]] || continue
+
+    IFS=$'\t' read -r delta line matched_price <<< "$hit"
+
+    if [[ -z "$best_delta" ]] || awk -v a="$delta" -v b="$best_delta" 'BEGIN { exit !(a < b) }'; then
+      best_delta="$delta"
+      best_source="$source"
+      best_line="$line"
+      best_price="$matched_price"
+    fi
+  done < <(current_sources)
+
+  [[ -n "$best_source" ]] || return 1
+  printf '%s\t%s\t%s\t%s\n' "$best_delta" "$best_source" "$best_line" "$best_price"
+}
+
+# ---------------------------------------------------------------------------
+# Order ID helpers
+# ---------------------------------------------------------------------------
+
+oid_line_in_source() {
+  local source="$1"
+  local oid="$2"
+
+  read_source "$source" |
+    awk -v oid="$oid" 'index($0,oid) { print NR; exit }'
+}
+
+find_oid() {
+  local oid="$1"
+  local source line
+
+  while IFS= read -r source; do
+    [[ -n "$source" ]] || continue
+    line="$(oid_line_in_source "$source" "$oid" || true)"
+    if [[ -n "$line" ]]; then
+      printf '%s\t%s\n' "$source" "$line"
+      return 0
+    fi
+  done < <(current_sources)
+
+  return 1
+}
+
+previous_step_line_at_or_before() {
+  local source="$1"
+  local stop="$2"
+
+  read_source "$source" |
+    awk -v stop="$stop" '
+      NR <= stop && /\[TRACE\] step.start/ { found=NR }
+      NR > stop { exit }
+      END { if (found) print found }
+    '
+}
+
+# ---------------------------------------------------------------------------
+# Tick filtering
+# ---------------------------------------------------------------------------
+
+filter_block() {
+  local side="$1"
+  local side_lc
+  side_lc="$(printf '%s' "$side" | tr '[:upper:]' '[:lower:]')"
+
+  awk -v side="$side" -v side_lc="$side_lc" '
+    {
+      line=$0
+
+      if (line ~ /\[TRACE\] step\.start/) print line
+      else if (line ~ /\[TRACE\] case5\./) print line
+      else if (line ~ /\[TRACE\] case11\./) print line
+      else if (line ~ /\[DEBUG\] Total Lots=/) print line
+      else if (line ~ /\[DEBUG\] EQUITY Trading:/) print line
+      else if (line ~ /\[TRACE\] signal\./) print line
+      else if (line ~ /\[TRACE\] regime\./) print line
+      else if (line ~ /\[TRACE\] recent\.window/) print line
+      else if (line ~ /\[TRACE\] hotpath\./) print line
+      else if (line ~ /\[TRACE\] balance\./) print line
+      else if (line ~ /\[TRACE\] pyramid\./) print line
+      else if (line ~ /pyrBuy\{|pyrSell\{/) print line
+      else if (line ~ /latchedGateBuy|latchedGateSell|latchedBuy=|latchedSell=|winLowBuy=|winHighSell=/) print line
+      else if (line ~ /OPEN-PENDING|pendingEntry|pendingExit|pending_entry|pending_exit/) print line
+      else if (line ~ /\[TRACE\] entry\.|\[TRACE\] exit\./) print line
+      else if (line ~ /\[TRACE\] order\.|order\.open|order\.close|LIVE ORDER/) print line
+      else if (line ~ /postonly\.|reprice/) print line
+      else if (line ~ /case3A\.|case3B\.|case3A_|case3B_/) print line
+      else if (line ~ /RecoveryByProfitTarget|RecoveryByPositionSize|RecoveryDebtUSD/) print line
+      else if (line ~ /recovery|replacement/) print line
+      else if (line ~ /threshold_stop_loss|profit_giveback|trailing|runner/) print line
+      else if (line ~ /FUNDS_EXHAUSTED|funding|refund|EQUITY GATE/) print line
+      else if (line ~ /GATE[0-9]|gate\.pre|gate\.block|gate\.post/) print line
+      else if (index(line,"side=" side) || index(line,side_lc ".gate.")) print line
+      else if (line ~ /LongOnly=|HOLD| FLAT$/) print line
+    }
+  '
+}
+
+# ---------------------------------------------------------------------------
+# Tick output
+# ---------------------------------------------------------------------------
+
+print_tick() {
+  local source="$1"
+  local start="$2"
+  local mode="$3"
+  local side="$4"
+  local anchor_kind="${5:-step_start}"
+
+  if [[ "$anchor_kind" == "hotpath_price" ]]; then
+    # Historical reconstructed tick:
+    # start at the selected hotpath.price_fetched and stop immediately before
+    # the next hotpath.price_fetched. This prevents streaming to EOF when
+    # rotated logs are missing step.start markers.
+    if [[ "$mode" == "raw" ]]; then
+      read_source "$source" |
+        awk -v start="$start" '
+          NR < start { next }
+          NR == start { inside=1; print; next }
+          inside && /\[TRACE\] hotpath.price_fetched/ { exit }
+          inside { print }
+        '
+    else
+      read_source "$source" |
+        awk -v start="$start" '
+          NR < start { next }
+          NR == start { inside=1; print; next }
+          inside && /\[TRACE\] hotpath.price_fetched/ { exit }
+          inside { print }
+        ' |
+        filter_block "$side"
+    fi
+    return
+  fi
+
+  # Normal step.start-owned tick. Stop at the next step.start. If a rotated
+  # audit lost that next marker, the next hotpath.price_fetched is a safe
+  # one-cycle boundary and prevents an unbounded dump.
+  if [[ "$mode" == "raw" ]]; then
+    read_source "$source" |
+      awk -v start="$start" '
+        NR < start { next }
+        NR == start { inside=1; print; next }
+        inside && /\[TRACE\] step.start/ { exit }
+        inside && /\[TRACE\] hotpath.price_fetched/ { exit }
+        inside { print }
+      '
+  else
+    read_source "$source" |
+      awk -v start="$start" '
+        NR < start { next }
+        NR == start { inside=1; print; next }
+        inside && /\[TRACE\] step.start/ { exit }
+        inside && /\[TRACE\] hotpath.price_fetched/ { exit }
+        inside { print }
+      ' |
+      filter_block "$side"
+  fi
+}
+
+print_context() {
+  local source="$1"
+  local anchor="$2"
+  local half="$3"
+  local side="$4"
+  local start=$((anchor - half))
+  local end=$((anchor + half))
+
+  (( start < 1 )) && start=1
+
+  read_source "$source" |
+    awk -v start="$start" -v end="$end" '
+      NR >= start && NR <= end { print }
+      NR > end { exit }
+    ' |
+    filter_block "$side"
+}
+
+# ---------------------------------------------------------------------------
+# --after path analysis — mawk-compatible, no mktime()
+# ---------------------------------------------------------------------------
+
+analyze_after_path() {
+  local source="$1"
+  local anchor="$2"
+  local side="$3"
+  local minutes="$4"
+
+  read_source "$source" |
+    awk -v anchor="$anchor" -v side="$side" -v max_minutes="$minutes" '
+      function leap_count(y) { return int(y/4) - int(y/100) + int(y/400) }
+
+      function iso_epoch(ts, y,mo,d,h,mi,s,days,i) {
+        y=substr(ts,1,4)+0; mo=substr(ts,6,2)+0; d=substr(ts,9,2)+0
+        h=substr(ts,12,2)+0; mi=substr(ts,15,2)+0; s=substr(ts,18,2)+0
+
+        days=365*(y-1970)
+        days+=leap_count(y-1)-leap_count(1969)
+        mdays[1]=31; mdays[2]=28; mdays[3]=31; mdays[4]=30
+        mdays[5]=31; mdays[6]=30; mdays[7]=31; mdays[8]=31
+        mdays[9]=30; mdays[10]=31; mdays[11]=30; mdays[12]=31
+        if ((y%4==0 && y%100!=0) || y%400==0) mdays[2]=29
+        for (i=1; i<mo; i++) days+=mdays[i]
+        days+=d-1
+        return days*86400+h*3600+mi*60+s
+      }
+
+      function step_ts(line, v) {
+        if (match(line,/ts=[^ ]+/)) {
+          v=substr(line,RSTART,RLENGTH); sub(/^ts=/,"",v); return v
+        }
+        return ""
+      }
+
+      function step_price(line, v) {
+        if (match(line,/livePrice=[0-9]+(\.[0-9]+)?/)) {
+          v=substr(line,RSTART,RLENGTH); sub(/^livePrice=/,"",v); return v+0
+        }
+        if (match(line,/price=[0-9]+(\.[0-9]+)?/)) {
+          v=substr(line,RSTART,RLENGTH); sub(/^price=/,"",v); return v+0
+        }
+        return -1
+      }
+
+      function favorable(px) { return side=="SELL" ? ((entry-px)/entry)*100 : ((px-entry)/entry)*100 }
+      function adverse(px) { return side=="SELL" ? ((px-entry)/entry)*100 : ((entry-px)/entry)*100 }
+
+      NR == anchor {
+        original_ts=step_ts($0)
+        entry=step_price($0)
+        if (original_ts=="" || entry<0) {
+          print "Could not parse selected step.start." > "/dev/stderr"
+          bad=1
+          exit
+        }
+        original_epoch=iso_epoch(original_ts)
+        print "Decision Snapshot"
+        print "-----------------"
+        print "ts=" original_ts
+        printf "price=%.2f\n", entry
+        print ""
+        print "Path Outcome (+" max_minutes "m)"
+        print "-------------------"
+      }
+
+      NR >= anchor && /\[TRACE\] step.start/ {
+        ts=step_ts($0)
+        px=step_price($0)
+        if (ts!="" && px>=0) {
+          now=iso_epoch(ts)
+          delta=int((now-original_epoch)/60)
+          if (delta>=0 && delta<=max_minutes) {
+            seen[delta]=px
+            f=favorable(px); a=adverse(px)
+            if (!have || f>mfe) mfe=f
+            if (!have || a>mae) mae=a
+            have=1
+          }
+          if (delta>max_minutes) exit
+        }
+      }
+
+      END {
+        if (bad) exit 2
+        split("5 10 15 20 30 45 60", marks, " ")
+        for (i=1; i<=7; i++) {
+          m=marks[i]
+          if (m>max_minutes) continue
+          best=-1
+          for (d in seen) if ((d+0)<=m && (d+0)>best) best=d+0
+          if (best>=0) {
+            px=seen[best]
+            pct=((px-entry)/entry)*100
+            printf "+%dm  %.2f  %+0.4f%%\n", m, px, pct
+          }
+        }
+        print ""
+        if (have) {
+          printf "MFE (%s): %.4f%%\n", side, mfe
+          printf "MAE (%s): %.4f%%\n", side, mae
+        } else {
+          print "No later step.start observations found."
+        }
+      }
+    '
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 case "$MODE" in
   price)
-    [[ ${#POS[@]} -ge 1 ]] || { echo "Missing PRICE"; usage; exit 1; }
-    PRICE="${POS[0]}"; PRICE="${PRICE//,/}"; PRICE="${PRICE//_/}"
-    ensure_has_steps_or_die "$LOG"
+    [[ ${#POS[@]} -ge 1 ]] || { echo "Missing PRICE." >&2; usage; exit 1; }
 
-    LN="$(nearest_step_line_by_price "$PRICE" "$LOG" || true)"
-    [[ -n "$LN" ]] || { echo "No step.start near price=$PRICE" >&2; exit 1; }
+    PRICE="${POS[0]}"
+    PRICE="${PRICE//,/}"
+    PRICE="${PRICE//_/}"
+    [[ "$PRICE" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "Invalid price '$PRICE'." >&2; exit 1; }
+
+    MATCH="$(find_nearest_price "$PRICE" || true)"
+    [[ -n "$MATCH" ]] || {
+      if [[ "$LOG_EXPLICIT" == true ]]; then
+        echo "No step.start containing a usable price was found in: $LOG" >&2
+      else
+        show_rotated_help "$PRICE" price
+      fi
+      exit 1
+    }
+
+    IFS=$'\t' read -r DELTA SOURCE LINE MATCHED_PRICE <<< "$MATCH"
+
+    echo "[why-trade] mode=price nearest"
+    echo "[why-trade] requested=$PRICE"
+    echo "[why-trade] matched=$MATCHED_PRICE"
+    echo "[why-trade] delta_price=$DELTA"
+    echo "[why-trade] source=$(source_label "$SOURCE")"
+    echo "[why-trade] step_line=$LINE"
+    echo
 
     if [[ "$AFTER_MODE" == true ]]; then
-      analyze_after_path "$LOG" "$LN" "$SIDE" "$AFTER_MIN"
+      analyze_after_path "$SOURCE" "$LINE" "$SIDE" "$AFTER_MIN"
       exit 0
     fi
 
-    if [[ "$CHUNK_MODE" != "none" ]]; then
-      NL="$(next_step_line_after "$LN" "$LOG" || true)"
-      END="${NL:-$(wc -l < "$LOG")}"
-      if [[ "$CHUNK_MODE" == "raw" ]]; then
-        sed -n "${LN},$(( (${NL:-$END}) - 1 ))p" "$LOG"
-      else
-        sed -n "${LN},$(( (${NL:-$END}) - 1 ))p" "$LOG" | filter_block "$SIDE"
-      fi
-      exit 0
-    fi
-
-    START=$((LN - W)); (( START < 1 )) && START=1
-    END=$((LN + W))
-    sed -n "${START},${END}p" "$LOG" | filter_block "$SIDE"
+    case "$CHUNK_MODE" in
+      raw) print_tick "$SOURCE" "$LINE" raw "$SIDE" ;;
+      filter) print_tick "$SOURCE" "$LINE" filter "$SIDE" ;;
+      *) print_context "$SOURCE" "$LINE" "$W" "$SIDE" ;;
+    esac
     ;;
 
   ts)
-    [[ ${#POS[@]} -ge 1 ]] || { echo "Missing TIMESTAMP substring"; usage; exit 1; }
-    TS="${POS[0]}"
-    ensure_has_steps_or_die "$LOG"
+    [[ ${#POS[@]} -ge 1 ]] || { echo "Missing TIME." >&2; usage; exit 1; }
 
-    LN="$(first_line_matching_ts "$TS" "$LOG" || true)"
-    [[ -n "$LN" ]] || { echo "No lines matching '$TS'." >&2; exit 1; }
+    REQUESTED_TS="${POS[0]}"
+    REQUESTED_EPOCH="$(normalize_requested_epoch "$REQUESTED_TS" || true)"
+    [[ -n "$REQUESTED_EPOCH" ]] || { echo "Invalid timestamp '$REQUESTED_TS'." >&2; exit 1; }
 
-    CHUNK_START="$LN"
-    if ! sed -n "${LN}p" "$LOG" | grep -q "\[TRACE\] step.start"; then
-      NS="$(next_step_line_after "$LN" "$LOG" || true)"
-      [[ -n "$NS" ]] && CHUNK_START="$NS"
-    fi
+    WINDOW_SEC=$((DOCKER_TS_WINDOW_MIN * 60))
+    DOCKER_SINCE="$(date -u -d "@$((REQUESTED_EPOCH - WINDOW_SEC))" '+%Y-%m-%dT%H:%M:%SZ')"
+    DOCKER_UNTIL="$(date -u -d "@$((REQUESTED_EPOCH + WINDOW_SEC))" '+%Y-%m-%dT%H:%M:%SZ')"
+
+    MATCH="$(find_nearest_ts "$REQUESTED_TS" || true)"
+    [[ -n "$MATCH" ]] || {
+      if [[ "$LOG_EXPLICIT" == true ]]; then
+        echo "No usable trading-tick anchor near '$REQUESTED_TS' in: $LOG" >&2
+      else
+        show_rotated_help "$REQUESTED_TS" ts
+      fi
+      exit 1
+    }
+
+    IFS=$'\t' read -r REQUESTED_EPOCH DELTA_SEC SOURCE LINE MATCHED_TS MATCHED_EPOCH ANCHOR_KIND <<< "$MATCH"
+    REQUESTED_NORMAL="$(date -u -d "@${REQUESTED_EPOCH}" '+%Y-%m-%dT%H:%M:%SZ')"
+
+    echo "[why-trade] mode=ts nearest"
+    echo "[why-trade] requested=$REQUESTED_NORMAL"
+    echo "[why-trade] matched=$MATCHED_TS"
+    echo "[why-trade] delta_sec=$DELTA_SEC"
+    echo "[why-trade] source=$(source_label "$SOURCE")"
+    echo "[why-trade] anchor=$ANCHOR_KIND"
+    echo "[why-trade] anchor_line=$LINE"
+    echo
 
     if [[ "$AFTER_MODE" == true ]]; then
-      analyze_after_path "$LOG" "$CHUNK_START" "$SIDE" "$AFTER_MIN"
+      analyze_after_path "$SOURCE" "$LINE" "$SIDE" "$AFTER_MIN"
       exit 0
     fi
 
-    if [[ "$CHUNK_MODE" != "none" ]]; then
-      NL="$(next_step_line_after "$CHUNK_START" "$LOG" || true)"
-      END="${NL:-$(wc -l < "$LOG")}"
-      if [[ "$CHUNK_MODE" == "raw" ]]; then
-        sed -n "${CHUNK_START},$(( (${NL:-$END}) - 1 ))p" "$LOG"
-      else
-        sed -n "${CHUNK_START},$(( (${NL:-$END}) - 1 ))p" "$LOG" | filter_block "$SIDE"
-      fi
-      exit 0
-    fi
-
-    START=$((CHUNK_START - W)); (( START < 1 )) && START=1
-    END=$((CHUNK_START + W))
-    sed -n "${START},${END}p" "$LOG" | filter_block "$SIDE"
+    case "$CHUNK_MODE" in
+      raw) print_tick "$SOURCE" "$LINE" raw "$SIDE" "$ANCHOR_KIND" ;;
+      filter) print_tick "$SOURCE" "$LINE" filter "$SIDE" "$ANCHOR_KIND" ;;
+      *) print_context "$SOURCE" "$LINE" "$W" "$SIDE" ;;
+    esac
     ;;
 
   oid)
-    [[ ${#POS[@]} -ge 1 ]] || { echo "Missing ORDER_ID"; usage; exit 1; }
+    [[ ${#POS[@]} -ge 1 ]] || { echo "Missing ORDER_ID." >&2; usage; exit 1; }
+
     OID="${POS[0]}"
-
-    MATCH="$(search_oid_in_audit "$OID" "$LOG" || true)"
-    if [[ -n "$MATCH" ]]; then
-      IFS=$'\n' read -r first <<< "$MATCH"
-      FILE="${first%%:*}"
-      REST="${first#*:}"
-      LINE="${REST%%:*}"
-
-      # Walk backward to nearest preceding step.start as chunk anchor
-      local_start=$(( LINE - 2000 )); (( local_start < 1 )) && local_start=1
-      if [[ "$FILE" == *.gz ]]; then
-        STEP_LINE="$(zcat "$FILE" | sed -n "${local_start},${LINE}p" | nl -ba -v "$local_start" | awk '/\[TRACE\] step.start/ {ln=$1} END{if(ln) print ln}')"
+    MATCH="$(find_oid "$OID" || true)"
+    [[ -n "$MATCH" ]] || {
+      if [[ "$LOG_EXPLICIT" == true ]]; then
+        echo "OrderId '$OID' was not found in: $LOG" >&2
       else
-        STEP_LINE="$(sed -n "${local_start},${LINE}p" "$FILE" | nl -ba -v "$local_start" | awk '/\[TRACE\] step.start/ {ln=$1} END{if(ln) print ln}')"
+        show_rotated_help "$OID" oid
       fi
-      [[ -z "$STEP_LINE" ]] && STEP_LINE="$LINE"
+      exit 2
+    }
 
-      if [[ "$CHUNK_MODE" == "none" ]]; then
-        START=$((STEP_LINE - W)); (( START < 1 )) && START=1
-        END=$((STEP_LINE + W))
-        if [[ "$FILE" == *.gz ]]; then
-          zcat "$FILE" | sed -n "${START},${END}p" | filter_block "$SIDE"
-        else
-          sed -n "${START},${END}p" "$FILE" | filter_block "$SIDE"
-        fi
-      else
-        print_chunk_around_line "$FILE" "$STEP_LINE" "$CHUNK_MODE" "$SIDE"
-      fi
-      exit 0
-    fi
+    IFS=$'\t' read -r SOURCE EVENT_LINE <<< "$MATCH"
+    STEP_LINE="$(previous_step_line_at_or_before "$SOURCE" "$EVENT_LINE" || true)"
+    [[ -n "$STEP_LINE" ]] || {
+      echo "Order '$OID' was found, but no owning step.start was found." >&2
+      exit 2
+    }
 
-    echo "OrderId '$OID' not found in audit rotations. Consider docker logs window, e.g.:" >&2
-    echo "  docker compose logs --no-color --since '2025-10-28T15:12:00Z' --until '2025-10-28T15:14:00Z' bot_binance | grep -n \"$OID\"" >&2
-    exit 2
+    echo "[why-trade] mode=oid"
+    echo "[why-trade] order_id=$OID"
+    echo "[why-trade] source=$(source_label "$SOURCE")"
+    echo "[why-trade] order_line=$EVENT_LINE"
+    echo "[why-trade] owning_step=$STEP_LINE"
+    echo
+
+    case "$CHUNK_MODE" in
+      raw) print_tick "$SOURCE" "$STEP_LINE" raw "$SIDE" ;;
+      filter) print_tick "$SOURCE" "$STEP_LINE" filter "$SIDE" ;;
+      *) print_context "$SOURCE" "$STEP_LINE" "$W" "$SIDE" ;;
+    esac
     ;;
 
-  *) usage; exit 1;;
+  *)
+    echo "Unknown mode '$MODE'." >&2
+    usage
+    exit 1
+    ;;
 esac
-# stop copy here paste save, exit and run the commands below
-WHYTRADE_EOF
-
-sudo chmod 755 /usr/local/bin/why-trade
-sudo chown chidi:chidi /usr/local/bin/why-trade
-bash -n /usr/local/bin/why-trade

@@ -1757,7 +1757,7 @@ func (t *Trader) combineEntryRawMaterials(
 	// Allow a fixed 10-point pre-EPS zone at idx-6, then require
 	// independent EMA high-peak geometry and the Pyramid SELL gate.
 	// -----------------------------------------------------------------
-	const macdPeakBuffer = 10.0
+	const macdPeakBuffer = 15.0
 
 	macdPrePeakThreshold :=
 		macd.EPS - macdPeakBuffer

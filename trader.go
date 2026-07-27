@@ -4663,7 +4663,11 @@ func (t *Trader) drainPendingEntry(
 				entry.OrderID,
 			)
 
+			// finish() may call entry.clearOwner(), which acquires t.mu.
+			// step() already owns t.mu while draining entries.
+			t.mu.Unlock()
 			finish()
+			t.mu.Lock()
 			return
 		}
 
@@ -4787,7 +4791,11 @@ func (t *Trader) drainPendingEntry(
 			}
 		}
 
+		// finish() may call entry.clearOwner(), which acquires t.mu.
+		// step() already owns t.mu while draining entries.
+		t.mu.Unlock()
 		finish()
+		t.mu.Lock()
 
 	default:
 		// No asynchronous result is available for this entry this tick.
