@@ -3422,7 +3422,40 @@ func (t *Trader) produceEntry(
 		return nil, err
 	}
 
+	// Registration succeeded. Advance the same-side latch immediately so
+	// another same-side pending entry must achieve additional adverse price
+	// movement before qualifying again. Save the latch together with the
+	// newly registered pending entry so both remain consistent.
+	oldBuyLatch := t.latchedGateBuy
+	oldSellLatch := t.latchedGateSell
+
+	nextLatch := pendingRegistrationLatchPrice(
+		intent.Side,
+		intent.LimitPx,
+		intent.BaseAtLimit,
+		t.cfg.FeeRatePct,
+	)
+
+	switch intent.Side {
+	case SideBuy:
+		// BUY latch may only move farther downward (more adverse).
+		if t.latchedGateBuy == 0 || nextLatch < t.latchedGateBuy {
+			t.latchedGateBuy = nextLatch
+		}
+
+	case SideSell:
+		// SELL latch may only move farther upward (more adverse).
+		if t.latchedGateSell == 0 || nextLatch > t.latchedGateSell {
+			t.latchedGateSell = nextLatch
+		}
+	}
+
 	if err := t.saveStateNoLock(); err != nil {
+		// Roll back latch advancement because the pending entry
+		// registration could not be persisted.
+		t.latchedGateBuy = oldBuyLatch
+		t.latchedGateSell = oldSellLatch
+
 		t.mu.Lock()
 
 		current, exists := t.pendingEntries[orderID]

@@ -220,6 +220,215 @@ For now, the roadmap is:
 ⏳ Case 10: Stabilize RegimeNormal transitions
 
 That keeps the experiments isolated so you can attribute any performance changes to the correct modification.
+====================================
+Case 11 — Peak-Reversal SELL Producer
+Objective
+
+Introduce an independent SELL producer that can detect and act on a potential market top before the normal AI/Logic decision pipeline. The producer is designed to identify high-probability peak reversals by combining momentum exhaustion, price-action confirmation, and the existing SELL pyramid gate.
+
+Motivation
+
+The standard AI/Logic pipeline primarily reacts to established directional signals. Near a market peak, however, momentum often begins to weaken before the AI or threshold-based logic fully transitions to a SELL opinion.
+
+Case 11 provides an earlier, pattern-driven SELL opportunity by recognizing the characteristic signs of a peak reversal while still requiring structural confirmation to reduce false signals.
+
+Entry Criteria
+
+A Case 11 SELL is generated only when all of the following conditions are satisfied:
+
+MACD Pre-Peak Zone
+The MACD line from six bars earlier (MACDLinePrev6) is within a configurable buffer of the SELL EPS threshold.
+This identifies momentum approaching a bearish transition without requiring it to have fully crossed the threshold.
+EMA High-Peak Confirmation
+The EMA pattern detector identifies a local high (peak), indicating that upward price movement is stalling or reversing.
+SELL Pyramid Gate
+The existing SELL pyramid gate passes, confirming that spacing, adverse movement, timing, and other risk-management requirements are satisfied before allowing another SELL.
+
+Only when all three conditions are simultaneously true does Case 11 produce a SELL signal.
+
+Decision Priority
+
+Case 11 has the highest evaluation priority because it is an independent directional producer, not an AI/Logic confirmation gate.
+
+When triggered:
+
+MACD Pre-Peak Zone
+        +
+EMA High-Peak
+        +
+SELL Pyramid Gate
+        ↓
+Case 11
+Peak-Reversal SELL Producer
+        ↓
+DecisionSource = PeakReversal
+        ↓
+Immediate SELL decision
+
+The decision is returned immediately without continuing through the normal AI/Logic entry evaluation.
+
+Decision Metadata
+
+When Case 11 fires, the decision records:
+
+Signal = Sell
+DecisionSource = EntryDecisionSourcePeakReversal
+SELL pyramid gate result and reason
+SELL equity trigger result and reason
+
+This preserves downstream sizing and auditing behavior while clearly identifying the source of the decision.
+
+Diagnostics
+
+Case 11 emits detailed trace logging containing:
+
+macd_idx6
+eps
+buffer
+threshold
+macd_zone
+ema_high_peak
+pyramid_sell
+
+These diagnostics allow production verification of exactly which conditions contributed to a peak-reversal SELL decision and simplify troubleshooting of missed or unexpected entries.
+===================================
+
+Case 12 — Prevent Duplicate Same-Side Entry Submission While Previous Entry Is Pending
+Objective
+
+Ensure the bot can have at most one outstanding normal entry per side (BUY or SELL). Once a normal BUY or SELL order has been submitted, subsequent ticks must not submit another normal entry on the same side until the existing pending entry is either:
+
+Filled and committed,
+Cancelled,
+Expired,
+Rejected, or
+Otherwise completed and removed from PendingEntries.
+Root Cause
+
+Current flow:
+
+Signal = BUY/SELL
+        ↓
+submitPendingIntent()
+        ↓
+registerPendingEntry()
+        ↓
+poller starts
+        ↓
+(waiting for fill)
+
+During this waiting period:
+
+BookBuy / BookSell still contains zero lots.
+The trading logic continues to produce the same valid BUY/SELL decision.
+There is no gate that checks for an existing incomplete same-side normal PendingEntry.
+Each eligible tick submits another exchange order.
+
+Observed production behavior:
+
+Tick 1
+    BUY submitted
+    order A = NEW
+
+Tick 2
+    BUY still NEW
+    BUY submitted again
+    order B = NEW
+
+Tick 3
+    both fill
+    two BUY lots created
+
+The identical behavior occurred for SELL.
+
+Evidence
+
+Observed production logs showed:
+
+pending.register
+order_id=A
+
+...
+
+pending.register
+order_id=B
+
+while order A was still NEW.
+
+Both subsequently produced:
+
+postonly.filled
+lot.created
+
+resulting in duplicate live positions.
+
+Required Behavior
+
+Before any normal BUY submission:
+
+if exists PendingEntry{
+        Source == normal &&
+        Side == BUY &&
+        Completed == false
+}
+    skip submission
+
+Before any normal SELL submission:
+
+if exists PendingEntry{
+        Source == normal &&
+        Side == SELL &&
+        Completed == false
+}
+    skip submission
+Completion Conditions
+
+The gate is released only when the PendingEntry lifecycle completes, including:
+
+Filled and committed
+Cancelled
+Timed out
+Rejected
+Broker failure
+Manual cleanup
+Success Criteria
+
+For any uninterrupted BUY or SELL signal lasting multiple ticks:
+
+Tick 1
+BUY
+↓
+submit order
+
+Tick 2
+BUY
+↓
+Pending BUY exists
+↓
+NO submission
+
+Tick 3
+BUY
+↓
+Pending BUY exists
+↓
+NO submission
+
+...
+
+Fill occurs
+
+↓
+
+Pending removed
+
+↓
+
+Next BUY may be submitted
+
+Invariant
+
+At any time, there shall never be more than one incomplete normal PendingEntry per side, eliminating duplicate exchange orders while preserving legitimate opposite-side entries and specialized flows such as Case 3B.
 
 
 ================================

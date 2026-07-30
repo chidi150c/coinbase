@@ -77,7 +77,7 @@ import (
 	"time"
 )
 
-const Version = 146
+const Version = 147
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -3246,5 +3246,39 @@ func (t *Trader) reserveCachedBase(amount float64) {
 	t.balanceSnapshot.AvailBase -= amount
 	if t.balanceSnapshot.AvailBase < 0 {
 		t.balanceSnapshot.AvailBase = 0
+	}
+}
+
+const pendingRegistrationAdditionalNetUSD = 0.05
+
+func pendingRegistrationLatchPrice(
+	side OrderSide,
+	entryPrice float64,
+	baseQty float64,
+	feeRatePct float64,
+) float64 {
+	if entryPrice <= 0 || baseQty <= 0 {
+		return entryPrice
+	}
+
+	fr := feeRatePct / 100.0
+
+	switch side {
+	case SideBuy:
+		return entryPrice -
+			pendingRegistrationAdditionalNetUSD/
+				(baseQty*(1.0+fr))
+
+	case SideSell:
+		den := baseQty * (1.0 - fr)
+		if den <= 0 {
+			return entryPrice
+		}
+
+		return entryPrice +
+			pendingRegistrationAdditionalNetUSD/den
+
+	default:
+		return entryPrice
 	}
 }
