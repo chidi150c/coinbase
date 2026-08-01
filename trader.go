@@ -1056,25 +1056,26 @@ func exitCSVRow(e ExitRecord) []string {
 }
 
 func decisionEntryReason(d EntryDecision) string {
-	parts := []string{
-		// AI / model summary.
-		fmt.Sprintf("pUp=%.5f", d.PUp),
+	cleanReason := func(s string) string {
+		// Keep every canonical field as one pipe-delimited key=value token.
+		return strings.ReplaceAll(strings.TrimSpace(s), "|", ";")
+	}
 
-		// Threshold context.
+	parts := []string{
+		// AI / model context.
+		fmt.Sprintf("pUp=%.5f", d.PUp),
 		fmt.Sprintf("buyTh=%.5f", d.BuyThreshold),
 		fmt.Sprintf("sellTh=%.5f", d.SellThreshold),
-
-		// Market context.
-		fmt.Sprintf("regime=%s", d.MarketRegime),
-		fmt.Sprintf("regimeMult=%.2f", d.RegimeMult),
-
-		// Confidence.
 		fmt.Sprintf("confidence=%.2f", d.Confidence),
 
-		// MACD interpretation context.
+		// Market / interpretation context.
+		fmt.Sprintf("regime=%s", d.MarketRegime),
+		fmt.Sprintf("regimeMult=%.2f", d.RegimeMult),
 		fmt.Sprintf("logicEPS=%.5f", d.LogicEPS),
+		fmt.Sprintf("logicBaseEPS=%.5f", d.LogicBaseEPS),
+		fmt.Sprintf("logicRegimeEPS=%.5f", d.LogicRegimeEPS),
 
-		// MACD evidence.
+		// MACD raw materials and interpretation.
 		fmt.Sprintf("logic_macd_line=%.5f", d.LogicMACDLine),
 		fmt.Sprintf("logic_macd_line_prev6=%.5f", d.LogicMACDLinePrev6),
 		fmt.Sprintf("logic_macd_turn=%.5f", d.LogicMACDTurn),
@@ -1086,7 +1087,7 @@ func decisionEntryReason(d EntryDecision) string {
 		fmt.Sprintf("logic_macd_momentum_down=%t", d.LogicMACDMomentumDown),
 		fmt.Sprintf("logic_macd_momentum_up=%t", d.LogicMACDMomentumUp),
 
-		// EMA / Pattern evidence.
+		// EMA raw materials and pattern interpretation.
 		fmt.Sprintf("logic_ema_spread=%.6f", d.LogicEMASpread),
 		fmt.Sprintf("logic_ema2050=%.6f", d.LogicEMA2050),
 		fmt.Sprintf("logic_pattern_high_peak=%t", d.LogicPatternHighPeak),
@@ -1096,28 +1097,55 @@ func decisionEntryReason(d EntryDecision) string {
 		fmt.Sprintf("logic_pattern_buy=%t", d.LogicPatternBuy),
 		fmt.Sprintf("logic_pattern_sell=%t", d.LogicPatternSell),
 
-		// Pyramid evaluation.
-		fmt.Sprintf(
-			"pyrBuy{spacing=%t adverse=%t gate=%t}",
-			d.PyramidBuySpacingPass,
-			d.PyramidBuyAdversePass,
-			d.PyramidBuyGatePassed,
-		),
-		fmt.Sprintf(
-			"pyrSell{spacing=%t adverse=%t gate=%t}",
-			d.PyramidSellSpacingPass,
-			d.PyramidSellAdversePass,
-			d.PyramidSellGatePassed,
-		),
+		// Case 11 — Peak-Reversal SELL producer.
+		fmt.Sprintf("macd_pre_peak_zone=%t", d.MACDPrePeakZone),
+		fmt.Sprintf("peak_reversal_sell=%t", d.PeakReversalSell),
 
-		// Equity evaluation.
-		fmt.Sprintf("eqBuy=%t", d.EquityBuyTrigger),
-		fmt.Sprintf("eqSell=%t", d.EquitySellTrigger),
+		// BUY Pyramid raw materials and derived results.
+		fmt.Sprintf("pyr_buy_elapsed_hr=%.4f", d.Pyramid.Buy.ElapsedHr),
+		fmt.Sprintf("pyr_buy_tfloor_hr=%.4f", d.Pyramid.Buy.TFloorHr),
+		fmt.Sprintf("pyr_buy_base_pct=%.6f", d.Pyramid.Buy.BasePct),
+		fmt.Sprintf("pyr_buy_eff_pct=%.6f", d.Pyramid.Buy.EffPct),
+		fmt.Sprintf("pyr_buy_latched=%.8f", d.Pyramid.Buy.Latched),
+		fmt.Sprintf("pyr_buy_effective_gate=%.8f", d.Pyramid.Buy.EffectiveGatePrice),
+		fmt.Sprintf("pyr_buy_spacing_pass=%t", d.Pyramid.Buy.SpacingPass),
+		fmt.Sprintf("pyr_buy_adverse_pass=%t", d.Pyramid.Buy.AdversePass),
+		fmt.Sprintf("pyr_buy_gate_pass=%t", d.Pyramid.Buy.GatePassed),
+		fmt.Sprintf("pyr_buy_reason=%s", cleanReason(d.Pyramid.Buy.Reason)),
+
+		// SELL Pyramid raw materials and derived results.
+		fmt.Sprintf("pyr_sell_elapsed_hr=%.4f", d.Pyramid.Sell.ElapsedHr),
+		fmt.Sprintf("pyr_sell_tfloor_hr=%.4f", d.Pyramid.Sell.TFloorHr),
+		fmt.Sprintf("pyr_sell_base_pct=%.6f", d.Pyramid.Sell.BasePct),
+		fmt.Sprintf("pyr_sell_eff_pct=%.6f", d.Pyramid.Sell.EffPct),
+		fmt.Sprintf("pyr_sell_latched=%.8f", d.Pyramid.Sell.Latched),
+		fmt.Sprintf("pyr_sell_effective_gate=%.8f", d.Pyramid.Sell.EffectiveGatePrice),
+		fmt.Sprintf("pyr_sell_spacing_pass=%t", d.Pyramid.Sell.SpacingPass),
+		fmt.Sprintf("pyr_sell_adverse_pass=%t", d.Pyramid.Sell.AdversePass),
+		fmt.Sprintf("pyr_sell_gate_pass=%t", d.Pyramid.Sell.GatePassed),
+		fmt.Sprintf("pyr_sell_reason=%s", cleanReason(d.Pyramid.Sell.Reason)),
+
+		// Equity materials currently carried by EquityResult.
+		fmt.Sprintf("equity_spare_quote=%.8f", d.Equity.SpareQuote),
+		fmt.Sprintf("equity_spare_base=%.8f", d.Equity.SpareBase),
+		fmt.Sprintf("equity_proposed_buy_quote=%.8f", d.Equity.ProposedBuyQuote),
+		fmt.Sprintf("equity_proposed_sell_base=%.8f", d.Equity.ProposedSellBase),
+		fmt.Sprintf("equity_buy_trigger=%t", d.Equity.BuyTrigger),
+		fmt.Sprintf("equity_sell_trigger=%t", d.Equity.SellTrigger),
+		fmt.Sprintf("equity_reason=%s", cleanReason(d.Equity.Reason)),
+
+		// Selected-side summaries.
+		fmt.Sprintf("selected_pyramid_pass=%t", d.PyramidPass),
+		fmt.Sprintf("selected_pyramid_reason=%s", cleanReason(d.PyramidReason)),
+		fmt.Sprintf("selected_equity_pass=%t", d.EquityPass),
+		fmt.Sprintf("selected_equity_reason=%s", cleanReason(d.EquityReason)),
 
 		// Decision flow.
-		fmt.Sprintf("aiRaw=%s", d.Raw),
+		// Raw and final are already printed by the canonical prefix as
+		// Raw= and Decision=, so they are not repeated here.
+		fmt.Sprintf("legacySignal=%s", d.LegacySignal),
 		fmt.Sprintf("logicOpinion=%s", d.LogicOpinion),
-		fmt.Sprintf("final=%s", d.Signal),
+		fmt.Sprintf("source=%s", d.DecisionSource),
 	}
 
 	return strings.Join(parts, "|")
