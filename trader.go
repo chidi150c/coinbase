@@ -1272,6 +1272,10 @@ func decisionEntryReason(d EntryDecision) string {
 		fmt.Sprintf("legacySignal=%s", d.LegacySignal),
 		fmt.Sprintf("logicOpinion=%s", d.LogicOpinion),
 		fmt.Sprintf("source=%s", d.DecisionSource),
+		// Backward-compatible aliases.
+		// Raw and Decision remain authoritative in the fixed log prefix.
+		fmt.Sprintf("aiRaw=%s", d.Raw),
+		fmt.Sprintf("final=%s", d.Signal),
 	)
 
 	return strings.Join(parts, "|")
