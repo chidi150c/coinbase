@@ -1056,26 +1056,88 @@ func exitCSVRow(e ExitRecord) []string {
 }
 
 func decisionEntryReason(d EntryDecision) string {
-	cleanReason := func(s string) string {
-		// Keep every canonical field as one pipe-delimited key=value token.
-		return strings.ReplaceAll(strings.TrimSpace(s), "|", ";")
+	parts := make([]string, 0, 100)
+
+	// Append an evaluator's pipe-delimited key=value materials as
+	// first-class canonical fields with a side/evaluator prefix.
+	//
+	// Example:
+	//   side=BUY|price=62987.36|gatePass=false
+	//
+	// Becomes:
+	//   pyr_buy_side=BUY|pyr_buy_price=62987.36|pyr_buy_gatePass=false
+	appendPrefixedFields := func(prefix, reason string) {
+		for _, token := range strings.Split(reason, "|") {
+			token = strings.TrimSpace(token)
+			if token == "" {
+				continue
+			}
+
+			key, value, found := strings.Cut(token, "=")
+			if !found {
+				// Preserve an unexpected non-key/value diagnostic instead
+				// of silently discarding it.
+				parts = append(
+					parts,
+					fmt.Sprintf(
+						"%s_diagnostic=%s",
+						prefix,
+						token,
+					),
+				)
+				continue
+			}
+
+			key = strings.TrimSpace(key)
+			value = strings.TrimSpace(value)
+
+			if key == "" {
+				continue
+			}
+
+			parts = append(
+				parts,
+				fmt.Sprintf(
+					"%s_%s=%s",
+					prefix,
+					key,
+					value,
+				),
+			)
+		}
 	}
 
-	parts := []string{
-		// AI / model context.
+	// -----------------------------------------------------------------
+	// AI / model context.
+	// -----------------------------------------------------------------
+
+	parts = append(
+		parts,
 		fmt.Sprintf("pUp=%.5f", d.PUp),
 		fmt.Sprintf("buyTh=%.5f", d.BuyThreshold),
 		fmt.Sprintf("sellTh=%.5f", d.SellThreshold),
 		fmt.Sprintf("confidence=%.2f", d.Confidence),
+	)
 
-		// Market / interpretation context.
+	// -----------------------------------------------------------------
+	// Market / interpretation context.
+	// -----------------------------------------------------------------
+
+	parts = append(
+		parts,
 		fmt.Sprintf("regime=%s", d.MarketRegime),
 		fmt.Sprintf("regimeMult=%.2f", d.RegimeMult),
 		fmt.Sprintf("logicEPS=%.5f", d.LogicEPS),
 		fmt.Sprintf("logicBaseEPS=%.5f", d.LogicBaseEPS),
 		fmt.Sprintf("logicRegimeEPS=%.5f", d.LogicRegimeEPS),
+	)
 
-		// MACD raw materials and interpretation.
+	// -----------------------------------------------------------------
+	// MACD raw materials and interpretation.
+	// -----------------------------------------------------------------
+
+	parts = append(
+		parts,
 		fmt.Sprintf("logic_macd_line=%.5f", d.LogicMACDLine),
 		fmt.Sprintf("logic_macd_line_prev6=%.5f", d.LogicMACDLinePrev6),
 		fmt.Sprintf("logic_macd_turn=%.5f", d.LogicMACDTurn),
@@ -1086,8 +1148,14 @@ func decisionEntryReason(d EntryDecision) string {
 		fmt.Sprintf("logic_macd_strong_negative=%t", d.LogicMACDStrongNegative),
 		fmt.Sprintf("logic_macd_momentum_down=%t", d.LogicMACDMomentumDown),
 		fmt.Sprintf("logic_macd_momentum_up=%t", d.LogicMACDMomentumUp),
+	)
 
-		// EMA raw materials and pattern interpretation.
+	// -----------------------------------------------------------------
+	// EMA raw materials and pattern interpretation.
+	// -----------------------------------------------------------------
+
+	parts = append(
+		parts,
 		fmt.Sprintf("logic_ema_spread=%.6f", d.LogicEMASpread),
 		fmt.Sprintf("logic_ema2050=%.6f", d.LogicEMA2050),
 		fmt.Sprintf("logic_pattern_high_peak=%t", d.LogicPatternHighPeak),
@@ -1096,57 +1164,115 @@ func decisionEntryReason(d EntryDecision) string {
 		fmt.Sprintf("logic_pattern_price_up_down=%t", d.LogicPatternPriceUpDown),
 		fmt.Sprintf("logic_pattern_buy=%t", d.LogicPatternBuy),
 		fmt.Sprintf("logic_pattern_sell=%t", d.LogicPatternSell),
+	)
 
-		// Case 11 — Peak-Reversal SELL producer.
+	// -----------------------------------------------------------------
+	// Case 11 — Peak-Reversal SELL producer.
+	// -----------------------------------------------------------------
+
+	parts = append(
+		parts,
 		fmt.Sprintf("macd_pre_peak_zone=%t", d.MACDPrePeakZone),
 		fmt.Sprintf("peak_reversal_sell=%t", d.PeakReversalSell),
+	)
 
-		// BUY Pyramid raw materials and derived results.
-		fmt.Sprintf("pyr_buy_elapsed_hr=%.4f", d.Pyramid.Buy.ElapsedHr),
-		fmt.Sprintf("pyr_buy_tfloor_hr=%.4f", d.Pyramid.Buy.TFloorHr),
-		fmt.Sprintf("pyr_buy_base_pct=%.6f", d.Pyramid.Buy.BasePct),
-		fmt.Sprintf("pyr_buy_eff_pct=%.6f", d.Pyramid.Buy.EffPct),
-		fmt.Sprintf("pyr_buy_latched=%.8f", d.Pyramid.Buy.Latched),
-		fmt.Sprintf("pyr_buy_effective_gate=%.8f", d.Pyramid.Buy.EffectiveGatePrice),
-		fmt.Sprintf("pyr_buy_spacing_pass=%t", d.Pyramid.Buy.SpacingPass),
-		fmt.Sprintf("pyr_buy_adverse_pass=%t", d.Pyramid.Buy.AdversePass),
-		fmt.Sprintf("pyr_buy_gate_pass=%t", d.Pyramid.Buy.GatePassed),
-		fmt.Sprintf("pyr_buy_reason=%s", cleanReason(d.Pyramid.Buy.Reason)),
+	// -----------------------------------------------------------------
+	// BUY Pyramid raw materials.
+	//
+	// Pyramid.Buy.Reason already contains the full evaluation evidence:
+	// side, price, anchor, gate price, latch, percentages, elapsed time,
+	// tFloor, latch mode, spacing result, gate result, and related fields.
+	// Each item is promoted to a prefixed canonical key=value field.
+	// -----------------------------------------------------------------
 
-		// SELL Pyramid raw materials and derived results.
-		fmt.Sprintf("pyr_sell_elapsed_hr=%.4f", d.Pyramid.Sell.ElapsedHr),
-		fmt.Sprintf("pyr_sell_tfloor_hr=%.4f", d.Pyramid.Sell.TFloorHr),
-		fmt.Sprintf("pyr_sell_base_pct=%.6f", d.Pyramid.Sell.BasePct),
-		fmt.Sprintf("pyr_sell_eff_pct=%.6f", d.Pyramid.Sell.EffPct),
-		fmt.Sprintf("pyr_sell_latched=%.8f", d.Pyramid.Sell.Latched),
-		fmt.Sprintf("pyr_sell_effective_gate=%.8f", d.Pyramid.Sell.EffectiveGatePrice),
-		fmt.Sprintf("pyr_sell_spacing_pass=%t", d.Pyramid.Sell.SpacingPass),
-		fmt.Sprintf("pyr_sell_adverse_pass=%t", d.Pyramid.Sell.AdversePass),
-		fmt.Sprintf("pyr_sell_gate_pass=%t", d.Pyramid.Sell.GatePassed),
-		fmt.Sprintf("pyr_sell_reason=%s", cleanReason(d.Pyramid.Sell.Reason)),
+	appendPrefixedFields(
+		"pyr_buy",
+		d.Pyramid.Buy.Reason,
+	)
 
-		// Equity materials currently carried by EquityResult.
-		fmt.Sprintf("equity_spare_quote=%.8f", d.Equity.SpareQuote),
-		fmt.Sprintf("equity_spare_base=%.8f", d.Equity.SpareBase),
-		fmt.Sprintf("equity_proposed_buy_quote=%.8f", d.Equity.ProposedBuyQuote),
-		fmt.Sprintf("equity_proposed_sell_base=%.8f", d.Equity.ProposedSellBase),
-		fmt.Sprintf("equity_buy_trigger=%t", d.Equity.BuyTrigger),
-		fmt.Sprintf("equity_sell_trigger=%t", d.Equity.SellTrigger),
-		fmt.Sprintf("equity_reason=%s", cleanReason(d.Equity.Reason)),
+	// AdversePass is carried directly by PyramidResult and may not be
+	// present inside the evaluator's reason string.
+	parts = append(
+		parts,
+		fmt.Sprintf(
+			"pyr_buy_adversePass=%t",
+			d.Pyramid.Buy.AdversePass,
+		),
+	)
 
-		// Selected-side summaries.
-		fmt.Sprintf("selected_pyramid_pass=%t", d.PyramidPass),
-		fmt.Sprintf("selected_pyramid_reason=%s", cleanReason(d.PyramidReason)),
-		fmt.Sprintf("selected_equity_pass=%t", d.EquityPass),
-		fmt.Sprintf("selected_equity_reason=%s", cleanReason(d.EquityReason)),
+	// -----------------------------------------------------------------
+	// SELL Pyramid raw materials.
+	// -----------------------------------------------------------------
 
-		// Decision flow.
-		// Raw and final are already printed by the canonical prefix as
-		// Raw= and Decision=, so they are not repeated here.
+	appendPrefixedFields(
+		"pyr_sell",
+		d.Pyramid.Sell.Reason,
+	)
+
+	parts = append(
+		parts,
+		fmt.Sprintf(
+			"pyr_sell_adversePass=%t",
+			d.Pyramid.Sell.AdversePass,
+		),
+	)
+
+	// -----------------------------------------------------------------
+	// Equity raw materials and derived results.
+	//
+	// Equity.Reason contains equity, baseline, multipliers, trigger
+	// thresholds, distances, spare balances, proposed sizes, pass states,
+	// and final trigger states. Promote every item to a canonical field.
+	// -----------------------------------------------------------------
+
+	appendPrefixedFields(
+		"equity",
+		d.Equity.Reason,
+	)
+
+	// -----------------------------------------------------------------
+	// Selected-side summaries.
+	//
+	// These explain the final selected side when a directional producer
+	// exists. For FLAT decisions, the pass values remain false and the
+	// reasons may be empty because no side was selected.
+	// -----------------------------------------------------------------
+
+	parts = append(
+		parts,
+		fmt.Sprintf(
+			"selected_pyramid_pass=%t",
+			d.PyramidPass,
+		),
+		fmt.Sprintf(
+			"selected_equity_pass=%t",
+			d.EquityPass,
+		),
+	)
+
+	appendPrefixedFields(
+		"selected_pyramid",
+		d.PyramidReason,
+	)
+
+	appendPrefixedFields(
+		"selected_equity",
+		d.EquityReason,
+	)
+
+	// -----------------------------------------------------------------
+	// Decision flow.
+	//
+	// Raw and final are already printed in the canonical log prefix as
+	// Raw= and Decision=, so they are not duplicated here.
+	// -----------------------------------------------------------------
+
+	parts = append(
+		parts,
 		fmt.Sprintf("legacySignal=%s", d.LegacySignal),
 		fmt.Sprintf("logicOpinion=%s", d.LogicOpinion),
 		fmt.Sprintf("source=%s", d.DecisionSource),
-	}
+	)
 
 	return strings.Join(parts, "|")
 }
