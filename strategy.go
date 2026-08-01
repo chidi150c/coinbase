@@ -68,22 +68,27 @@ const (
 //
 // Exit-specific information belongs exclusively to ExitDecision.
 type EntryDecision struct {
-	Signal       Signal
-	Raw          Signal
-	LegacySignal Signal
-	Confidence   float64
-
+	// Final decision.
+	Signal         Signal
+	Raw            Signal
+	LegacySignal   Signal
+	LogicOpinion   Signal
 	DecisionSource EntryDecisionSource
+	Confidence     float64
 
-	// Model / AI summary.
+	// AI / model context.
 	PUp           float64
 	BuyThreshold  float64
 	SellThreshold float64
 
-	// Combined legacy MACD + EMA opinion.
-	LogicOpinion Signal
+	// Market / interpretation context.
+	MarketRegime   MarketRegime
+	RegimeMult     float64
+	LogicEPS       float64
+	LogicBaseEPS   float64
+	LogicRegimeEPS float64
 
-	// Complete Case 5 interpreted evidence.
+	// Complete Case 5 evaluator outputs.
 	Pyramid PyramidResult
 	Equity  EquityResult
 
@@ -93,8 +98,9 @@ type EntryDecision struct {
 	EquityPass    bool
 	EquityReason  string
 
-	// Logic MACD raw materials.
+	// MACD evidence.
 	LogicMACDLine           float64
+	LogicMACDLinePrev6      float64
 	LogicMACDTurn           float64
 	LogicMACDHist           float64
 	LogicMACDDHist          float64
@@ -104,11 +110,11 @@ type EntryDecision struct {
 	LogicMACDMomentumDown   bool
 	LogicMACDMomentumUp     bool
 
-	// Logic EMA raw materials.
+	// EMA evidence.
 	LogicEMASpread float64
 	LogicEMA2050   float64
 
-	// Logic pattern raw materials.
+	// Pattern evidence.
 	LogicPatternHighPeak    bool
 	LogicPatternLowBottom   bool
 	LogicPatternPriceDownUp bool
@@ -116,15 +122,21 @@ type EntryDecision struct {
 	LogicPatternBuy         bool
 	LogicPatternSell        bool
 
-	// Logic interpretation context.
-	LogicEPS           float64
-	LogicBaseEPS       float64
-	LogicRegimeEPS     float64
-	MarketRegime       MarketRegime
-	RegimeMult         float64
-	LogicMACDLinePrev6 float64
-	MACDPrePeakZone    bool
-	PeakReversalSell   bool
+	// Peak-reversal (Case 11).
+	MACDPrePeakZone  bool
+	PeakReversalSell bool
+
+	// Pyramid evaluation.
+	PyramidBuySpacingPass  bool
+	PyramidBuyAdversePass  bool
+	PyramidBuyGatePassed   bool
+	PyramidSellSpacingPass bool
+	PyramidSellAdversePass bool
+	PyramidSellGatePassed  bool
+
+	// Equity evaluation.
+	EquityBuyTrigger  bool
+	EquitySellTrigger bool
 }
 
 // ExitDecision contains only the information required to
@@ -371,11 +383,12 @@ func (t *Trader) evaluateAI(
 }
 
 type MACDSnapshotResult struct {
-	Line    float64
-	Turn    float64
-	Hist    float64
-	DHist   float64
-	DSmooth float64
+	Line      float64
+	LinePrev6 float64
+	Turn      float64
+	Hist      float64
+	DHist     float64
+	DSmooth   float64
 
 	// Raw momentum inputs produced by the snapshot.
 	MomentumDown bool
@@ -722,6 +735,7 @@ func (t *Trader) evaluateMACDSnapshot(
 	}
 
 	result.Line = snap.MACDLine
+	result.LinePrev6 = snap.MACDLinePrev6
 	result.Turn = snap.MACDTurningPoint
 	result.Hist = snap.MACDHist
 	result.DHist = snap.MACDHistDelta
@@ -788,6 +802,7 @@ func interpretMACD(
 	result := MACDResult{
 		EPS:          eps,
 		Line:         raw.Line,
+		LinePrev6:    raw.LinePrev6,
 		Turn:         raw.Turn,
 		Hist:         raw.Hist,
 		DHist:        raw.DHist,
@@ -1814,6 +1829,14 @@ func (t *Trader) combineEntryRawMaterials(
 		MACDPrePeakZone:    macdPrePeakZone,
 		PeakReversalSell:   peakReversalSell,
 	}
+	d.PyramidBuySpacingPass = pyramid.Buy.SpacingPass
+	d.PyramidBuyAdversePass = pyramid.Buy.AdversePass
+	d.PyramidBuyGatePassed = pyramid.Buy.GatePassed
+	d.PyramidSellSpacingPass = pyramid.Sell.SpacingPass
+	d.PyramidSellAdversePass = pyramid.Sell.AdversePass
+	d.PyramidSellGatePassed = pyramid.Sell.GatePassed
+	d.EquityBuyTrigger = equity.BuyTrigger
+	d.EquitySellTrigger = equity.SellTrigger
 
 	// -------------------------------------------------------------
 	// Case 11 has first priority because it is an independent
@@ -1837,7 +1860,9 @@ func (t *Trader) combineEntryRawMaterials(
 		log.Printf(
 			"[TRACE] case11.peak_reversal_sell "+
 				"macd_idx6=%.6f eps=%.6f buffer=%.2f threshold=%.6f "+
-				"macd_zone=%t ema_high_peak=%t pyramid_sell=%t",
+				"macd_zone=%t ema_high_peak=%t "+
+				"pyramid_sell=%t pyramid_reason=%s "+
+				"equity_sell=%t equity_reason=%s",
 			macd.LinePrev6,
 			macd.EPS,
 			macdPeakBuffer,
@@ -1845,6 +1870,9 @@ func (t *Trader) combineEntryRawMaterials(
 			macdPrePeakZone,
 			ema.HighPeak,
 			pyramid.Sell.GatePassed,
+			pyramid.Sell.Reason,
+			equity.SellTrigger,
+			equity.Reason,
 		)
 
 		return d

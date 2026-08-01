@@ -77,7 +77,7 @@ import (
 	"time"
 )
 
-const Version = 147
+const Version = 148
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -1466,35 +1466,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	reasonBasePct := selectedPyramid.BasePct
 	reasonElapsedHr := selectedPyramid.ElapsedHr
 	reasonTFloorHr := selectedPyramid.TFloorHr
-
-	log.Printf(
-		"[TRACE] case5.fanin "+
-			"ai_ms=%d macd_ms=%d ema_ms=%d pyramid_ms=%d equity_ms=%d "+
-			"aiRaw=%s macd=%s ema=%s logic=%s legacy=%s "+
-			"pyrBuy{spacing=%t adverse=%t gate=%t} "+
-			"pyrSell{spacing=%t adverse=%t gate=%t} "+
-			"eqBuy=%t eqSell=%t source=%s final=%s",
-		aiResult.Elapsed.Milliseconds(),
-		macdSnapshot.Elapsed.Milliseconds(),
-		emaResult.Elapsed.Milliseconds(),
-		pyramidRaw.Elapsed.Milliseconds(),
-		equityResult.Elapsed.Milliseconds(),
-		aiResult.Raw,
-		macdResult.Opinion,
-		emaResult.Opinion,
-		logicOpinion,
-		legacySignal,
-		pyramidResult.Buy.SpacingPass,
-		pyramidResult.Buy.AdversePass,
-		pyramidResult.Buy.GatePassed,
-		pyramidResult.Sell.SpacingPass,
-		pyramidResult.Sell.AdversePass,
-		pyramidResult.Sell.GatePassed,
-		equityResult.BuyTrigger,
-		equityResult.SellTrigger,
-		entryDecision.DecisionSource,
-		entryDecision.Signal,
-	)
 
 	d := entryDecision
 

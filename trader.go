@@ -1076,6 +1076,7 @@ func decisionEntryReason(d EntryDecision) string {
 
 		// MACD evidence.
 		fmt.Sprintf("logic_macd_line=%.5f", d.LogicMACDLine),
+		fmt.Sprintf("logic_macd_line_prev6=%.5f", d.LogicMACDLinePrev6),
 		fmt.Sprintf("logic_macd_turn=%.5f", d.LogicMACDTurn),
 		fmt.Sprintf("logic_macd_hist=%.5f", d.LogicMACDHist),
 		fmt.Sprintf("logic_macd_dhist=%.5f", d.LogicMACDDHist),
@@ -1094,6 +1095,24 @@ func decisionEntryReason(d EntryDecision) string {
 		fmt.Sprintf("logic_pattern_price_up_down=%t", d.LogicPatternPriceUpDown),
 		fmt.Sprintf("logic_pattern_buy=%t", d.LogicPatternBuy),
 		fmt.Sprintf("logic_pattern_sell=%t", d.LogicPatternSell),
+
+		// Pyramid evaluation.
+		fmt.Sprintf(
+			"pyrBuy{spacing=%t adverse=%t gate=%t}",
+			d.PyramidBuySpacingPass,
+			d.PyramidBuyAdversePass,
+			d.PyramidBuyGatePassed,
+		),
+		fmt.Sprintf(
+			"pyrSell{spacing=%t adverse=%t gate=%t}",
+			d.PyramidSellSpacingPass,
+			d.PyramidSellAdversePass,
+			d.PyramidSellGatePassed,
+		),
+
+		// Equity evaluation.
+		fmt.Sprintf("eqBuy=%t", d.EquityBuyTrigger),
+		fmt.Sprintf("eqSell=%t", d.EquitySellTrigger),
 
 		// Decision flow.
 		fmt.Sprintf("aiRaw=%s", d.Raw),
