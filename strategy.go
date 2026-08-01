@@ -122,9 +122,12 @@ type EntryDecision struct {
 	LogicPatternBuy         bool
 	LogicPatternSell        bool
 
-	// Peak-reversal (Case 11).
+	// Peak-reversal (Case 11A).
 	MACDPrePeakZone  bool
 	PeakReversalSell bool
+	// Bottom-reversal (Case 11B).
+	MACDPreBottomZone bool
+	BottomReversalBuy bool
 
 	// Pyramid evaluation.
 	PyramidBuySpacingPass  bool
@@ -199,10 +202,11 @@ func decisionExitReason(d ExitDecision) string {
 type EntryDecisionSource string
 
 const (
-	EntryDecisionSourceNone          EntryDecisionSource = ""
-	EntryDecisionSourceLegacyPyramid EntryDecisionSource = "LEGACY_PYRAMID"
-	EntryDecisionSourceLegacyEquity  EntryDecisionSource = "LEGACY_EQUITY"
-	EntryDecisionSourcePeakReversal  EntryDecisionSource = "peak_reversal"
+	EntryDecisionSourceNone           EntryDecisionSource = ""
+	EntryDecisionSourceLegacyPyramid  EntryDecisionSource = "LEGACY_PYRAMID"
+	EntryDecisionSourceLegacyEquity   EntryDecisionSource = "LEGACY_EQUITY"
+	EntryDecisionSourcePeakReversal   EntryDecisionSource = "peak_reversal"
+	EntryDecisionSourceBottomReversal EntryDecisionSource = "BottomReversal"
 )
 
 // EquityRawResult preserves the complete direction-independent Equity
@@ -1766,7 +1770,7 @@ func (t *Trader) combineEntryRawMaterials(
 	}
 
 	// -----------------------------------------------------------------
-	// Case 11 — Peak reversal SELL producer.
+	// Case 11A — Peak reversal SELL producer.
 	//
 	// At the observed BTC price peak, MACD may still be below +EPS.
 	// Allow a fixed 10-point pre-EPS zone at idx-6, then require
@@ -1784,6 +1788,28 @@ func (t *Trader) combineEntryRawMaterials(
 		macdPrePeakZone &&
 			ema.HighPeak &&
 			pyramid.Sell.GatePassed
+
+	// -----------------------------------------------------------------
+	// Case 11B — Bottom reversal BUY producer.
+	// Mirror of Case 11A:
+	// MACD[idx-6] <= -EPS + buffer
+	// AND EMA low-bottom
+	// AND Pyramid BUY gate
+	// The positive buffer allows MACD to approach the negative EPS
+	// threshold without requiring it to cross fully below -EPS.
+	// -----------------------------------------------------------------
+	const macdBottomBuffer = 15.0
+
+	macdPreBottomThreshold :=
+		-macd.EPS + macdBottomBuffer
+
+	macdPreBottomZone :=
+		macd.LinePrev6 <= macdPreBottomThreshold
+
+	bottomReversalBuy :=
+		macdPreBottomZone &&
+			ema.LowBottom &&
+			pyramid.Buy.GatePassed
 
 	d := EntryDecision{
 		Signal:         Flat,
@@ -1828,6 +1854,8 @@ func (t *Trader) combineEntryRawMaterials(
 		LogicMACDLinePrev6: macd.LinePrev6,
 		MACDPrePeakZone:    macdPrePeakZone,
 		PeakReversalSell:   peakReversalSell,
+		MACDPreBottomZone:  macdPreBottomZone,
+		BottomReversalBuy:  bottomReversalBuy,
 	}
 	d.PyramidBuySpacingPass = pyramid.Buy.SpacingPass
 	d.PyramidBuyAdversePass = pyramid.Buy.AdversePass
@@ -1858,7 +1886,7 @@ func (t *Trader) combineEntryRawMaterials(
 			equity.Reason
 
 		log.Printf(
-			"[TRACE] case11.peak_reversal_sell "+
+			"[TRACE] case11A.peak_reversal_sell "+
 				"macd_idx6=%.6f eps=%.6f buffer=%.2f threshold=%.6f "+
 				"macd_zone=%t ema_high_peak=%t "+
 				"pyramid_sell=%t pyramid_reason=%s "+
@@ -1872,6 +1900,49 @@ func (t *Trader) combineEntryRawMaterials(
 			pyramid.Sell.GatePassed,
 			pyramid.Sell.Reason,
 			equity.SellTrigger,
+			equity.Reason,
+		)
+
+		return d
+	}
+
+	// -------------------------------------------------------------
+	// Case 11B has first priority because it is an independent
+	// directional producer, not an AI/Logic gate.
+	//
+	// Equity is recorded for diagnostics only. It is not required
+	// and does not block the Bottom-Reversal BUY producer.
+	// -------------------------------------------------------------
+	if bottomReversalBuy {
+		d.Signal = Buy
+		d.DecisionSource =
+			EntryDecisionSourceBottomReversal
+
+		d.PyramidPass =
+			pyramid.Buy.GatePassed
+		d.PyramidReason =
+			pyramid.Buy.Reason
+
+		d.EquityPass =
+			equity.BuyTrigger
+		d.EquityReason =
+			equity.Reason
+
+		log.Printf(
+			"[TRACE] case11B.bottom_reversal_buy "+
+				"macd_idx6=%.6f eps=%.6f buffer=%.2f threshold=%.6f "+
+				"macd_zone=%t ema_low_bottom=%t "+
+				"pyramid_buy=%t pyramid_reason=%s "+
+				"equity_buy=%t equity_reason=%s",
+			macd.LinePrev6,
+			macd.EPS,
+			macdBottomBuffer,
+			macdPreBottomThreshold,
+			macdPreBottomZone,
+			ema.LowBottom,
+			pyramid.Buy.GatePassed,
+			pyramid.Buy.Reason,
+			equity.BuyTrigger,
 			equity.Reason,
 		)
 

@@ -1174,6 +1174,8 @@ func decisionEntryReason(d EntryDecision) string {
 		parts,
 		fmt.Sprintf("macd_pre_peak_zone=%t", d.MACDPrePeakZone),
 		fmt.Sprintf("peak_reversal_sell=%t", d.PeakReversalSell),
+		fmt.Sprintf("macd_pre_bottom_zone=%t", d.MACDPreBottomZone),
+		fmt.Sprintf("bottom_reversal_buy=%t", d.BottomReversalBuy),
 	)
 
 	// -----------------------------------------------------------------
