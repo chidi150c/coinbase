@@ -140,6 +140,11 @@ type EntryDecision struct {
 	// Equity evaluation.
 	EquityBuyTrigger  bool
 	EquitySellTrigger bool
+	// Case 13 — Capitulation-Bottom BUY evidence.
+	NearRecentLowPct      float64
+	PriceNearRecentLow    bool
+	CapitulationBuyArm    bool
+	CapitulationBottomBuy bool
 }
 
 // ExitDecision contains only the information required to
@@ -202,11 +207,12 @@ func decisionExitReason(d ExitDecision) string {
 type EntryDecisionSource string
 
 const (
-	EntryDecisionSourceNone           EntryDecisionSource = ""
-	EntryDecisionSourceLegacyPyramid  EntryDecisionSource = "LEGACY_PYRAMID"
-	EntryDecisionSourceLegacyEquity   EntryDecisionSource = "LEGACY_EQUITY"
-	EntryDecisionSourcePeakReversal   EntryDecisionSource = "peak_reversal"
-	EntryDecisionSourceBottomReversal EntryDecisionSource = "BottomReversal"
+	EntryDecisionSourceNone                  EntryDecisionSource = ""
+	EntryDecisionSourceLegacyPyramid         EntryDecisionSource = "LEGACY_PYRAMID"
+	EntryDecisionSourceLegacyEquity          EntryDecisionSource = "LEGACY_EQUITY"
+	EntryDecisionSourcePeakReversal          EntryDecisionSource = "peak_reversal"
+	EntryDecisionSourceBottomReversal        EntryDecisionSource = "BottomReversal"
+	EntryDecisionSourceCapitulationBottomBuy EntryDecisionSource = "CapitulationBottomBuy"
 )
 
 // EquityRawResult preserves the complete direction-independent Equity
@@ -1736,25 +1742,21 @@ func interpretPyramidSideRaw(
 	return result, transition
 }
 
-// combineEntryRawMaterials is the Case 5 final entry-decision engine.
+// combineEntryRawMaterials is the final entry-decision engine.
 //
-// Initial policy:
+// Case 5 policy:
 //
-//  1. Legacy AI + MACD + EMA remains the only directional producer.
+//  1. Legacy AI + MACD + EMA produces the legacy direction.
 //  2. A matching executable Equity trigger bypasses Pyramid.
 //  3. Otherwise, the matching Pyramid gate must pass.
-//  4. Pyramid-only and Equity-only directions are not enabled yet.
+//  4. Pyramid-only and Equity-only directions are not enabled.
 //  5. Sizing, LongOnly, lot caps, pending checks, and placement remain outside.
 //
-// combineEntryRawMaterials is the Case 5 final entry-decision engine.
+// Independent producers run before the legacy Case 5 route:
 //
-// Case 11 adds an independent peak-reversal SELL producer:
-//
-//	MACD[idx-6] >= EPS - 10
-//	AND EMA high-peak
-//	AND Pyramid SELL gate
-//
-// Case 11 does not require AI SELL or legacy SELL.
+//   - Case 11A: Peak-Reversal SELL
+//   - Case 11B: Bottom-Reversal BUY
+//   - Case 13B: Capitulation-Bottom BUY
 func (t *Trader) combineEntryRawMaterials(
 	ai AIResult,
 	macd MACDResult,
@@ -1763,53 +1765,12 @@ func (t *Trader) combineEntryRawMaterials(
 	equity EquityResult,
 	legacySignal Signal,
 	logicOpinion Signal,
+	price float64,
 ) EntryDecision {
 	regimeMult := t.RegimeMultiplier
 	if regimeMult <= 0 {
 		regimeMult = 1.0
 	}
-
-	// -----------------------------------------------------------------
-	// Case 11A — Peak reversal SELL producer.
-	//
-	// At the observed BTC price peak, MACD may still be below +EPS.
-	// Allow a fixed 10-point pre-EPS zone at idx-6, then require
-	// independent EMA high-peak geometry and the Pyramid SELL gate.
-	// -----------------------------------------------------------------
-	const macdPeakBuffer = 15.0
-
-	macdPrePeakThreshold :=
-		macd.EPS - macdPeakBuffer
-
-	macdPrePeakZone :=
-		macd.LinePrev6 >= macdPrePeakThreshold
-
-	peakReversalSell :=
-		macdPrePeakZone &&
-			ema.HighPeak &&
-			pyramid.Sell.GatePassed
-
-	// -----------------------------------------------------------------
-	// Case 11B — Bottom reversal BUY producer.
-	// Mirror of Case 11A:
-	// MACD[idx-6] <= -EPS + buffer
-	// AND EMA low-bottom
-	// AND Pyramid BUY gate
-	// The positive buffer allows MACD to approach the negative EPS
-	// threshold without requiring it to cross fully below -EPS.
-	// -----------------------------------------------------------------
-	const macdBottomBuffer = 15.0
-
-	macdPreBottomThreshold :=
-		-macd.EPS + macdBottomBuffer
-
-	macdPreBottomZone :=
-		macd.LinePrev6 <= macdPreBottomThreshold
-
-	bottomReversalBuy :=
-		macdPreBottomZone &&
-			ema.LowBottom &&
-			pyramid.Buy.GatePassed
 
 	d := EntryDecision{
 		Signal:         Flat,
@@ -1828,6 +1789,7 @@ func (t *Trader) combineEntryRawMaterials(
 		Equity:  equity,
 
 		LogicMACDLine:           macd.Line,
+		LogicMACDLinePrev6:      macd.LinePrev6,
 		LogicMACDTurn:           macd.Turn,
 		LogicMACDHist:           macd.Hist,
 		LogicMACDDHist:          macd.DHist,
@@ -1850,102 +1812,43 @@ func (t *Trader) combineEntryRawMaterials(
 		LogicEPS:     macd.EPS,
 		MarketRegime: t.MarketRegime,
 		RegimeMult:   regimeMult,
-
-		LogicMACDLinePrev6: macd.LinePrev6,
-		MACDPrePeakZone:    macdPrePeakZone,
-		PeakReversalSell:   peakReversalSell,
-		MACDPreBottomZone:  macdPreBottomZone,
-		BottomReversalBuy:  bottomReversalBuy,
 	}
 	d.PyramidBuySpacingPass = pyramid.Buy.SpacingPass
 	d.PyramidBuyAdversePass = pyramid.Buy.AdversePass
 	d.PyramidBuyGatePassed = pyramid.Buy.GatePassed
+
 	d.PyramidSellSpacingPass = pyramid.Sell.SpacingPass
 	d.PyramidSellAdversePass = pyramid.Sell.AdversePass
 	d.PyramidSellGatePassed = pyramid.Sell.GatePassed
+
 	d.EquityBuyTrigger = equity.BuyTrigger
 	d.EquitySellTrigger = equity.SellTrigger
 
-	// -------------------------------------------------------------
-	// Case 11 has first priority because it is an independent
-	// directional producer, not an AI/Logic gate.
-	// -------------------------------------------------------------
-	if peakReversalSell {
-		d.Signal = Sell
-		d.DecisionSource =
-			EntryDecisionSourcePeakReversal
-
-		d.PyramidPass =
-			pyramid.Sell.GatePassed
-		d.PyramidReason =
-			pyramid.Sell.Reason
-
-		d.EquityPass =
-			equity.SellTrigger
-		d.EquityReason =
-			equity.Reason
-
-		log.Printf(
-			"[TRACE] case11A.peak_reversal_sell "+
-				"macd_idx6=%.6f eps=%.6f buffer=%.2f threshold=%.6f "+
-				"macd_zone=%t ema_high_peak=%t "+
-				"pyramid_sell=%t pyramid_reason=%s "+
-				"equity_sell=%t equity_reason=%s",
-			macd.LinePrev6,
-			macd.EPS,
-			macdPeakBuffer,
-			macdPrePeakThreshold,
-			macdPrePeakZone,
-			ema.HighPeak,
-			pyramid.Sell.GatePassed,
-			pyramid.Sell.Reason,
-			equity.SellTrigger,
-			equity.Reason,
-		)
-
+	// -----------------------------------------------------------------
+	// Case 11 — Independent reversal producers.
+	//
+	// Evaluate the Case 11 reversal producers before the legacy Case 5
+	// decision path. These producers recognize specific reversal market
+	// phenomena and may emit a directional BUY or SELL independently of
+	// the legacy AI/Logic producer.
+	// -----------------------------------------------------------------
+	if applyCase11ReversalProducer(&d, macd, ema, pyramid, equity) {
 		return d
 	}
 
-	// -------------------------------------------------------------
-	// Case 11B has first priority because it is an independent
-	// directional producer, not an AI/Logic gate.
+	// -----------------------------------------------------------------
+	// Case 13 — Independent capitulation-bottom BUY producer.
 	//
-	// Equity is recorded for diagnostics only. It is not required
-	// and does not block the Bottom-Reversal BUY producer.
-	// -------------------------------------------------------------
-	if bottomReversalBuy {
-		d.Signal = Buy
-		d.DecisionSource =
-			EntryDecisionSourceBottomReversal
-
-		d.PyramidPass =
-			pyramid.Buy.GatePassed
-		d.PyramidReason =
-			pyramid.Buy.Reason
-
-		d.EquityPass =
-			equity.BuyTrigger
-		d.EquityReason =
-			equity.Reason
-
-		log.Printf(
-			"[TRACE] case11B.bottom_reversal_buy "+
-				"macd_idx6=%.6f eps=%.6f buffer=%.2f threshold=%.6f "+
-				"macd_zone=%t ema_low_bottom=%t "+
-				"pyramid_buy=%t pyramid_reason=%s "+
-				"equity_buy=%t equity_reason=%s",
-			macd.LinePrev6,
-			macd.EPS,
-			macdBottomBuffer,
-			macdPreBottomThreshold,
-			macdPreBottomZone,
-			ema.LowBottom,
-			pyramid.Buy.GatePassed,
-			pyramid.Buy.Reason,
-			equity.BuyTrigger,
-			equity.Reason,
-		)
-
+	// Case 13 identifies a persistent bearish environment in which AI has
+	// already produced BUY with sufficient confidence, price remains near
+	// the recent low, BUY spacing has passed, MACD remains negative across
+	// the current and idx-6 observations, and EMA confirms a low-bottom
+	// structure.
+	//
+	// The producer may emit BUY independently of the legacy Case 5
+	// AI/Logic route.
+	// -----------------------------------------------------------------
+	if applycase13BCapitulationBottomProducer(&d, ai, macd, ema, pyramid, equity, price, t.RecentLow, t.MarketRegime) {
 		return d
 	}
 
@@ -1958,6 +1861,7 @@ func (t *Trader) combineEntryRawMaterials(
 			pyramid.Buy.GatePassed
 		d.PyramidReason =
 			pyramid.Buy.Reason
+
 		d.EquityPass =
 			equity.BuyTrigger
 		d.EquityReason =
@@ -1980,6 +1884,7 @@ func (t *Trader) combineEntryRawMaterials(
 			pyramid.Sell.GatePassed
 		d.PyramidReason =
 			pyramid.Sell.Reason
+
 		d.EquityPass =
 			equity.SellTrigger
 		d.EquityReason =

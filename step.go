@@ -77,7 +77,7 @@ import (
 	"time"
 )
 
-const Version = 153
+const Version = 154
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -1440,6 +1440,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		equityResult,
 		legacySignal,
 		logicOpinion,
+		price,
 	)
 
 	log.Printf(

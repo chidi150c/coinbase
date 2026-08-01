@@ -1167,15 +1167,21 @@ func decisionEntryReason(d EntryDecision) string {
 	)
 
 	// -----------------------------------------------------------------
-	// Case 11 — Peak-Reversal SELL producer.
+	// Case xx Entry Producers.
 	// -----------------------------------------------------------------
 
 	parts = append(
 		parts,
+		// Case 11 — Peak-Reversal SELL producer.
 		fmt.Sprintf("macd_pre_peak_zone=%t", d.MACDPrePeakZone),
 		fmt.Sprintf("peak_reversal_sell=%t", d.PeakReversalSell),
 		fmt.Sprintf("macd_pre_bottom_zone=%t", d.MACDPreBottomZone),
 		fmt.Sprintf("bottom_reversal_buy=%t", d.BottomReversalBuy),
+		// Case 13 — Capitulation-Bottom BUY evidence.
+		fmt.Sprintf("case13B_near_low_pct=%.6f", d.NearRecentLowPct),
+		fmt.Sprintf("case13B_price_near_low=%t", d.PriceNearRecentLow),
+		fmt.Sprintf("case13B_buy_arm=%t", d.CapitulationBuyArm),
+		fmt.Sprintf("case13B_bottom_buy=%t", d.CapitulationBottomBuy),
 	)
 
 	// -----------------------------------------------------------------

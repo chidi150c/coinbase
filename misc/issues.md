@@ -430,6 +430,106 @@ Invariant
 
 At any time, there shall never be more than one incomplete normal PendingEntry per side, eliminating duplicate exchange orders while preserving legitimate opposite-side entries and specialized flows such as Case 3B.
 
+========================================
+
+Case 13 — Independent Capitulation Bottom BUY Producer
+Objective
+
+Detect and enter an early BUY opportunity after a prolonged bearish move, when the market shows signs of capitulation and the first structural evidence of a bottom begins to form.
+
+Unlike the legacy BUY logic, Case 13 is designed to recognize a specific market phenomenon rather than wait for broader directional agreement.
+
+Market Phenomenon
+
+Case 13 models a market that has been selling for some time and is approaching exhaustion.
+
+Its characteristics are:
+
+AI has already shifted to a BUY bias.
+The broader market regime is still DOWN.
+Price remains very close to the recent swing low.
+The bearish trend has persisted for several candles.
+Selling pressure is still present.
+The first bottom structure begins to appear.
+
+This combination represents an early capitulation bottom, where sellers may be exhausting before a reversal.
+
+Producer Design
+Arm (Environment)
+
+The arm identifies that the market is in a potential capitulation environment.
+
+capitulationBuyArm :=
+    ai.Raw == Buy &&
+    ai.Confidence >= 0.65 &&
+    t.MarketRegime == RegimeDown &&
+    pyramid.Buy.SpacingPass &&
+    priceNearRecentLow &&
+    macd.LinePrev6 < 0 &&
+    macd.Line < 0 &&
+    macd.Hist < 0
+
+This arm does not generate a BUY.
+
+It simply declares:
+
+"The market is now in a capitulation environment."
+
+Trigger
+
+The final confirmation is the emergence of a bottom structure.
+
+capitulationBottomBuy :=
+    capitulationBuyArm &&
+    ema.LowBottom
+
+Only when the environment already exists and EMA confirms a bottom does the producer emit a BUY signal.
+
+Raw Materials
+Purpose	Raw Material
+Direction	ai.Raw == Buy
+Signal Quality	ai.Confidence >= 0.65
+Market Context	t.MarketRegime == RegimeDown
+Entry Protection	pyramid.Buy.SpacingPass
+Price Location	priceNearRecentLow
+Trend Persistence	macd.LinePrev6 < 0
+Current Trend	macd.Line < 0
+Selling Pressure	macd.Hist < 0
+Structural Confirmation	ema.LowBottom
+Price Near Recent Low
+
+Case 13 introduces a reusable price-location feature.
+
+nearLowPct :=
+    (price - t.RecentLow) /
+        t.RecentLow * 100.0
+
+priceNearRecentLow :=
+    t.RecentLow > 0 &&
+    nearLowPct >= 0 &&
+    nearLowPct <= 0.10
+
+This ensures the producer only activates while price remains within 0.10% above the recent low, preventing late entries after price has already moved away from the bottom.
+
+Decision Source
+EntryDecisionSourceCapitulationBottomBuy
+Characteristics
+Independent BUY producer.
+Focused on one market phenomenon.
+Uses the minimum raw materials required.
+Separates the persistent market environment (Arm) from the structural confirmation (Trigger).
+Does not modify or depend on the legacy BUY producer.
+Expected Behavior
+
+Case 13 should fire in situations where:
+
+the market has experienced a sustained decline,
+AI anticipates a reversal,
+price is still sitting near the recent low,
+bearish momentum has persisted,
+and the first bottom structure appears,
+
+allowing the bot to participate earlier in a developing reversal while retaining structural confirmation before entering.
 
 ================================
 
