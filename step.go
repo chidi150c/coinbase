@@ -77,7 +77,7 @@ import (
 	"time"
 )
 
-const Version = 149
+const Version = 150
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -1414,21 +1414,21 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		baseStep,
 	)
 
-	log.Printf(
-		"[TRACE] case5.equity raw_ms=%d interpret_ms=%d legacy=%s "+
-			"buy_pass=%t sell_pass=%t buy_trigger=%t sell_trigger=%t "+
-			"buy_quote=%.8f sell_base=%.8f reason=%s",
-		equityRaw.Elapsed.Milliseconds(),
-		equityResult.Elapsed.Milliseconds(),
-		legacySignal,
-		equityRaw.BuyThresholdPassed,
-		equityRaw.SellThresholdPassed,
-		equityResult.BuyTrigger,
-		equityResult.SellTrigger,
-		equityResult.ProposedBuyQuote,
-		equityResult.ProposedSellBase,
-		equityResult.Reason,
-	)
+	// log.Printf(
+	// 	"[TRACE] case5.equity raw_ms=%d interpret_ms=%d legacy=%s "+
+	// 		"buy_pass=%t sell_pass=%t buy_trigger=%t sell_trigger=%t "+
+	// 		"buy_quote=%.8f sell_base=%.8f reason=%s",
+	// 	equityRaw.Elapsed.Milliseconds(),
+	// 	equityResult.Elapsed.Milliseconds(),
+	// 	legacySignal,
+	// 	equityRaw.BuyThresholdPassed,
+	// 	equityRaw.SellThresholdPassed,
+	// 	equityResult.BuyTrigger,
+	// 	equityResult.SellTrigger,
+	// 	equityResult.ProposedBuyQuote,
+	// 	equityResult.ProposedSellBase,
+	// 	equityResult.Reason,
+	// )
 
 	// Case 5 may retain or override the legacy AI + Logic decision using
 	// the complete AI, MACD, EMA and Pyramid materials.
