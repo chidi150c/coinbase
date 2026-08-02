@@ -77,7 +77,7 @@ import (
 	"time"
 )
 
-const Version = 154
+const Version = 155
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -1204,7 +1204,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	if regimeMult <= 0 {
 		regimeMult = 1.0
 	}
-	eps := computeLogicEPS(
+	eps, regimeEPS, baseEPS := computeLogicEPS(
 		t.cfg.MACDLineEPS,
 		aiResult.Raw,
 		aiResult.Confidence,
@@ -1214,6 +1214,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	macdResult := interpretMACD(
 		macdSnapshot,
 		eps,
+		regimeEPS,
+		baseEPS,
 	)
 
 	// ----------------------------------------------------------

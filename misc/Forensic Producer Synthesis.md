@@ -144,7 +144,7 @@ Implement the phenomenon as a standalone producer.
 
 Example
 
-capitulationBottomBuy := ...
+bottomBuy := ...
 
 The producer must:
 
@@ -168,10 +168,10 @@ Producer
 
 Example
 
-capitulationBuyArm := ...
+bottomBuyArm := ...
 
-capitulationBottomBuy :=
-    capitulationBuyArm &&
+bottomBuy :=
+    bottomBuyArm &&
     ema.LowBottom
 
 The Arm is optional.

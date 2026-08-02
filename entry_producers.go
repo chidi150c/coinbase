@@ -64,7 +64,9 @@
 // ---------------------------------------------------------------------------------------------
 package main
 
-import "log"
+import (
+	"log"
+)
 
 // applyCase11ReversalProducer evaluates the independent Case 11
 // reversal producers:
@@ -209,26 +211,166 @@ func applyCase11ReversalProducer(
 	return false
 }
 
-// applycase13BCapitulationBottomProducer evaluates Case 13, an independent
-// Capitulation-Bottom BUY producer.
+// applyCase13Producer evaluates the independent Case 13 producers.
 //
-// Case 13 targets an early reversal from a persistent bearish condition:
+// Case 13 consists of:
 //
-//   - AI has produced BUY with at least 0.65 confidence.
-//   - Market regime remains DOWN.
-//   - BUY-side spacing protection has passed.
-//   - Live price is no more than 0.10% above the recent low.
-//   - MACD was negative at idx-6 and remains negative now.
-//   - MACD histogram remains negative.
-//   - EMA low-bottom geometry provides the final entry trigger.
+//   - Case 13A — Peak SELL producer.
+//   - Case 13B — Bottom BUY producer.
 //
-// The normal Pyramid BUY gate is intentionally not required. Case 13 uses
-// Pyramid spacing for entry-frequency protection while proximity to the
-// recent low and EMA low-bottom geometry qualify the entry location.
+// Both producers target early reversals from persistent trends by
+// combining AI conviction, market regime, price location, MACD
+// persistence, and EMA structural confirmation.
+func applyCase13Producer(
+	d *EntryDecision,
+	ai AIResult,
+	macd MACDResult,
+	ema EMAPatternResult,
+	pyramid PyramidResult,
+	equity EquityResult,
+	price float64,
+	recentLow float64,
+	recentHigh float64,
+	regime MarketRegime,
+) bool {
+	if applyCase13APeakProducer(
+		d,
+		ai,
+		macd,
+		ema,
+		pyramid,
+		equity,
+		price,
+		recentHigh,
+		regime,
+	) {
+		return true
+	}
+
+	if applyCase13BBottomProducer(
+		d,
+		ai,
+		macd,
+		ema,
+		pyramid,
+		equity,
+		price,
+		recentLow,
+		regime,
+	) {
+		return true
+	}
+
+	return false
+}
+
+// applyCase13APeakProducer evaluates Case 13A, an independent Peak SELL
+// producer.
 //
-// The function always populates the Case 13 diagnostic fields in d. It
-// returns true only when Case 13 emits an independent BUY decision.
-func applycase13BCapitulationBottomProducer(
+// Case 13A targets an early reversal from a persistent bullish condition:
+//
+//   - AI has produced SELL with at least 0.65 confidence.
+//   - Market regime remains UP.
+//   - SELL-side spacing protection has passed.
+//   - Live price is no more than 0.10% below the recent peak.
+//   - MACD was positive at idx-6 and remains positive now.
+//   - MACD histogram remains positive.
+//   - EMA high-peak geometry provides the final entry trigger.
+//
+// The normal Pyramid SELL gate is intentionally not required. Case 13A
+// uses Pyramid spacing for entry-frequency protection while proximity to
+// the recent peak and EMA high-peak geometry qualify the entry location.
+//
+// The function always populates the Case 13A diagnostic fields in d. It
+// returns true only when Case 13A emits an independent SELL decision.
+func applyCase13APeakProducer(
+	d *EntryDecision,
+	ai AIResult,
+	macd MACDResult,
+	ema EMAPatternResult,
+	pyramid PyramidResult,
+	equity EquityResult,
+	price float64,
+	recentHigh float64,
+	regime MarketRegime,
+) bool {
+	const (
+		minConfidence  = 0.65
+		maxNearPeakPct = 0.10
+	)
+
+	nearPeakPct := 0.0
+	PriceNearRecentHigh := false
+
+	if recentHigh > 0 && price > 0 {
+		nearPeakPct =
+			(recentHigh - price) /
+				recentHigh * 100.0
+
+		PriceNearRecentHigh =
+			nearPeakPct >= 0 &&
+				nearPeakPct <= maxNearPeakPct
+	}
+
+	// The arm identifies the complete peak environment. It does not
+	// produce SELL until EMA supplies the high-peak trigger.
+	peakSellArm :=
+		ai.Raw == Sell &&
+			ai.Confidence >= minConfidence &&
+			regime == RegimeUp &&
+			pyramid.Sell.SpacingPass &&
+			PriceNearRecentHigh &&
+			macd.LinePrev6 > 0 &&
+			macd.Line > 0 &&
+			macd.Hist > 0
+
+		// EMA high-peak geometry is the final structural confirmation.
+	peakSell :=
+		peakSellArm &&
+			ema.HighPeak
+
+	// Preserve Case 13A interpretation regardless of whether the
+	// producer emits SELL.
+	d.NearRecentHighPct = nearPeakPct
+	d.PriceNearRecentHigh = PriceNearRecentHigh
+
+	if !peakSell {
+		return false
+	}
+
+	d.Signal = Sell
+	d.DecisionSource = EntryDecisionSourceCase13APeakSell
+
+	// Case 13A requires SELL spacing, not the normal Pyramid gate.
+	d.PyramidPass = pyramid.Sell.SpacingPass
+	d.PyramidReason = pyramid.Sell.Reason
+
+	// Equity is recorded for diagnostics only.
+	d.EquityPass = equity.SellTrigger
+	d.EquityReason = equity.Reason
+
+	log.Printf(
+		"[TRACE] case13A.peak_sell "+
+			"ai_raw=%s confidence=%.2f regime=%s "+
+			"price=%.8f recent_peak=%.8f near_peak_pct=%.6f "+
+			"macd_idx6=%.6f macd_line=%.6f macd_hist=%.6f "+
+			"ema_high_peak=%t",
+		ai.Raw,
+		ai.Confidence,
+		regime,
+		price,
+		recentHigh,
+		nearPeakPct,
+		macd.LinePrev6,
+		macd.Line,
+		macd.Hist,
+		ema.HighPeak,
+	)
+
+	return true
+}
+
+func applyCase13BBottomProducer(
 	d *EntryDecision,
 	ai AIResult,
 	macd MACDResult,
@@ -239,6 +381,7 @@ func applycase13BCapitulationBottomProducer(
 	recentLow float64,
 	regime MarketRegime,
 ) bool {
+
 	const (
 		minConfidence = 0.65
 		maxNearLowPct = 0.10
@@ -252,9 +395,9 @@ func applycase13BCapitulationBottomProducer(
 		priceNearRecentLow = nearLowPct >= 0 && nearLowPct <= maxNearLowPct
 	}
 
-	// The arm identifies the complete capitulation environment. It does
-	// not produce BUY until EMA supplies the low-bottom trigger.
-	capitulationBuyArm :=
+	// The arm identifies the complete bottom environment. It does not
+	// produce BUY until EMA supplies the low-bottom trigger.
+	bottomBuyArm :=
 		ai.Raw == Buy &&
 			ai.Confidence >= minConfidence &&
 			regime == RegimeDown &&
@@ -264,24 +407,22 @@ func applycase13BCapitulationBottomProducer(
 			macd.Line < 0 &&
 			macd.Hist < 0
 
-	// EMA low-bottom geometry is the final structural confirmation.
-	capitulationBottomBuy :=
-		capitulationBuyArm &&
+		// EMA low-bottom geometry is the final structural confirmation.
+	bottomBuy :=
+		bottomBuyArm &&
 			ema.LowBottom
 
 	// Preserve Case 13 interpretation in the canonical decision record
 	// regardless of whether the producer emits BUY.
 	d.NearRecentLowPct = nearLowPct
 	d.PriceNearRecentLow = priceNearRecentLow
-	d.CapitulationBuyArm = capitulationBuyArm
-	d.CapitulationBottomBuy = capitulationBottomBuy
 
-	if !capitulationBottomBuy {
+	if !bottomBuy {
 		return false
 	}
 
 	d.Signal = Buy
-	d.DecisionSource = EntryDecisionSourceCapitulationBottomBuy
+	d.DecisionSource = EntryDecisionSourceCase13BBottomBuy
 
 	// Case 13 requires BUY spacing, not the normal Pyramid adverse gate.
 	d.PyramidPass = pyramid.Buy.SpacingPass
@@ -292,7 +433,7 @@ func applycase13BCapitulationBottomProducer(
 	d.EquityReason = equity.Reason
 
 	log.Printf(
-		"[TRACE] case13B.capitulation_bottom_buy "+
+		"[TRACE] case13B.bottom_buy "+
 			"ai_raw=%s confidence=%.2f min_confidence=%.2f regime=%s "+
 			"price=%.8f recent_low=%.8f near_low_pct=%.6f max_near_low_pct=%.2f price_near_low=%t "+
 			"macd_idx6=%.6f macd_line=%.6f macd_hist=%.6f "+
@@ -315,8 +456,8 @@ func applycase13BCapitulationBottomProducer(
 		pyramid.Buy.GatePassed,
 		pyramid.Buy.Reason,
 		ema.LowBottom,
-		capitulationBuyArm,
-		capitulationBottomBuy,
+		bottomBuyArm,
+		bottomBuy,
 		equity.BuyTrigger,
 		equity.Reason,
 	)

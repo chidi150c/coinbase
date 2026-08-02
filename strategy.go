@@ -141,10 +141,10 @@ type EntryDecision struct {
 	EquityBuyTrigger  bool
 	EquitySellTrigger bool
 	// Case 13 — Capitulation-Bottom BUY evidence.
-	NearRecentLowPct      float64
-	PriceNearRecentLow    bool
-	CapitulationBuyArm    bool
-	CapitulationBottomBuy bool
+	NearRecentLowPct    float64
+	PriceNearRecentLow  bool
+	NearRecentHighPct   float64
+	PriceNearRecentHigh bool
 }
 
 // ExitDecision contains only the information required to
@@ -207,12 +207,13 @@ func decisionExitReason(d ExitDecision) string {
 type EntryDecisionSource string
 
 const (
-	EntryDecisionSourceNone                  EntryDecisionSource = ""
-	EntryDecisionSourceLegacyPyramid         EntryDecisionSource = "LEGACY_PYRAMID"
-	EntryDecisionSourceLegacyEquity          EntryDecisionSource = "LEGACY_EQUITY"
-	EntryDecisionSourcePeakReversal          EntryDecisionSource = "peak_reversal"
-	EntryDecisionSourceBottomReversal        EntryDecisionSource = "BottomReversal"
-	EntryDecisionSourceCapitulationBottomBuy EntryDecisionSource = "CapitulationBottomBuy"
+	EntryDecisionSourceNone             EntryDecisionSource = ""
+	EntryDecisionSourceLegacyPyramid    EntryDecisionSource = "LEGACY_PYRAMID"
+	EntryDecisionSourceLegacyEquity     EntryDecisionSource = "LEGACY_EQUITY"
+	EntryDecisionSourcePeakReversal     EntryDecisionSource = "peak_reversal"
+	EntryDecisionSourceBottomReversal   EntryDecisionSource = "BottomReversal"
+	EntryDecisionSourceCase13BBottomBuy EntryDecisionSource = "bottomBuy"
+	EntryDecisionSourceCase13APeakSell  EntryDecisionSource = "Case13APeakSell"
 )
 
 // EquityRawResult preserves the complete direction-independent Equity
@@ -424,8 +425,10 @@ type MACDResult struct {
 	MomentumDown   bool
 	MomentumUp     bool
 
-	Err     error
-	Elapsed time.Duration
+	Err       error
+	Elapsed   time.Duration
+	RegimeEPS float64
+	BaseEPS   float64
 }
 
 type EMAPatternResult struct {
@@ -763,7 +766,7 @@ func computeLogicEPS(
 	confidence float64,
 	regime MarketRegime,
 	regimeMult float64,
-) float64 {
+) (float64, float64, float64) {
 
 	if regimeMult <= 0 {
 		regimeMult = 1.0
@@ -801,12 +804,14 @@ func computeLogicEPS(
 		eps = 10
 	}
 
-	return eps
+	return eps, regimeEPS, baseEPS
 }
 
 func interpretMACD(
 	raw MACDSnapshotResult,
 	eps float64,
+	regimeEPS float64,
+	baseEPS float64,
 ) MACDResult {
 
 	result := MACDResult{
@@ -821,6 +826,8 @@ func interpretMACD(
 		MomentumUp:   raw.MomentumUp,
 		Err:          raw.Err,
 		Elapsed:      raw.Elapsed,
+		RegimeEPS:    regimeEPS,
+		BaseEPS:      baseEPS,
 	}
 
 	if raw.Err != nil {
@@ -1809,9 +1816,11 @@ func (t *Trader) combineEntryRawMaterials(
 		LogicPatternBuy:         ema.PatternBuy,
 		LogicPatternSell:        ema.PatternSell,
 
-		LogicEPS:     macd.EPS,
-		MarketRegime: t.MarketRegime,
-		RegimeMult:   regimeMult,
+		LogicEPS:       macd.EPS,
+		LogicRegimeEPS: macd.RegimeEPS,
+		LogicBaseEPS:   macd.BaseEPS,
+		MarketRegime:   t.MarketRegime,
+		RegimeMult:     regimeMult,
 	}
 	d.PyramidBuySpacingPass = pyramid.Buy.SpacingPass
 	d.PyramidBuyAdversePass = pyramid.Buy.AdversePass
@@ -1827,8 +1836,7 @@ func (t *Trader) combineEntryRawMaterials(
 	// -----------------------------------------------------------------
 	// Case 11 — Independent reversal producers.
 	//
-	// Evaluate the Case 11 reversal producers before the legacy Case 5
-	// decision path. These producers recognize specific reversal market
+	// These producers recognize specific reversal market
 	// phenomena and may emit a directional BUY or SELL independently of
 	// the legacy AI/Logic producer.
 	// -----------------------------------------------------------------
@@ -1837,18 +1845,13 @@ func (t *Trader) combineEntryRawMaterials(
 	}
 
 	// -----------------------------------------------------------------
-	// Case 13 — Independent capitulation-bottom BUY producer.
-	//
-	// Case 13 identifies a persistent bearish environment in which AI has
-	// already produced BUY with sufficient confidence, price remains near
-	// the recent low, BUY spacing has passed, MACD remains negative across
-	// the current and idx-6 observations, and EMA confirms a low-bottom
-	// structure.
-	//
-	// The producer may emit BUY independently of the legacy Case 5
-	// AI/Logic route.
+	// applyCase13Producer evaluates the independent Case 13 producers.
+	// Case 13A — Peak SELL producer.
+	// Case 13B — Bottom BUY producer.
+	// Both producers target early reversals from persistent trends by combining AI conviction,
+	// market regime, price location, MACD persistence, and EMA structural confirmation.
 	// -----------------------------------------------------------------
-	if applycase13BCapitulationBottomProducer(&d, ai, macd, ema, pyramid, equity, price, t.RecentLow, t.MarketRegime) {
+	if applyCase13Producer(&d, ai, macd, ema, pyramid, equity, price, t.RecentLow, t.RecentHigh, t.MarketRegime) {
 		return d
 	}
 

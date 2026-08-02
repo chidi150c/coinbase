@@ -1180,8 +1180,8 @@ func decisionEntryReason(d EntryDecision) string {
 		// Case 13 — Capitulation-Bottom BUY evidence.
 		fmt.Sprintf("case13B_near_low_pct=%.6f", d.NearRecentLowPct),
 		fmt.Sprintf("case13B_price_near_low=%t", d.PriceNearRecentLow),
-		fmt.Sprintf("case13B_buy_arm=%t", d.CapitulationBuyArm),
-		fmt.Sprintf("case13B_bottom_buy=%t", d.CapitulationBottomBuy),
+		fmt.Sprintf("case13A_near_high_pct=%.6f", d.NearRecentHighPct),
+		fmt.Sprintf("case13A_price_near_high=%t", d.PriceNearRecentHigh),
 	)
 
 	// -----------------------------------------------------------------

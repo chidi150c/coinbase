@@ -431,8 +431,25 @@ Invariant
 At any time, there shall never be more than one incomplete normal PendingEntry per side, eliminating duplicate exchange orders while preserving legitimate opposite-side entries and specialized flows such as Case 3B.
 
 ========================================
+Case 13A — Independent Capitulation-Peak SELL Producer
+Objective
 
-Case 13 — Independent Capitulation Bottom BUY Producer
+Detect an early SELL opportunity after a prolonged bullish move, when buyers appear exhausted and the first structural evidence of a peak begins to form.
+
+Market Phenomenon
+
+Case 13A models a market where:
+
+AI has already shifted to a SELL bias.
+The broader market regime is still UP.
+Price remains very close to the recent swing high.
+The bullish trend has persisted.
+Buying pressure is still present.
+The first top structure begins to appear.
+
+This represents an early capitulation peak, where buyers may be exhausting before a reversal.
+
+Case 13B — Independent Capitulation Bottom BUY Producer
 Objective
 
 Detect and enter an early BUY opportunity after a prolonged bearish move, when the market shows signs of capitulation and the first structural evidence of a bottom begins to form.
@@ -459,7 +476,7 @@ Arm (Environment)
 
 The arm identifies that the market is in a potential capitulation environment.
 
-capitulationBuyArm :=
+bottomBuyArm :=
     ai.Raw == Buy &&
     ai.Confidence >= 0.65 &&
     t.MarketRegime == RegimeDown &&
@@ -479,8 +496,8 @@ Trigger
 
 The final confirmation is the emergence of a bottom structure.
 
-capitulationBottomBuy :=
-    capitulationBuyArm &&
+bottomBuy :=
+    bottomBuyArm &&
     ema.LowBottom
 
 Only when the environment already exists and EMA confirms a bottom does the producer emit a BUY signal.
@@ -512,7 +529,7 @@ priceNearRecentLow :=
 This ensures the producer only activates while price remains within 0.10% above the recent low, preventing late entries after price has already moved away from the bottom.
 
 Decision Source
-EntryDecisionSourceCapitulationBottomBuy
+EntryDecisionSourceCase13BBottomBuy
 Characteristics
 Independent BUY producer.
 Focused on one market phenomenon.
