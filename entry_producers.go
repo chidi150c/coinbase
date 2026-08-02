@@ -307,9 +307,7 @@ func applyCase13APeakProducer(
 			(recentHigh - price) /
 				recentHigh * 100.0
 
-		PriceNearRecentHigh =
-			nearPeakPct >= 0 &&
-				nearPeakPct <= maxNearPeakPct
+		PriceNearRecentHigh = nearPeakPct <= maxNearPeakPct
 	}
 
 	// The arm identifies the complete peak environment. It does not
@@ -392,7 +390,7 @@ func applyCase13BBottomProducer(
 
 	if recentLow > 0 && price > 0 {
 		nearLowPct = (price - recentLow) / recentLow * 100.0
-		priceNearRecentLow = nearLowPct >= 0 && nearLowPct <= maxNearLowPct
+		priceNearRecentLow = nearLowPct <= maxNearLowPct
 	}
 
 	// The arm identifies the complete bottom environment. It does not
