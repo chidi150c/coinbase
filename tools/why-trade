@@ -555,7 +555,7 @@ filter_block() {
       else if (line ~ /\[TRACE\] entry\.|\[TRACE\] exit\./) print line
       else if (line ~ /\[TRACE\] order\.|order\.open|order\.close|LIVE ORDER/) print line
       else if (line ~ /postonly\.|reprice/) print line
-      else if (line ~ /case3A\.|case3B\.|case3A_|case3B_/) print line
+      else if (line ~ /Case3B\.|Case3A\.|Case3B_|Case3A_/) print line
       else if (line ~ /RecoveryByProfitTarget|RecoveryByPositionSize|RecoveryDebtUSD/) print line
       else if (line ~ /recovery|replacement/) print line
       else if (line ~ /threshold_stop_loss|profit_giveback|trailing|runner/) print line

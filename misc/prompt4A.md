@@ -11,7 +11,7 @@ We are replacing the old fragmented entry lifecycle:
 
     pendingBuy  *PendingOpen
     pendingSell *PendingOpen
-    pendingCase3B map[string]*PendingEntry
+    pendingCase3A map[string]*PendingEntry
 
 with ONE unified registry:
 
@@ -69,7 +69,7 @@ Current direction is approximately:
 
     type PendingEntry struct {
         Side    OrderSide
-        Source  EntrySource
+        Source  EntryProducer
         OrderID string
 
         Intent *PendingIntent
@@ -99,7 +99,7 @@ IMPORTANT:
 - Legacy `entry.Pending` is being removed/replaced by `entry.Intent`.
 - Do NOT reintroduce PendingOpen.
 - OrderID is generic and is also the pendingEntries map key.
-- SourceEntryOrderID is different: for Case3B it identifies the source position being recovered.
+- SourceEntryOrderID is different: for Case3A it identifies the source position being recovered.
 
 
 ============================================================
@@ -158,7 +158,7 @@ The generic producer now owns:
 
 Source wrappers construct PendingIntent and call produceEntry().
 
-Normal BUY/SELL and Case3B should all eventually use this producer.
+Normal BUY/SELL and Case3A should all eventually use this producer.
 
 
 ============================================================
@@ -189,7 +189,7 @@ Poller context:
 6. GENERIC DRAIN
 ============================================================
 
-step() should no longer drain BUY, SELL and Case3B separately.
+step() should no longer drain BUY, SELL and Case3A separately.
 
 We added:
 
@@ -228,16 +228,16 @@ Do NOT replace this with iteration while holding t.mu.
 
 
 ============================================================
-7. COMMIT ELIGIBILITY / CASE3B
+7. COMMIT ELIGIBILITY / Case3A
 ============================================================
 
 Old special function:
 
-    drainPendingCase3BEntries()
+    drainPendingCase3AEntries()
 
 is being DELETED.
 
-The unique Case3B behavior was:
+The unique Case3A behavior was:
 
 Do not consume/commit the replacement fill until the originating loss exit has committed.
 
@@ -261,19 +261,19 @@ At top of drainPendingEntry():
 Normal BUY/SELL:
     CommitEligible == nil
 
-Case3B:
-    CommitEligible = t.case3BCommitEligible
+Case3A:
+    CommitEligible = t.Case3ACommitEligible
 
 Current eligibility function:
 
-    func (t *Trader) case3BCommitEligible(
+    func (t *Trader) Case3ACommitEligible(
         entry *PendingEntry,
     ) bool {
         if t == nil || entry == nil {
             return false
         }
 
-        if entry.Source != EntrySourceCase3B {
+        if entry.Source != EntrySourceCase3A {
             return true
         }
 
@@ -291,10 +291,10 @@ Current eligibility function:
 
 DO NOT refactor this further right now.
 
-The assignment should happen when generic buildPendingEntry() creates a Case3B PendingEntry:
+The assignment should happen when generic buildPendingEntry() creates a Case3A PendingEntry:
 
-    if intent.Source == EntrySourceCase3B {
-        entry.CommitEligible = t.case3BCommitEligible
+    if intent.Source == EntrySourceCase3A {
+        entry.CommitEligible = t.Case3ACommitEligible
     }
 
 Normal entries naturally leave the callback nil.
@@ -320,7 +320,7 @@ We introduced source-based EntryPolicy:
 Normal entries:
     ResetRegime = true
 
-Case3B:
+Case3A:
     ResetRegime = false
 
 Case 10 behavior:
@@ -330,7 +330,7 @@ A successful NORMAL entry resets directional regime only when entry agrees with 
     UP   + BUY  -> NORMAL
     DOWN + SELL -> NORMAL
 
-Case3B replacement DOES NOT reset regime.
+Case3A replacement DOES NOT reset regime.
 
 Reason:
 A DOWN regime + successful SELL means the current directional opportunity was consumed.
@@ -433,14 +433,14 @@ Immediate fixes:
 
 
 ============================================================
-11. REPLACEMENTREQUEST / CASE3B — WHERE WE STOPPED
+11. REPLACEMENTREQUEST / Case3A — WHERE WE STOPPED
 ============================================================
 
-We were just starting to fix the Case3B retry flow.
+We were just starting to fix the Case3A retry flow.
 
 The uploaded closeLot() still uses ReplacementRequest heavily.
 
-Current Case3B recovery behavior in closeLot():
+Current Case3A recovery behavior in closeLot():
 
 SELL threshold_stop_loss with actual loss.
 
@@ -461,21 +461,21 @@ Mode B CURRENT FILE:
 The current closeLot file explicitly contains this behavior. Do not accidentally change it while fixing compile errors.
 
 Mode A flow:
-    startCase3BReplacement(ctx, repl)
+    startCase3AReplacement(ctx, repl)
     BEFORE loss exit.
     If replacement fails, abort loss exit.
 
 Mode B maker-exit flow:
     start loss exit
-    then startCase3BReplacement(ctx, repl)
+    then startCase3AReplacement(ctx, repl)
     if replacement fails:
-        markCase3BReplacementRetryLocked(...)
+        markCase3AReplacementRetryLocked(...)
 
 Mode B market-exit flow:
     market exit accepted
-    then startCase3BReplacement(ctx, repl)
+    then startCase3AReplacement(ctx, repl)
     if replacement fails:
-        markCase3BReplacementRetryLocked(...)
+        markCase3AReplacementRetryLocked(...)
 
 The file still declares:
 
@@ -486,7 +486,7 @@ and constructs ReplacementRequest values.
 So the current undefined ReplacementRequest build errors must be resolved without losing this behavior.
 
 IMPORTANT HISTORICAL REQUIREMENT:
-There was also a newer desired Case3B Mode B rule discussed:
+There was also a newer desired Case3A Mode B rule discussed:
 
     Insufficient spare base
     + UP regime
@@ -508,19 +508,19 @@ We had just pasted this retry block and were about to refactor it:
     if t.PendingReplacementRetry.Enabled {
         repl := t.PendingReplacementRetry.Replacement
 
-        OrderID, err := t.startCase3BReplacement(
+        OrderID, err := t.startCase3AReplacement(
             ctx,
             repl,
         )
         if err != nil {
             log.Printf(
-                "[TRACE] case3B.retry.failed method=%s err=%v",
+                "[TRACE] Case3A.retry.failed method=%s err=%v",
                 repl.Method.String(),
                 err,
             )
         } else {
             log.Printf(
-                "[TRACE] case3B.retry.started method=%s replacement_order_id=%s",
+                "[TRACE] Case3A.retry.started method=%s replacement_order_id=%s",
                 repl.Method.String(),
                 OrderID,
             )
@@ -529,7 +529,7 @@ We had just pasted this retry block and were about to refactor it:
 
             if err := t.saveStateNoLock(); err != nil {
                 log.Printf(
-                    "[TRACE] case3B.retry.state_save_failed replacement_order_id=%s err=%v",
+                    "[TRACE] Case3A.retry.state_save_failed replacement_order_id=%s err=%v",
                     OrderID,
                     err,
                 )
@@ -539,7 +539,7 @@ We had just pasted this retry block and were about to refactor it:
 
 THIS IS WHERE IMPLEMENTATION SHOULD RESUME.
 
-Need determine how PendingReplacementRetry.Replacement should evolve now that ReplacementRequest is undefined and Case3B ultimately feeds the generic PendingIntent/PendingEntry producer.
+Need determine how PendingReplacementRetry.Replacement should evolve now that ReplacementRequest is undefined and Case3A ultimately feeds the generic PendingIntent/PendingEntry producer.
 
 Do not invent a new architecture before inspecting the current relevant structs/functions.
 
@@ -552,7 +552,7 @@ Do NOT restore:
 
     pendingBuy *PendingOpen
     pendingSell *PendingOpen
-    pendingCase3B map[string]*PendingEntry
+    pendingCase3A map[string]*PendingEntry
 
 Do NOT restore PendingOpen merely to make compilation pass.
 
@@ -573,7 +573,7 @@ Intended normal flow:
 
     step()
       ↓
-    startNormalBuyEntry()/startNormalSellEntry()
+    startProducerBuyEntry()/startProducerSellEntry()
       ↓
     PendingIntent
       ↓
@@ -620,4 +620,4 @@ For each compiler error:
 5. handle the next compiler errors.
 
 NEXT TASK:
-Continue from the Case3B retry flow / undefined ReplacementRequest errors.
+Continue from the Case3A retry flow / undefined ReplacementRequest errors.

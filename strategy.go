@@ -69,12 +69,12 @@ const (
 // Exit-specific information belongs exclusively to ExitDecision.
 type EntryDecision struct {
 	// Final decision.
-	Signal         Signal
-	Raw            Signal
-	LegacySignal   Signal
-	LogicOpinion   Signal
-	DecisionSource EntryDecisionSource
-	Confidence     float64
+	Signal       Signal
+	Raw          Signal
+	LegacySignal Signal
+	LogicOpinion Signal
+	Producer     EntryProducer
+	Confidence   float64
 
 	// AI / model context.
 	PUp           float64
@@ -204,16 +204,24 @@ func decisionExitReason(d ExitDecision) string {
 	return strings.Join(parts, "|")
 }
 
-type EntryDecisionSource string
+type EntryProducer string
 
 const (
-	EntryDecisionSourceNone             EntryDecisionSource = ""
-	EntryDecisionSourceLegacyPyramid    EntryDecisionSource = "LEGACY_PYRAMID"
-	EntryDecisionSourceLegacyEquity     EntryDecisionSource = "LEGACY_EQUITY"
-	EntryDecisionSourcePeakReversal     EntryDecisionSource = "peak_reversal"
-	EntryDecisionSourceBottomReversal   EntryDecisionSource = "BottomReversal"
-	EntryDecisionSourceCase13BBottomBuy EntryDecisionSource = "bottomBuy"
-	EntryDecisionSourceCase13APeakSell  EntryDecisionSource = "Case13APeakSell"
+	EntryProducerNone EntryProducer = ""
+
+	// Standard entry paths.
+	EntryProducerNormal EntryProducer = "NormalLegacy"
+
+	// Recovery / replacement paths.
+	EntryProducerCase3AReplacement EntryProducer = "Case3AReplacement"
+
+	// Case 11.
+	EntryProducerCase11APeakReversal   EntryProducer = "Case11APeakReversal"
+	EntryProducerCase11BBottomReversal EntryProducer = "Case11BBottomReversal"
+
+	// Case 13.
+	EntryProducerCase13APeakSell  EntryProducer = "Case13APeakSell"
+	EntryProducerCase13BBottomBuy EntryProducer = "Case13BBottomBuy"
 )
 
 // EquityRawResult preserves the complete direction-independent Equity
@@ -1773,6 +1781,7 @@ func (t *Trader) combineEntryRawMaterials(
 	legacySignal Signal,
 	logicOpinion Signal,
 	price float64,
+	pendingCounts PendingProducerCounts,
 ) EntryDecision {
 	regimeMult := t.RegimeMultiplier
 	if regimeMult <= 0 {
@@ -1780,11 +1789,11 @@ func (t *Trader) combineEntryRawMaterials(
 	}
 
 	d := EntryDecision{
-		Signal:         Flat,
-		Raw:            ai.Raw,
-		LegacySignal:   legacySignal,
-		Confidence:     ai.Confidence,
-		DecisionSource: EntryDecisionSourceNone,
+		Signal:       Flat,
+		Raw:          ai.Raw,
+		LegacySignal: legacySignal,
+		Confidence:   ai.Confidence,
+		Producer:     EntryProducerNone,
 
 		PUp:           ai.PUp,
 		BuyThreshold:  ai.BuyThreshold,
@@ -1851,7 +1860,7 @@ func (t *Trader) combineEntryRawMaterials(
 	// Both producers target early reversals from persistent trends by combining AI conviction,
 	// market regime, price location, MACD persistence, and EMA structural confirmation.
 	// -----------------------------------------------------------------
-	if applyCase13Producer(&d, ai, macd, ema, pyramid, equity, price, t.RecentLow, t.RecentHigh, t.MarketRegime) {
+	if applyCase13Producer(&d, ai, macd, ema, pyramid, equity, price, t.RecentLow, t.RecentHigh, t.MarketRegime, pendingCounts) {
 		return d
 	}
 
@@ -1873,13 +1882,13 @@ func (t *Trader) combineEntryRawMaterials(
 		switch {
 		case equity.BuyTrigger:
 			d.Signal = Buy
-			d.DecisionSource =
-				EntryDecisionSourceLegacyEquity
+			d.Producer =
+				EntryProducerNormal
 
 		case pyramid.Buy.GatePassed:
 			d.Signal = Buy
-			d.DecisionSource =
-				EntryDecisionSourceLegacyPyramid
+			d.Producer =
+				EntryProducerNormal
 		}
 
 	case Sell:
@@ -1896,13 +1905,13 @@ func (t *Trader) combineEntryRawMaterials(
 		switch {
 		case equity.SellTrigger:
 			d.Signal = Sell
-			d.DecisionSource =
-				EntryDecisionSourceLegacyEquity
+			d.Producer =
+				EntryProducerNormal
 
 		case pyramid.Sell.GatePassed:
 			d.Signal = Sell
-			d.DecisionSource =
-				EntryDecisionSourceLegacyPyramid
+			d.Producer =
+				EntryProducerNormal
 		}
 
 	default:
@@ -2452,10 +2461,10 @@ type EntryPolicy struct {
 	ResetRegime          bool
 }
 
-func entryPolicyForSource(source EntrySource) EntryPolicy {
+func entryPolicyForSource(source EntryProducer) EntryPolicy {
 	switch source {
 
-	case EntrySourceNormal:
+	case EntryProducerNormal:
 		return EntryPolicy{
 			ResetLastAdd:         true,
 			ResetWinExtreme:      true,
@@ -2465,7 +2474,7 @@ func entryPolicyForSource(source EntrySource) EntryPolicy {
 			ResetRegime:          true,
 		}
 
-	case EntrySourceCase3B:
+	case EntryProducerCase3AReplacement:
 		return EntryPolicy{
 			ResetLastAdd:         true,
 			ResetWinExtreme:      true,

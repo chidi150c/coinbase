@@ -33,11 +33,11 @@ Case 3 — SELL Loss Management
 
 Purpose: Reduce repeated SELL losses and intelligently recover from unavoidable loss-stop exits.
 
-Case 3A — SELL Loss Protection
+Case 3B — SELL Loss Protection
 
 Prevent repeated SELL entries below the previous SELL loss-stop BUY exit price while the market is in an UP regime.
 
-Case 3B — SELL Loss Recovery
+Case 3A — SELL Loss Recovery
 
 Automatically recover realized SELL losses through adaptive replacement sizing, profit-target adjustment, and persistent retry mechanisms.
 
@@ -261,7 +261,7 @@ SELL Pyramid Gate
 Case 11
 Peak-Reversal SELL Producer
         ↓
-DecisionSource = PeakReversal
+Producer = PeakReversal
         ↓
 Immediate SELL decision
 
@@ -272,7 +272,7 @@ Decision Metadata
 When Case 11 fires, the decision records:
 
 Signal = Sell
-DecisionSource = EntryDecisionSourcePeakReversal
+Producer = EntryProducerPeakReversal
 SELL pyramid gate result and reason
 SELL equity trigger result and reason
 
@@ -428,7 +428,7 @@ Next BUY may be submitted
 
 Invariant
 
-At any time, there shall never be more than one incomplete normal PendingEntry per side, eliminating duplicate exchange orders while preserving legitimate opposite-side entries and specialized flows such as Case 3B.
+At any time, there shall never be more than one incomplete normal PendingEntry per side, eliminating duplicate exchange orders while preserving legitimate opposite-side entries and specialized flows such as Case 3A.
 
 ========================================
 Case 13A — Independent Capitulation-Peak SELL Producer
@@ -529,7 +529,7 @@ priceNearRecentLow :=
 This ensures the producer only activates while price remains within 0.10% above the recent low, preventing late entries after price has already moved away from the bottom.
 
 Decision Source
-EntryDecisionSourceCase13BBottomBuy
+EntryProducerCase13BBottomBuy
 Characteristics
 Independent BUY producer.
 Focused on one market phenomenon.
@@ -551,14 +551,14 @@ allowing the bot to participate earlier in a developing reversal while retaining
 ================================
 
 
-Case 3B – Mode C (Regime == UP)
+Case 3A – Mode C (Regime == UP)
 Trigger
 
 A recovery intent is created when all of the following are true:
 
 A SELL position exits via threshold_stop_loss.
-Case 3B Mode A cannot be funded (insufficient spare base).
-Case 3B Mode B is not applicable because MarketRegime != DOWN (i.e., the market is in an UP regime).
+Case 3A Mode A cannot be funded (insufficient spare base).
+Case 3A Mode B is not applicable because MarketRegime != DOWN (i.e., the market is in an UP regime).
 Recovery Signal
 
 Wait for a favorable SELL setup:
@@ -581,7 +581,7 @@ Decision Flow
 SELL threshold_stop_loss
         │
         ▼
-Case 3B Mode A
+Case 3A Mode A
 (Sufficient spare?)
         │
    Yes ─────────► RecoveryByPositionSize
@@ -590,12 +590,12 @@ Case 3B Mode A
         ▼
 Regime == DOWN?
         │
-   Yes ─────────► Case 3B Mode B
+   Yes ─────────► Case 3A Mode B
                   Immediate RecoveryByProfitTarget
         │
        No (UP)
         ▼
-Case 3B Mode C
+Case 3A Mode C
         │
 Recovery signal true?
         │
@@ -613,7 +613,7 @@ Signal becomes true before timeout?
         ▼
 Cancel pending recovery
 
-This keeps the Case 3B family well organized:
+This keeps the Case 3A family well organized:
 
 Mode A → Preferred recovery using additional capital (RecoveryByPositionSize).
 Mode B → Immediate profit-target recovery in a DOWN regime.

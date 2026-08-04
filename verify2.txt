@@ -284,7 +284,7 @@
   "BaseAtLimit": 0.0019000000000000002,
   "Quote": 118.36000600000001,
   "Take": 0,
-  "Reason": "case3B_replacement method=RecoveryByPositionSize recovery=0.386157",
+  "Reason": "Case3A_replacement method=RecoveryByPositionSize recovery=0.386157",
   "refund_portion_usd": 0,
   "ProductID": "",
   "CreatedAt": "0001-01-01T00:00:00Z",

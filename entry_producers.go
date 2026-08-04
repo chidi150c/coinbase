@@ -17,7 +17,7 @@
 //   - Detect a specific market phenomenon.
 //   - Produce BUY or SELL independently when its conditions are satisfied.
 //   - Populate EntryDecision diagnostics for both successful and unsuccessful evaluations.
-//   - Assign a unique EntryDecisionSource for traceability.
+//   - Assign a unique EntryProducer for traceability.
 //   - Emit sufficient TRACE logging for why-trade forensic analysis.
 //
 // Non-Responsibilities
@@ -58,7 +58,7 @@
 //	1. Represent one observable market phenomenon.
 //	2. Have a clearly documented objective.
 //	3. Use only the minimum required raw materials.
-//	4. Define its own diagnostics and DecisionSource.
+//	4. Define its own diagnostics and Producer.
 //	5. Be historically validated before production use.
 //
 // ---------------------------------------------------------------------------------------------
@@ -136,8 +136,8 @@ func applyCase11ReversalProducer(
 	// Case 11A has priority over Case 11B if both somehow evaluate true.
 	if peakReversalSell {
 		d.Signal = Sell
-		d.DecisionSource =
-			EntryDecisionSourcePeakReversal
+		d.Producer =
+			EntryProducerCase11APeakReversal
 
 		d.PyramidPass =
 			pyramid.Sell.GatePassed
@@ -173,8 +173,8 @@ func applyCase11ReversalProducer(
 
 	if bottomReversalBuy {
 		d.Signal = Buy
-		d.DecisionSource =
-			EntryDecisionSourceBottomReversal
+		d.Producer =
+			EntryProducerCase11BBottomReversal
 
 		d.PyramidPass =
 			pyramid.Buy.GatePassed
@@ -232,6 +232,7 @@ func applyCase13Producer(
 	recentLow float64,
 	recentHigh float64,
 	regime MarketRegime,
+	pendingCounts PendingProducerCounts,
 ) bool {
 	if applyCase13APeakProducer(
 		d,
@@ -243,6 +244,7 @@ func applyCase13Producer(
 		price,
 		recentHigh,
 		regime,
+		pendingCounts,
 	) {
 		return true
 	}
@@ -257,6 +259,7 @@ func applyCase13Producer(
 		price,
 		recentLow,
 		regime,
+		pendingCounts,
 	) {
 		return true
 	}
@@ -293,54 +296,120 @@ func applyCase13APeakProducer(
 	price float64,
 	recentHigh float64,
 	regime MarketRegime,
+	pendingCounts PendingProducerCounts,
 ) bool {
 	const (
 		minConfidence  = 0.65
 		maxNearPeakPct = 0.10
 	)
 
+	// Case 12 extension for Case 13A:
+	//
+	// The first Case13A SELL may qualify without the adverse latch.
+	// While another Case13A SELL remains pending, a subsequent Case13A
+	// SELL must reach the advanced SELL latch.
+	case13APending :=
+		pendingCounts.Count(
+			EntryProducerCase13APeakSell,
+			SideSell,
+		)
+
+	case13AAdverseRequired :=
+		case13APending > 0
+
+	sellAdverseReached :=
+		pyramid.Sell.Latched > 0 &&
+			price >= pyramid.Sell.Latched
+
+	case13AAdversePass :=
+		!case13AAdverseRequired ||
+			sellAdverseReached
+
 	nearPeakPct := 0.0
-	PriceNearRecentHigh := false
+	priceNearRecentHigh := false
 
 	if recentHigh > 0 && price > 0 {
 		nearPeakPct =
 			(recentHigh - price) /
 				recentHigh * 100.0
 
-		PriceNearRecentHigh = nearPeakPct <= maxNearPeakPct
+		priceNearRecentHigh =
+			nearPeakPct <= maxNearPeakPct
 	}
 
-	// The arm identifies the complete peak environment. It does not
-	// produce SELL until EMA supplies the high-peak trigger.
+	// Preserve Case 13A interpretation regardless of whether the
+	// producer ultimately emits SELL.
+	d.NearRecentHighPct = nearPeakPct
+	d.PriceNearRecentHigh = priceNearRecentHigh
+
+	// The arm identifies the complete peak environment.
+	//
+	// Case13A normally requires only Pyramid SELL spacing. However, when
+	// another Case13A SELL is already pending, it additionally requires
+	// price to reach the SELL latch advanced during pending registration.
 	peakSellArm :=
 		ai.Raw == Sell &&
 			ai.Confidence >= minConfidence &&
 			regime == RegimeUp &&
 			pyramid.Sell.SpacingPass &&
-			PriceNearRecentHigh &&
+			case13AAdversePass &&
+			priceNearRecentHigh &&
 			macd.LinePrev6 > 0 &&
 			macd.Line > 0 &&
 			macd.Hist > 0
 
-		// EMA high-peak geometry is the final structural confirmation.
+	// EMA high-peak geometry is the final structural confirmation.
 	peakSell :=
 		peakSellArm &&
 			ema.HighPeak
 
-	// Preserve Case 13A interpretation regardless of whether the
-	// producer emits SELL.
-	d.NearRecentHighPct = nearPeakPct
-	d.PriceNearRecentHigh = PriceNearRecentHigh
+	log.Printf(
+		"[TRACE] case13A.peak_sell.evaluate "+
+			"ai_raw=%s confidence=%.2f min_confidence=%.2f regime=%s "+
+			"price=%.8f recent_peak=%.8f near_peak_pct=%.6f "+
+			"price_near_peak=%t "+
+			"macd_idx6=%.6f macd_line=%.6f macd_hist=%.6f "+
+			"ema_high_peak=%t "+
+			"pyramid_spacing=%t "+
+			"pending_count=%d adverse_required=%t "+
+			"sell_latched=%.8f adverse_reached=%t adverse_pass=%t "+
+			"arm=%t producer=%t",
+		ai.Raw,
+		ai.Confidence,
+		minConfidence,
+		regime,
+		price,
+		recentHigh,
+		nearPeakPct,
+		priceNearRecentHigh,
+		macd.LinePrev6,
+		macd.Line,
+		macd.Hist,
+		ema.HighPeak,
+		pyramid.Sell.SpacingPass,
+		case13APending,
+		case13AAdverseRequired,
+		pyramid.Sell.Latched,
+		sellAdverseReached,
+		case13AAdversePass,
+		peakSellArm,
+		peakSell,
+	)
 
 	if !peakSell {
 		return false
 	}
 
 	d.Signal = Sell
-	d.DecisionSource = EntryDecisionSourceCase13APeakSell
+	d.Producer = EntryProducerCase13APeakSell
 
-	// Case 13A requires SELL spacing, not the normal Pyramid gate.
-	d.PyramidPass = pyramid.Sell.SpacingPass
+	// Case13A requires SELL spacing. The complete ordinary Pyramid gate
+	// is not required for the first entry. Its advanced latch is required
+	// only when another Case13A SELL is already pending.
+	d.PyramidPass =
+		pyramid.Sell.SpacingPass &&
+			case13AAdversePass
+
 	d.PyramidReason = pyramid.Sell.Reason
 
 	// Equity is recorded for diagnostics only.
@@ -348,21 +417,17 @@ func applyCase13APeakProducer(
 	d.EquityReason = equity.Reason
 
 	log.Printf(
-		"[TRACE] case13A.peak_sell "+
-			"ai_raw=%s confidence=%.2f regime=%s "+
-			"price=%.8f recent_peak=%.8f near_peak_pct=%.6f "+
-			"macd_idx6=%.6f macd_line=%.6f macd_hist=%.6f "+
-			"ema_high_peak=%t",
-		ai.Raw,
-		ai.Confidence,
-		regime,
+		"[TRACE] case13A.peak_sell.produced "+
+			"producer=%s side=%s price=%.8f "+
+			"pending_count=%d adverse_required=%t "+
+			"sell_latched=%.8f adverse_reached=%t",
+		EntryProducerCase13APeakSell,
+		SideSell,
 		price,
-		recentHigh,
-		nearPeakPct,
-		macd.LinePrev6,
-		macd.Line,
-		macd.Hist,
-		ema.HighPeak,
+		case13APending,
+		case13AAdverseRequired,
+		pyramid.Sell.Latched,
+		sellAdverseReached,
 	)
 
 	return true
@@ -378,65 +443,84 @@ func applyCase13BBottomProducer(
 	price float64,
 	recentLow float64,
 	regime MarketRegime,
+	pendingCounts PendingProducerCounts,
 ) bool {
-
 	const (
 		minConfidence = 0.65
 		maxNearLowPct = 0.10
 	)
 
+	// Case 12 extension for Case 13B:
+	//
+	// The first Case13B BUY may qualify without the adverse latch.
+	// While another Case13B BUY remains pending, a subsequent Case13B
+	// BUY must reach the advanced BUY latch.
+	case13BPending :=
+		pendingCounts.Count(
+			EntryProducerCase13BBottomBuy,
+			SideBuy,
+		)
+
+	case13BAdverseRequired :=
+		case13BPending > 0
+
+	buyAdverseReached :=
+		pyramid.Buy.Latched > 0 &&
+			price <= pyramid.Buy.Latched
+
+	case13BAdversePass :=
+		!case13BAdverseRequired ||
+			buyAdverseReached
+
 	nearLowPct := 0.0
 	priceNearRecentLow := false
 
 	if recentLow > 0 && price > 0 {
-		nearLowPct = (price - recentLow) / recentLow * 100.0
-		priceNearRecentLow = nearLowPct <= maxNearLowPct
+		nearLowPct =
+			(price - recentLow) /
+				recentLow * 100.0
+
+		priceNearRecentLow =
+			nearLowPct <= maxNearLowPct
 	}
 
-	// The arm identifies the complete bottom environment. It does not
-	// produce BUY until EMA supplies the low-bottom trigger.
+	// Preserve Case 13B interpretation regardless of whether the
+	// producer ultimately emits BUY.
+	d.NearRecentLowPct = nearLowPct
+	d.PriceNearRecentLow = priceNearRecentLow
+
+	// The arm identifies the complete bottom environment.
+	//
+	// Case13B normally requires only Pyramid BUY spacing. However, when
+	// another Case13B BUY is already pending, it additionally requires
+	// price to reach the BUY latch advanced during pending registration.
 	bottomBuyArm :=
 		ai.Raw == Buy &&
 			ai.Confidence >= minConfidence &&
 			regime == RegimeDown &&
 			pyramid.Buy.SpacingPass &&
+			case13BAdversePass &&
 			priceNearRecentLow &&
 			macd.LinePrev6 < 0 &&
 			macd.Line < 0 &&
 			macd.Hist < 0
 
-		// EMA low-bottom geometry is the final structural confirmation.
+	// EMA low-bottom geometry is the final structural confirmation.
 	bottomBuy :=
 		bottomBuyArm &&
 			ema.LowBottom
 
-	// Preserve Case 13 interpretation in the canonical decision record
-	// regardless of whether the producer emits BUY.
-	d.NearRecentLowPct = nearLowPct
-	d.PriceNearRecentLow = priceNearRecentLow
-
-	if !bottomBuy {
-		return false
-	}
-
-	d.Signal = Buy
-	d.DecisionSource = EntryDecisionSourceCase13BBottomBuy
-
-	// Case 13 requires BUY spacing, not the normal Pyramid adverse gate.
-	d.PyramidPass = pyramid.Buy.SpacingPass
-	d.PyramidReason = pyramid.Buy.Reason
-
-	// Equity is recorded for diagnostics only. It does not gate Case 13.
-	d.EquityPass = equity.BuyTrigger
-	d.EquityReason = equity.Reason
-
 	log.Printf(
-		"[TRACE] case13B.bottom_buy "+
+		"[TRACE] case13B.bottom_buy.evaluate "+
 			"ai_raw=%s confidence=%.2f min_confidence=%.2f regime=%s "+
-			"price=%.8f recent_low=%.8f near_low_pct=%.6f max_near_low_pct=%.2f price_near_low=%t "+
+			"price=%.8f recent_low=%.8f near_low_pct=%.6f "+
+			"max_near_low_pct=%.2f price_near_low=%t "+
 			"macd_idx6=%.6f macd_line=%.6f macd_hist=%.6f "+
-			"pyramid_buy_spacing=%t pyramid_buy_gate=%t pyramid_reason=%s "+
-			"ema_low_bottom=%t arm=%t producer=%t "+
+			"ema_low_bottom=%t "+
+			"pyramid_buy_spacing=%t "+
+			"pending_count=%d adverse_required=%t "+
+			"buy_latched=%.8f adverse_reached=%t adverse_pass=%t "+
+			"arm=%t producer=%t "+
 			"equity_buy=%t equity_reason=%s",
 		ai.Raw,
 		ai.Confidence,
@@ -450,14 +534,51 @@ func applyCase13BBottomProducer(
 		macd.LinePrev6,
 		macd.Line,
 		macd.Hist,
-		pyramid.Buy.SpacingPass,
-		pyramid.Buy.GatePassed,
-		pyramid.Buy.Reason,
 		ema.LowBottom,
+		pyramid.Buy.SpacingPass,
+		case13BPending,
+		case13BAdverseRequired,
+		pyramid.Buy.Latched,
+		buyAdverseReached,
+		case13BAdversePass,
 		bottomBuyArm,
 		bottomBuy,
 		equity.BuyTrigger,
 		equity.Reason,
+	)
+
+	if !bottomBuy {
+		return false
+	}
+
+	d.Signal = Buy
+	d.Producer = EntryProducerCase13BBottomBuy
+
+	// Case13B requires BUY spacing. The complete ordinary Pyramid gate
+	// is not required for the first entry. Its advanced latch is required
+	// only when another Case13B BUY is already pending.
+	d.PyramidPass =
+		pyramid.Buy.SpacingPass &&
+			case13BAdversePass
+
+	d.PyramidReason = pyramid.Buy.Reason
+
+	// Equity is recorded for diagnostics only.
+	d.EquityPass = equity.BuyTrigger
+	d.EquityReason = equity.Reason
+
+	log.Printf(
+		"[TRACE] case13B.bottom_buy.produced "+
+			"producer=%s side=%s price=%.8f "+
+			"pending_count=%d adverse_required=%t "+
+			"buy_latched=%.8f adverse_reached=%t",
+		EntryProducerCase13BBottomBuy,
+		SideBuy,
+		price,
+		case13BPending,
+		case13BAdverseRequired,
+		pyramid.Buy.Latched,
+		buyAdverseReached,
 	)
 
 	return true

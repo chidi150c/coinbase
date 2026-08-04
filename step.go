@@ -77,7 +77,7 @@ import (
 	"time"
 )
 
-const Version = 156
+const Version = 157
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -232,7 +232,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// Drain every completed asynchronous entry.
 	//
 	// Each PendingEntry decides for itself whether it is currently
-	// eligible to commit (for example Case3B waits until its source
+	// eligible to commit (for example Case3A waits until its producer
 	// exit has committed).
 	entries := t.pendingEntriesSnapshot()
 
@@ -263,7 +263,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			t.positionExistsByEntryOrderID(sourceEntryOrderID) {
 
 			log.Printf(
-				"[TRACE] case3B.retry.wait "+
+				"[TRACE] Case3A.retry.wait "+
 					"source_entry_id=%s wait_exit_id=%s reason=%s",
 				sourceEntryOrderID,
 				retry.WaitForExitOrderID,
@@ -275,7 +275,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			// which acquires t.mu. Never call it while step() owns t.mu.
 			t.mu.Unlock()
 
-			orderID, err := t.startCase3BReplacement(
+			orderID, err := t.startCase3AReplacement(
 				ctx,
 				repl,
 			)
@@ -284,7 +284,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 			if err != nil {
 				log.Printf(
-					"[TRACE] case3B.retry.failed "+
+					"[TRACE] Case3A.retry.failed "+
 						"method=%s source_entry_id=%s err=%v",
 					repl.RecoveryMethod.String(),
 					sourceEntryOrderID,
@@ -293,7 +293,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 			} else {
 				log.Printf(
-					"[TRACE] case3B.retry.started "+
+					"[TRACE] Case3A.retry.started "+
 						"method=%s source_entry_id=%s replacement_order_id=%s",
 					repl.RecoveryMethod.String(),
 					sourceEntryOrderID,
@@ -304,7 +304,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				if err := t.saveStateNoLock(); err != nil {
 					log.Printf(
-						"[TRACE] case3B.retry.state_save_failed "+
+						"[TRACE] Case3A.retry.state_save_failed "+
 							"replacement_order_id=%s err=%v",
 						orderID,
 						err,
@@ -1305,30 +1305,31 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	)
 
 	if legacySignal == Buy || legacySignal == Sell {
-		var cacheOK bool
-
 		log.Printf(
-			"[TRACE] hotpath.before_balance elapsed_ms=%d legacy=%s",
+			"[TRACE] hotpath.before_equity_balance elapsed_ms=%d legacy=%s",
 			time.Since(hotStart).Milliseconds(),
 			legacySignal,
 		)
 
-		snapshot, cacheOK :=
-			t.getBalanceSnapshot(
-				balanceSnapshotMaxAge,
-			)
+		equityBalance, ok := t.getBalanceSpare(
+			balanceSnapshotMaxAge,
+			reservedShortQuoteWithFee,
+			reservedLongBase,
+		)
 
-		if !cacheOK {
+		if !ok {
 			ageMS := int64(-1)
-			if !snapshot.UpdatedAt.IsZero() {
+
+			if !equityBalance.Snapshot.UpdatedAt.IsZero() {
 				ageMS =
 					time.Since(
-						snapshot.UpdatedAt,
+						equityBalance.Snapshot.UpdatedAt,
 					).Milliseconds()
 			}
 
 			log.Printf(
-				"[WARN] balance.cache.unavailable legacy=%s age_ms=%d",
+				"[WARN] balance.equity_cache.unavailable "+
+					"legacy=%s age_ms=%d",
 				legacySignal,
 				ageMS,
 			)
@@ -1336,24 +1337,26 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			t.mu.Unlock()
 
 			return StepResult{
-				Msg:    "HOLD balance cache unavailable or stale",
+				Msg:    "HOLD",
 				Raw:    aiResult.Raw,
 				Signal: Flat,
 			}, nil
 		}
 
-		symQ = snapshot.SymQuote
-		availQuote = snapshot.AvailQuote
-		quoteStep = snapshot.QuoteStep
+		availQuote = equityBalance.AvailQuote
+		quoteStep = equityBalance.QuoteStep
+		availBase = equityBalance.AvailBase
+		baseStep = equityBalance.BaseStep
 
-		symB = snapshot.SymBase
-		availBase = snapshot.AvailBase
-		baseStep = snapshot.BaseStep
+		spareQuote = equityBalance.SpareQuote
+		spareBase = equityBalance.SpareBase
+		symQ = equityBalance.Snapshot.SymQuote
+		symB = equityBalance.Snapshot.SymBase
 
 		log.Printf(
 			"[TRACE] balance.cache.hit legacy=%s age_ms=%d quote=%.8f base=%.8f",
 			legacySignal,
-			time.Since(snapshot.UpdatedAt).Milliseconds(),
+			time.Since(equityBalance.Snapshot.UpdatedAt).Milliseconds(),
 			availQuote,
 			availBase,
 		)
@@ -1397,14 +1400,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				}, nil
 			}
 		}
-
-		spareQuote =
-			availQuote -
-				reservedShortQuoteWithFee
-
-		spareBase =
-			availBase -
-				reservedLongBase
 	}
 
 	equityResult := interpretEquityRaw(
@@ -1432,6 +1427,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// 	equityResult.Reason,
 	// )
 
+	pendingCounts :=
+		t.pendingProducerCountsNoLock()
+
 	// Case 5 may retain or override the legacy AI + Logic decision using
 	// the complete AI, MACD, EMA and Pyramid materials.
 	entryDecision := t.combineEntryRawMaterials(
@@ -1443,6 +1441,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		legacySignal,
 		logicOpinion,
 		price,
+		pendingCounts,
 	)
 
 	log.Printf(
@@ -1472,6 +1471,95 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	d := entryDecision
 
+	side, ok := d.SignalToSide()
+	if !ok {
+		log.Printf(
+			"[TRACE] signal.no_side signal=%s raw=%s final=%s",
+			d.Signal,
+			d.Raw,
+			d.Signal,
+		)
+
+		t.mu.Unlock()
+
+		return StepResult{
+			Msg:    "FLAT",
+			Raw:    d.Raw,
+			Signal: d.Signal,
+		}, nil
+	}
+
+	executionBalance, executionCacheOK :=
+		t.getBalanceSpare(
+			balanceSnapshotMaxAge,
+			reservedShortQuoteWithFee,
+			reservedLongBase,
+		)
+
+	if !executionCacheOK {
+		ageMS := int64(-1)
+
+		if !executionBalance.Snapshot.UpdatedAt.IsZero() {
+			ageMS =
+				time.Since(
+					executionBalance.Snapshot.UpdatedAt,
+				).Milliseconds()
+		}
+
+		log.Printf(
+			"[WARN] balance.execution_cache.unavailable "+
+				"side=%s source=%s legacy=%s final=%s age_ms=%d",
+			side,
+			d.Producer,
+			legacySignal,
+			d.Signal,
+			ageMS,
+		)
+
+		t.mu.Unlock()
+
+		return StepResult{
+			Msg:    "HOLD",
+			Raw:    d.Raw,
+			Signal: d.Signal,
+		}, nil
+	}
+
+	availQuote = executionBalance.AvailQuote
+	quoteStep = executionBalance.QuoteStep
+	availBase = executionBalance.AvailBase
+	baseStep = executionBalance.BaseStep
+
+	spare := 0.0
+
+	switch side {
+	case SideBuy:
+		spare = executionBalance.SpareQuote
+
+	case SideSell:
+		spare = executionBalance.SpareBase
+	}
+
+	log.Printf(
+		"[TRACE] balance.execution_cache.hit "+
+			"side=%s producer=%s legacy=%s final=%s age_ms=%d "+
+			"quote=%.8f quoteStep=%.8f base=%.8f baseStep=%.8f",
+		side,
+		d.Producer,
+		legacySignal,
+		d.Signal,
+		time.Since(executionBalance.Snapshot.UpdatedAt).Milliseconds(),
+		availQuote,
+		quoteStep,
+		availBase,
+		baseStep,
+	)
+
+	log.Printf(
+		"[TRACE] hotpath.after_execution_balance elapsed_ms=%d legacy=%s",
+		time.Since(hotStart).Milliseconds(),
+		legacySignal,
+	)
 	// --------------------------------------------------------------------------------------------------------
 	//---ADD path continues-----
 	// --------------------------------------------------------------------------------------------------------
@@ -1489,14 +1577,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		Version,
 	)
 
-	// Determine the side and its book
-	side, ok := d.SignalToSide()
-	if !ok {
-		log.Printf("[TRACE] signal.no_side signal=%s raw=%s final=%s", d.Signal, d.Raw, d.Signal)
-		t.mu.Unlock()
-		return StepResult{Msg: "FLAT", Raw: d.Raw, Signal: d.Signal}, nil
-	}
-
 	book := t.book(side)
 
 	// Case 5 already evaluated Equity thresholds, direction, spare funding,
@@ -1512,18 +1592,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	equitySpareBase :=
 		equityResult.ProposedSellBase
-
-	// Preserve the execution-stage side-specific spare variable expected by the
-	// existing sizing and order-placement pipeline.
-	spare := 0.0
-
-	switch side {
-	case SideBuy:
-		spare = equityResult.SpareQuote
-
-	case SideSell:
-		spare = equityResult.SpareBase
-	}
 
 	// Existing execution classification.
 	isAdd :=
@@ -1547,7 +1615,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// }
 
 	// -----------------------------------------------------------------------------
-	// Case 3A-Opposite - DOWN-Regime BUY Protection
+	// Case 3B-Opposite - DOWN-Regime BUY Protection
 	//
 	// If the immediately previous exit was a BUY threshold-stop loss,
 	// block any new BUY entry above that loss-exit SELL price while the
@@ -1565,7 +1633,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			price > last.ClosePrice {
 
 			log.Printf(
-				"[TRACE] case3A.block_buy regime=%s buy_price=%.8f last_exit_sell_price=%.8f last_exit_net=%.6f",
+				"[TRACE] Case3B.block_buy regime=%s buy_price=%.8f last_exit_sell_price=%.8f last_exit_net=%.6f",
 				t.MarketRegime,
 				price,
 				last.ClosePrice,
@@ -1573,11 +1641,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			)
 
 			t.mu.Unlock()
-			return StepResult{Msg: "HOLD case3A block BUY above last loss-exit SELL price", Raw: d.Raw, Signal: d.Signal}, nil
+			return StepResult{Msg: "HOLD Case3B block BUY above last loss-exit SELL price", Raw: d.Raw, Signal: d.Signal}, nil
 		}
 	}
 	// -----------------------------------------------------------------------------
-	// Case 3A - UP-Regime SELL Protection
+	// Case 3B - UP-Regime SELL Protection
 	//
 	// If the immediately previous exit was a SELL threshold-stop loss,
 	// block any new SELL entry below that loss-exit BUY price while the
@@ -1595,7 +1663,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			price < last.ClosePrice {
 
 			log.Printf(
-				"[TRACE] case3A.block_sell regime=%s sell_price=%.8f last_exit_buy_price=%.8f last_exit_net=%.6f",
+				"[TRACE] Case3B.block_sell regime=%s sell_price=%.8f last_exit_buy_price=%.8f last_exit_net=%.6f",
 				t.MarketRegime,
 				price,
 				last.ClosePrice,
@@ -1603,7 +1671,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			)
 
 			t.mu.Unlock()
-			return StepResult{Msg: "HOLD case3A block SELL below last loss-exit BUY price", Raw: d.Raw, Signal: d.Signal}, nil
+			return StepResult{Msg: "HOLD Case3B block SELL below last loss-exit BUY price", Raw: d.Raw, Signal: d.Signal}, nil
 		}
 	}
 
@@ -2408,7 +2476,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// Maker-first entry production now routes through the unified producer:
 	//
 	//	step()
-	//	  → startNormalBuyEntry()/startNormalSellEntry()
+	//	  → startProducerBuyEntry()/startProducerSellEntry()
 	//	  → PendingIntent
 	//	  → produceEntry()
 	//	  → submitPendingIntent()
@@ -2491,7 +2559,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 			switch side {
 			case SideBuy:
-				entry, err = t.startNormalBuyEntry(
+				entry, err = t.startProducerBuyEntry(
 					ctx,
 					limitPx,
 					baseAtLimit,
@@ -2502,10 +2570,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					entryProfitGateUSD,
 					entryAIMode,
 					equityTriggerBuy,
+					d.Producer,
 				)
 
 			case SideSell:
-				entry, err = t.startNormalSellEntry(
+				entry, err = t.startProducerSellEntry(
 					ctx,
 					limitPx,
 					baseAtLimit,
@@ -2516,6 +2585,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					entryProfitGateUSD,
 					entryAIMode,
 					equityTriggerSell,
+					d.Producer,
 				)
 
 			default:
@@ -2535,10 +2605,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				log.Printf(
 					"[TRACE] postonly.pending.set "+
-						"source=%s side=%s order_id=%s "+
+						"producer=%s side=%s order_id=%s "+
 						"limit=%.8f base=%.8f quote=%.2f "+
 						"dl=%s eqFlags[buy=%v sell=%v]",
-					entry.Source,
+					entry.Producer,
 					entry.Side,
 					entry.OrderID,
 					entry.Intent.LimitPx,
@@ -2744,10 +2814,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		ConfidenceMult:   confMult,
 		EntryMethod:      entryAIMode,
 		ProfitGateUSD:    entryProfitGateUSD,
+		Producer:         d.Producer,
 	}
 
 	log.Printf(
-		"[KPI] lot.created side=%s mode=%s conf=%.2f gate=%.2f",
+		"[KPI] lot.created producer=%s side=%s mode=%s conf=%.2f gate=%.2f",
+		newLot.Producer,
 		newLot.Side,
 		newLot.EntryMethod,
 		newLot.ConfidenceMult,
@@ -3024,6 +3096,60 @@ func (t *Trader) setBalanceSnapshot(snapshot balanceSnapshot) {
 	t.balanceMu.Lock()
 	t.balanceSnapshot = snapshot
 	t.balanceMu.Unlock()
+}
+
+type BalanceSpare struct {
+	Snapshot balanceSnapshot
+
+	AvailQuote float64
+	QuoteStep  float64
+	AvailBase  float64
+	BaseStep   float64
+
+	SpareQuote float64
+	SpareBase  float64
+}
+
+func (t *Trader) getBalanceSpare(
+	maxAge time.Duration,
+	reservedShortQuoteWithFee float64,
+	reservedLongBase float64,
+) (BalanceSpare, bool) {
+
+	snapshot, ok := t.getBalanceSnapshot(maxAge)
+	if !ok {
+		return BalanceSpare{
+			Snapshot: snapshot,
+		}, false
+	}
+
+	spareQuote :=
+		snapshot.AvailQuote -
+			reservedShortQuoteWithFee
+
+	spareBase :=
+		snapshot.AvailBase -
+			reservedLongBase
+
+	if spareQuote < 0 {
+		spareQuote = 0
+	}
+
+	if spareBase < 0 {
+		spareBase = 0
+	}
+
+	return BalanceSpare{
+		Snapshot: snapshot,
+
+		AvailQuote: snapshot.AvailQuote,
+		QuoteStep:  snapshot.QuoteStep,
+		AvailBase:  snapshot.AvailBase,
+		BaseStep:   snapshot.BaseStep,
+
+		SpareQuote: spareQuote,
+		SpareBase:  spareBase,
+	}, true
 }
 
 func (t *Trader) getBalanceSnapshot(maxAge time.Duration) (balanceSnapshot, bool) {

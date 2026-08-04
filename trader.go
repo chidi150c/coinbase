@@ -86,9 +86,10 @@ type Position struct {
 	EntryOrderID             string  `json:"entry_order_id,omitempty"`
 	ProfitTrailActive        bool    `json:"profit_trail_active,omitempty"`
 	ProfitPeakUSD            float64 `json:"profit_peak_usd,omitempty"`
-	Case3BReplacementStarted bool    `json:"case3_b_replacement_started"`
+	Case3AReplacementStarted bool    `json:"case3_b_replacement_started"`
 
-	Case3BReplacementOrderID string `json:"case3_b_replacement_order_id"`
+	Case3AReplacementOrderID string        `json:"case3_b_replacement_order_id"`
+	Producer                 EntryProducer `json:"entry_producer,omitempty"`
 }
 
 // --- NEW: per-side book (authoritative store) ---
@@ -1279,7 +1280,7 @@ func decisionEntryReason(d EntryDecision) string {
 		parts,
 		fmt.Sprintf("legacySignal=%s", d.LegacySignal),
 		fmt.Sprintf("logicOpinion=%s", d.LogicOpinion),
-		fmt.Sprintf("source=%s", d.DecisionSource),
+		fmt.Sprintf("Producer=%s", d.Producer),
 		// Backward-compatible aliases.
 		// Raw and Decision remain authoritative in the fixed log prefix.
 		fmt.Sprintf("aiRaw=%s", d.Raw),
@@ -1762,9 +1763,9 @@ func (t *Trader) RehydratePending(
 			// Preserve the old one-shot market-fallback behavior
 			// ONLY for normal entries.
 			//
-			// Case3B recovery entries must not create a normal
+			// Case3A recovery entries must not create a normal
 			// BUY/SELL market-preference flag.
-			if persisted.Source != EntrySourceCase3B {
+			if persisted.Producer != EntryProducerCase3AReplacement {
 				t.mu.Lock()
 
 				switch persisted.Side {
@@ -1827,7 +1828,7 @@ func (t *Trader) RehydratePending(
 			log.Printf(
 				"[TRACE] entry.rehydrate.get_order_failed side=%s source=%s order_id=%s err=%v",
 				persisted.Side,
-				persisted.Source,
+				persisted.Producer,
 				orderID,
 				err,
 			)
@@ -1839,7 +1840,7 @@ func (t *Trader) RehydratePending(
 			t.mu.Lock()
 
 			// Only normal entries create the one-shot market preference.
-			if persisted.Source != EntrySourceCase3B {
+			if persisted.Producer != EntryProducerCase3AReplacement {
 				switch persisted.Side {
 				case SideBuy:
 					t.pendingRecheckBuy = true
@@ -1904,9 +1905,9 @@ func (t *Trader) RehydratePending(
 			continue
 		}
 
-		if persisted.Source == EntrySourceCase3B {
+		if persisted.Producer == EntryProducerCase3AReplacement {
 			persisted.CommitEligible =
-				t.case3BCommitEligible
+				t.Case3ACommitEligible
 		} else {
 			persisted.CommitEligible = nil
 		}
@@ -1950,7 +1951,7 @@ func (t *Trader) RehydratePending(
 			log.Printf(
 				"[TRACE] entry.rehydrate.filled side=%s source=%s order_id=%s",
 				persisted.Side,
-				persisted.Source,
+				persisted.Producer,
 				orderID,
 			)
 
@@ -1971,7 +1972,7 @@ func (t *Trader) RehydratePending(
 		log.Printf(
 			"[TRACE] entry.rehydrate.resumed side=%s source=%s order_id=%s deadline=%s",
 			persisted.Side,
-			persisted.Source,
+			persisted.Producer,
 			orderID,
 			intent.Deadline.Format(time.RFC3339),
 		)
@@ -2132,7 +2133,7 @@ type PendingReplacementRetry struct {
 	CreatedAt          time.Time
 }
 
-func (t *Trader) markCase3BReplacementRetryLocked(repl PendingIntent, waitForExitOrderID string, reason string) {
+func (t *Trader) markCase3AReplacementRetryLocked(repl PendingIntent, waitForExitOrderID string, reason string) {
 	if !repl.Enabled {
 		return
 	}
@@ -2146,7 +2147,7 @@ func (t *Trader) markCase3BReplacementRetryLocked(repl PendingIntent, waitForExi
 	}
 
 	log.Printf(
-		"[TRACE] case3B.retry.marked side=%s price=%.8f base=%.8f method=%s wait_exit_id=%s reason=%s",
+		"[TRACE] Case3A.retry.marked side=%s price=%.8f base=%.8f method=%s wait_exit_id=%s reason=%s",
 		repl.Side,
 		repl.LimitPx,
 		repl.BaseAtLimit,
@@ -2381,7 +2382,7 @@ func (t *Trader) closeLot(
 	// CASE 3 - SELL LOSS RECOVERY & PROTECTION
 	//
 	// Case 3 introduces two complementary strategies:
-	//   • Case 3A - Prevent repeating weak SELLs in an UP regime.
+	//   • Case 3B - Prevent repeating weak SELLs in an UP regime.
 	//   • Case 3B - Recover intelligently in a continuing DOWN regime
 	//
 	// Sufficient spare base
@@ -2390,11 +2391,11 @@ func (t *Trader) closeLot(
 	// Insufficient spare + regime DOWN
 	// 		→ Case 3B Mode B
 	// Insufficient spare + regime UP/NORMAL
-	// 		→ case3B.modeA.blocked
+	// 		→ Case3A.modeA.blocked
 	// 		→ no replacement
 	// =============================================================================
 
-	case3BLossUSD := 0.0
+	Case3ALossUSD := 0.0
 	// Prepare an empty PendingIntent in case Case 3B recovery becomes necessary.
 	var repl PendingIntent
 	// Estimate the exit fee
@@ -2413,7 +2414,7 @@ func (t *Trader) closeLot(
 		strings.HasPrefix(exitReason, "threshold_stop_loss") {
 
 		// =============================================================================
-		// CASE 3B - SELL Stop-Loss Recovery
+		// Case 3B - SELL Stop-Loss Recovery
 		// -----------------------------------
 		// Trigger:
 		//     SELL threshold_stop_loss with loss
@@ -2431,29 +2432,29 @@ func (t *Trader) closeLot(
 		//===============================================================================
 
 		if net < 0 {
-			case3BLossUSD = -net
+			Case3ALossUSD = -net
 
 			log.Printf(
-				"[TRACE] case3B.detect side=%s closeSide=%s regime=%s entry_price=%.8f stop_price=%.8f base=%.8f net_loss=%.6f",
+				"[TRACE] Case3A.detect side=%s closeSide=%s regime=%s entry_price=%.8f stop_price=%.8f base=%.8f net_loss=%.6f",
 				lot.Side,
 				closeSide,
 				t.MarketRegime,
 				lot.OpenPrice,
 				livePrice,
 				baseRequested,
-				case3BLossUSD,
+				Case3ALossUSD,
 			)
 
-			recoveryNetUSD := case3BLossUSD
+			recoveryNetUSD := Case3ALossUSD
 
 			if recoveryNetUSD > 0 {
 				beforeDebt := t.RecoveryDebtUSD
 				afterDebt := beforeDebt + recoveryNetUSD
 
 				log.Printf(
-					"[TRACE] case3B.recovery_preview side=%s loss=%.6f recovery=%.6f debt_before=%.6f debt_after=%.6f",
+					"[TRACE] Case3A.recovery_preview side=%s loss=%.6f recovery=%.6f debt_before=%.6f debt_after=%.6f",
 					lot.Side,
-					case3BLossUSD,
+					Case3ALossUSD,
 					recoveryNetUSD,
 					beforeDebt,
 					afterDebt,
@@ -2472,7 +2473,7 @@ func (t *Trader) closeLot(
 
 					if recoveryPerBase <= 0 {
 						log.Printf(
-							"[TRACE] case3B.recovery_per_base.skip side=%s regime=%s recovery_net=%.6f price_move=%.8f recovery_per_base=%.8f reason=non_positive_recovery_move",
+							"[TRACE] Case3A.recovery_per_base.skip side=%s regime=%s recovery_net=%.6f price_move=%.8f recovery_per_base=%.8f reason=non_positive_recovery_move",
 							lot.Side,
 							t.MarketRegime,
 							recoveryNetUSD,
@@ -2489,7 +2490,7 @@ func (t *Trader) closeLot(
 
 						freshSpareBase, freshBaseStep, err := t.currentSpareBaseLocked(ctx)
 						if err != nil {
-							log.Printf("[TRACE] case3B.spare_base.failed err=%v", err)
+							log.Printf("[TRACE] Case3A.spare_base.failed err=%v", err)
 							freshSpareBase = 0
 						}
 
@@ -2513,7 +2514,7 @@ func (t *Trader) closeLot(
 								ProfitGateUSD:      t.cfg.ProfitGateUSD,
 								SourceEntryOrderID: lot.EntryOrderID,
 								Reason: fmt.Sprintf(
-									"case3B_replacement method=%s recovery=%.6f regime=%s",
+									"Case3A_replacement method=%s recovery=%.6f regime=%s",
 									RecoveryByPositionSize.String(),
 									recoveryNetUSD,
 									t.MarketRegime,
@@ -2530,7 +2531,7 @@ func (t *Trader) closeLot(
 								RecoveryMethod: RecoveryByProfitTarget,
 								ProfitGateUSD:  t.cfg.ProfitGateUSD + recoveryNetUSD,
 								Reason: fmt.Sprintf(
-									"case3B_replacement method=%s recovery=%.6f regime=%s usePendingMakerExit=%v",
+									"Case3A_replacement method=%s recovery=%.6f regime=%s usePendingMakerExit=%v",
 									RecoveryByProfitTarget.String(),
 									recoveryNetUSD,
 									t.MarketRegime,
@@ -2542,7 +2543,7 @@ func (t *Trader) closeLot(
 							// UP/NORMAL with insufficient spare cannot safely run Mode A.
 							// Do not fabricate an oversized replacement request.
 							log.Printf(
-								"[TRACE] case3B.modeA.blocked side=%s regime=%s spare_base=%.8f required_base=%.8f normal_base=%.8f extra_base=%.8f recovery=%.6f",
+								"[TRACE] Case3A.modeA.blocked side=%s regime=%s spare_base=%.8f required_base=%.8f normal_base=%.8f extra_base=%.8f recovery=%.6f",
 								lot.Side,
 								t.MarketRegime,
 								freshSpareBase,
@@ -2555,7 +2556,7 @@ func (t *Trader) closeLot(
 
 						if repl.Enabled {
 							log.Printf(
-								"[TRACE] case3B.recovery_mode side=%s spare_base=%.8f normal_base=%.8f extra_base=%.8f method=%s replacement_base=%.8f replacement_notional=%.2f profit_gate=%.6f reason=%s",
+								"[TRACE] Case3A.recovery_mode side=%s spare_base=%.8f normal_base=%.8f extra_base=%.8f method=%s replacement_base=%.8f replacement_notional=%.2f profit_gate=%.6f reason=%s",
 								lot.Side,
 								freshSpareBase,
 								normalBase,
@@ -2571,7 +2572,7 @@ func (t *Trader) closeLot(
 
 				} else {
 					log.Printf(
-						"[TRACE] case3B.extra_base.skip side=%s recovery_net=%.6f stop_entry=%.8f recovery_exit=%.8f reason=no_positive_sell_recovery_move",
+						"[TRACE] Case3A.extra_base.skip side=%s recovery_net=%.6f stop_entry=%.8f recovery_exit=%.8f reason=no_positive_sell_recovery_move",
 						lot.Side,
 						recoveryNetUSD,
 						replacementEntryPrice,
@@ -2587,19 +2588,19 @@ func (t *Trader) closeLot(
 		// Sufficient spare for normalBase + extraBase.
 		// Post replacement first, then continue to loss-exit.
 
-		if lot.Case3BReplacementStarted {
+		if lot.Case3AReplacementStarted {
 			log.Printf(
-				"[TRACE] case3B.modeA.replacement_already_started side=%s source_entry_id=%s replacement_order_id=%s",
+				"[TRACE] Case3A.modeA.replacement_already_started side=%s source_entry_id=%s replacement_order_id=%s",
 				lot.Side,
 				lot.EntryOrderID,
-				lot.Case3BReplacementOrderID,
+				lot.Case3AReplacementOrderID,
 			)
 		} else {
 			var err error
 			var oid string
-			if oid, err = t.startCase3BReplacement(ctx, repl); err != nil {
+			if oid, err = t.startCase3AReplacement(ctx, repl); err != nil {
 				log.Printf(
-					"[TRACE] case3B.modeA.replacement_failed side=%s entry_id=%s base=%.8f entry_price=%.8f recovery=%.6f err=%v",
+					"[TRACE] Case3A.modeA.replacement_failed side=%s entry_id=%s base=%.8f entry_price=%.8f recovery=%.6f err=%v",
 					lot.Side,
 					lot.EntryOrderID,
 					repl.BaseAtLimit,
@@ -2609,14 +2610,14 @@ func (t *Trader) closeLot(
 				)
 
 				return "", fmt.Errorf(
-					"case3B modeA replacement failed; loss exit aborted entry_id=%s: %w",
+					"Case3A modeA replacement failed; loss exit aborted entry_id=%s: %w",
 					lot.EntryOrderID,
 					err,
 				)
 			}
 
 			log.Printf(
-				"[TRACE] case3B.modeA.replacement_started side=%s entry_id=%s base=%.8f entry_price=%.8f recovery=%.6f",
+				"[TRACE] Case3A.modeA.replacement_started side=%s entry_id=%s base=%.8f entry_price=%.8f recovery=%.6f",
 				lot.Side,
 				lot.EntryOrderID,
 				repl.BaseAtLimit,
@@ -2624,11 +2625,11 @@ func (t *Trader) closeLot(
 				repl.RecoveryNetUSD,
 			)
 
-			lot.Case3BReplacementStarted = true
-			lot.Case3BReplacementOrderID = oid
+			lot.Case3AReplacementStarted = true
+			lot.Case3AReplacementOrderID = oid
 
 			if err := t.saveStateNoLock(); err != nil {
-				log.Printf("[WARN] saveState case3B source flag: %v", err)
+				log.Printf("[WARN] saveState Case3A source flag: %v", err)
 			}
 		}
 	}
@@ -2703,8 +2704,8 @@ func (t *Trader) closeLot(
 			// Case 3B Mode B:
 			// Post loss-exit first, then attempt replacement in same tick.
 			// If replacement fails later, retry waits until loss-exit fill.
-			if _, err := t.startCase3BReplacement(ctx, repl); err != nil {
-				t.markCase3BReplacementRetryLocked(
+			if _, err := t.startCase3AReplacement(ctx, repl); err != nil {
+				t.markCase3AReplacementRetryLocked(
 					repl,
 					waitID,
 					fmt.Sprintf("initial_modeB_replacement_failed: %v", err),
@@ -2788,8 +2789,8 @@ func (t *Trader) closeLot(
 	// The loss exit has been accepted by the exchange.
 	// Submit the replacement immediately before heavier exit bookkeeping.
 	if repl.Enabled && repl.RecoveryMethod == RecoveryByProfitTarget {
-		if _, rerr := t.startCase3BReplacement(ctx, repl); rerr != nil {
-			t.markCase3BReplacementRetryLocked(
+		if _, rerr := t.startCase3AReplacement(ctx, repl); rerr != nil {
+			t.markCase3AReplacementRetryLocked(
 				repl,
 				placedOrderID(placed),
 				fmt.Sprintf(
@@ -3234,9 +3235,9 @@ func (t *Trader) maybeCloseDustBasket(ctx context.Context, side OrderSide, liveP
 }
 
 type PendingEntry struct {
-	OrderID string
-	Side    OrderSide
-	Source  EntrySource
+	OrderID  string
+	Side     OrderSide
+	Producer EntryProducer
 
 	Intent *PendingIntent
 
@@ -3260,8 +3261,8 @@ type PendingEntry struct {
 }
 
 type PendingIntent struct {
-	Enabled bool
-	Source  EntrySource
+	Enabled  bool
+	Producer EntryProducer
 
 	Side        OrderSide
 	LimitPx     float64
@@ -3294,23 +3295,16 @@ type PendingIntent struct {
 	ProfitGateUSD  float64 `json:"profit_gate_usd,omitempty"`
 	EntryMethod    string  `json:"entry_ai_mode,omitempty"`
 
-	// Case3B recovery metadata.
+	// Case3A recovery metadata.
 	RecoveryNetUSD float64        `json:"recovery_net_usd,omitempty"`
 	RecoveryMethod RecoveryMethod `json:"recovery_method,omitempty"`
 
 	CancelRequested bool `json:"cancel_requested,omitempty"`
 
 	// Empty for normal entries.
-	// Case3B uses this to identify the entry that caused the replacement.
+	// Case3A uses this to identify the entry that caused the replacement.
 	SourceEntryOrderID string `json:"source_entry_order_id,omitempty"`
 }
-
-type EntrySource string
-
-const (
-	EntrySourceNormal EntrySource = "normal"
-	EntrySourceCase3B EntrySource = "case3b"
-)
 
 func (t *Trader) positionExistsByEntryOrderID(orderID string) bool {
 	if t == nil || orderID == "" {
@@ -3369,7 +3363,7 @@ func (t *Trader) ensurePendingEntries() {
 	generic commit
 */
 // Buy Source Wrapper
-func (t *Trader) startNormalBuyEntry(
+func (t *Trader) startProducerBuyEntry(
 	ctx context.Context,
 	limitPx float64,
 	baseAtLimit float64,
@@ -3380,10 +3374,16 @@ func (t *Trader) startNormalBuyEntry(
 	profitGateUSD float64,
 	entryAIMode string,
 	equityTriggered bool,
+	producer EntryProducer,
 ) (*PendingEntry, error) {
-	intent := &PendingIntent{
-		Source: EntrySourceNormal,
+	if producer == EntryProducerNone {
+		return nil, fmt.Errorf(
+			"startProducerBuyEntry: missing entry producer",
+		)
+	}
 
+	intent := &PendingIntent{
+		Producer:    producer,
 		Side:        SideBuy,
 		LimitPx:     limitPx,
 		BaseAtLimit: baseAtLimit,
@@ -3409,7 +3409,7 @@ func (t *Trader) startNormalBuyEntry(
 }
 
 // Sell Source Wrapper
-func (t *Trader) startNormalSellEntry(
+func (t *Trader) startProducerSellEntry(
 	ctx context.Context,
 	limitPx float64,
 	baseAtLimit float64,
@@ -3420,9 +3420,15 @@ func (t *Trader) startNormalSellEntry(
 	profitGateUSD float64,
 	entryAIMode string,
 	equityTriggered bool,
+	producer EntryProducer,
 ) (*PendingEntry, error) {
+	if producer == EntryProducerNone {
+		return nil, fmt.Errorf(
+			"startProducerSellEntry: missing entry producer",
+		)
+	}
 	intent := &PendingIntent{
-		Source: EntrySourceNormal,
+		Producer: producer,
 
 		Side:        SideSell,
 		LimitPx:     limitPx,
@@ -3448,14 +3454,14 @@ func (t *Trader) startNormalSellEntry(
 	return t.produceEntry(ctx, intent)
 }
 
-// Case3B Source Wrapper
-func (t *Trader) startCase3BReplacement(
+// Case3A Source Wrapper
+func (t *Trader) startCase3AReplacement(
 	ctx context.Context,
 	repl PendingIntent,
 ) (string, error) {
 	if !repl.Enabled {
 		log.Printf(
-			"[TRACE] case3B.replacement.disabled "+
+			"[TRACE] Case3A.replacement.disabled "+
 				"side=%s method=%s base=%.8f "+
 				"entry=%.8f notional=%.2f",
 			repl.Side,
@@ -3469,7 +3475,7 @@ func (t *Trader) startCase3BReplacement(
 	}
 
 	log.Printf(
-		"[TRACE] case3B.replacement.enter "+
+		"[TRACE] Case3A.replacement.enter "+
 			"side=%s method=%s base=%.8f "+
 			"entry=%.8f notional=%.2f",
 		repl.Side,
@@ -3480,7 +3486,7 @@ func (t *Trader) startCase3BReplacement(
 	)
 
 	defer log.Printf(
-		"[TRACE] case3B.replacement.leave",
+		"[TRACE] Case3A.replacement.leave",
 	)
 
 	sourceEntryOrderID := strings.TrimSpace(
@@ -3489,16 +3495,16 @@ func (t *Trader) startCase3BReplacement(
 
 	if sourceEntryOrderID == "" {
 		return "", errors.New(
-			"Case3B replacement: missing SourceEntryOrderID",
+			"Case3A replacement: missing SourceEntryOrderID",
 		)
 	}
 
 	// ReplacementRequest has been absorbed into PendingIntent.
 	// Preserve the complete recovery intent and only enforce
-	// Case3B-specific ownership/runtime metadata here.
+	// Case3A-specific ownership/runtime metadata here.
 	intent := repl
 
-	intent.Source = EntrySourceCase3B
+	intent.Producer = EntryProducerCase3AReplacement
 	intent.ProductID = t.cfg.ProductID
 	intent.SourceEntryOrderID = sourceEntryOrderID
 
@@ -3514,7 +3520,7 @@ func (t *Trader) startCase3BReplacement(
 		intent.History = make([]string, 0, 5)
 	}
 
-	// Quote must agree with the actual Case3B price/size.
+	// Quote must agree with the actual Case3A price/size.
 	if intent.Quote <= 0 &&
 		intent.LimitPx > 0 &&
 		intent.BaseAtLimit > 0 {
@@ -3531,7 +3537,7 @@ func (t *Trader) startCase3BReplacement(
 
 	if err != nil {
 		log.Printf(
-			"[TRACE] case3B.replacement.failed "+
+			"[TRACE] Case3A.replacement.failed "+
 				"side=%s price=%.8f base=%.8f "+
 				"method=%s err=%v",
 			repl.Side,
@@ -3546,12 +3552,12 @@ func (t *Trader) startCase3BReplacement(
 
 	if entry == nil {
 		return "", errors.New(
-			"Case3B replacement: produceEntry returned nil entry",
+			"Case3A replacement: produceEntry returned nil entry",
 		)
 	}
 
 	log.Printf(
-		"[TRACE] case3B.replacement.started "+
+		"[TRACE] Case3A.replacement.started "+
 			"order_id=%s source_entry_order_id=%s "+
 			"side=%s price=%.8f base=%.8f method=%s",
 		entry.OrderID,
@@ -3852,18 +3858,18 @@ func (t *Trader) buildPendingEntry(
 	}
 
 	entry := &PendingEntry{
-		Side:    intent.Side,
-		Source:  intent.Source,
-		OrderID: intent.OrderID,
-		Intent:  intent,
+		Side:     intent.Side,
+		Producer: intent.Producer,
+		OrderID:  intent.OrderID,
+		Intent:   intent,
 
 		ResultC: make(chan OpenResult, 1),
 
 		Completed: false,
 	}
 
-	if intent.Source == EntrySourceCase3B {
-		entry.CommitEligible = t.case3BCommitEligible
+	if intent.Producer == EntryProducerCase3AReplacement {
+		entry.CommitEligible = t.Case3ACommitEligible
 	}
 
 	switch intent.Side {
@@ -3948,9 +3954,9 @@ func (t *Trader) registerPendingEntry(
 
 	log.Printf(
 		"[TRACE] pending.register "+
-			"source=%s side=%s order_id=%s "+
+			"producer=%s side=%s order_id=%s "+
 			"limit=%.8f base=%.8f quote=%.8f",
-		entry.Source,
+		entry.Producer,
 		entry.Side,
 		orderID,
 		entry.Intent.LimitPx,
@@ -4006,10 +4012,10 @@ func (t *Trader) runPendingEntryPoller(
 ) {
 	log.Printf(
 		"[TRACE] postonly.poll.start "+
-			"source=%s side=%s init_id=%s "+
+			"producer=%s side=%s init_id=%s "+
 			"init_limit=%.8f init_base=%.8f "+
 			"deadline=%s offset_bps=%.3f",
-		entry.Source,
+		entry.Producer,
 		side,
 		initialOrderID,
 		initialLimitPx,
@@ -4020,8 +4026,8 @@ func (t *Trader) runPendingEntryPoller(
 
 	defer log.Printf(
 		"[TRACE] postonly.poll.stopped "+
-			"source=%s side=%s initial_id=%s",
-		entry.Source,
+			"producer=%s side=%s initial_id=%s",
+		entry.Producer,
 		side,
 		initialOrderID,
 	)
@@ -4046,8 +4052,8 @@ poll:
 		case <-pollCtx.Done():
 			log.Printf(
 				"[TRACE] postonly.poll.cancelled "+
-					"source=%s side=%s last_id=%s",
-				entry.Source,
+					"producer=%s side=%s last_id=%s",
+				entry.Producer,
 				side,
 				orderID,
 			)
@@ -4098,11 +4104,11 @@ poll:
 
 			log.Printf(
 				"[TRACE] postonly.poll.tick "+
-					"source=%s side=%s order_id=%s status=%s "+
+					"producer=%s side=%s order_id=%s status=%s "+
 					"price=%.8f base=%.8f quote=%.2f fee=%.6f "+
 					"sess_agg[base=%.8f quote=%.2f fee=%.6f] "+
 					"reprices=%d",
-				entry.Source,
+				entry.Producer,
 				side,
 				orderID,
 				status,
@@ -4126,10 +4132,10 @@ poll:
 
 				log.Printf(
 					"[TRACE] postonly.filled "+
-						"source=%s order_id=%s "+
+						"producer=%s order_id=%s "+
 						"price=%.8f baseFilled=%.8f "+
 						"quoteSpent=%.2f fee=%.4f",
-					entry.Source,
+					entry.Producer,
 					orderID,
 					ord.Price,
 					ord.BaseSize,
@@ -4139,10 +4145,10 @@ poll:
 
 				log.Printf(
 					"[KPI] maker.open.filled "+
-						"source=%s side=%s vwap=%.8f "+
+						"producer=%s side=%s vwap=%.8f "+
 						"base=%.8f quote=%.2f fee=%.6f "+
 						"order_id=%s",
-					entry.Source,
+					entry.Producer,
 					side,
 					placed.Price,
 					placed.BaseSize,
@@ -4166,8 +4172,8 @@ poll:
 				if t.pendingEntryCancelRequested(entry) {
 					log.Printf(
 						"[TRACE] postonly.reprice.skip.cancel_requested "+
-							"source=%s side=%s order_id=%s",
-						entry.Source,
+							"producer=%s side=%s order_id=%s",
+						entry.Producer,
 						side,
 						orderID,
 					)
@@ -4186,10 +4192,10 @@ poll:
 
 				log.Printf(
 					"[TRACE] postonly.reprice.try "+
-						"source=%s side=%s order_id=%s "+
+						"producer=%s side=%s order_id=%s "+
 						"status=%s last_limit=%.8f "+
 						"reprice_count=%d",
-					entry.Source,
+					entry.Producer,
 					side,
 					orderID,
 					status,
@@ -4214,9 +4220,9 @@ poll:
 				if didReprice && newID != orderID {
 					log.Printf(
 						"[TRACE] postonly.reprice.swap "+
-							"source=%s side=%s old_id=%s "+
+							"producer=%s side=%s old_id=%s "+
 							"new_id=%s new_limit=%.8f count=%d",
-						entry.Source,
+						entry.Producer,
 						side,
 						orderID,
 						newID,
@@ -4242,10 +4248,10 @@ poll:
 				} else {
 					log.Printf(
 						"[TRACE] postonly.reprice.skip "+
-							"source=%s side=%s order_id=%s "+
+							"producer=%s side=%s order_id=%s "+
 							"reason=no_guard_or_no_improve "+
 							"last_limit=%.8f count=%d",
-						entry.Source,
+						entry.Producer,
 						side,
 						orderID,
 						newLastLimitPx,
@@ -4268,10 +4274,10 @@ poll:
 
 					log.Printf(
 						"[KPI] maker.open.filled "+
-							"source=%s side=%s vwap=%.8f "+
+							"producer=%s side=%s vwap=%.8f "+
 							"base=%.8f quote=%.2f fee=%.6f "+
 							"order_id=%s status=%s",
-						entry.Source,
+						entry.Producer,
 						side,
 						placed.Price,
 						placed.BaseSize,
@@ -4302,10 +4308,10 @@ poll:
 
 				log.Printf(
 					"[TRACE] postonly.poll.done "+
-						"source=%s side=%s order_id=%s "+
+						"producer=%s side=%s order_id=%s "+
 						"final=%s vwap=%.8f base=%.8f "+
 						"quote=%.2f fee=%.6f",
-					entry.Source,
+					entry.Producer,
 					side,
 					orderID,
 					status,
@@ -4326,8 +4332,8 @@ poll:
 		case <-pollCtx.Done():
 			log.Printf(
 				"[TRACE] postonly.poll.cancelled "+
-					"source=%s side=%s last_id=%s",
-				entry.Source,
+					"producer=%s side=%s last_id=%s",
+				entry.Producer,
 				side,
 				orderID,
 			)
@@ -4358,8 +4364,8 @@ poll:
 	if cancelErr != nil {
 		log.Printf(
 			"[WARN] postonly.poll.timeout_cancel_failed "+
-				"source=%s side=%s order_id=%s err=%v",
-			entry.Source,
+				"producer=%s side=%s order_id=%s err=%v",
+			entry.Producer,
 			side,
 			orderID,
 			cancelErr,
@@ -4368,9 +4374,9 @@ poll:
 
 	log.Printf(
 		"[TRACE] postonly.poll.timeout "+
-			"source=%s side=%s last_id=%s "+
+			"producer=%s side=%s last_id=%s "+
 			"sess_base=%.8f sess_quote=%.2f sess_fee=%.6f",
-		entry.Source,
+		entry.Producer,
 		side,
 		orderID,
 		sessionBase,
@@ -4447,8 +4453,8 @@ func (t *Trader) rekeyPendingEntry(
 	if !exists || current != entry {
 		log.Printf(
 			"[WARN] pending.rekey.owner_mismatch "+
-				"source=%s side=%s old_id=%s new_id=%s",
-			entry.Source,
+				"producer=%s side=%s old_id=%s new_id=%s",
+			entry.Producer,
 			entry.Side,
 			oldOrderID,
 			newOrderID,
@@ -4462,8 +4468,8 @@ func (t *Trader) rekeyPendingEntry(
 
 		log.Printf(
 			"[ERROR] pending.rekey.collision "+
-				"source=%s side=%s old_id=%s new_id=%s",
-			entry.Source,
+				"producer=%s side=%s old_id=%s new_id=%s",
+			entry.Producer,
 			entry.Side,
 			oldOrderID,
 			newOrderID,
@@ -4838,13 +4844,39 @@ func (t *Trader) drainPendingEntry(
 	pending := entry.Intent
 	book := entry.Book
 
+	if entry.Producer == EntryProducerNone {
+		log.Printf(
+			"[ERROR] postonly.drain.missing_producer "+
+				"side=%s order_id=%s",
+			side,
+			entry.OrderID,
+		)
+		return
+	}
+
+	if pending != nil &&
+		entry.Producer != pending.Producer {
+
+		log.Printf(
+			"[ERROR] postonly.drain.producer_mismatch "+
+				"side=%s order_id=%s "+
+				"entry_producer=%s intent_producer=%s",
+			side,
+			entry.OrderID,
+			entry.Producer,
+			pending.Producer,
+		)
+
+		return
+	}
+
 	/*
 		Finish the pending lifecycle after a terminal broker result.
 
 		The owner-specific cleanup is supplied when the PendingEntry is
 		constructed, so this generic drain does not need to know whether
-		the entry came from normal BUY, normal SELL, Case3B, or another
-		entry source.
+		the entry came from normal BUY, normal SELL, Case3A, or another
+		entry producer.
 	*/
 	finish := func() {
 		if entry.Cancel != nil {
@@ -4862,9 +4894,9 @@ func (t *Trader) drainPendingEntry(
 
 		if err := t.saveStateNoLock(); err != nil {
 			log.Printf(
-				"[WARN] saveState (drain %s source=%s id=%s): %v",
+				"[WARN] saveState (drain %s producer=%s id=%s): %v",
 				side,
-				entry.Source,
+				entry.Producer,
 				entry.OrderID,
 				err,
 			)
@@ -4875,9 +4907,9 @@ func (t *Trader) drainPendingEntry(
 	case res, ok := <-entry.ResultC:
 		if !ok {
 			log.Printf(
-				"[WARN] postonly.drain.channel_closed side=%s source=%s id=%s",
+				"[WARN] postonly.drain.channel_closed side=%s producer=%s id=%s",
 				side,
-				entry.Source,
+				entry.Producer,
 				entry.OrderID,
 			)
 
@@ -4890,9 +4922,9 @@ func (t *Trader) drainPendingEntry(
 		}
 
 		log.Printf(
-			"[TRACE] postonly.drain.recv side=%s source=%s id=%s order_id=%s filled=%v placed_nil=%v",
+			"[TRACE] postonly.drain.recv side=%s producer=%s id=%s order_id=%s filled=%v placed_nil=%v",
 			side,
-			entry.Source,
+			entry.Producer,
 			entry.OrderID,
 			res.OrderID,
 			res.Filled,
@@ -4912,9 +4944,9 @@ func (t *Trader) drainPendingEntry(
 
 		if res.Filled && res.Placed != nil {
 			log.Printf(
-				"[TRACE] postonly.drain.placed side=%s source=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f",
+				"[TRACE] postonly.drain.placed side=%s producer=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f",
 				side,
-				entry.Source,
+				entry.Producer,
 				res.OrderID,
 				res.Placed.Price,
 				res.Placed.BaseSize,
@@ -4937,9 +4969,9 @@ func (t *Trader) drainPendingEntry(
 				accept = true
 
 				log.Printf(
-					"[WARN] postonly.fill.without_pending side=%s source=%s order_id=%s",
+					"[WARN] postonly.fill.without_pending side=%s producer=%s order_id=%s",
 					side,
-					entry.Source,
+					entry.Producer,
 					res.OrderID,
 				)
 			}
@@ -4955,9 +4987,9 @@ func (t *Trader) drainPendingEntry(
 					cannot currently be committed into a position book.
 				*/
 				log.Printf(
-					"[ERROR] postonly.fill.book_nil side=%s source=%s id=%s order_id=%s reconciliation_required=true",
+					"[ERROR] postonly.fill.book_nil side=%s producer=%s id=%s order_id=%s reconciliation_required=true",
 					side,
-					entry.Source,
+					entry.Producer,
 					entry.OrderID,
 					res.OrderID,
 				)
@@ -4973,9 +5005,9 @@ func (t *Trader) drainPendingEntry(
 			); err != nil {
 
 				log.Printf(
-					"[ERROR] postonly.commit side=%s source=%s order_id=%s: %v",
+					"[ERROR] postonly.commit side=%s producer=%s order_id=%s: %v",
 					side,
-					entry.Source,
+					entry.Producer,
 					res.OrderID,
 					err,
 				)
@@ -4994,16 +5026,16 @@ func (t *Trader) drainPendingEntry(
 
 			if cancelRequested {
 				log.Printf(
-					"[TRACE] postonly.cancel.ack side=%s source=%s order_id=%s fallback=false reason=signal_changed",
+					"[TRACE] postonly.cancel.ack side=%s producer=%s order_id=%s fallback=false reason=signal_changed",
 					side,
-					entry.Source,
+					entry.Producer,
 					res.OrderID,
 				)
 			} else {
 				log.Printf(
-					"[TRACE] postonly.recheck side=%s source=%s set=true reason=timeout_or_error order_id=%s",
+					"[TRACE] postonly.recheck side=%s producer=%s set=true reason=timeout_or_error order_id=%s",
 					side,
-					entry.Source,
+					entry.Producer,
 					res.OrderID,
 				)
 			}
@@ -5064,7 +5096,7 @@ func (t *Trader) commitEntryFill(
 	book := entry.Book
 
 	// policy := entryPolicyForSide(side)
-	policy := entryPolicyForSource(entry.Source)
+	policy := entryPolicyForSource(entry.Producer)
 
 	priceToUse := res.Placed.Price
 	baseToUse := res.Placed.BaseSize
@@ -5081,9 +5113,9 @@ func (t *Trader) commitEntryFill(
 
 	if t.positionExistsByEntryOrderID(res.OrderID) {
 		log.Printf(
-			"[TRACE] postonly.commit.duplicate side=%s source=%s order_id=%s",
+			"[TRACE] postonly.commit.duplicate side=%s producer=%s order_id=%s",
 			side,
-			entry.Source,
+			entry.Producer,
 			res.OrderID,
 		)
 		return nil
@@ -5148,9 +5180,9 @@ func (t *Trader) commitEntryFill(
 	if baseToUse <= 0 || quoteSpent <= 0 {
 
 		log.Printf(
-			"[TRACE] postonly.fill.refund_consumed_all side=%s source=%s order_id=%s",
+			"[TRACE] postonly.fill.refund_consumed_all side=%s producer=%s order_id=%s",
 			side,
-			entry.Source,
+			entry.Producer,
 			res.OrderID,
 		)
 
@@ -5173,6 +5205,8 @@ func (t *Trader) commitEntryFill(
 		ConfidenceMult:   pending.ConfidenceMult,
 		EntryMethod:      pending.EntryMethod,
 		ProfitGateUSD:    pending.ProfitGateUSD,
+
+		Producer: entry.Producer,
 	}
 
 	if newLot.ConfidenceMult <= 0 {
@@ -5188,9 +5222,9 @@ func (t *Trader) commitEntryFill(
 	}
 
 	log.Printf(
-		"[KPI] lot.created side=%s source=%s mode=%s conf=%.2f gate=%.2f order_id=%s",
+		"[KPI] lot.created side=%s producer=%s mode=%s conf=%.2f gate=%.2f order_id=%s",
 		newLot.Side,
-		entry.Source,
+		entry.Producer,
 		newLot.EntryMethod,
 		newLot.ConfidenceMult,
 		newLot.ProfitGateUSD,
@@ -5224,9 +5258,9 @@ func (t *Trader) commitEntryFill(
 	} else {
 
 		log.Printf(
-			"[WARN] postonly.fill.spare_pointer_nil side=%s source=%s order_id=%s",
+			"[WARN] postonly.fill.spare_pointer_nil side=%s producer=%s order_id=%s",
 			side,
-			entry.Source,
+			entry.Producer,
 			res.OrderID,
 		)
 	}
@@ -5246,10 +5280,10 @@ func (t *Trader) commitEntryFill(
 		t.applyRunnerTargets(runner)
 
 		log.Printf(
-			"[TRACE] runner.assign idx=%d side=%s source=%s open=%.8f take=%.8f",
+			"[TRACE] runner.assign idx=%d side=%s producer=%s open=%.8f take=%.8f",
 			newIndex,
 			side,
-			entry.Source,
+			entry.Producer,
 			runner.OpenPrice,
 			runner.Take,
 		)
@@ -5273,9 +5307,9 @@ func (t *Trader) commitEntryFill(
 		t.lastAddEquity = t.equityUSD
 
 		log.Printf(
-			"[TRACE] equity.baseline.set side=%s source=%s old=%.2f new=%.2f",
+			"[TRACE] equity.baseline.set side=%s producer=%s old=%.2f new=%.2f",
 			side,
-			entry.Source,
+			entry.Producer,
 			oldEquityBaseline,
 			t.lastAddEquity,
 		)
@@ -5290,14 +5324,14 @@ func (t *Trader) commitEntryFill(
 			UP   + BUY  -> NORMAL
 			DOWN + SELL -> NORMAL
 
-		Case3B replacements leave the regime unchanged because their
-		source policy sets ResetRegime=false.
+		Case3A replacements leave the regime unchanged because their
+		producer policy sets ResetRegime=false.
 	*/
 	if policy.ResetRegime && t.shouldResetRegime(side) {
 		t.toNormal(
 			fmt.Sprintf(
-				"successful_entry_fill source=%s side=%s order_id=%s",
-				entry.Source,
+				"successful_entry_fill producer=%s side=%s order_id=%s",
+				entry.Producer,
 				side,
 				res.OrderID,
 			),
@@ -5324,14 +5358,18 @@ func (t *Trader) commitEntryFill(
 
 	return nil
 }
-func (t *Trader) case3BCommitEligible(
+func (t *Trader) Case3ACommitEligible(
 	entry *PendingEntry,
 ) bool {
 	if t == nil || entry == nil {
 		return false
 	}
 
-	if entry.Source != EntrySourceCase3B {
+	if entry.Intent == nil {
+		return false
+	}
+
+	if entry.Producer != EntryProducerCase3AReplacement {
 		return true
 	}
 
@@ -5847,4 +5885,65 @@ func (t *Trader) pendingExitsSnapshot() []*PendingExit {
 	}
 
 	return exits
+}
+
+type PendingProducerCounts struct {
+	ByProducer map[EntryProducer]map[OrderSide]int
+
+	TotalBuy  int
+	TotalSell int
+}
+
+func (p PendingProducerCounts) Count(
+	producer EntryProducer,
+	side OrderSide,
+) int {
+	if bySide, ok := p.ByProducer[producer]; ok {
+		return bySide[side]
+	}
+
+	return 0
+}
+
+func (t *Trader) pendingProducerCountsNoLock() PendingProducerCounts {
+	result := PendingProducerCounts{
+		ByProducer: make(
+			map[EntryProducer]map[OrderSide]int,
+		),
+	}
+
+	for _, entry := range t.pendingEntries {
+		if entry == nil ||
+			entry.Completed ||
+			entry.Intent == nil {
+			continue
+		}
+
+		producer := entry.Producer
+		side := entry.Side
+
+		if producer == EntryProducerNone {
+			continue
+		}
+
+		switch side {
+		case SideBuy:
+			result.TotalBuy++
+
+		case SideSell:
+			result.TotalSell++
+
+		default:
+			continue
+		}
+
+		if _, ok := result.ByProducer[producer]; !ok {
+			result.ByProducer[producer] =
+				make(map[OrderSide]int)
+		}
+
+		result.ByProducer[producer][side]++
+	}
+
+	return result
 }

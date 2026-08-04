@@ -15,13 +15,13 @@ Scan SELL lots
     ↓
 Lot A qualifies for threshold stop-loss
     ↓
-Case3BReplacementStarted == false
+Case3AReplacementStarted == false
     ↓
 Post 3B Mode A replacement
     ↓
-Store dedicated Case 3B pending session
+Store dedicated Case 3A pending session
     ↓
-Set Lot A.Case3BReplacementStarted = true
+Set Lot A.Case3AReplacementStarted = true
     ↓
 Start Lot A exit
     ↓
@@ -37,7 +37,7 @@ Exit result is drained
     ↓
 Lot A is removed and EXIT record is written
     ↓
-Case 3B drain sees source lot no longer exists
+Case 3A drain sees source lot no longer exists
     ↓
 Replacement result is committed as a new SELL lot
 
@@ -58,8 +58,8 @@ Currently I have the followings configured[
 
 	// Exit result is drained
 	t.drainPendingExitCh(ctx, execHistory, livePrice)
-	// Case 3B drain sees source lot no longer exists
-	t.drainPendingCase3BEntries(
+	// Case 3A drain sees source lot no longer exists
+	t.drainPendingCase3AEntries(
 		now,
 		wallNow,
 	)
@@ -74,7 +74,7 @@ Currently I have the followings configured[
 type PendingEntry struct {
 	ID     string
 	Side   OrderSide
-	Source EntrySource
+	Source EntryProducer
 
 	Pending *PendingOpen
 	ResultC <-chan OpenResult
@@ -94,12 +94,12 @@ type PendingEntry struct {
 	clearOwner     func()
 }
 
-type EntrySource string
+type EntryProducer string
 
 const (
-	EntrySourceNormalBuy  EntrySource = "normal_buy"
-	EntrySourceNormalSell EntrySource = "normal_sell"
-	EntrySourceCase3B     EntrySource = "case3b"
+	EntrySourceNormalBuy  EntryProducer = "normal_buy"
+	EntrySourceNormalSell EntryProducer = "normal_sell"
+	EntrySourceCase3A     EntryProducer = "Case3A"
 )
 
 //Entry Producers:
@@ -182,39 +182,39 @@ func (t *Trader) pendingEntryForSide(side OrderSide) *PendingEntry {
 
 	return nil
 }
-func (t *Trader) registerCase3BPendingEntry(
+func (t *Trader) registerCase3APendingEntry(
 	pending *PendingOpen,
 	resultC <-chan OpenResult,
 	cancel context.CancelFunc,
 	sourceEntryOrderID string,
 ) (*PendingEntry, error) {
 	if t == nil {
-		return nil, errors.New("register Case3B entry: nil Trader")
+		return nil, errors.New("register Case3A entry: nil Trader")
 	}
 
 	if pending == nil {
-		return nil, errors.New("register Case3B entry: nil PendingOpen")
+		return nil, errors.New("register Case3A entry: nil PendingOpen")
 	}
 
 	if resultC == nil {
-		return nil, errors.New("register Case3B entry: nil result channel")
+		return nil, errors.New("register Case3A entry: nil result channel")
 	}
 
 	if sourceEntryOrderID == "" {
 		return nil, errors.New(
-			"register Case3B entry: missing source entry order ID",
+			"register Case3A entry: missing source entry order ID",
 		)
 	}
 
 	if pending.OrderID == "" {
 		return nil, errors.New(
-			"register Case3B entry: missing replacement order ID",
+			"register Case3A entry: missing replacement order ID",
 		)
 	}
 
 	if pending.Side != SideBuy && pending.Side != SideSell {
 		return nil, fmt.Errorf(
-			"register Case3B entry: invalid side %q",
+			"register Case3A entry: invalid side %q",
 			pending.Side,
 		)
 	}
@@ -226,9 +226,9 @@ func (t *Trader) registerCase3BPendingEntry(
 		pending.OrderID,
 	)
 
-	if _, exists := t.pendingCase3B[id]; exists {
+	if _, exists := t.pendingCase3A[id]; exists {
 		return nil, fmt.Errorf(
-			"Case3B pending entry already exists: %s",
+			"Case3A pending entry already exists: %s",
 			id,
 		)
 	}
@@ -236,7 +236,7 @@ func (t *Trader) registerCase3BPendingEntry(
 	entry := &PendingEntry{
 		ID:                 id,
 		Side:               pending.Side,
-		Source:             EntrySourceCase3B,
+		Source:             EntrySourceCase3A,
 		Pending:            pending,
 		ResultC:            resultC,
 		Cancel:             cancel,
@@ -245,13 +245,13 @@ func (t *Trader) registerCase3BPendingEntry(
 	}
 
 	entry.clearOwner = func() {
-		delete(t.pendingCase3B, id)
+		delete(t.pendingCase3A, id)
 	}
 
-	t.pendingCase3B[id] = entry
+	t.pendingCase3A[id] = entry
 
 	log.Printf(
-		"[TRACE] case3b.pending.register id=%s side=%s source_entry_order_id=%s replacement_order_id=%s",
+		"[TRACE] Case3A.pending.register id=%s side=%s source_entry_order_id=%s replacement_order_id=%s",
 		entry.ID,
 		entry.Side,
 		entry.SourceEntryOrderID,
@@ -284,7 +284,7 @@ func (t *Trader) drainPendingEntry(
 
 		The owner-specific cleanup is supplied when the PendingEntry is
 		constructed, so this generic drain does not need to know whether
-		the entry came from normal BUY, normal SELL, Case3B, or another
+		the entry came from normal BUY, normal SELL, Case3A, or another
 		entry source.
 	*/
 	finish := func() {
@@ -725,14 +725,14 @@ func (t *Trader) commitEntryFill(
 
 	return nil
 }
-func (t *Trader) case3BCommitEligible(
+func (t *Trader) Case3ACommitEligible(
 	entry *PendingEntry,
 ) bool {
 	if t == nil || entry == nil {
 		return false
 	}
 
-	if entry.Source != EntrySourceCase3B {
+	if entry.Source != EntrySourceCase3A {
 		return true
 	}
 
@@ -782,16 +782,16 @@ func pendingEntryID(side OrderSide, orderID string) string {
 	return fmt.Sprintf("%s:%s", side, orderID)
 }
 func (t *Trader) ensurePendingEntryMaps() {
-	if t.pendingCase3B == nil {
-		t.pendingCase3B = make(map[string]*PendingEntry)
+	if t.pendingCase3A == nil {
+		t.pendingCase3A = make(map[string]*PendingEntry)
 	}
 }
 
-func (t *Trader) drainPendingCase3BEntries(
+func (t *Trader) drainPendingCase3AEntries(
 	now time.Time,
 	wallNow time.Time,
 ) {
-	if t == nil || len(t.pendingCase3B) == 0 {
+	if t == nil || len(t.pendingCase3A) == 0 {
 		return
 	}
 
@@ -799,13 +799,13 @@ func (t *Trader) drainPendingCase3BEntries(
 		Take a snapshot before draining.
 
 		drainPendingEntry may call entry.clearOwner(), which removes the
-		entry from pendingCase3B. A snapshot keeps iteration independent
+		entry from pendingCase3A. A snapshot keeps iteration independent
 		of those map mutations and ensures entries registered during this
 		drain wait until the next tick.
 	*/
-	entries := make([]*PendingEntry, 0, len(t.pendingCase3B))
+	entries := make([]*PendingEntry, 0, len(t.pendingCase3A))
 
-	for _, entry := range t.pendingCase3B {
+	for _, entry := range t.pendingCase3A {
 		if entry == nil {
 			continue
 		}
@@ -821,13 +821,13 @@ func (t *Trader) drainPendingCase3BEntries(
 		)
 	}
 }
-func (t *Trader) startCase3BReplacement(
+func (t *Trader) startCase3AReplacement(
 	ctx context.Context,
 	repl ReplacementRequest,
 ) (string, error) {
 	if !repl.Enabled {
 		log.Printf(
-			"[TRACE] case3B.replacement.disabled side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
+			"[TRACE] Case3A.replacement.disabled side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
 			repl.Side,
 			repl.Method.String(),
 			repl.Base,
@@ -838,7 +838,7 @@ func (t *Trader) startCase3BReplacement(
 	}
 
 	log.Printf(
-		"[TRACE] case3B.replacement.enter side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
+		"[TRACE] Case3A.replacement.enter side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
 		repl.Side,
 		repl.Method.String(),
 		repl.Base,
@@ -846,12 +846,12 @@ func (t *Trader) startCase3BReplacement(
 		repl.Base*repl.EntryPrice,
 	)
 
-	defer log.Printf("[TRACE] case3B.replacement.leave")
+	defer log.Printf("[TRACE] Case3A.replacement.leave")
 
 	started, err := t.startPendingReplacementEntry(ctx, repl)
 	if err != nil {
 		log.Printf(
-			"[TRACE] case3B.replacement.failed side=%s price=%.8f base=%.8f method=%s err=%v",
+			"[TRACE] Case3A.replacement.failed side=%s price=%.8f base=%.8f method=%s err=%v",
 			repl.Side,
 			repl.EntryPrice,
 			repl.Base,
@@ -866,7 +866,7 @@ func (t *Trader) startCase3BReplacement(
 		)
 	}
 	if strings.TrimSpace(repl.SourceEntryOrderID) == "" {
-		return t.cancelCase3BAttempt(
+		return t.cancelCase3AAttempt(
 			ctx,
 			started,
 			nil,
@@ -874,7 +874,7 @@ func (t *Trader) startCase3BReplacement(
 		)
 	}
 	if started.Pending == nil {
-		return t.cancelCase3BAttempt(
+		return t.cancelCase3AAttempt(
 			ctx,
 			started,
 			nil,
@@ -883,7 +883,7 @@ func (t *Trader) startCase3BReplacement(
 	}
 
 	if started.ResultC == nil {
-		return t.cancelCase3BAttempt(
+		return t.cancelCase3AAttempt(
 			ctx,
 			started,
 			nil,
@@ -892,7 +892,7 @@ func (t *Trader) startCase3BReplacement(
 	}
 
 	if strings.TrimSpace(started.OrderID) == "" {
-		return t.cancelCase3BAttempt(
+		return t.cancelCase3AAttempt(
 			ctx,
 			started,
 			nil,
@@ -900,7 +900,7 @@ func (t *Trader) startCase3BReplacement(
 		)
 	}
 
-	_, err = t.registerCase3BPendingEntry(
+	_, err = t.registerCase3APendingEntry(
 		started.Pending,
 		started.ResultC,
 		started.Cancel,
@@ -908,16 +908,16 @@ func (t *Trader) startCase3BReplacement(
 	)
 
 	if err != nil {
-		return t.cancelCase3BAttempt(
+		return t.cancelCase3AAttempt(
 			ctx,
 			started,
 			err,
-			"register Case3B replacement",
+			"register Case3A replacement",
 		)
 	}
 
 	log.Printf(
-		"[TRACE] case3B.replacement.started order_id=%s source_entry_order_id=%s side=%s price=%.8f base=%.8f method=%s",
+		"[TRACE] Case3A.replacement.started order_id=%s source_entry_order_id=%s side=%s price=%.8f base=%.8f method=%s",
 		started.OrderID,
 		repl.SourceEntryOrderID,
 		repl.Side,
@@ -930,7 +930,7 @@ func (t *Trader) startCase3BReplacement(
 }
 
 
-func (t *Trader) cancelCase3BAttempt(
+func (t *Trader) cancelCase3AAttempt(
 	ctx context.Context,
 	started *StartedPendingEntry,
 	cause error,
@@ -1015,7 +1015,7 @@ func (t *Trader) startPendingReplacementEntry(
 	}
 
 	log.Printf(
-		"[TRACE] case3B.replacement.before_postonly side=%s limit=%.8f base=%.8f notional=%.2f method=%s",
+		"[TRACE] Case3A.replacement.before_postonly side=%s limit=%.8f base=%.8f notional=%.2f method=%s",
 		repl.Side,
 		limitPx,
 		repl.Base,
@@ -1028,7 +1028,7 @@ func (t *Trader) startPendingReplacementEntry(
 	t.mu.Lock()
 
 	log.Printf(
-		"[TRACE] case3B.replacement.after_postonly side=%s order_id=%s err=%v",
+		"[TRACE] Case3A.replacement.after_postonly side=%s order_id=%s err=%v",
 		repl.Side,
 		orderID,
 		err,
@@ -1395,7 +1395,7 @@ func (t *Trader) startPendingReplacementEntry(
 	}(initOrderID, side, deadline, initLimitPx, initBaseAtLimit, pend, ch, pctx)
 
 	log.Printf(
-		"[TRACE] case3B.replacement.posted side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f method=%s gate=%.6f reason=%s",
+		"[TRACE] Case3A.replacement.posted side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f method=%s gate=%.6f reason=%s",
 		repl.Side,
 		orderID,
 		limitPx,

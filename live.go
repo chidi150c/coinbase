@@ -573,9 +573,9 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 						continue
 					}
 
-					// Case3B replacement lifecycle is not controlled by the
+					// Case3A replacement lifecycle is not controlled by the
 					// current normal entry signal.
-					if entry.Source == EntrySourceCase3B {
+					if entry.Producer == EntryProducerCase3AReplacement {
 						continue
 					}
 
