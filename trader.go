@@ -73,7 +73,7 @@ type Position struct {
 	FixedTPWorking   bool     `json:"-"` // internal flag: emulate a posted TP (re-post each tick while gate holds)
 	ConfidenceMult   float64  `json:"confidence_mult,omitempty"`
 	ProfitGateUSD    float64  `json:"profit_gate_usd,omitempty"`
-	EntryMethod      string   `json:"entry_ai_mode,omitempty"` // AI_MATCH or AI_FLAT
+	EntryMethod      string   `json:"entry_method,omitempty"`
 
 	TrailActivateGateUSD float64 `json:"activate_gate_usd"` // from TRAIL_ACTIVATE_USD (runner/scalp)
 	TrailDistancePct     float64 `json:"distance_pct"`      // from TRAIL_DISTANCE_PCT (runner/scalp)
@@ -3296,7 +3296,7 @@ type PendingIntent struct {
 
 	ConfidenceMult float64 `json:"confidence_mult,omitempty"`
 	ProfitGateUSD  float64 `json:"profit_gate_usd,omitempty"`
-	EntryMethod    string  `json:"entry_ai_mode,omitempty"`
+	EntryMethod    string  `json:"entry_method,omitempty"`
 
 	// Case3A recovery metadata.
 	RecoveryNetUSD float64        `json:"recovery_net_usd,omitempty"`

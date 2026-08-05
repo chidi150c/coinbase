@@ -583,3 +583,133 @@ func applyCase13BBottomProducer(
 
 	return true
 }
+
+// Case14BUptrendBuyProducer eases the normal BUY adverse-price gate during
+// strong UP-trend continuation.
+//
+// This producer owns only the buffered window immediately above the BUY
+// latch and never overlaps with NormalLegacy.
+//
+// Territory:
+//
+//	price <= BUY latch
+//	    -> NormalLegacy
+//
+//	BUY latch < price <= buffered BUY latch
+//	    -> Case14B (reduced profit target)
+//
+//	price > buffered BUY latch
+//	    -> No Case14B entry
+//
+//	pending Case14B > 0
+//	    -> Case14B disabled
+//
+// Requires AI BUY, Legacy BUY, Logic BUY, BUY pattern, UP regime, and
+// BUY spacing gate.
+func applyCase14BUptrendBuyProducer(
+	d *EntryDecision,
+	ai AIResult,
+	ema EMAPatternResult,
+	pyramid PyramidResult,
+	equity EquityResult,
+	price float64,
+	regime MarketRegime,
+	legacySignal Signal,
+	logicOpinion Signal,
+	pendingCounts PendingProducerCounts,
+) bool {
+	const (
+		minConfidence        = 0.30
+		nearLatchBufferPct   = 0.56
+		profitGateMultiplier = 0.50
+	)
+
+	case14BPending :=
+		pendingCounts.Count(
+			EntryProducerCase14BUptrendBuy,
+			SideBuy,
+		)
+
+	latchValid :=
+		pyramid.Buy.Latched > 0
+
+	actualLatchReached :=
+		latchValid &&
+			price <= pyramid.Buy.Latched
+
+	bufferedLatch := 0.0
+
+	if latchValid {
+		bufferedLatch =
+			pyramid.Buy.Latched *
+				(1.0 + nearLatchBufferPct/100.0)
+	}
+
+	// case14B owns only the narrow window immediately above the BUY latch.
+	//
+	// At or below the latch, NormalLegacy owns the entry.
+	// Above the buffered latch, the entry is too early.
+	withinLatchWindow :=
+		latchValid &&
+			!actualLatchReached &&
+			price <= bufferedLatch
+
+	// A pending case14B entry disables this producer completely.
+	case14BAvailable :=
+		case14BPending == 0 &&
+			withinLatchWindow
+
+	uptrendBuy :=
+		case14BAvailable &&
+			ai.Raw == Buy &&
+			ai.Confidence >= minConfidence &&
+			legacySignal == Buy &&
+			logicOpinion == Buy &&
+			regime == RegimeUp &&
+			ema.PatternBuy &&
+			pyramid.Buy.SpacingPass
+
+	log.Printf(
+		"[TRACE] case14B.uptrend_buy.evaluate "+
+			"ai_raw=%s confidence=%.2f min_confidence=%.2f "+
+			"legacy=%s logic=%s regime=%s pattern_buy=%t "+
+			"price=%.8f latch=%.8f buffered_latch=%.8f "+
+			"buffer_pct=%.4f actual_latch_reached=%t "+
+			"within_latch_window=%t spacing=%t "+
+			"pending_count=%d available=%t "+
+			"profit_gate_mult=%.2f producer=%t",
+		ai.Raw,
+		ai.Confidence,
+		minConfidence,
+		legacySignal,
+		logicOpinion,
+		regime,
+		ema.PatternBuy,
+		price,
+		pyramid.Buy.Latched,
+		bufferedLatch,
+		nearLatchBufferPct,
+		actualLatchReached,
+		withinLatchWindow,
+		pyramid.Buy.SpacingPass,
+		case14BPending,
+		case14BAvailable,
+		profitGateMultiplier,
+		uptrendBuy,
+	)
+
+	if !uptrendBuy {
+		return false
+	}
+
+	d.Signal = Buy
+	d.Producer = EntryProducerCase14BUptrendBuy
+	d.ProfitGateMultiplier = profitGateMultiplier
+
+	d.PyramidReason = pyramid.Buy.Reason
+
+	d.EquityPass = equity.BuyTrigger
+	d.EquityReason = equity.Reason
+
+	return true
+}

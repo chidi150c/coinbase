@@ -77,7 +77,7 @@ import (
 	"time"
 )
 
-const Version = 158
+const Version = 159
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -1944,26 +1944,64 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			t.nearestNetSell,
 			t.nearestIdxSell,
 		)
+
 		t.mu.Unlock()
-		return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
+
+		return StepResult{
+			Msg:    "HOLD",
+			Raw:    d.Raw,
+			Signal: d.Signal,
+		}, nil
 	}
 
-	entryAIMode := "AI_MATCH"
-	if d.Raw == Flat {
-		entryAIMode = "AI_FLAT"
+	entryAIMode :=
+		string(d.Producer)
+
+	if entryAIMode == "" {
+		entryAIMode = "UNKNOWN"
 	}
 
-	entryProfitGateUSD := t.cfg.ProfitGateUSD * confMult
-	if entryProfitGateUSD < 0.30 {
-		entryProfitGateUSD = 0.30
+	// Calculate the ordinary confidence-adjusted target first.
+	baseEntryProfitGateUSD :=
+		t.cfg.ProfitGateUSD * confMult
+
+	if baseEntryProfitGateUSD < 0.30 {
+		baseEntryProfitGateUSD = 0.30
 	}
 
-	recoveryAddUSD := t.recoveryTargetAddUSD()
-	entryProfitGateUSD += recoveryAddUSD
+	// Producers may reduce or increase the ordinary target.
+	// A zero/unset multiplier preserves existing behavior.
+	profitGateMultiplier :=
+		d.ProfitGateMultiplier
+
+	if profitGateMultiplier <= 0 {
+		profitGateMultiplier = 1.0
+	}
+
+	producerProfitGateUSD :=
+		baseEntryProfitGateUSD *
+			profitGateMultiplier
+
+	// Recovery debt is independent of producer target policy and must not
+	// be reduced by the producer multiplier.
+	recoveryAddUSD :=
+		t.recoveryTargetAddUSD()
+
+	entryProfitGateUSD :=
+		producerProfitGateUSD +
+			recoveryAddUSD
 
 	log.Printf(
-		"[TRACE] recovery.entry debt=%.4f add=%.4f targetNetUSD=%.4f",
-		t.RecoveryDebtUSD,
+		"[TRACE] entry.profit_gate "+
+			"producer=%s confidence=%.2f "+
+			"base_usd=%.4f multiplier=%.4f "+
+			"producer_usd=%.4f recovery_add_usd=%.4f "+
+			"resolved_usd=%.4f",
+		d.Producer,
+		confMult,
+		baseEntryProfitGateUSD,
+		profitGateMultiplier,
+		producerProfitGateUSD,
 		recoveryAddUSD,
 		entryProfitGateUSD,
 	)

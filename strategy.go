@@ -141,10 +141,11 @@ type EntryDecision struct {
 	EquityBuyTrigger  bool
 	EquitySellTrigger bool
 	// Case 13 — Capitulation-Bottom BUY evidence.
-	NearRecentLowPct    float64
-	PriceNearRecentLow  bool
-	NearRecentHighPct   float64
-	PriceNearRecentHigh bool
+	NearRecentLowPct     float64
+	PriceNearRecentLow   bool
+	NearRecentHighPct    float64
+	PriceNearRecentHigh  bool
+	ProfitGateMultiplier float64
 }
 
 // ExitDecision contains only the information required to
@@ -222,6 +223,8 @@ const (
 	// Case 13.
 	EntryProducerCase13APeakSell  EntryProducer = "Case13APeakSell"
 	EntryProducerCase13BBottomBuy EntryProducer = "Case13BBottomBuy"
+
+	EntryProducerCase14BUptrendBuy EntryProducer = "Case14BUptrendBuy"
 )
 
 // EquityRawResult preserves the complete direction-independent Equity
@@ -1789,11 +1792,12 @@ func (t *Trader) combineEntryRawMaterials(
 	}
 
 	d := EntryDecision{
-		Signal:       Flat,
-		Raw:          ai.Raw,
-		LegacySignal: legacySignal,
-		Confidence:   ai.Confidence,
-		Producer:     EntryProducerNone,
+		Signal:               Flat,
+		Raw:                  ai.Raw,
+		LegacySignal:         legacySignal,
+		Confidence:           ai.Confidence,
+		Producer:             EntryProducerNone,
+		ProfitGateMultiplier: 1.0,
 
 		PUp:           ai.PUp,
 		BuyThreshold:  ai.BuyThreshold,
@@ -1861,6 +1865,28 @@ func (t *Trader) combineEntryRawMaterials(
 	// market regime, price location, MACD persistence, and EMA structural confirmation.
 	// -----------------------------------------------------------------
 	if applyCase13Producer(&d, ai, macd, ema, pyramid, equity, price, t.RecentLow, t.RecentHigh, t.MarketRegime, pendingCounts) {
+		return d
+	}
+
+	//-----------------------------------------------------------------------
+	// Case14B eases the BUY adverse gate only inside the buffer above the latch.
+	//	price <= latch                  -> NormalLegacy
+	//	latch < price <= bufferedLatch -> Case14B
+	//	price > bufferedLatch          -> No entry
+	//	pending Case14B > 0            -> Case14B disabled
+	//----------------------------------------------------------------
+	if applyCase14BUptrendBuyProducer(
+		&d,
+		ai,
+		ema,
+		pyramid,
+		equity,
+		price,
+		t.MarketRegime,
+		legacySignal,
+		logicOpinion,
+		pendingCounts,
+	) {
 		return d
 	}
 
