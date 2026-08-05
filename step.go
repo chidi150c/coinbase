@@ -77,7 +77,7 @@ import (
 	"time"
 )
 
-const Version = 159
+const Version = 160
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -1471,6 +1471,19 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	d := entryDecision
 
+	totalLots := lsb + lss
+
+	log.Printf(
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver=%d",
+		totalLots,
+		d.Raw,
+		d.Signal,
+		price,
+		decisionEntryReason(d),
+		t.cfg.LongOnly,
+		Version,
+	)
+
 	side, ok := d.SignalToSide()
 	if !ok {
 		log.Printf(
@@ -1563,19 +1576,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// --------------------------------------------------------------------------------------------------------
 	//---ADD path continues-----
 	// --------------------------------------------------------------------------------------------------------
-
-	totalLots := lsb + lss
-
-	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver=%d",
-		totalLots,
-		d.Raw,
-		d.Signal,
-		price,
-		decisionEntryReason(d),
-		t.cfg.LongOnly,
-		Version,
-	)
 
 	book := t.book(side)
 

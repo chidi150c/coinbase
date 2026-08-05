@@ -2509,6 +2509,37 @@ func entryPolicyForSource(source EntryProducer) EntryPolicy {
 			UpdateEquityBaseline: true,
 			ResetRegime:          false,
 		}
+	case EntryProducerCase11APeakReversal,
+		EntryProducerCase11BBottomReversal:
+		return EntryPolicy{
+			ResetLastAdd:         true,
+			ResetWinExtreme:      true,
+			ResetLatchedGate:     true,
+			AllowRunner:          false,
+			UpdateEquityBaseline: false,
+			ResetRegime:          false,
+		}
+
+	case EntryProducerCase13APeakSell,
+		EntryProducerCase13BBottomBuy:
+		return EntryPolicy{
+			ResetLastAdd:         true,
+			ResetWinExtreme:      true,
+			ResetLatchedGate:     true,
+			AllowRunner:          false,
+			UpdateEquityBaseline: false,
+			ResetRegime:          false,
+		}
+
+	case EntryProducerCase14BUptrendBuy:
+		return EntryPolicy{
+			AllowRunner:          false, // or match your intended producer policy
+			ResetLastAdd:         true,
+			ResetWinExtreme:      true,
+			ResetLatchedGate:     true,
+			UpdateEquityBaseline: false,
+			ResetRegime:          false,
+		}
 
 	default:
 		panic(fmt.Sprintf("entryPolicyForSource: unsupported source %q", source))
