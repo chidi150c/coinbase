@@ -135,8 +135,10 @@ type Config struct {
 	VolRiskAdjust  bool // enable volatility-aware risk sizing
 	UseDirectSlack bool // true if SLACK_WEBHOOK is set
 
-	RecoveryTargetPct float64
-	RecoveryMaxAddUSD float64
+	RecoveryTargetPct    float64
+	RecoveryMaxAddUSD    float64
+	EnableLiveMining     bool
+	EnableLiveRetraining bool
 }
 
 // loadConfigFromEnv reads the process env (already hydrated by loadBotEnv())
@@ -250,11 +252,13 @@ func loadConfigFromEnv() Config {
 		AIMinEdgePct:   getEnvFloat("AI_MIN_EDGE_PCT", 0.05),
 
 		// Runtime optional toggles
-		WalkForwardMin:    getEnvInt("WALK_FORWARD_MIN", 0),
-		VolRiskAdjust:     getEnvBool("VOL_RISK_ADJUST", false),
-		UseDirectSlack:    getEnv("SLACK_WEBHOOK", "") != "",
-		RecoveryTargetPct: getEnvFloat("RECOVERY_TARGET_PCT", 0.25),
-		RecoveryMaxAddUSD: getEnvFloat("RECOVERY_MAX_ADD_USD", 0.50),
+		WalkForwardMin:       getEnvInt("WALK_FORWARD_MIN", 0),
+		VolRiskAdjust:        getEnvBool("VOL_RISK_ADJUST", false),
+		UseDirectSlack:       getEnv("SLACK_WEBHOOK", "") != "",
+		RecoveryTargetPct:    getEnvFloat("RECOVERY_TARGET_PCT", 0.25),
+		RecoveryMaxAddUSD:    getEnvFloat("RECOVERY_MAX_ADD_USD", 0.50),
+		EnableLiveMining:     getEnvBool("ENABLE_LIVE_MINING", false),
+		EnableLiveRetraining: getEnvBool("ENABLE_LIVE_RETRAINING", false),
 	}
 
 	// Historical carry-over: if someone still sets BROKER=X, we may still
@@ -345,17 +349,19 @@ func (c *Config) DirectSlackEnabled() bool {
 
 func (c *Config) FeatureLabelConfig() FeatureLabelConfig {
 	return FeatureLabelConfig{
-		Horizon:         getEnvInt("AI_LABEL_HORIZON", c.AILabelHorizon),
-		FeeRatePct:      getEnvFloat("FEE_RATE_PCT", c.FeeRatePct),
-		MinEdgePct:      getEnvFloat("AI_MIN_EDGE_PCT", c.AIMinEdgePct),
-		MinRows:         100,
-		ProfitGateUSD:   getEnvFloat("PROFIT_GATE_USD", c.ProfitGateUSD),
-		BaseSizeUSD:     getEnvFloat("RISK_PER_TRADE_USD", c.RiskPerTradeUSD),
-		MinedLabelsFile: getEnv("AI_MINED_LABELS_FILE", "/opt/coinbase/state/mined_labels_binance.jsonl"),
-		MinedMaxRows:    getEnvInt("AI_MINED_MAX_ROWS", 10000),
-		Symbol:          getEnv("PRODUCT_ID", c.ProductID),
-		MACDLineEPS:     c.MACDLineEPS,
-		AIFeatureDim:    c.AIFeatureDim,
+		Horizon:              getEnvInt("AI_LABEL_HORIZON", c.AILabelHorizon),
+		FeeRatePct:           getEnvFloat("FEE_RATE_PCT", c.FeeRatePct),
+		MinEdgePct:           getEnvFloat("AI_MIN_EDGE_PCT", c.AIMinEdgePct),
+		MinRows:              100,
+		ProfitGateUSD:        getEnvFloat("PROFIT_GATE_USD", c.ProfitGateUSD),
+		BaseSizeUSD:          getEnvFloat("RISK_PER_TRADE_USD", c.RiskPerTradeUSD),
+		MinedLabelsFile:      getEnv("AI_MINED_LABELS_FILE", "/opt/coinbase/state/mined_labels_binance.jsonl"),
+		MinedMaxRows:         getEnvInt("AI_MINED_MAX_ROWS", 10000),
+		Symbol:               getEnv("PRODUCT_ID", c.ProductID),
+		MACDLineEPS:          c.MACDLineEPS,
+		AIFeatureDim:         c.AIFeatureDim,
+		EnableLiveMining:     c.EnableLiveMining,
+		EnableLiveRetraining: c.EnableLiveRetraining,
 	}
 }
 

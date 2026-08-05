@@ -205,6 +205,9 @@ func loadBotEnv() {
 
 		"RECOVERY_TARGET_PCT":  {},
 		"RECOVERY_MAX_ADD_USD": {},
+
+		"ENABLE_LIVE_MINING":     {},
+		"ENABLE_LIVE_RETRAINING": {},
 	}
 
 	s := bufio.NewScanner(f)

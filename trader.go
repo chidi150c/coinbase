@@ -1689,6 +1689,9 @@ func volRiskFactor(c []Candle) float64 {
 // 2) optional walk-forward cadence satisfied (cfg.WalkForwardMin).
 // This is a guard only; it performs no fitting and emits no logs/metrics.
 func (t *Trader) shouldRefit(historyLen int) bool {
+	if !t.cfg.EnableLiveRetraining {
+		return false
+	}
 	if historyLen < t.cfg.MaxHistoryCandles {
 		return false
 	}

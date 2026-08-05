@@ -252,50 +252,86 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 		log.Fatalf("signal warmup failed: no candles returned for tf=%s GateTF=%s", signalTF, signalGateTF)
 	}
 
-	// Initialize/warm-start the AI model after signalHistory is available.
-	// Prefer persisted mined labels; fallback to signalHistory-derived labels.
+	// Restore and validate the persisted AI model.
+	//
+	// The model loaded from BotState is authoritative. Startup must never
+	// silently replace it with a newly initialized model, because doing so
+	// could overwrite the trained weights in the persisted state file.
 	model := trader.model
 
-	if model == nil {
+	modelValid :=
+		model != nil &&
+			model.FeatDim == trader.cfg.AIFeatureDim &&
+			len(model.W) == trader.cfg.AIFeatureDim
+
+	if !modelValid {
+
+		if !trader.cfg.EnableLiveRetraining {
+			log.Fatalf(
+				"[MODEL_BOOT] persisted model unavailable or invalid; "+
+					"live retraining disabled so startup cannot continue "+
+					"model_nil=%t feat_dim=%d expected_feat_dim=%d weights=%d",
+				model == nil,
+				func() int {
+					if model == nil {
+						return 0
+					}
+					return model.FeatDim
+				}(),
+				trader.cfg.AIFeatureDim,
+				func() int {
+					if model == nil {
+						return 0
+					}
+					return len(model.W)
+				}(),
+			)
+		}
+
 		log.Printf(
-			"[MODEL_BOOT] model=nil → initializing feat_dim=%d",
-			trader.cfg.AIFeatureDim,
+			"[MODEL_BOOT] persisted model unavailable or invalid; rebuilding because live retraining is enabled",
 		)
 
 		model = newModel(trader.cfg.AIFeatureDim)
 	}
 
-	if model.FeatDim != trader.cfg.AIFeatureDim ||
-		len(model.W) != trader.cfg.AIFeatureDim {
+	log.Printf(
+		"[MODEL_BOOT] restored persisted model "+
+			"feat_dim=%d weights=%d last_fit=%s retraining=%t",
+		model.FeatDim,
+		len(model.W),
+		trader.lastFit.Format(time.RFC3339),
+		trader.cfg.EnableLiveRetraining,
+	)
 
-		log.Printf(
-			"[MODEL_BOOT] feat mismatch old=%d new=%d weights=%d → rebuilding",
-			model.FeatDim,
-			trader.cfg.AIFeatureDim,
-			len(model.W),
+	if trader.cfg.EnableLiveRetraining {
+		model.fit(
+			signalHistory,
+			0.05,
+			6,
 		)
 
-		model = newModel(trader.cfg.AIFeatureDim)
+		trader.mu.Lock()
+
+		trader.model = model
+		trader.lastFit = time.Now().UTC()
+
+		if err := trader.saveStateNoLock(); err != nil {
+			log.Printf(
+				"[WARN] saveState after model boot fit: %v",
+				err,
+			)
+		} else {
+			log.Printf(
+				"[MODEL_STATE] boot saved lastFit=%s feat_dim=%d weights=%d",
+				trader.lastFit.Format(time.RFC3339),
+				trader.model.FeatDim,
+				len(trader.model.W),
+			)
+		}
+
+		trader.mu.Unlock()
 	}
-
-	// warm-start training
-	model.fit(signalHistory, 0.05, 6)
-
-	// assign back to trader
-	trader.mu.Lock()
-	trader.model = model
-	trader.lastFit = time.Now().UTC()
-
-	if err := trader.saveStateNoLock(); err != nil {
-		log.Printf("[WARN] saveState after model boot fit: %v", err)
-	} else {
-		log.Printf("[MODEL_STATE] boot saved lastFit=%s feat_dim=%d weights=%d",
-			trader.lastFit.Format(time.RFC3339),
-			trader.model.FeatDim,
-			len(trader.model.W),
-		)
-	}
-	trader.mu.Unlock()
 
 	lastRefit := &trader.lastFit
 
@@ -901,6 +937,10 @@ func fetchBrokerBalances(ctx context.Context, trader *Trader, productID string) 
 // ---- Phase-7: walk-forward refit ----
 
 func maybeWalkForwardRefit(cfg Config, mdl *LogisticModel, history []Candle, lastRefit *time.Time) (*time.Time, *LogisticModel) {
+	if !cfg.EnableLiveRetraining {
+		return lastRefit, mdl
+	}
+
 	if cfg.WalkForwardMin <= 0 {
 		return lastRefit, mdl
 	}

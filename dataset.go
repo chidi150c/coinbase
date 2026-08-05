@@ -16,11 +16,13 @@ type FeatureLabelConfig struct {
 	AIFeatureDim int
 
 	// Path-based net-profit labeling.
-	ProfitGateUSD   float64
-	BaseSizeUSD     float64
-	MinedLabelsFile string
-	MinedMaxRows    int
-	Symbol          string
+	ProfitGateUSD        float64
+	BaseSizeUSD          float64
+	MinedLabelsFile      string
+	MinedMaxRows         int
+	Symbol               string
+	EnableLiveMining     bool
+	EnableLiveRetraining bool
 }
 
 func BuildFeaturesAndLabels(c []Candle, cfg FeatureLabelConfig) ([][]float64, []float64) {
@@ -142,7 +144,7 @@ func BuildFeaturesAndLabels(c []Candle, cfg FeatureLabelConfig) ([][]float64, []
 			continue
 		}
 
-		if cfg.MinedLabelsFile != "" {
+		if cfg.EnableLiveMining && cfg.MinedLabelsFile != "" {
 			appendMinedLabel(cfg.MinedLabelsFile, MinedLabelRow{
 				TS:         c[i].Time.Format(time.RFC3339),
 				Symbol:     cfg.Symbol,
