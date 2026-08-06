@@ -146,6 +146,7 @@ type EntryDecision struct {
 	NearRecentHighPct    float64
 	PriceNearRecentHigh  bool
 	ProfitGateMultiplier float64
+	ProducerReason       string
 }
 
 // ExitDecision contains only the information required to
@@ -210,18 +211,18 @@ type EntryProducer string
 const (
 	EntryProducerNone EntryProducer = ""
 
-	// Standard entry paths.
-	EntryProducerNormal EntryProducer = "NormalLegacy"
+	EntryProducerNormalLegacy EntryProducer = "NormalLegacy"
 
-	// Recovery / replacement paths.
+	EntryProducerEquity EntryProducer = "Equity"
+
 	EntryProducerCase3AReplacement EntryProducer = "Case3AReplacement"
 
-	// Case 11.
-	EntryProducerCase11APeakReversal   EntryProducer = "Case11APeakReversal"
+	EntryProducerCase11APeakReversal EntryProducer = "Case11APeakReversal"
+
 	EntryProducerCase11BBottomReversal EntryProducer = "Case11BBottomReversal"
 
-	// Case 13.
-	EntryProducerCase13APeakSell  EntryProducer = "Case13APeakSell"
+	EntryProducerCase13APeakSell EntryProducer = "Case13APeakSell"
+
 	EntryProducerCase13BBottomBuy EntryProducer = "Case13BBottomBuy"
 
 	EntryProducerCase14BUptrendBuy EntryProducer = "Case14BUptrendBuy"
@@ -1271,114 +1272,124 @@ func (t *Trader) applyPyramidRawTransitions(
 // --------------------------------------------------------------------------
 func (t *Trader) applyPyramidDecisionTransitions(
 	pyramid PyramidResult,
-	finalSignal Signal,
 ) {
 	state := pyramid.State
 
-	switch finalSignal {
-	case Buy:
-		if state.Buy.UpdateWin {
-			t.winLowBuy =
-				state.Buy.NextWin
-		}
+	if state.Buy.UpdateWin {
+		t.winLowBuy =
+			state.Buy.NextWin
+	}
 
-		if state.Buy.UpdateLatched {
-			t.latchedGateBuy =
-				state.Buy.NextLatched
+	if state.Buy.UpdateLatched {
+		t.latchedGateBuy =
+			state.Buy.NextLatched
 
-			if pyramid.Buy.HardLatchEligible {
-				log.Printf(
-					"[DEBUG] LATCH SET BUY: latchedGate=%.2f winLow=%.2f elapsedMin=%.1f tFloorMin=%.2f",
-					pyramid.Buy.LatchBeforeClamp,
-					t.winLowBuy,
-					pyramid.Buy.ElapsedMin,
-					pyramid.Buy.TFloorMin,
-				)
-			}
-
-			if pyramid.Buy.LatchClampApplied {
-				log.Printf(
-					"[TRACE] pyramid.latch_clamp.buy old=%.8f last=%.8f new=%.8f",
-					pyramid.Buy.LatchBeforeClamp,
-					pyramid.Buy.LastAnchor,
-					pyramid.Buy.LatchAfterClamp,
-				)
-			}
-		}
-
-		if state.RebaseSellOnBuy {
-			oldLatch := t.latchedGateSell
-			oldWin := t.winHighSell
-
-			t.latchedGateSell =
-				state.NextSellLatch
-
-			t.winHighSell =
-				state.NextSellWin
-
+		if pyramid.Buy.HardLatchEligible {
 			log.Printf(
-				"[DEBUG] LATCH REBASE SELL: ageHr=%.2f logic=%s old_latched=%.2f old_winHigh=%.2f new_latched=%.2f new_winHigh=%.2f price=%.2f",
-				pyramid.Sell.ElapsedHr,
-				finalSignal,
-				oldLatch,
-				oldWin,
-				t.latchedGateSell,
-				t.winHighSell,
-				pyramid.Buy.CurrentPrice,
+				"[DEBUG] LATCH SET BUY: latchedGate=%.2f winLow=%.2f elapsedMin=%.1f tFloorMin=%.2f",
+				pyramid.Buy.LatchBeforeClamp,
+				t.winLowBuy,
+				pyramid.Buy.ElapsedMin,
+				pyramid.Buy.TFloorMin,
 			)
 		}
+
+		if pyramid.Buy.LatchClampApplied {
+			log.Printf(
+				"[TRACE] pyramid.latch_clamp.buy old=%.8f last=%.8f new=%.8f",
+				pyramid.Buy.LatchBeforeClamp,
+				pyramid.Buy.LastAnchor,
+				pyramid.Buy.LatchAfterClamp,
+			)
+		}
+	}
+
+	if state.Sell.UpdateWin {
+		t.winHighSell =
+			state.Sell.NextWin
+	}
+
+	if state.Sell.UpdateLatched {
+		t.latchedGateSell =
+			state.Sell.NextLatched
+
+		if pyramid.Sell.HardLatchEligible {
+			log.Printf(
+				"[DEBUG] LATCH SET SELL: latchedGate=%.2f winHigh=%.2f elapsedMin=%.1f tFloorMin=%.2f",
+				pyramid.Sell.LatchBeforeClamp,
+				t.winHighSell,
+				pyramid.Sell.ElapsedMin,
+				pyramid.Sell.TFloorMin,
+			)
+		}
+
+		if pyramid.Sell.LatchClampApplied {
+			log.Printf(
+				"[TRACE] pyramid.latch_clamp.sell old=%.8f last=%.8f new=%.8f",
+				pyramid.Sell.LatchBeforeClamp,
+				pyramid.Sell.LastAnchor,
+				pyramid.Sell.LatchAfterClamp,
+			)
+		}
+	}
+}
+
+func (t *Trader) applyPyramidRebaseTransactions(
+	pyramid PyramidResult,
+	signal Signal,
+) {
+	state := pyramid.State
+
+	switch signal {
+	case Buy:
+		if !state.RebaseSellOnBuy {
+			return
+		}
+
+		oldLatch := t.latchedGateSell
+		oldWin := t.winHighSell
+
+		t.latchedGateSell = state.NextSellLatch
+		t.winHighSell = state.NextSellWin
+
+		log.Printf(
+			"[DEBUG] LATCH REBASE SELL: "+
+				"ageHr=%.2f signal=%s "+
+				"old_latched=%.2f old_winHigh=%.2f "+
+				"new_latched=%.2f new_winHigh=%.2f price=%.2f",
+			pyramid.Sell.ElapsedHr,
+			signal,
+			oldLatch,
+			oldWin,
+			t.latchedGateSell,
+			t.winHighSell,
+			pyramid.Buy.CurrentPrice,
+		)
 
 	case Sell:
-		if state.Sell.UpdateWin {
-			t.winHighSell =
-				state.Sell.NextWin
+		if !state.RebaseBuyOnSell {
+			return
 		}
 
-		if state.Sell.UpdateLatched {
-			t.latchedGateSell =
-				state.Sell.NextLatched
+		oldLatch := t.latchedGateBuy
+		oldWin := t.winLowBuy
 
-			if pyramid.Sell.HardLatchEligible {
-				log.Printf(
-					"[DEBUG] LATCH SET SELL: latchedGate=%.2f winHigh=%.2f elapsedMin=%.1f tFloorMin=%.2f",
-					pyramid.Sell.LatchBeforeClamp,
-					t.winHighSell,
-					pyramid.Sell.ElapsedMin,
-					pyramid.Sell.TFloorMin,
-				)
-			}
+		t.latchedGateBuy = state.NextBuyLatch
+		t.winLowBuy = state.NextBuyWin
 
-			if pyramid.Sell.LatchClampApplied {
-				log.Printf(
-					"[TRACE] pyramid.latch_clamp.sell old=%.8f last=%.8f new=%.8f",
-					pyramid.Sell.LatchBeforeClamp,
-					pyramid.Sell.LastAnchor,
-					pyramid.Sell.LatchAfterClamp,
-				)
-			}
-		}
-
-		if state.RebaseBuyOnSell {
-			oldLatch := t.latchedGateBuy
-			oldWin := t.winLowBuy
-
-			t.latchedGateBuy =
-				state.NextBuyLatch
-
-			t.winLowBuy =
-				state.NextBuyWin
-
-			log.Printf(
-				"[DEBUG] LATCH REBASE BUY: ageHr=%.2f logic=%s old_latched=%.2f old_winLow=%.2f new_latched=%.2f new_winLow=%.2f price=%.2f",
-				pyramid.Buy.ElapsedHr,
-				finalSignal,
-				oldLatch,
-				oldWin,
-				t.latchedGateBuy,
-				t.winLowBuy,
-				pyramid.Sell.CurrentPrice,
-			)
-		}
+		log.Printf(
+			"[DEBUG] LATCH REBASE BUY: "+
+				"ageHr=%.2f signal=%s "+
+				"old_latched=%.2f old_winLow=%.2f "+
+				"new_latched=%.2f new_winLow=%.2f price=%.2f",
+			pyramid.Buy.ElapsedHr,
+			signal,
+			oldLatch,
+			oldWin,
+			t.latchedGateBuy,
+			t.winLowBuy,
+			pyramid.Sell.CurrentPrice,
+		)
 	}
 }
 
@@ -1760,29 +1771,28 @@ func interpretPyramidSideRaw(
 	return result, transition
 }
 
-// combineEntryRawMaterials is the final entry-decision engine.
+// combineEntryRawMaterials is the final entry-producer selection engine.
 //
-// Case 5 policy:
+// Producer priority:
 //
-//  1. Legacy AI + MACD + EMA produces the legacy direction.
-//  2. A matching executable Equity trigger bypasses Pyramid.
-//  3. Otherwise, the matching Pyramid gate must pass.
-//  4. Pyramid-only and Equity-only directions are not enabled.
-//  5. Sizing, LongOnly, lot caps, pending checks, and placement remain outside.
+//  1. Case11A — Peak-Reversal SELL
+//  2. Case11B — Bottom-Reversal BUY
+//  3. Case13A — Peak SELL
+//  4. Case13B — Bottom BUY
+//  5. Case14B — Uptrend buffered-latch BUY
+//  6. Equity
+//  7. NormalLegacy
 //
-// Independent producers run before the legacy Case 5 route:
+// The first producer that emits BUY or SELL becomes the final decision.
 //
-//   - Case 11A: Peak-Reversal SELL
-//   - Case 11B: Bottom-Reversal BUY
-//   - Case 13B: Capitulation-Bottom BUY
+// Sizing, LongOnly, lot caps, pending-entry registration, funding approval,
+// and order placement remain outside this function.
 func (t *Trader) combineEntryRawMaterials(
 	ai AIResult,
 	macd MACDResult,
 	ema EMAPatternResult,
 	pyramid PyramidResult,
 	equity EquityResult,
-	legacySignal Signal,
-	logicOpinion Signal,
 	price float64,
 	pendingCounts PendingProducerCounts,
 ) EntryDecision {
@@ -1794,7 +1804,8 @@ func (t *Trader) combineEntryRawMaterials(
 	d := EntryDecision{
 		Signal:               Flat,
 		Raw:                  ai.Raw,
-		LegacySignal:         legacySignal,
+		LegacySignal:         Flat,
+		LogicOpinion:         Flat,
 		Confidence:           ai.Confidence,
 		Producer:             EntryProducerNone,
 		ProfitGateMultiplier: 1.0,
@@ -1802,8 +1813,6 @@ func (t *Trader) combineEntryRawMaterials(
 		PUp:           ai.PUp,
 		BuyThreshold:  ai.BuyThreshold,
 		SellThreshold: ai.SellThreshold,
-
-		LogicOpinion: logicOpinion,
 
 		Pyramid: pyramid,
 		Equity:  equity,
@@ -1835,113 +1844,66 @@ func (t *Trader) combineEntryRawMaterials(
 		MarketRegime:   t.MarketRegime,
 		RegimeMult:     regimeMult,
 	}
-	d.PyramidBuySpacingPass = pyramid.Buy.SpacingPass
-	d.PyramidBuyAdversePass = pyramid.Buy.AdversePass
-	d.PyramidBuyGatePassed = pyramid.Buy.GatePassed
 
-	d.PyramidSellSpacingPass = pyramid.Sell.SpacingPass
-	d.PyramidSellAdversePass = pyramid.Sell.AdversePass
-	d.PyramidSellGatePassed = pyramid.Sell.GatePassed
+	// Preserve evaluator-level diagnostics regardless of producer outcome.
+	d.PyramidBuySpacingPass =
+		pyramid.Buy.SpacingPass
+	d.PyramidBuyAdversePass =
+		pyramid.Buy.AdversePass
+	d.PyramidBuyGatePassed =
+		pyramid.Buy.GatePassed
 
-	d.EquityBuyTrigger = equity.BuyTrigger
-	d.EquitySellTrigger = equity.SellTrigger
+	d.PyramidSellSpacingPass =
+		pyramid.Sell.SpacingPass
+	d.PyramidSellAdversePass =
+		pyramid.Sell.AdversePass
+	d.PyramidSellGatePassed =
+		pyramid.Sell.GatePassed
 
-	// -----------------------------------------------------------------
+	d.EquityBuyTrigger =
+		equity.BuyTrigger
+	d.EquitySellTrigger =
+		equity.SellTrigger
+
+	// -------------------------------------------------------------
 	// Case 11 — Independent reversal producers.
-	//
-	// These producers recognize specific reversal market
-	// phenomena and may emit a directional BUY or SELL independently of
-	// the legacy AI/Logic producer.
-	// -----------------------------------------------------------------
-	if applyCase11ReversalProducer(&d, macd, ema, pyramid, equity) {
-		return d
-	}
-
-	// -----------------------------------------------------------------
-	// applyCase13Producer evaluates the independent Case 13 producers.
-	// Case 13A — Peak SELL producer.
-	// Case 13B — Bottom BUY producer.
-	// Both producers target early reversals from persistent trends by combining AI conviction,
-	// market regime, price location, MACD persistence, and EMA structural confirmation.
-	// -----------------------------------------------------------------
-	if applyCase13Producer(&d, ai, macd, ema, pyramid, equity, price, t.RecentLow, t.RecentHigh, t.MarketRegime, pendingCounts) {
-		return d
-	}
-
-	//-----------------------------------------------------------------------
-	// Case14B eases the BUY adverse gate only inside the buffer above the latch.
-	//	price <= latch                  -> NormalLegacy
-	//	latch < price <= bufferedLatch -> Case14B
-	//	price > bufferedLatch          -> No entry
-	//	pending Case14B > 0            -> Case14B disabled
-	//----------------------------------------------------------------
-	if applyCase14BUptrendBuyProducer(
-		&d,
-		ai,
-		ema,
-		pyramid,
-		equity,
-		price,
-		t.MarketRegime,
-		legacySignal,
-		logicOpinion,
-		pendingCounts,
-	) {
+	// -------------------------------------------------------------
+	if applyCase11ReversalProducer(&d, macd, ema, pyramid) {
 		return d
 	}
 
 	// -------------------------------------------------------------
-	// Existing Case 5 / legacy producer.
+	// Case 13 — Independent persistent-trend reversal producers.
 	// -------------------------------------------------------------
-	switch legacySignal {
-	case Buy:
-		d.PyramidPass =
-			pyramid.Buy.GatePassed
-		d.PyramidReason =
-			pyramid.Buy.Reason
+	if applyCase13Producer(&d, ai, macd, ema, pyramid, price, t.RecentLow, t.RecentHigh, t.MarketRegime, pendingCounts) {
+		return d
+	}
 
-		d.EquityPass =
-			equity.BuyTrigger
-		d.EquityReason =
-			equity.Reason
+	// -------------------------------------------------------------
+	// Case14B — Buffered-latch BUY in an UP regime.
+	// price <= latch: NormalLegacy territory
+	// latch < price <= buffered latch: Case14B territory
+	// price > buffered latch: no Case14B entry
+	// pending Case14B > 0: Case14B disabled
+	// -------------------------------------------------------------
+	if applyCase14BUptrendBuyProducer(&d, ai, macd, ema, pyramid, price, t.MarketRegime, pendingCounts) {
+		return d
+	}
 
-		switch {
-		case equity.BuyTrigger:
-			d.Signal = Buy
-			d.Producer =
-				EntryProducerNormal
+	// -------------------------------------------------------------
+	// Equity — AI + Logic direction, matching complete Pyramid gate,
+	// and matching Equity trigger.
+	// -------------------------------------------------------------
+	if applyEquityProducer(&d, ai, macd, ema, pyramid, equity) {
+		return d
+	}
 
-		case pyramid.Buy.GatePassed:
-			d.Signal = Buy
-			d.Producer =
-				EntryProducerNormal
-		}
-
-	case Sell:
-		d.PyramidPass =
-			pyramid.Sell.GatePassed
-		d.PyramidReason =
-			pyramid.Sell.Reason
-
-		d.EquityPass =
-			equity.SellTrigger
-		d.EquityReason =
-			equity.Reason
-
-		switch {
-		case equity.SellTrigger:
-			d.Signal = Sell
-			d.Producer =
-				EntryProducerNormal
-
-		case pyramid.Sell.GatePassed:
-			d.Signal = Sell
-			d.Producer =
-				EntryProducerNormal
-		}
-
-	default:
-		d.Signal = Flat
+	// -------------------------------------------------------------
+	// NormalLegacy — AI + Logic direction and matching complete
+	// Pyramid gate.
+	// -------------------------------------------------------------
+	if applyNormalLegacyProducer(&d, ai, macd, ema, pyramid) {
+		return d
 	}
 
 	return d
@@ -2490,7 +2452,17 @@ type EntryPolicy struct {
 func entryPolicyForSource(source EntryProducer) EntryPolicy {
 	switch source {
 
-	case EntryProducerNormal:
+	case EntryProducerNormalLegacy:
+		return EntryPolicy{
+			ResetLastAdd:         true,
+			ResetWinExtreme:      true,
+			ResetLatchedGate:     true,
+			AllowRunner:          false,
+			UpdateEquityBaseline: false,
+			ResetRegime:          true,
+		}
+
+	case EntryProducerEquity:
 		return EntryPolicy{
 			ResetLastAdd:         true,
 			ResetWinExtreme:      true,

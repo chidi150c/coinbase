@@ -65,8 +65,460 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"strings"
+	"time"
 )
+
+// applyNormalLegacyProducer evaluates the standard AI + Logic + Pyramid
+// entry producer.
+//
+// It produces only when:
+//
+//   - AI and Logic resolve to BUY or SELL; and
+//   - the matching complete Pyramid gate passes.
+func applyNormalLegacyProducer(
+	d *EntryDecision,
+	ai AIResult,
+	macd MACDResult,
+	ema EMAPatternResult,
+	pyramid PyramidResult,
+) bool {
+	if d == nil {
+		return false
+	}
+
+	legacy :=
+		evaluateLegacyDirection(
+			ai,
+			macd,
+			ema,
+		)
+
+	switch legacy.Signal {
+	case Buy:
+		produced :=
+			pyramid.Buy.GatePassed
+
+		log.Printf(
+			"[TRACE] normal_legacy.buy.evaluate "+
+				"ai_raw=%s logic=%s legacy=%s "+
+				"strong_negative=%t momentum_up=%t pattern_buy=%t "+
+				"spacing=%t adverse=%t gate=%t produced=%t",
+			ai.Raw,
+			legacy.LogicOpinion,
+			legacy.Signal,
+			macd.StrongNegative,
+			macd.MomentumUp,
+			ema.PatternBuy,
+			pyramid.Buy.SpacingPass,
+			pyramid.Buy.AdversePass,
+			pyramid.Buy.GatePassed,
+			produced,
+		)
+
+		if !produced {
+			return false
+		}
+
+		d.Signal = Buy
+		d.Producer = EntryProducerNormalLegacy
+		d.LogicOpinion = legacy.LogicOpinion
+		d.LegacySignal = legacy.Signal
+
+		d.PyramidPass =
+			pyramid.Buy.GatePassed
+		d.PyramidReason =
+			pyramid.Buy.Reason
+
+		d.ProducerReason = fmt.Sprintf(
+			"normal_legacy_buy|"+
+				"ai_raw=%s|logic=%s|"+
+				"strong_negative=%t|momentum_up=%t|pattern_buy=%t|"+
+				"spacing=%t|adverse=%t|gate=%t|"+
+				"latched=%.8f|gate_price=%.8f",
+			ai.Raw,
+			legacy.LogicOpinion,
+			macd.StrongNegative,
+			macd.MomentumUp,
+			ema.PatternBuy,
+			pyramid.Buy.SpacingPass,
+			pyramid.Buy.AdversePass,
+			pyramid.Buy.GatePassed,
+			pyramid.Buy.Latched,
+			pyramid.Buy.EffectiveGatePrice,
+		)
+
+		return true
+
+	case Sell:
+		produced :=
+			pyramid.Sell.GatePassed
+
+		log.Printf(
+			"[TRACE] normal_legacy.sell.evaluate "+
+				"ai_raw=%s logic=%s legacy=%s "+
+				"strong_positive=%t momentum_down=%t pattern_sell=%t "+
+				"spacing=%t adverse=%t gate=%t produced=%t",
+			ai.Raw,
+			legacy.LogicOpinion,
+			legacy.Signal,
+			macd.StrongPositive,
+			macd.MomentumDown,
+			ema.PatternSell,
+			pyramid.Sell.SpacingPass,
+			pyramid.Sell.AdversePass,
+			pyramid.Sell.GatePassed,
+			produced,
+		)
+
+		if !produced {
+			return false
+		}
+
+		d.Signal = Sell
+		d.Producer = EntryProducerNormalLegacy
+		d.LogicOpinion = legacy.LogicOpinion
+		d.LegacySignal = legacy.Signal
+
+		d.PyramidPass =
+			pyramid.Sell.GatePassed
+		d.PyramidReason =
+			pyramid.Sell.Reason
+
+		d.ProducerReason = fmt.Sprintf(
+			"normal_legacy_sell|"+
+				"ai_raw=%s|logic=%s|"+
+				"strong_positive=%t|momentum_down=%t|pattern_sell=%t|"+
+				"spacing=%t|adverse=%t|gate=%t|"+
+				"latched=%.8f|gate_price=%.8f",
+			ai.Raw,
+			legacy.LogicOpinion,
+			macd.StrongPositive,
+			macd.MomentumDown,
+			ema.PatternSell,
+			pyramid.Sell.SpacingPass,
+			pyramid.Sell.AdversePass,
+			pyramid.Sell.GatePassed,
+			pyramid.Sell.Latched,
+			pyramid.Sell.EffectiveGatePrice,
+		)
+
+		return true
+
+	default:
+		log.Printf(
+			"[TRACE] normal_legacy.evaluate "+
+				"ai_raw=%s logic=%s legacy=%s "+
+				"normal_buy=%t normal_sell=%t produced=false",
+			ai.Raw,
+			legacy.LogicOpinion,
+			legacy.Signal,
+			legacy.NormalBuy,
+			legacy.NormalSell,
+		)
+
+		return false
+	}
+}
+
+func (t *Trader) evaluateEquityProducerMaterial(
+	ai AIResult,
+	macd MACDResult,
+	ema EMAPatternResult,
+	balanceSnapshotMaxAge time.Duration,
+	reservedShortQuoteWithFee float64,
+	reservedLongBase float64,
+) (EquityResult, error) {
+	equityRaw := t.evaluateEquityRaw()
+	legacy :=
+		evaluateLegacyDirection(
+			ai,
+			macd,
+			ema,
+		)
+	var (
+		symQ       string
+		availQuote float64
+		quoteStep  float64
+
+		symB      string
+		availBase float64
+		baseStep  float64
+
+		spareQuote float64
+		spareBase  float64
+	)
+
+	if legacy.Signal == Buy ||
+		legacy.Signal == Sell {
+
+		equityBalance, ok :=
+			t.getBalanceSpare(
+				balanceSnapshotMaxAge,
+				reservedShortQuoteWithFee,
+				reservedLongBase,
+			)
+
+		if !ok {
+			ageMS := int64(-1)
+
+			if !equityBalance.Snapshot.UpdatedAt.IsZero() {
+				ageMS =
+					time.Since(
+						equityBalance.Snapshot.UpdatedAt,
+					).Milliseconds()
+			}
+
+			return EquityResult{}, fmt.Errorf(
+				"equity balance cache unavailable: "+
+					"legacy=%s age_ms=%d",
+				legacy.Signal,
+				ageMS,
+			)
+		}
+
+		availQuote = equityBalance.AvailQuote
+		quoteStep = equityBalance.QuoteStep
+		availBase = equityBalance.AvailBase
+		baseStep = equityBalance.BaseStep
+
+		spareQuote = equityBalance.SpareQuote
+		spareBase = equityBalance.SpareBase
+
+		symQ = equityBalance.Snapshot.SymQuote
+		symB = equityBalance.Snapshot.SymBase
+
+		log.Printf(
+			"[TRACE] equity.balance_cache.hit "+
+				"legacy=%s age_ms=%d "+
+				"quote=%.8f base=%.8f",
+			legacy.Signal,
+			time.Since(
+				equityBalance.Snapshot.UpdatedAt,
+			).Milliseconds(),
+			availQuote,
+			availBase,
+		)
+
+		switch legacy.Signal {
+		case Buy:
+			if strings.TrimSpace(symQ) == "" ||
+				quoteStep <= 0 {
+
+				return EquityResult{}, fmt.Errorf(
+					"invalid cached quote metadata: "+
+						"symbol=%q step=%.8f",
+					symQ,
+					quoteStep,
+				)
+			}
+
+		case Sell:
+			if strings.TrimSpace(symB) == "" ||
+				baseStep <= 0 {
+
+				return EquityResult{}, fmt.Errorf(
+					"invalid cached base metadata: "+
+						"symbol=%q step=%.8f",
+					symB,
+					baseStep,
+				)
+			}
+		}
+	}
+
+	equityResult :=
+		interpretEquityRaw(
+			equityRaw,
+			legacy.Signal,
+			spareQuote,
+			spareBase,
+			quoteStep,
+			baseStep,
+		)
+
+	if equityResult.Err != nil {
+		return EquityResult{},
+			fmt.Errorf(
+				"interpret equity raw: %w",
+				equityResult.Err,
+			)
+	}
+
+	return equityResult, nil
+}
+
+// applyEquityProducer evaluates the AI + Logic + Pyramid + Equity producer.
+//
+// Equity is independently attributed, but it still requires:
+//
+//   - a resolved legacy BUY or SELL direction;
+//   - the matching complete Pyramid gate; and
+//   - the matching Equity trigger.
+func applyEquityProducer(
+	d *EntryDecision,
+	ai AIResult,
+	macd MACDResult,
+	ema EMAPatternResult,
+	pyramid PyramidResult,
+	equity EquityResult,
+) bool {
+	if d == nil {
+		return false
+	}
+
+	legacy :=
+		evaluateLegacyDirection(
+			ai,
+			macd,
+			ema,
+		)
+
+	switch legacy.Signal {
+	case Buy:
+		pyramidPass :=
+			pyramid.Buy.GatePassed
+
+		equityPass :=
+			equity.BuyTrigger
+
+		produced :=
+			pyramidPass &&
+				equityPass
+
+		log.Printf(
+			"[TRACE] equity.buy.evaluate "+
+				"ai_raw=%s logic=%s legacy=%s "+
+				"pyramid_gate=%t equity_trigger=%t produced=%t "+
+				"equity=%.2f baseline=%.2f",
+			ai.Raw,
+			legacy.LogicOpinion,
+			legacy.Signal,
+			pyramidPass,
+			equityPass,
+			produced,
+			equity.Raw.EquityUSD,
+			equity.Raw.BaselineUSD,
+		)
+
+		if !produced {
+			return false
+		}
+
+		d.Signal = Buy
+		d.Producer = EntryProducerEquity
+		d.LogicOpinion = legacy.LogicOpinion
+		d.LegacySignal = legacy.Signal
+
+		d.PyramidPass = pyramidPass
+		d.PyramidReason = pyramid.Buy.Reason
+
+		d.EquityPass = equityPass
+		d.EquityReason = equity.Reason
+
+		d.ProducerReason = fmt.Sprintf(
+			"equity_buy|"+
+				"ai_raw=%s|logic=%s|"+
+				"equity=%.2f|baseline=%.2f|"+
+				"trigger_usd=%.2f|distance_usd=%.2f|"+
+				"equity_trigger=%t|"+
+				"spacing=%t|adverse=%t|pyramid_gate=%t|"+
+				"latched=%.8f|gate_price=%.8f",
+			ai.Raw,
+			legacy.LogicOpinion,
+			equity.Raw.EquityUSD,
+			equity.Raw.BaselineUSD,
+			equity.Raw.BuyTriggerUSD,
+			equity.Raw.BuyThresholdDistanceUSD,
+			equityPass,
+			pyramid.Buy.SpacingPass,
+			pyramid.Buy.AdversePass,
+			pyramidPass,
+			pyramid.Buy.Latched,
+			pyramid.Buy.EffectiveGatePrice,
+		)
+
+		return true
+
+	case Sell:
+		pyramidPass :=
+			pyramid.Sell.GatePassed
+
+		equityPass :=
+			equity.SellTrigger
+
+		produced :=
+			pyramidPass &&
+				equityPass
+
+		log.Printf(
+			"[TRACE] equity.sell.evaluate "+
+				"ai_raw=%s logic=%s legacy=%s "+
+				"pyramid_gate=%t equity_trigger=%t produced=%t "+
+				"equity=%.2f baseline=%.2f",
+			ai.Raw,
+			legacy.LogicOpinion,
+			legacy.Signal,
+			pyramidPass,
+			equityPass,
+			produced,
+			equity.Raw.EquityUSD,
+			equity.Raw.BaselineUSD,
+		)
+
+		if !produced {
+			return false
+		}
+
+		d.Signal = Sell
+		d.Producer = EntryProducerEquity
+		d.LogicOpinion = legacy.LogicOpinion
+		d.LegacySignal = legacy.Signal
+
+		d.PyramidPass = pyramidPass
+		d.PyramidReason = pyramid.Sell.Reason
+
+		d.EquityPass = equityPass
+		d.EquityReason = equity.Reason
+
+		d.ProducerReason = fmt.Sprintf(
+			"equity_sell|"+
+				"ai_raw=%s|logic=%s|"+
+				"equity=%.2f|baseline=%.2f|"+
+				"trigger_usd=%.2f|distance_usd=%.2f|"+
+				"equity_trigger=%t|"+
+				"spacing=%t|adverse=%t|pyramid_gate=%t|"+
+				"latched=%.8f|gate_price=%.8f",
+			ai.Raw,
+			legacy.LogicOpinion,
+			equity.Raw.EquityUSD,
+			equity.Raw.BaselineUSD,
+			equity.Raw.SellTriggerUSD,
+			equity.Raw.SellThresholdDistanceUSD,
+			equityPass,
+			pyramid.Sell.SpacingPass,
+			pyramid.Sell.AdversePass,
+			pyramidPass,
+			pyramid.Sell.Latched,
+			pyramid.Sell.EffectiveGatePrice,
+		)
+
+		return true
+
+	default:
+		log.Printf(
+			"[TRACE] equity.evaluate "+
+				"ai_raw=%s logic=%s legacy=%s produced=false",
+			ai.Raw,
+			legacy.LogicOpinion,
+			legacy.Signal,
+		)
+
+		return false
+	}
+}
 
 // applyCase11ReversalProducer evaluates the independent Case 11
 // reversal producers:
@@ -83,7 +535,6 @@ func applyCase11ReversalProducer(
 	macd MACDResult,
 	ema EMAPatternResult,
 	pyramid PyramidResult,
-	equity EquityResult,
 ) bool {
 	const (
 		macdPeakBuffer   = 15.0
@@ -133,6 +584,35 @@ func applyCase11ReversalProducer(
 	d.MACDPreBottomZone = macdPreBottomZone
 	d.BottomReversalBuy = bottomReversalBuy
 
+	log.Printf(
+		"[TRACE] case11A.peak_reversal_sell.evaluate "+
+			"macd_idx6=%.6f eps=%.6f buffer=%.2f threshold=%.6f "+
+			"macd_zone=%t ema_high_peak=%t "+
+			"pyramid_sell=%t pyramid_reason=%s",
+		macd.LinePrev6,
+		macd.EPS,
+		macdPeakBuffer,
+		macdPrePeakThreshold,
+		macdPrePeakZone,
+		ema.HighPeak,
+		pyramid.Sell.GatePassed,
+		pyramid.Sell.Reason,
+	)
+	log.Printf(
+		"[TRACE] case11B.bottom_reversal_buy.evaluate "+
+			"macd_idx6=%.6f eps=%.6f buffer=%.2f threshold=%.6f "+
+			"macd_zone=%t ema_low_bottom=%t "+
+			"pyramid_buy=%t pyramid_reason=%s",
+		macd.LinePrev6,
+		macd.EPS,
+		macdBottomBuffer,
+		macdPreBottomThreshold,
+		macdPreBottomZone,
+		ema.LowBottom,
+		pyramid.Buy.GatePassed,
+		pyramid.Buy.Reason,
+	)
+
 	// Case 11A has priority over Case 11B if both somehow evaluate true.
 	if peakReversalSell {
 		d.Signal = Sell
@@ -144,18 +624,13 @@ func applyCase11ReversalProducer(
 		d.PyramidReason =
 			pyramid.Sell.Reason
 
-		// Diagnostic only. Equity does not gate Case 11A.
-		d.EquityPass =
-			equity.SellTrigger
-		d.EquityReason =
-			equity.Reason
-
-		log.Printf(
-			"[TRACE] case11A.peak_reversal_sell "+
-				"macd_idx6=%.6f eps=%.6f buffer=%.2f threshold=%.6f "+
-				"macd_zone=%t ema_high_peak=%t "+
-				"pyramid_sell=%t pyramid_reason=%s "+
-				"equity_sell=%t equity_reason=%s",
+		d.ProducerReason = fmt.Sprintf(
+			"peak_reversal_sell|"+
+				"macd_idx6=%.6f|eps=%.6f|buffer=%.2f|"+
+				"threshold=%.6f|"+
+				"macd_zone=%t|"+
+				"ema_high_peak=%t|"+
+				"pyramid_sell=%t",
 			macd.LinePrev6,
 			macd.EPS,
 			macdPeakBuffer,
@@ -163,9 +638,6 @@ func applyCase11ReversalProducer(
 			macdPrePeakZone,
 			ema.HighPeak,
 			pyramid.Sell.GatePassed,
-			pyramid.Sell.Reason,
-			equity.SellTrigger,
-			equity.Reason,
 		)
 
 		return true
@@ -181,18 +653,13 @@ func applyCase11ReversalProducer(
 		d.PyramidReason =
 			pyramid.Buy.Reason
 
-		// Diagnostic only. Equity does not gate Case 11B.
-		d.EquityPass =
-			equity.BuyTrigger
-		d.EquityReason =
-			equity.Reason
-
-		log.Printf(
-			"[TRACE] case11B.bottom_reversal_buy "+
-				"macd_idx6=%.6f eps=%.6f buffer=%.2f threshold=%.6f "+
-				"macd_zone=%t ema_low_bottom=%t "+
-				"pyramid_buy=%t pyramid_reason=%s "+
-				"equity_buy=%t equity_reason=%s",
+		d.ProducerReason = fmt.Sprintf(
+			"bottom_reversal_buy|"+
+				"macd_idx6=%.6f|eps=%.6f|buffer=%.2f|"+
+				"threshold=%.6f|"+
+				"macd_zone=%t|"+
+				"ema_low_bottom=%t|"+
+				"pyramid_buy=%t",
 			macd.LinePrev6,
 			macd.EPS,
 			macdBottomBuffer,
@@ -200,9 +667,6 @@ func applyCase11ReversalProducer(
 			macdPreBottomZone,
 			ema.LowBottom,
 			pyramid.Buy.GatePassed,
-			pyramid.Buy.Reason,
-			equity.BuyTrigger,
-			equity.Reason,
 		)
 
 		return true
@@ -227,7 +691,6 @@ func applyCase13Producer(
 	macd MACDResult,
 	ema EMAPatternResult,
 	pyramid PyramidResult,
-	equity EquityResult,
 	price float64,
 	recentLow float64,
 	recentHigh float64,
@@ -240,7 +703,6 @@ func applyCase13Producer(
 		macd,
 		ema,
 		pyramid,
-		equity,
 		price,
 		recentHigh,
 		regime,
@@ -255,7 +717,6 @@ func applyCase13Producer(
 		macd,
 		ema,
 		pyramid,
-		equity,
 		price,
 		recentLow,
 		regime,
@@ -292,7 +753,6 @@ func applyCase13APeakProducer(
 	macd MACDResult,
 	ema EMAPatternResult,
 	pyramid PyramidResult,
-	equity EquityResult,
 	price float64,
 	recentHigh float64,
 	regime MarketRegime,
@@ -406,28 +866,37 @@ func applyCase13APeakProducer(
 	// Case13A requires SELL spacing. The complete ordinary Pyramid gate
 	// is not required for the first entry. Its advanced latch is required
 	// only when another Case13A SELL is already pending.
-	d.PyramidPass =
-		pyramid.Sell.SpacingPass &&
-			case13AAdversePass
+	// d.PyramidPass =
+	// 	pyramid.Sell.SpacingPass &&
+	// 		case13AAdversePass
 
 	d.PyramidReason = pyramid.Sell.Reason
 
-	// Equity is recorded for diagnostics only.
-	d.EquityPass = equity.SellTrigger
-	d.EquityReason = equity.Reason
-
-	log.Printf(
-		"[TRACE] case13A.peak_sell.produced "+
-			"producer=%s side=%s price=%.8f "+
-			"pending_count=%d adverse_required=%t "+
-			"sell_latched=%.8f adverse_reached=%t",
-		EntryProducerCase13APeakSell,
-		SideSell,
-		price,
+	d.ProducerReason = fmt.Sprintf(
+		"peak_sell|"+
+			"confidence=%.2f|regime=%s|"+
+			"near_peak_pct=%.6f|"+
+			"macd_idx6=%.6f|macd_line=%.6f|macd_hist=%.6f|"+
+			"ema_high_peak=%t|"+
+			"spacing=%t|"+
+			"pending=%d|"+
+			"adverse_required=%t|"+
+			"sell_latched=%.8f|"+
+			"adverse_reached=%t|"+
+			"adverse_pass=%t",
+		ai.Confidence,
+		regime,
+		nearPeakPct,
+		macd.LinePrev6,
+		macd.Line,
+		macd.Hist,
+		ema.HighPeak,
+		pyramid.Sell.SpacingPass,
 		case13APending,
 		case13AAdverseRequired,
 		pyramid.Sell.Latched,
 		sellAdverseReached,
+		case13AAdversePass,
 	)
 
 	return true
@@ -439,7 +908,6 @@ func applyCase13BBottomProducer(
 	macd MACDResult,
 	ema EMAPatternResult,
 	pyramid PyramidResult,
-	equity EquityResult,
 	price float64,
 	recentLow float64,
 	regime MarketRegime,
@@ -520,8 +988,7 @@ func applyCase13BBottomProducer(
 			"pyramid_buy_spacing=%t "+
 			"pending_count=%d adverse_required=%t "+
 			"buy_latched=%.8f adverse_reached=%t adverse_pass=%t "+
-			"arm=%t producer=%t "+
-			"equity_buy=%t equity_reason=%s",
+			"arm=%t producer=%t ",
 		ai.Raw,
 		ai.Confidence,
 		minConfidence,
@@ -543,8 +1010,6 @@ func applyCase13BBottomProducer(
 		case13BAdversePass,
 		bottomBuyArm,
 		bottomBuy,
-		equity.BuyTrigger,
-		equity.Reason,
 	)
 
 	if !bottomBuy {
@@ -557,28 +1022,35 @@ func applyCase13BBottomProducer(
 	// Case13B requires BUY spacing. The complete ordinary Pyramid gate
 	// is not required for the first entry. Its advanced latch is required
 	// only when another Case13B BUY is already pending.
-	d.PyramidPass =
-		pyramid.Buy.SpacingPass &&
-			case13BAdversePass
+	// d.PyramidPass =
+	// 	pyramid.Buy.SpacingPass &&
+	// 		case13BAdversePass
 
 	d.PyramidReason = pyramid.Buy.Reason
 
-	// Equity is recorded for diagnostics only.
-	d.EquityPass = equity.BuyTrigger
-	d.EquityReason = equity.Reason
-
-	log.Printf(
-		"[TRACE] case13B.bottom_buy.produced "+
-			"producer=%s side=%s price=%.8f "+
-			"pending_count=%d adverse_required=%t "+
-			"buy_latched=%.8f adverse_reached=%t",
-		EntryProducerCase13BBottomBuy,
-		SideBuy,
+	d.ProducerReason = fmt.Sprintf(
+		"bottom_buy|"+
+			"confidence=%.2f|regime=%s|"+
+			"price=%.8f|recent_low=%.8f|near_low_pct=%.6f|"+
+			"macd_idx6=%.6f|macd_line=%.6f|macd_hist=%.6f|"+
+			"ema_low_bottom=%t|spacing=%t|"+
+			"pending=%d|adverse_required=%t|"+
+			"buy_latched=%.8f|adverse_reached=%t|adverse_pass=%t",
+		ai.Confidence,
+		regime,
 		price,
+		recentLow,
+		nearLowPct,
+		macd.LinePrev6,
+		macd.Line,
+		macd.Hist,
+		ema.LowBottom,
+		pyramid.Buy.SpacingPass,
 		case13BPending,
 		case13BAdverseRequired,
 		pyramid.Buy.Latched,
 		buyAdverseReached,
+		case13BAdversePass,
 	)
 
 	return true
@@ -609,15 +1081,19 @@ func applyCase13BBottomProducer(
 func applyCase14BUptrendBuyProducer(
 	d *EntryDecision,
 	ai AIResult,
+	macd MACDResult,
 	ema EMAPatternResult,
 	pyramid PyramidResult,
-	equity EquityResult,
 	price float64,
 	regime MarketRegime,
-	legacySignal Signal,
-	logicOpinion Signal,
 	pendingCounts PendingProducerCounts,
 ) bool {
+	legacy :=
+		evaluateLegacyDirection(
+			ai,
+			macd,
+			ema,
+		)
 	const (
 		minConfidence        = 0.30
 		nearLatchBufferPct   = 0.56
@@ -663,8 +1139,8 @@ func applyCase14BUptrendBuyProducer(
 		case14BAvailable &&
 			ai.Raw == Buy &&
 			ai.Confidence >= minConfidence &&
-			legacySignal == Buy &&
-			logicOpinion == Buy &&
+			legacy.Signal == Buy &&
+			legacy.LogicOpinion == Buy &&
 			regime == RegimeUp &&
 			ema.PatternBuy &&
 			pyramid.Buy.SpacingPass
@@ -677,12 +1153,12 @@ func applyCase14BUptrendBuyProducer(
 			"buffer_pct=%.4f actual_latch_reached=%t "+
 			"within_latch_window=%t spacing=%t "+
 			"pending_count=%d available=%t "+
-			"profit_gate_mult=%.2f producer=%t",
+			"profit_gate_mult=%.2f produced=%t",
 		ai.Raw,
 		ai.Confidence,
 		minConfidence,
-		legacySignal,
-		logicOpinion,
+		legacy.Signal,
+		legacy.LogicOpinion,
 		regime,
 		ema.PatternBuy,
 		price,
@@ -708,8 +1184,78 @@ func applyCase14BUptrendBuyProducer(
 
 	d.PyramidReason = pyramid.Buy.Reason
 
-	d.EquityPass = equity.BuyTrigger
-	d.EquityReason = equity.Reason
+	d.ProducerReason = fmt.Sprintf(
+		"uptrend_buffered_latch_buy|"+
+			"confidence=%.2f|"+
+			"regime=%s|"+
+			"price=%.8f|"+
+			"latch=%.8f|"+
+			"buffered_latch=%.8f|"+
+			"actual_latch=%t|"+
+			"within_window=%t|"+
+			"spacing=%t|"+
+			"pending=%d|"+
+			"legacy=%s|"+
+			"logic=%s|"+
+			"pattern_buy=%t|"+
+			"profit_gate_mult=%.2f",
+		ai.Confidence,
+		regime,
+		price,
+		pyramid.Buy.Latched,
+		bufferedLatch,
+		actualLatchReached,
+		withinLatchWindow,
+		pyramid.Buy.SpacingPass,
+		case14BPending,
+		legacy.Signal,
+		legacy.LogicOpinion,
+		ema.PatternBuy,
+		profitGateMultiplier,
+	)
 
 	return true
+}
+
+type LegacyDirectionResult struct {
+	NormalBuy  bool
+	NormalSell bool
+
+	LogicOpinion Signal
+	Signal       Signal
+}
+
+func evaluateLegacyDirection(
+	ai AIResult,
+	macd MACDResult,
+	ema EMAPatternResult,
+) LegacyDirectionResult {
+	result := LegacyDirectionResult{
+		NormalBuy: macd.StrongNegative &&
+			macd.MomentumUp &&
+			ema.PatternBuy,
+
+		NormalSell: macd.StrongPositive &&
+			macd.MomentumDown &&
+			ema.PatternSell,
+	}
+
+	switch {
+	case result.NormalBuy:
+		result.LogicOpinion = Buy
+
+	case result.NormalSell:
+		result.LogicOpinion = Sell
+
+	default:
+		result.LogicOpinion = Flat
+	}
+
+	result.Signal =
+		finalSignalFromAILogic(
+			ai.Raw,
+			result.LogicOpinion,
+		)
+
+	return result
 }

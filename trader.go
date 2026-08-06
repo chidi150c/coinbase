@@ -63,7 +63,7 @@ type Position struct {
 	TrailStop   float64 // current trailing stop level derived from TrailPeak and TRAIL_DISTANCE_PCT
 
 	// --- NEW: human-readable gates/why string captured at entry time ---
-	Reason string `json:"reason,omitempty"`
+	ProducerReason string `json:"reason,omitempty"`
 
 	// --- NEW (profit-gate data model) ---
 	EstExitFeeUSD    float64  `json:"est_exit_fee_usd,omitempty"` // recomputed each tick from mark
@@ -649,8 +649,8 @@ func mergeLots(book *SideBook, fromIdx, toIdx int, px float64) {
 	// keep USD persistence based on entry price
 	a.OpenNotionalUSD = a.SizeBase * a.OpenPrice
 
-	// tag reason with the absorbed lot's original EntryOrderID
-	a.Reason = strings.TrimSpace(a.Reason + "|merge:" + b.EntryOrderID)
+	// tag ProducerReason with the absorbed lot's original EntryOrderID
+	a.ProducerReason = strings.TrimSpace(a.ProducerReason + "|merge:" + b.EntryOrderID)
 
 	// drop fromIdx
 	book.Lots = append(book.Lots[:fromIdx], book.Lots[fromIdx+1:]...)
@@ -769,8 +769,8 @@ func (t *Trader) consolidateRunners(book *SideBook, px float64) {
 			survivor.OpenTime = source.OpenTime
 		}
 
-		// tag reason
-		survivor.Reason = strings.TrimSpace(survivor.Reason + "|mergedRunner:" + source.EntryOrderID)
+		// tag ProducerReason
+		survivor.ProducerReason = strings.TrimSpace(survivor.ProducerReason + "|mergedRunner:" + source.EntryOrderID)
 
 		// write back survivor before we change the slice
 		book.Lots[toIdx] = survivor
@@ -2385,21 +2385,21 @@ func (t *Trader) closeLot(
 	// CASE 3 - SELL LOSS RECOVERY & PROTECTION
 	//
 	// Case 3 introduces two complementary strategies:
+	//   • Case 3A - Recover intelligently in a continuing DOWN regime
 	//   • Case 3B - Prevent repeating weak SELLs in an UP regime.
-	//   • Case 3B - Recover intelligently in a continuing DOWN regime
 	//
 	// Sufficient spare base
-	// 		→ Case 3B Mode A in any regime
+	// 		→ Case 3A Mode A in any regime
 	// 		→ replacement SELL should start before closing the losing SELL
 	// Insufficient spare + regime DOWN
-	// 		→ Case 3B Mode B
+	// 		→ Case 3A Mode B
 	// Insufficient spare + regime UP/NORMAL
 	// 		→ Case3A.modeA.blocked
 	// 		→ no replacement
 	// =============================================================================
 
 	Case3ALossUSD := 0.0
-	// Prepare an empty PendingIntent in case Case 3B recovery becomes necessary.
+	// Prepare an empty PendingIntent in case Case 3A recovery becomes necessary.
 	var repl PendingIntent
 	// Estimate the exit fee
 	estExitFee := quote * (t.cfg.FeeRatePct / 100.0)
@@ -2417,7 +2417,7 @@ func (t *Trader) closeLot(
 		strings.HasPrefix(exitReason, "threshold_stop_loss") {
 
 		// =============================================================================
-		// Case 3B - SELL Stop-Loss Recovery
+		// Case 3A - SELL Stop-Loss Recovery
 		// -----------------------------------
 		// Trigger:
 		//     SELL threshold_stop_loss with loss
@@ -2516,11 +2516,16 @@ func (t *Trader) closeLot(
 								RecoveryMethod:     RecoveryByPositionSize,
 								ProfitGateUSD:      t.cfg.ProfitGateUSD,
 								SourceEntryOrderID: lot.EntryOrderID,
-								Reason: fmt.Sprintf(
-									"Case3A_replacement method=%s recovery=%.6f regime=%s",
+								ProducerReason: fmt.Sprintf(
+									"case3A_replacement|"+
+										"method=%s|"+
+										"recovery_usd=%.6f|"+
+										"regime=%s|"+
+										"source_order_id=%s",
 									RecoveryByPositionSize.String(),
 									recoveryNetUSD,
 									t.MarketRegime,
+									lot.EntryOrderID,
 								),
 							}
 						case t.MarketRegime == RegimeDown:
@@ -2533,12 +2538,17 @@ func (t *Trader) closeLot(
 								RecoveryNetUSD: recoveryNetUSD,
 								RecoveryMethod: RecoveryByProfitTarget,
 								ProfitGateUSD:  t.cfg.ProfitGateUSD + recoveryNetUSD,
-								Reason: fmt.Sprintf(
-									"Case3A_replacement method=%s recovery=%.6f regime=%s usePendingMakerExit=%v",
-									RecoveryByProfitTarget.String(),
+								ProducerReason: fmt.Sprintf(
+									"%s|"+
+										"method=%s|"+
+										"recovery_usd=%.6f|"+
+										"regime=%s|"+
+										"source_order_id=%s",
+									EntryProducerCase3AReplacement,
+									RecoveryByPositionSize.String(),
 									recoveryNetUSD,
 									t.MarketRegime,
-									usePendingMakerExit,
+									lot.EntryOrderID,
 								),
 							}
 
@@ -2568,7 +2578,7 @@ func (t *Trader) closeLot(
 								repl.BaseAtLimit,
 								repl.Quote,
 								repl.ProfitGateUSD,
-								repl.Reason,
+								repl.ProducerReason,
 							)
 						}
 					}
@@ -2587,7 +2597,7 @@ func (t *Trader) closeLot(
 	}
 
 	if repl.Enabled && repl.RecoveryMethod == RecoveryByPositionSize {
-		// Case 3B Mode A:
+		// Case 3A Mode A:
 		// Sufficient spare for normalBase + extraBase.
 		// Post replacement first, then continue to loss-exit.
 
@@ -2704,7 +2714,7 @@ func (t *Trader) closeLot(
 		}
 
 		if repl.Enabled && repl.RecoveryMethod == RecoveryByProfitTarget {
-			// Case 3B Mode B:
+			// Case 3A Mode B:
 			// Post loss-exit first, then attempt replacement in same tick.
 			// If replacement fails later, retry waits until loss-exit fill.
 			if _, err := t.startCase3AReplacement(ctx, repl); err != nil {
@@ -2971,7 +2981,7 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 		EntryFeeUSD:      entryPortion,
 		ExitFeeUSD:       exitFee,
 		PNLUSD:           pl,
-		Reason:           exitReason + " | exitReason{" + exitDecision + "}  ||  openReason{" + lot.Reason + "}",
+		Reason:           exitReason + " | exitReason{" + exitDecision + "}  ||  openReason{" + lot.ProducerReason + "}",
 		ExitMode:         lot.ExitMode,
 		WasRunner:        removedWasRunner,
 		RefundPortionUSD: lot.RefundPortionUSD,
@@ -3011,7 +3021,7 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 			t.archiveOrphanDust(book, priceExec, minNotional)
 		}
 
-		msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)", exitTime.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, entryPortion+exitFee)
+		msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)", exitTime.Format(time.RFC3339), priceExec, exitReason, lot.ProducerReason, pl, entryPortion+exitFee)
 		if t.cfg.UseDirectSlack {
 			postSlack(msg)
 		}
@@ -3070,7 +3080,7 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 		}
 	}
 
-	msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)", exitTime.Format(time.RFC3339), priceExec, exitReason, lot.Reason, pl, entryPortion+exitFee)
+	msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)", exitTime.Format(time.RFC3339), priceExec, exitReason, lot.ProducerReason, pl, entryPortion+exitFee)
 	if t.cfg.UseDirectSlack {
 		postSlack(msg)
 	}
@@ -3238,11 +3248,11 @@ func (t *Trader) maybeCloseDustBasket(ctx context.Context, side OrderSide, liveP
 }
 
 type PendingEntry struct {
-	OrderID  string
-	Side     OrderSide
-	Producer EntryProducer
-
-	Intent *PendingIntent
+	OrderID        string
+	Side           OrderSide
+	Producer       EntryProducer
+	ProducerReason string
+	Intent         *PendingIntent
 
 	ResultC chan OpenResult    `json:"-"`
 	Cancel  context.CancelFunc `json:"-"`
@@ -3267,12 +3277,12 @@ type PendingIntent struct {
 	Enabled  bool
 	Producer EntryProducer
 
-	Side        OrderSide
-	LimitPx     float64
-	BaseAtLimit float64
-	Quote       float64
-	Take        float64
-	Reason      string
+	Side           OrderSide
+	LimitPx        float64
+	BaseAtLimit    float64
+	Quote          float64
+	Take           float64
+	ProducerReason string
 
 	RefundPortionUSD float64 `json:"refund_portion_usd"`
 
@@ -3371,7 +3381,7 @@ func (t *Trader) startProducerBuyEntry(
 	limitPx float64,
 	baseAtLimit float64,
 	take float64,
-	reason string,
+	producerReason string,
 	refundPortionUSD float64,
 	confidenceMult float64,
 	profitGateUSD float64,
@@ -3386,13 +3396,13 @@ func (t *Trader) startProducerBuyEntry(
 	}
 
 	intent := &PendingIntent{
-		Producer:    producer,
-		Side:        SideBuy,
-		LimitPx:     limitPx,
-		BaseAtLimit: baseAtLimit,
-		Quote:       baseAtLimit * limitPx,
-		Take:        take,
-		Reason:      reason,
+		Producer:       producer,
+		Side:           SideBuy,
+		LimitPx:        limitPx,
+		BaseAtLimit:    baseAtLimit,
+		Quote:          baseAtLimit * limitPx,
+		Take:           take,
+		ProducerReason: producerReason,
 
 		RefundPortionUSD: refundPortionUSD,
 
@@ -3417,7 +3427,7 @@ func (t *Trader) startProducerSellEntry(
 	limitPx float64,
 	baseAtLimit float64,
 	take float64,
-	reason string,
+	producerReason string,
 	refundPortionUSD float64,
 	confidenceMult float64,
 	profitGateUSD float64,
@@ -3433,12 +3443,12 @@ func (t *Trader) startProducerSellEntry(
 	intent := &PendingIntent{
 		Producer: producer,
 
-		Side:        SideSell,
-		LimitPx:     limitPx,
-		BaseAtLimit: baseAtLimit,
-		Quote:       baseAtLimit * limitPx,
-		Take:        take,
-		Reason:      reason,
+		Side:           SideSell,
+		LimitPx:        limitPx,
+		BaseAtLimit:    baseAtLimit,
+		Quote:          baseAtLimit * limitPx,
+		Take:           take,
+		ProducerReason: producerReason,
 
 		RefundPortionUSD: refundPortionUSD,
 
@@ -3750,7 +3760,7 @@ func (t *Trader) validatePendingIntent(
 		)
 	}
 
-	if strings.TrimSpace(intent.Reason) == "" {
+	if strings.TrimSpace(intent.ProducerReason) == "" {
 		return errors.New(
 			"validate pending intent: missing Reason",
 		)
@@ -3861,15 +3871,25 @@ func (t *Trader) buildPendingEntry(
 	}
 
 	entry := &PendingEntry{
-		Side:     intent.Side,
-		Producer: intent.Producer,
-		OrderID:  intent.OrderID,
-		Intent:   intent,
+		Side:           intent.Side,
+		Producer:       intent.Producer,
+		ProducerReason: intent.ProducerReason,
+		OrderID:        intent.OrderID,
+		Intent:         intent,
 
 		ResultC: make(chan OpenResult, 1),
 
 		Completed: false,
 	}
+
+	log.Printf(
+		"[PRODUCER] stage=pending "+
+			"producer=%s side=%s order_id=%s reason=%q",
+		entry.Producer,
+		entry.Side,
+		entry.OrderID,
+		entry.ProducerReason,
+	)
 
 	if intent.Producer == EntryProducerCase3AReplacement {
 		entry.CommitEligible = t.Case3ACommitEligible
@@ -4242,6 +4262,15 @@ poll:
 					lastSeenBase = 0
 					lastSeenQuote = 0
 					lastSeenFee = 0
+					log.Printf(
+						"[PRODUCER] stage=pending "+
+							"producer=%s side=%s order_id=%s reason=%q repriced=%t",
+						entry.Producer,
+						entry.Side,
+						newID,
+						entry.ProducerReason,
+						true,
+					)
 
 					t.rekeyPendingEntry(
 						entry,
@@ -5000,6 +5029,19 @@ func (t *Trader) drainPendingEntry(
 				return
 			}
 
+			log.Printf(
+				"[PRODUCER] stage=filled "+
+					"producer=%s side=%s order_id=%s "+
+					"price=%.8f base=%.8f quote=%.8f fee_usd=%.8f",
+				entry.Producer,
+				entry.Side,
+				res.OrderID,
+				res.Placed.Price,
+				res.Placed.BaseSize,
+				res.Placed.QuoteSpent,
+				res.Placed.CommissionUSD,
+			)
+
 			if err := t.commitEntryFill(
 				entry,
 				res,
@@ -5199,7 +5241,7 @@ func (t *Trader) commitEntryFill(
 		OpenTime:        now,
 		EntryFee:        entryFee,
 		OpenNotionalUSD: quoteSpent,
-		Reason:          pending.Reason,
+		ProducerReason:  pending.ProducerReason,
 		Take:            pending.Take,
 		Version:         Version,
 		EntryOrderID:    res.OrderID,
@@ -5268,6 +5310,8 @@ func (t *Trader) commitEntryFill(
 		)
 	}
 
+	// Promote Equity-produced entries into runners. NormalLegacy entries
+	// remain scalp-only and therefore never receive runner assignment.
 	if policy.AllowRunner && entry.EquityTriggered {
 
 		newIndex := len(book.Lots) - 1
@@ -5347,7 +5391,7 @@ func (t *Trader) commitEntryFill(
 		quoteSpent,
 		newLot.Take,
 		entryFee,
-		newLot.Reason,
+		newLot.ProducerReason,
 		"async postonly filled",
 	)
 
@@ -5358,6 +5402,19 @@ func (t *Trader) commitEntryFill(
 	if err := t.saveStateNoLock(); err != nil {
 		return fmt.Errorf("saveStateNoLock: %w", err)
 	}
+
+	log.Printf(
+		"[PRODUCER] stage=committed "+
+			"producer=%s side=%s order_id=%s "+
+			"price=%.8f base=%.8f fee_usd=%.8f reason=%q",
+		entry.Producer,
+		side,
+		res.OrderID,
+		newLot.OpenPrice,
+		newLot.SizeBase,
+		newLot.EntryFee,
+		newLot.ProducerReason,
+	)
 
 	return nil
 }

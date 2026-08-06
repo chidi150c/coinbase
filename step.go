@@ -77,7 +77,7 @@ import (
 	"time"
 )
 
-const Version = 160
+const Version = 161
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -1123,9 +1123,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			wallNow,
 		)
 
-	equityRaw :=
-		t.evaluateEquityRaw()
-
 	// ------------------------------------------------------
 	// 4. Fan in the concurrent results
 	// -------------------------------------------------------
@@ -1245,170 +1242,19 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		pyramidRaw.State,
 	)
 
-	// -----------------------------------------------------------------
-	// Preserve the legacy AI + Logic decision used by the original
-	// Pyramid state-maintenance block.
-	//
-	// Pyramid state transitions are committed using this legacy signal.
-	// Case 5 then receives all raw/interpreted materials and may retain
-	// or override that legacy signal when producing the final entry
-	// decision.
-	// -----------------------------------------------------------------
-	normalBuy :=
-		macdResult.StrongNegative &&
-			macdResult.MomentumUp &&
-			emaResult.PatternBuy
-
-	normalSell :=
-		macdResult.StrongPositive &&
-			macdResult.MomentumDown &&
-			emaResult.PatternSell
-
-	logicOpinion := Flat
-
-	if normalBuy {
-		logicOpinion = Buy
-	} else if normalSell {
-		logicOpinion = Sell
-	}
-
-	legacySignal := finalSignalFromAILogic(
-		aiResult.Raw,
-		logicOpinion,
-	)
-
 	// Preserve the original selected-side Pyramid state behavior using
 	// the decision that existed before the Case 5 override stage.
 	t.applyPyramidDecisionTransitions(
 		pyramidResult,
-		legacySignal,
 	)
 
-	// -----------------------------------------------------------------
-	// Case 5 Equity funding snapshot.
-	//
-	// The background refresher remains the sole balance-cache writer.
-	// This block only reads the cache and derives both side-specific spare
-	// materials before Equity interpretation.
-	// -----------------------------------------------------------------
-	var (
-		symQ       string
-		availQuote float64
-		quoteStep  float64
-
-		symB      string
-		availBase float64
-		baseStep  float64
-
-		spareQuote float64
-		spareBase  float64
-	)
-
-	if legacySignal == Buy || legacySignal == Sell {
-		log.Printf(
-			"[TRACE] hotpath.before_equity_balance elapsed_ms=%d legacy=%s",
-			time.Since(hotStart).Milliseconds(),
-			legacySignal,
-		)
-
-		equityBalance, ok := t.getBalanceSpare(
-			balanceSnapshotMaxAge,
-			reservedShortQuoteWithFee,
-			reservedLongBase,
-		)
-
-		if !ok {
-			ageMS := int64(-1)
-
-			if !equityBalance.Snapshot.UpdatedAt.IsZero() {
-				ageMS =
-					time.Since(
-						equityBalance.Snapshot.UpdatedAt,
-					).Milliseconds()
-			}
-
-			log.Printf(
-				"[WARN] balance.equity_cache.unavailable "+
-					"legacy=%s age_ms=%d",
-				legacySignal,
-				ageMS,
-			)
-
-			t.mu.Unlock()
-
-			return StepResult{
-				Msg:    "HOLD",
-				Raw:    aiResult.Raw,
-				Signal: Flat,
-			}, nil
-		}
-
-		availQuote = equityBalance.AvailQuote
-		quoteStep = equityBalance.QuoteStep
-		availBase = equityBalance.AvailBase
-		baseStep = equityBalance.BaseStep
-
-		spareQuote = equityBalance.SpareQuote
-		spareBase = equityBalance.SpareBase
-		symQ = equityBalance.Snapshot.SymQuote
-		symB = equityBalance.Snapshot.SymBase
-
-		log.Printf(
-			"[TRACE] balance.cache.hit legacy=%s age_ms=%d quote=%.8f base=%.8f",
-			legacySignal,
-			time.Since(equityBalance.Snapshot.UpdatedAt).Milliseconds(),
-			availQuote,
-			availBase,
-		)
-
-		switch legacySignal {
-		case Buy:
-			if strings.TrimSpace(symQ) == "" ||
-				quoteStep <= 0 {
-
-				log.Printf(
-					"[WARN] balance.cache.invalid_quote symbol=%q step=%.8f",
-					symQ,
-					quoteStep,
-				)
-
-				t.mu.Unlock()
-
-				return StepResult{
-					Msg:    "HOLD invalid cached quote metadata",
-					Raw:    aiResult.Raw,
-					Signal: Flat,
-				}, nil
-			}
-
-		case Sell:
-			if strings.TrimSpace(symB) == "" ||
-				baseStep <= 0 {
-
-				log.Printf(
-					"[WARN] balance.cache.invalid_base symbol=%q step=%.8f",
-					symB,
-					baseStep,
-				)
-
-				t.mu.Unlock()
-
-				return StepResult{
-					Msg:    "HOLD invalid cached base metadata",
-					Raw:    aiResult.Raw,
-					Signal: Flat,
-				}, nil
-			}
-		}
-	}
-
-	equityResult := interpretEquityRaw(
-		equityRaw,
-		legacySignal,
-		spareQuote,
-		spareBase,
-		quoteStep,
-		baseStep,
+	equityResult, _ := t.evaluateEquityProducerMaterial(
+		aiResult,
+		macdResult,
+		emaResult,
+		balanceSnapshotMaxAge,
+		reservedShortQuoteWithFee,
+		reservedLongBase,
 	)
 
 	// log.Printf(
@@ -1417,7 +1263,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// 		"buy_quote=%.8f sell_base=%.8f reason=%s",
 	// 	equityRaw.Elapsed.Milliseconds(),
 	// 	equityResult.Elapsed.Milliseconds(),
-	// 	legacySignal,
+	// 	d.Signal,
 	// 	equityRaw.BuyThresholdPassed,
 	// 	equityRaw.SellThresholdPassed,
 	// 	equityResult.BuyTrigger,
@@ -1438,8 +1284,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		emaResult,
 		pyramidResult,
 		equityResult,
-		legacySignal,
-		logicOpinion,
 		price,
 		pendingCounts,
 	)
@@ -1449,27 +1293,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		time.Since(hotStart).Milliseconds(),
 	)
 
-	// 8. Copy Pyramid audit fields for the selected side
-	var selectedPyramid PyramidSideResult
-
-	switch entryDecision.Signal {
-	case Buy:
-		selectedPyramid = pyramidResult.Buy
-
-	case Sell:
-		selectedPyramid = pyramidResult.Sell
-	}
-
-	// Restore the existing reason values:
-
-	reasonGatePrice := selectedPyramid.EffectiveGatePrice
-	reasonLatched := selectedPyramid.Latched
-	reasonEffPct := selectedPyramid.EffPct
-	reasonBasePct := selectedPyramid.BasePct
-	reasonElapsedHr := selectedPyramid.ElapsedHr
-	reasonTFloorHr := selectedPyramid.TFloorHr
-
 	d := entryDecision
+
+	if d.Signal != Flat {
+		t.applyPyramidRebaseTransactions(
+			pyramidResult,
+			d.Signal,
+		)
+	}
 
 	totalLots := lsb + lss
 
@@ -1502,6 +1333,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}, nil
 	}
 
+	if d.Signal == Buy || d.Signal == Sell {
+		log.Printf(
+			"[PRODUCER] stage=produced "+
+				"producer=%s side=%s reason=%q",
+			d.Producer,
+			d.Signal,
+			d.ProducerReason,
+		)
+	}
+
 	executionBalance, executionCacheOK :=
 		t.getBalanceSpare(
 			balanceSnapshotMaxAge,
@@ -1521,10 +1362,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 		log.Printf(
 			"[WARN] balance.execution_cache.unavailable "+
-				"side=%s source=%s legacy=%s final=%s age_ms=%d",
+				"side=%s source=%s final=%s age_ms=%d",
 			side,
 			d.Producer,
-			legacySignal,
 			d.Signal,
 			ageMS,
 		)
@@ -1538,10 +1378,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}, nil
 	}
 
-	availQuote = executionBalance.AvailQuote
-	quoteStep = executionBalance.QuoteStep
-	availBase = executionBalance.AvailBase
-	baseStep = executionBalance.BaseStep
+	availQuote := executionBalance.AvailQuote
+	quoteStep := executionBalance.QuoteStep
+	availBase := executionBalance.AvailBase
+	baseStep := executionBalance.BaseStep
 
 	spare := 0.0
 
@@ -1555,11 +1395,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	log.Printf(
 		"[TRACE] balance.execution_cache.hit "+
-			"side=%s producer=%s legacy=%s final=%s age_ms=%d "+
+			"side=%s producer=%s final=%s age_ms=%d "+
 			"quote=%.8f quoteStep=%.8f base=%.8f baseStep=%.8f",
 		side,
 		d.Producer,
-		legacySignal,
 		d.Signal,
 		time.Since(executionBalance.Snapshot.UpdatedAt).Milliseconds(),
 		availQuote,
@@ -1569,9 +1408,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	)
 
 	log.Printf(
-		"[TRACE] hotpath.after_execution_balance elapsed_ms=%d legacy=%s",
+		"[TRACE] hotpath.after_execution_balance elapsed_ms=%d final=%s",
 		time.Since(hotStart).Milliseconds(),
-		legacySignal,
+		d.Signal,
 	)
 	// --------------------------------------------------------------------------------------------------------
 	//---ADD path continues-----
@@ -1708,7 +1547,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	if isAdd && !skipPyramidGates {
 		var pyramidSide PyramidSideResult
 
-		switch legacySignal {
+		switch d.Signal {
 		case Buy:
 			pyramidSide = pyramidResult.Buy
 
@@ -1716,7 +1555,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			pyramidSide = pyramidResult.Sell
 		}
 
-		if legacySignal == Buy || legacySignal == Sell {
+		if d.Signal == Buy || d.Signal == Sell {
 			log.Printf(
 				"[TRACE] pyramid.spacing since_last=%.1fs need>=%ds",
 				pyramidSide.ElapsedSec,
@@ -1755,7 +1594,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				)
 
 				if pyramidSide.UsedSoftGate {
-					switch legacySignal {
+					switch d.Signal {
 					case Buy:
 						log.Printf(
 							"[DEBUG] SOFT GATE BUY: elapsedMin=%.1f tFloorMin=%.2f old_gate=%.2f recentLow=%.2f soft_gate=%.2f winLow=%.2f price=%.2f",
@@ -1783,7 +1622,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				}
 
 				if pyramidSide.GatePassed {
-					switch legacySignal {
+					switch d.Signal {
 					case Buy:
 						log.Printf(
 							"[DEBUG] pyramid: BUY baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
@@ -1805,7 +1644,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						)
 					}
 				} else {
-					switch legacySignal {
+					switch d.Signal {
 					case Buy:
 						log.Printf(
 							"[DEBUG] pyramid: blocked by last gate (BUY): price=%.2f gatePrice=%.2f",
@@ -2332,44 +2171,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	feeRate := t.cfg.FeeRatePct
 	entryFee := quote * (feeRate / 100.0)
 
-	// --- side-biased Lot reason ---
-	var gatesReason string
-
-	if equityTriggerSell && side == SideSell && equitySpareBase > 0 {
-		gatesReason = fmt.Sprintf(
-			"equityTrading=true|equityUSD=%.2f|lastAddEquity=%.2f|sellEquityMultiplier=%.6f|sellEquityTriggerMult=%.2f|equitySpareBase=%.8f|confidenceMult=%.2f",
-			t.equityUSD,
-			t.lastAddEquity,
-			t.equityUSD/t.lastAddEquity,
-			t.cfg.SellEquityTriggerMult,
-			equitySpareBase,
-			confMult,
-		)
-	} else if equityTriggerBuy && side == SideBuy && equitySpareQuote > 0 {
-		gatesReason = fmt.Sprintf(
-			"equityTrading=true|equityUSD=%.2f|lastAddEquity=%.2f|buyEquityMultiplier=%.6f|buyEquityTriggerMult=%.2f|equitySpareQuote=%.2f|confidenceMult=%.2f",
-			t.equityUSD,
-			t.lastAddEquity,
-			t.equityUSD/t.lastAddEquity,
-			t.cfg.BuyEquityTriggerMult,
-			equitySpareQuote,
-			confMult,
-		)
-	} else {
-		gatesReason = fmt.Sprintf(
-			"gatePrice=%.3f|latched=%.3f|effPct=%.3f|basePct=%.3f|elapsedHr=%.1f|latchTargetHr=%.2f|targetNetUSD=%.2f",
-			reasonGatePrice,
-			reasonLatched,
-			reasonEffPct,
-			reasonBasePct,
-			reasonElapsedHr,
-			2.0*reasonTFloorHr,
-			entryProfitGateUSD,
-		)
-	}
-
-	gatesReason = appendReason(gatesReason, decisionEntryReason(d))
-
 	refundFromOpposite := 0.0
 	refundMinConf := 0.60
 	if t.refundBuyUSD > 0 && side == SideSell && confMult >= refundMinConf {
@@ -2403,10 +2204,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				t.refundBuyUSD = 0
 			}
 
+			gatesReason := d.ProducerReason
 			if t.refundBuyUSD == 0 {
-				gatesReason = strings.TrimSpace(gatesReason + "|refund=buy-full")
+				d.ProducerReason = strings.TrimSpace(gatesReason + "|refund=buy-full")
+
 			} else {
-				gatesReason = strings.TrimSpace(gatesReason + "|refund=buy-partial")
+				d.ProducerReason = strings.TrimSpace(gatesReason + "|refund=buy-partial")
 			}
 		}
 	} else if t.refundBuyUSD > 0 && side == SideSell && confMult < refundMinConf {
@@ -2443,10 +2246,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				t.refundSellUSD = 0
 			}
 
+			gatesReason := d.ProducerReason
 			if t.refundSellUSD == 0 {
-				gatesReason = strings.TrimSpace(gatesReason + "|refund=sell-full")
+				d.ProducerReason = strings.TrimSpace(gatesReason + "|refund=sell-full")
 			} else {
-				gatesReason = strings.TrimSpace(gatesReason + "|refund=sell-partial")
+				d.ProducerReason = strings.TrimSpace(gatesReason + "|refund=sell-partial")
 			}
 		}
 	} else if t.refundSellUSD > 0 && side == SideBuy && confMult < refundMinConf {
@@ -2602,7 +2406,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					limitPx,
 					baseAtLimit,
 					take,
-					gatesReason,
+					d.ProducerReason,
 					refundFromOpposite,
 					confMult,
 					entryProfitGateUSD,
@@ -2617,7 +2421,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					limitPx,
 					baseAtLimit,
 					take,
-					gatesReason,
+					d.ProducerReason,
 					refundFromOpposite,
 					confMult,
 					entryProfitGateUSD,
@@ -2843,8 +2647,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		SizeBase:         baseToUse,
 		OpenTime:         now,
 		EntryFee:         entryFee,
-		OpenNotionalUSD:  actualQuote, // <<< USD PERSISTENCE: notional in USD at open
-		Reason:           gatesReason, // side-biased; no winLow
+		OpenNotionalUSD:  actualQuote,      // <<< USD PERSISTENCE: notional in USD at open
+		ProducerReason:   d.ProducerReason, // side-biased; no winLow
 		Take:             take,
 		Version:          Version,
 		EntryOrderID:     placedOrderID(placed),
@@ -2926,7 +2730,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	msg := ""
 	msg = fmt.Sprintf("[LIVE ORDER] %s notional=%.2f take=%.2f fee=%.4f reason=%s",
-		side, newLot.OpenNotionalUSD, newLot.Take, entryFee, newLot.Reason)
+		side, newLot.OpenNotionalUSD, newLot.Take, entryFee, newLot.ProducerReason)
 
 	if t.cfg.UseDirectSlack {
 		postSlack(msg)
@@ -3021,8 +2825,8 @@ func (t *Trader) consolidateDust(book *SideBook, px float64, minNotional float64
 		a.EntryFee += b.EntryFee
 		a.OpenNotionalUSD = a.SizeBase * a.OpenPrice
 
-		// tag reason
-		a.Reason = strings.TrimSpace(a.Reason + "|merge:" + b.EntryOrderID)
+		// tag ProducerReason
+		a.ProducerReason = strings.TrimSpace(a.ProducerReason + "|merge:" + b.EntryOrderID)
 
 		// drop fromIdx
 		book.Lots = append(book.Lots[:fromIdx], book.Lots[fromIdx+1:]...)
