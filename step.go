@@ -2413,6 +2413,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					entryAIMode,
 					equityTriggerBuy,
 					d.Producer,
+					d.PendingCancelPolicy,
 				)
 
 			case SideSell:
@@ -2428,6 +2429,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					entryAIMode,
 					equityTriggerSell,
 					d.Producer,
+					d.PendingCancelPolicy,
 				)
 
 			default:

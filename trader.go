@@ -2540,16 +2540,16 @@ func (t *Trader) closeLot(
 								RecoveryNetUSD:      recoveryNetUSD,
 								RecoveryMethod:      RecoveryByProfitTarget,
 								ProfitGateUSD:       t.cfg.ProfitGateUSD + recoveryNetUSD,
+								SourceEntryOrderID:  lot.EntryOrderID,
 								Producer:            EntryProducerCase3AReplacement,
 								PendingCancelPolicy: PendingSignalCancelDisabled,
 								ProducerReason: fmt.Sprintf(
-									"%s|"+
+									"case3A_replacement|"+
 										"method=%s|"+
 										"recovery_usd=%.6f|"+
 										"regime=%s|"+
 										"source_order_id=%s",
-									EntryProducerCase3AReplacement,
-									RecoveryByPositionSize.String(),
+									RecoveryByProfitTarget.String(),
 									recoveryNetUSD,
 									t.MarketRegime,
 									lot.EntryOrderID,
@@ -2717,50 +2717,12 @@ func (t *Trader) closeLot(
 			return "", nil
 		}
 
-		if repl.Enabled && repl.RecoveryMethod == RecoveryByProfitTarget {
-			// Case 3A Mode B:
-			// Post loss-exit first, then attempt replacement in same tick.
-			// Operational replacement failures are retained for retry after
-			// the loss-exit fill. Invalid producer/intent configuration is not
-			// treated as a transient retry condition.
-			if _, err := t.startCase3AReplacement(ctx, repl); err != nil {
-				switch {
-				case errors.Is(err, ErrEntrySubmitFailed),
-					errors.Is(err, ErrEntryBuildFailed),
-					errors.Is(err, ErrEntryRegisterFailed),
-					errors.Is(err, ErrEntryPersistFailed):
-
-					t.markCase3AReplacementRetryLocked(
-						repl,
-						waitID,
-						fmt.Sprintf(
-							"initial_modeB_replacement_retryable: %v",
-							err,
-						),
-					)
-
-				case errors.Is(err, ErrEntryIntentInvalid):
-					log.Printf(
-						"[ERROR] Case3A.replacement.invalid "+
-							"method=%s wait_id=%s err=%v",
-						repl.RecoveryMethod.String(),
-						waitID,
-						err,
-					)
-
-				default:
-					// Unknown failures should not silently disappear.
-					// Preserve retry behavior until they are explicitly classified.
-					t.markCase3AReplacementRetryLocked(
-						repl,
-						waitID,
-						fmt.Sprintf(
-							"initial_modeB_replacement_unclassified: %v",
-							err,
-						),
-					)
-				}
-			}
+		if _, err := t.startCase3AReplacement(ctx, repl); err != nil {
+			t.handleCase3AReplacementError(
+				repl,
+				waitID,
+				err,
+			)
 		}
 
 		return fmt.Sprintf("PENDING_EXIT %s side=%s entry_id=%s limit=%.2f base=%.8f reason=%s", exitTime.Format(time.RFC3339), lot.Side, lot.EntryOrderID, limitPx, baseRequested, exitReason), nil
@@ -2840,13 +2802,10 @@ func (t *Trader) closeLot(
 	// Submit the replacement immediately before heavier exit bookkeeping.
 	if repl.Enabled && repl.RecoveryMethod == RecoveryByProfitTarget {
 		if _, rerr := t.startCase3AReplacement(ctx, repl); rerr != nil {
-			t.markCase3AReplacementRetryLocked(
+			t.handleCase3AReplacementError(
 				repl,
 				placedOrderID(placed),
-				fmt.Sprintf(
-					"initial_modeB_replacement_failed: %v",
-					rerr,
-				),
+				rerr,
 			)
 		}
 	}
@@ -3427,6 +3386,7 @@ func (t *Trader) startProducerBuyEntry(
 	entryAIMode string,
 	equityTriggered bool,
 	producer EntryProducer,
+	cancelPolicy PendingSignalCancelPolicy,
 ) (*PendingEntry, error) {
 	if producer == EntryProducerNone {
 		return nil, fmt.Errorf(
@@ -3435,13 +3395,14 @@ func (t *Trader) startProducerBuyEntry(
 	}
 
 	intent := &PendingIntent{
-		Producer:       producer,
-		Side:           SideBuy,
-		LimitPx:        limitPx,
-		BaseAtLimit:    baseAtLimit,
-		Quote:          baseAtLimit * limitPx,
-		Take:           take,
-		ProducerReason: producerReason,
+		Producer:            producer,
+		PendingCancelPolicy: cancelPolicy,
+		Side:                SideBuy,
+		LimitPx:             limitPx,
+		BaseAtLimit:         baseAtLimit,
+		Quote:               baseAtLimit * limitPx,
+		Take:                take,
+		ProducerReason:      producerReason,
 
 		RefundPortionUSD: refundPortionUSD,
 
@@ -3457,7 +3418,19 @@ func (t *Trader) startProducerBuyEntry(
 		EntryMethod:    entryAIMode,
 	}
 
-	return t.produceEntry(ctx, intent)
+	entry, err := t.produceEntry(
+		ctx,
+		intent,
+	)
+	if err != nil {
+		return nil, t.handleEntryProduceError(
+			ctx,
+			intent,
+			err,
+		)
+	}
+
+	return entry, nil
 }
 
 // Sell Source Wrapper
@@ -3473,6 +3446,7 @@ func (t *Trader) startProducerSellEntry(
 	entryAIMode string,
 	equityTriggered bool,
 	producer EntryProducer,
+	cancelPolicy PendingSignalCancelPolicy,
 ) (*PendingEntry, error) {
 	if producer == EntryProducerNone {
 		return nil, fmt.Errorf(
@@ -3480,30 +3454,37 @@ func (t *Trader) startProducerSellEntry(
 		)
 	}
 	intent := &PendingIntent{
-		Producer: producer,
-
-		Side:           SideSell,
-		LimitPx:        limitPx,
-		BaseAtLimit:    baseAtLimit,
-		Quote:          baseAtLimit * limitPx,
-		Take:           take,
-		ProducerReason: producerReason,
-
-		RefundPortionUSD: refundPortionUSD,
-
-		ProductID: t.cfg.ProductID,
-
-		EquityBuy:  false,
-		EquitySell: equityTriggered,
-
-		History: make([]string, 0, 5),
-
-		ConfidenceMult: confidenceMult,
-		ProfitGateUSD:  profitGateUSD,
-		EntryMethod:    entryAIMode,
+		Producer:            producer,
+		PendingCancelPolicy: cancelPolicy,
+		ProducerReason:      producerReason,
+		Side:                SideSell,
+		LimitPx:             limitPx,
+		BaseAtLimit:         baseAtLimit,
+		Quote:               baseAtLimit * limitPx,
+		Take:                take,
+		RefundPortionUSD:    refundPortionUSD,
+		ProductID:           t.cfg.ProductID,
+		EquityBuy:           false,
+		EquitySell:          equityTriggered,
+		History:             make([]string, 0, 5),
+		ConfidenceMult:      confidenceMult,
+		ProfitGateUSD:       profitGateUSD,
+		EntryMethod:         entryAIMode,
 	}
 
-	return t.produceEntry(ctx, intent)
+	entry, err := t.produceEntry(
+		ctx,
+		intent,
+	)
+	if err != nil {
+		return nil, t.handleEntryProduceError(
+			ctx,
+			intent,
+			err,
+		)
+	}
+
+	return entry, nil
 }
 
 // Case3A Source Wrapper
@@ -3551,7 +3532,6 @@ func (t *Trader) startCase3AReplacement(
 		)
 	}
 
-	intent.Producer = EntryProducerCase3AReplacement
 	intent.ProductID = t.cfg.ProductID
 	intent.SourceEntryOrderID = sourceEntryOrderID
 
@@ -3583,14 +3563,17 @@ func (t *Trader) startCase3AReplacement(
 	)
 
 	if err != nil {
+		err = t.handleEntryProduceError(
+			ctx,
+			&intent,
+			err,
+		)
+
 		log.Printf(
 			"[TRACE] Case3A.replacement.failed "+
-				"side=%s price=%.8f base=%.8f "+
-				"method=%s err=%v",
-			entry.Side,
-			entry.Intent.LimitPx,
-			entry.Intent.BaseAtLimit,
-			entry.Intent.RecoveryMethod.String(),
+				"side=%s method=%s err=%v",
+			intent.Side,
+			intent.RecoveryMethod.String(),
 			err,
 		)
 
@@ -3634,12 +3617,35 @@ func (t *Trader) produceEntry(
 	intent *PendingIntent,
 ) (*PendingEntry, error) {
 	if err := t.validatePendingIntent(intent); err != nil {
-		return nil, err
+		producer := EntryProducerNone
+		side := ""
+
+		if intent != nil {
+			producer = intent.Producer
+			side = fmt.Sprint(intent.Side)
+		}
+
+		return nil, &EntryProduceError{
+			Code:     EntryProduceErrInvalidIntent,
+			Producer: producer,
+			Side:     side,
+			Cause:    err,
+		}
 	}
 
-	orderID, err := t.submitPendingIntent(ctx, intent)
+	orderID, err := t.submitPendingIntent(
+		ctx,
+		intent,
+	)
 	if err != nil {
-		return nil, err
+		return nil, &EntryProduceError{
+			Code:            EntryProduceErrSubmit,
+			Producer:        intent.Producer,
+			Side:            fmt.Sprint(intent.Side),
+			OrderID:         orderID,
+			CleanupRequired: orderID != "",
+			Cause:           err,
+		}
 	}
 
 	entry, err := t.buildPendingEntry(
@@ -3647,17 +3653,25 @@ func (t *Trader) produceEntry(
 		orderID,
 	)
 	if err != nil {
-		return nil, err
+		return nil, &EntryProduceError{
+			Code:            EntryProduceErrBuild,
+			Producer:        intent.Producer,
+			Side:            fmt.Sprint(intent.Side),
+			OrderID:         orderID,
+			CleanupRequired: true,
+			Cause:           err,
+		}
 	}
 
 	if err := t.registerPendingEntry(entry); err != nil {
-		_ = t.broker.CancelOrder(
-			ctx,
-			intent.ProductID,
-			orderID,
-		)
-
-		return nil, err
+		return nil, &EntryProduceError{
+			Code:            EntryProduceErrRegister,
+			Producer:        intent.Producer,
+			Side:            fmt.Sprint(intent.Side),
+			OrderID:         orderID,
+			CleanupRequired: true,
+			Cause:           err,
+		}
 	}
 
 	// Registration succeeded. Advance the same-side latch immediately so
@@ -3677,20 +3691,23 @@ func (t *Trader) produceEntry(
 	switch intent.Side {
 	case SideBuy:
 		// BUY latch may only move farther downward (more adverse).
-		if t.latchedGateBuy == 0 || nextLatch < t.latchedGateBuy {
+		if t.latchedGateBuy == 0 ||
+			nextLatch < t.latchedGateBuy {
+
 			t.latchedGateBuy = nextLatch
 		}
 
 	case SideSell:
 		// SELL latch may only move farther upward (more adverse).
-		if t.latchedGateSell == 0 || nextLatch > t.latchedGateSell {
+		if t.latchedGateSell == 0 ||
+			nextLatch > t.latchedGateSell {
+
 			t.latchedGateSell = nextLatch
 		}
 	}
 
 	if err := t.saveStateNoLock(); err != nil {
-		// Roll back latch advancement because the pending entry
-		// registration could not be persisted.
+		// Roll back only the local state mutated by produceEntry().
 		t.latchedGateBuy = oldBuyLatch
 		t.latchedGateSell = oldSellLatch
 
@@ -3698,21 +3715,37 @@ func (t *Trader) produceEntry(
 
 		current, exists := t.pendingEntries[orderID]
 		if exists && current == entry {
-			delete(t.pendingEntries, orderID)
+			delete(
+				t.pendingEntries,
+				orderID,
+			)
 		}
 
 		t.mu.Unlock()
 
-		_ = t.broker.CancelOrder(
-			ctx,
-			intent.ProductID,
-			orderID,
-		)
-
-		return nil, err
+		return nil, &EntryProduceError{
+			Code:            EntryProduceErrPersist,
+			Producer:        intent.Producer,
+			Side:            fmt.Sprint(intent.Side),
+			OrderID:         orderID,
+			CleanupRequired: true,
+			Cause:           err,
+		}
 	}
 
-	t.startEntryPoller(ctx, entry)
+	log.Printf(
+		"[PRODUCER] stage=pending "+
+			"producer=%s side=%s order_id=%s reason=%q",
+		entry.Producer,
+		entry.Side,
+		entry.OrderID,
+		entry.ProducerReason,
+	)
+
+	t.startEntryPoller(
+		ctx,
+		entry,
+	)
 
 	return entry, nil
 }
@@ -4065,6 +4098,91 @@ func (t *Trader) startEntryPoller(
 		entry.Intent.BaseAtLimit,
 		t.cfg.LimitPriceOffsetBps,
 	)
+}
+func (t *Trader) handleEntryProduceError(
+	ctx context.Context,
+	intent *PendingIntent,
+	err error,
+) error {
+	if err == nil {
+		return nil
+	}
+
+	var produceErr *EntryProduceError
+
+	if !errors.As(err, &produceErr) {
+		log.Printf(
+			"[ERROR] producer.entry_failed "+
+				"producer=%s side=%s "+
+				"code=unclassified err=%q",
+			intent.Producer,
+			intent.Side,
+			err,
+		)
+
+		return err
+	}
+
+	log.Printf(
+		"[PRODUCER] stage=entry_failed "+
+			"producer=%s side=%s order_id=%s "+
+			"code=%s cleanup_required=%t reason=%q",
+		produceErr.Producer,
+		produceErr.Side,
+		produceErr.OrderID,
+		produceErr.Code,
+		produceErr.CleanupRequired,
+		produceErr.Cause,
+	)
+
+	if !produceErr.CleanupRequired ||
+		produceErr.OrderID == "" {
+
+		return produceErr
+	}
+
+	cancelErr := t.broker.CancelOrder(
+		ctx,
+		intent.ProductID,
+		produceErr.OrderID,
+	)
+	if cancelErr != nil {
+		log.Printf(
+			"[PRODUCER] stage=cleanup_cancel_failed "+
+				"producer=%s side=%s order_id=%s "+
+				"original_code=%s err=%q",
+			produceErr.Producer,
+			produceErr.Side,
+			produceErr.OrderID,
+			produceErr.Code,
+			cancelErr,
+		)
+
+		return &EntryProduceError{
+			Code:            EntryProduceErrCleanupCancel,
+			Producer:        produceErr.Producer,
+			Side:            produceErr.Side,
+			OrderID:         produceErr.OrderID,
+			CleanupRequired: true,
+			Cause: fmt.Errorf(
+				"original=%v cleanup_cancel=%w",
+				produceErr,
+				cancelErr,
+			),
+		}
+	}
+
+	log.Printf(
+		"[PRODUCER] stage=cleanup_cancelled "+
+			"producer=%s side=%s order_id=%s "+
+			"original_code=%s",
+		produceErr.Producer,
+		produceErr.Side,
+		produceErr.OrderID,
+		produceErr.Code,
+	)
+
+	return produceErr
 }
 
 // Entry Producer Main Helper internal helps
@@ -6054,4 +6172,79 @@ func (t *Trader) pendingProducerCountsNoLock() PendingProducerCounts {
 	}
 
 	return result
+}
+
+func (t *Trader) handleCase3AReplacementError(
+	repl PendingIntent,
+	anchorID string,
+	err error,
+) {
+	if err == nil {
+		return
+	}
+
+	var produceErr *EntryProduceError
+
+	if errors.As(err, &produceErr) {
+		switch produceErr.Code {
+
+		case EntryProduceErrSubmit,
+			EntryProduceErrPersist:
+
+			t.markCase3AReplacementRetryLocked(
+				repl,
+				anchorID,
+				fmt.Sprintf(
+					"initial_modeB_replacement_retryable: %v",
+					err,
+				),
+			)
+
+		case EntryProduceErrCleanupCancel:
+			log.Printf(
+				"[ERROR] Case3A.replacement.cleanup_uncertain "+
+					"method=%s anchor_id=%s order_id=%s err=%v",
+				repl.RecoveryMethod.String(),
+				anchorID,
+				produceErr.OrderID,
+				err,
+			)
+
+		case EntryProduceErrInvalidIntent,
+			EntryProduceErrBuild,
+			EntryProduceErrRegister:
+
+			log.Printf(
+				"[ERROR] Case3A.replacement.non_retryable "+
+					"code=%s method=%s anchor_id=%s "+
+					"order_id=%s err=%v",
+				produceErr.Code,
+				repl.RecoveryMethod.String(),
+				anchorID,
+				produceErr.OrderID,
+				err,
+			)
+
+		default:
+			t.markCase3AReplacementRetryLocked(
+				repl,
+				anchorID,
+				fmt.Sprintf(
+					"initial_modeB_replacement_unclassified: %v",
+					err,
+				),
+			)
+		}
+
+		return
+	}
+
+	t.markCase3AReplacementRetryLocked(
+		repl,
+		anchorID,
+		fmt.Sprintf(
+			"initial_modeB_replacement_unclassified: %v",
+			err,
+		),
+	)
 }
