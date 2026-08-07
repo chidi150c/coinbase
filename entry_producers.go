@@ -123,15 +123,12 @@ func applyNormalLegacyProducer(
 		}
 
 		d.Signal = Buy
-		d.Producer = EntryProducerNormalLegacy
 		d.LogicOpinion = legacy.LogicOpinion
 		d.LegacySignal = legacy.Signal
-
-		d.PyramidPass =
-			pyramid.Buy.GatePassed
-		d.PyramidReason =
-			pyramid.Buy.Reason
-
+		d.PyramidPass = pyramid.Buy.GatePassed
+		d.PyramidReason = pyramid.Buy.Reason
+		d.Producer = EntryProducerNormalLegacy
+		d.PendingCancelPolicy = PendingSignalCancelOnFlatOrOpposite
 		d.ProducerReason = fmt.Sprintf(
 			"normal_legacy_buy|"+
 				"ai_raw=%s|logic=%s|"+
@@ -178,7 +175,6 @@ func applyNormalLegacyProducer(
 		}
 
 		d.Signal = Sell
-		d.Producer = EntryProducerNormalLegacy
 		d.LogicOpinion = legacy.LogicOpinion
 		d.LegacySignal = legacy.Signal
 
@@ -186,7 +182,8 @@ func applyNormalLegacyProducer(
 			pyramid.Sell.GatePassed
 		d.PyramidReason =
 			pyramid.Sell.Reason
-
+		d.Producer = EntryProducerNormalLegacy
+		d.PendingCancelPolicy = PendingSignalCancelOnFlatOrOpposite
 		d.ProducerReason = fmt.Sprintf(
 			"normal_legacy_sell|"+
 				"ai_raw=%s|logic=%s|"+
@@ -408,16 +405,14 @@ func applyEquityProducer(
 		}
 
 		d.Signal = Buy
-		d.Producer = EntryProducerEquity
 		d.LogicOpinion = legacy.LogicOpinion
 		d.LegacySignal = legacy.Signal
-
 		d.PyramidPass = pyramidPass
 		d.PyramidReason = pyramid.Buy.Reason
-
 		d.EquityPass = equityPass
 		d.EquityReason = equity.Reason
-
+		d.Producer = EntryProducerEquity
+		d.PendingCancelPolicy = PendingSignalCancelOnOpposite
 		d.ProducerReason = fmt.Sprintf(
 			"equity_buy|"+
 				"ai_raw=%s|logic=%s|"+
@@ -473,7 +468,6 @@ func applyEquityProducer(
 		}
 
 		d.Signal = Sell
-		d.Producer = EntryProducerEquity
 		d.LogicOpinion = legacy.LogicOpinion
 		d.LegacySignal = legacy.Signal
 
@@ -482,7 +476,8 @@ func applyEquityProducer(
 
 		d.EquityPass = equityPass
 		d.EquityReason = equity.Reason
-
+		d.PendingCancelPolicy = PendingSignalCancelOnOpposite
+		d.Producer = EntryProducerEquity
 		d.ProducerReason = fmt.Sprintf(
 			"equity_sell|"+
 				"ai_raw=%s|logic=%s|"+
@@ -616,14 +611,10 @@ func applyCase11ReversalProducer(
 	// Case 11A has priority over Case 11B if both somehow evaluate true.
 	if peakReversalSell {
 		d.Signal = Sell
-		d.Producer =
-			EntryProducerCase11APeakReversal
-
-		d.PyramidPass =
-			pyramid.Sell.GatePassed
-		d.PyramidReason =
-			pyramid.Sell.Reason
-
+		d.PyramidPass = pyramid.Sell.GatePassed
+		d.PyramidReason = pyramid.Sell.Reason
+		d.Producer = EntryProducerCase11APeakReversal
+		d.PendingCancelPolicy = PendingSignalCancelDisabled
 		d.ProducerReason = fmt.Sprintf(
 			"peak_reversal_sell|"+
 				"macd_idx6=%.6f|eps=%.6f|buffer=%.2f|"+
@@ -645,14 +636,10 @@ func applyCase11ReversalProducer(
 
 	if bottomReversalBuy {
 		d.Signal = Buy
-		d.Producer =
-			EntryProducerCase11BBottomReversal
-
-		d.PyramidPass =
-			pyramid.Buy.GatePassed
-		d.PyramidReason =
-			pyramid.Buy.Reason
-
+		d.PyramidPass = pyramid.Buy.GatePassed
+		d.PyramidReason = pyramid.Buy.Reason
+		d.Producer = EntryProducerCase11BBottomReversal
+		d.PendingCancelPolicy = PendingSignalCancelDisabled
 		d.ProducerReason = fmt.Sprintf(
 			"bottom_reversal_buy|"+
 				"macd_idx6=%.6f|eps=%.6f|buffer=%.2f|"+
@@ -861,7 +848,6 @@ func applyCase13APeakProducer(
 	}
 
 	d.Signal = Sell
-	d.Producer = EntryProducerCase13APeakSell
 
 	// Case13A requires SELL spacing. The complete ordinary Pyramid gate
 	// is not required for the first entry. Its advanced latch is required
@@ -869,9 +855,9 @@ func applyCase13APeakProducer(
 	// d.PyramidPass =
 	// 	pyramid.Sell.SpacingPass &&
 	// 		case13AAdversePass
-
 	d.PyramidReason = pyramid.Sell.Reason
-
+	d.Producer = EntryProducerCase13APeakSell
+	d.PendingCancelPolicy = PendingSignalCancelDisabled
 	d.ProducerReason = fmt.Sprintf(
 		"peak_sell|"+
 			"confidence=%.2f|regime=%s|"+
@@ -1017,7 +1003,6 @@ func applyCase13BBottomProducer(
 	}
 
 	d.Signal = Buy
-	d.Producer = EntryProducerCase13BBottomBuy
 
 	// Case13B requires BUY spacing. The complete ordinary Pyramid gate
 	// is not required for the first entry. Its advanced latch is required
@@ -1025,9 +1010,9 @@ func applyCase13BBottomProducer(
 	// d.PyramidPass =
 	// 	pyramid.Buy.SpacingPass &&
 	// 		case13BAdversePass
-
 	d.PyramidReason = pyramid.Buy.Reason
-
+	d.Producer = EntryProducerCase13BBottomBuy
+	d.PendingCancelPolicy = PendingSignalCancelDisabled
 	d.ProducerReason = fmt.Sprintf(
 		"bottom_buy|"+
 			"confidence=%.2f|regime=%s|"+
@@ -1179,11 +1164,10 @@ func applyCase14BUptrendBuyProducer(
 	}
 
 	d.Signal = Buy
-	d.Producer = EntryProducerCase14BUptrendBuy
 	d.ProfitGateMultiplier = profitGateMultiplier
-
 	d.PyramidReason = pyramid.Buy.Reason
-
+	d.Producer = EntryProducerCase14BUptrendBuy
+	d.PendingCancelPolicy = PendingSignalCancelDisabled
 	d.ProducerReason = fmt.Sprintf(
 		"uptrend_buffered_latch_buy|"+
 			"confidence=%.2f|"+

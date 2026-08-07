@@ -147,6 +147,7 @@ type EntryDecision struct {
 	PriceNearRecentHigh  bool
 	ProfitGateMultiplier float64
 	ProducerReason       string
+	PendingCancelPolicy  PendingSignalCancelPolicy
 }
 
 // ExitDecision contains only the information required to
@@ -226,6 +227,21 @@ const (
 	EntryProducerCase13BBottomBuy EntryProducer = "Case13BBottomBuy"
 
 	EntryProducerCase14BUptrendBuy EntryProducer = "Case14BUptrendBuy"
+)
+
+type PendingSignalCancelPolicy string
+
+const (
+	PendingSignalCancelUnspecified PendingSignalCancelPolicy = ""
+
+	// Cancel when the current decision becomes FLAT or opposite.
+	PendingSignalCancelOnFlatOrOpposite PendingSignalCancelPolicy = "CancelOnFlatOrOpposite"
+
+	// Ignore FLAT; cancel only when the current decision becomes opposite.
+	PendingSignalCancelOnOpposite PendingSignalCancelPolicy = "CancelOnOpposite"
+
+	// Do not cancel based on the ordinary entry decision signal.
+	PendingSignalCancelDisabled PendingSignalCancelPolicy = "Disabled"
 )
 
 // EquityRawResult preserves the complete direction-independent Equity
@@ -1808,6 +1824,7 @@ func (t *Trader) combineEntryRawMaterials(
 		LogicOpinion:         Flat,
 		Confidence:           ai.Confidence,
 		Producer:             EntryProducerNone,
+		PendingCancelPolicy:  PendingSignalCancelUnspecified,
 		ProfitGateMultiplier: 1.0,
 
 		PUp:           ai.PUp,

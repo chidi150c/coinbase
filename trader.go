@@ -2508,14 +2508,16 @@ func (t *Trader) closeLot(
 						case freshSpareBase >= modeARequiredBase:
 							// Mode A is permitted in every regime, including UP.
 							repl = PendingIntent{
-								Enabled:            true,
-								Side:               SideSell,
-								LimitPx:            replacementEntryPrice,
-								BaseAtLimit:        modeARequiredBase,
-								RecoveryNetUSD:     recoveryNetUSD,
-								RecoveryMethod:     RecoveryByPositionSize,
-								ProfitGateUSD:      t.cfg.ProfitGateUSD,
-								SourceEntryOrderID: lot.EntryOrderID,
+								Enabled:             true,
+								Side:                SideSell,
+								LimitPx:             replacementEntryPrice,
+								BaseAtLimit:         modeARequiredBase,
+								RecoveryNetUSD:      recoveryNetUSD,
+								RecoveryMethod:      RecoveryByPositionSize,
+								ProfitGateUSD:       t.cfg.ProfitGateUSD,
+								SourceEntryOrderID:  lot.EntryOrderID,
+								Producer:            EntryProducerCase3AReplacement,
+								PendingCancelPolicy: PendingSignalCancelDisabled,
 								ProducerReason: fmt.Sprintf(
 									"case3A_replacement|"+
 										"method=%s|"+
@@ -2531,13 +2533,15 @@ func (t *Trader) closeLot(
 						case t.MarketRegime == RegimeDown:
 							// Mode B remains the insufficient-spare fallback only in DOWN regime.
 							repl = PendingIntent{
-								Enabled:        true,
-								Side:           SideSell,
-								LimitPx:        replacementEntryPrice,
-								BaseAtLimit:    normalBase,
-								RecoveryNetUSD: recoveryNetUSD,
-								RecoveryMethod: RecoveryByProfitTarget,
-								ProfitGateUSD:  t.cfg.ProfitGateUSD + recoveryNetUSD,
+								Enabled:             true,
+								Side:                SideSell,
+								LimitPx:             replacementEntryPrice,
+								BaseAtLimit:         normalBase,
+								RecoveryNetUSD:      recoveryNetUSD,
+								RecoveryMethod:      RecoveryByProfitTarget,
+								ProfitGateUSD:       t.cfg.ProfitGateUSD + recoveryNetUSD,
+								Producer:            EntryProducerCase3AReplacement,
+								PendingCancelPolicy: PendingSignalCancelDisabled,
 								ProducerReason: fmt.Sprintf(
 									"%s|"+
 										"method=%s|"+
@@ -2716,13 +2720,46 @@ func (t *Trader) closeLot(
 		if repl.Enabled && repl.RecoveryMethod == RecoveryByProfitTarget {
 			// Case 3A Mode B:
 			// Post loss-exit first, then attempt replacement in same tick.
-			// If replacement fails later, retry waits until loss-exit fill.
+			// Operational replacement failures are retained for retry after
+			// the loss-exit fill. Invalid producer/intent configuration is not
+			// treated as a transient retry condition.
 			if _, err := t.startCase3AReplacement(ctx, repl); err != nil {
-				t.markCase3AReplacementRetryLocked(
-					repl,
-					waitID,
-					fmt.Sprintf("initial_modeB_replacement_failed: %v", err),
-				)
+				switch {
+				case errors.Is(err, ErrEntrySubmitFailed),
+					errors.Is(err, ErrEntryBuildFailed),
+					errors.Is(err, ErrEntryRegisterFailed),
+					errors.Is(err, ErrEntryPersistFailed):
+
+					t.markCase3AReplacementRetryLocked(
+						repl,
+						waitID,
+						fmt.Sprintf(
+							"initial_modeB_replacement_retryable: %v",
+							err,
+						),
+					)
+
+				case errors.Is(err, ErrEntryIntentInvalid):
+					log.Printf(
+						"[ERROR] Case3A.replacement.invalid "+
+							"method=%s wait_id=%s err=%v",
+						repl.RecoveryMethod.String(),
+						waitID,
+						err,
+					)
+
+				default:
+					// Unknown failures should not silently disappear.
+					// Preserve retry behavior until they are explicitly classified.
+					t.markCase3AReplacementRetryLocked(
+						repl,
+						waitID,
+						fmt.Sprintf(
+							"initial_modeB_replacement_unclassified: %v",
+							err,
+						),
+					)
+				}
 			}
 		}
 
@@ -3248,11 +3285,12 @@ func (t *Trader) maybeCloseDustBasket(ctx context.Context, side OrderSide, liveP
 }
 
 type PendingEntry struct {
-	OrderID        string
-	Side           OrderSide
-	Producer       EntryProducer
-	ProducerReason string
-	Intent         *PendingIntent
+	OrderID             string
+	Side                OrderSide
+	Producer            EntryProducer
+	ProducerReason      string
+	PendingCancelPolicy PendingSignalCancelPolicy
+	Intent              *PendingIntent
 
 	ResultC chan OpenResult    `json:"-"`
 	Cancel  context.CancelFunc `json:"-"`
@@ -3316,7 +3354,8 @@ type PendingIntent struct {
 
 	// Empty for normal entries.
 	// Case3A uses this to identify the entry that caused the replacement.
-	SourceEntryOrderID string `json:"source_entry_order_id,omitempty"`
+	SourceEntryOrderID  string                    `json:"source_entry_order_id,omitempty"`
+	PendingCancelPolicy PendingSignalCancelPolicy `json:"pending_cancel_policy,omitempty"`
 }
 
 func (t *Trader) positionExistsByEntryOrderID(orderID string) bool {
@@ -3470,18 +3509,18 @@ func (t *Trader) startProducerSellEntry(
 // Case3A Source Wrapper
 func (t *Trader) startCase3AReplacement(
 	ctx context.Context,
-	repl PendingIntent,
+	intent PendingIntent,
 ) (string, error) {
-	if !repl.Enabled {
+	if !intent.Enabled {
 		log.Printf(
 			"[TRACE] Case3A.replacement.disabled "+
 				"side=%s method=%s base=%.8f "+
 				"entry=%.8f notional=%.2f",
-			repl.Side,
-			repl.RecoveryMethod.String(),
-			repl.BaseAtLimit,
-			repl.LimitPx,
-			repl.Quote,
+			intent.Side,
+			intent.RecoveryMethod.String(),
+			intent.BaseAtLimit,
+			intent.LimitPx,
+			intent.Quote,
 		)
 
 		return "", nil
@@ -3491,11 +3530,11 @@ func (t *Trader) startCase3AReplacement(
 		"[TRACE] Case3A.replacement.enter "+
 			"side=%s method=%s base=%.8f "+
 			"entry=%.8f notional=%.2f",
-		repl.Side,
-		repl.RecoveryMethod.String(),
-		repl.BaseAtLimit,
-		repl.LimitPx,
-		repl.Quote,
+		intent.Side,
+		intent.RecoveryMethod.String(),
+		intent.BaseAtLimit,
+		intent.LimitPx,
+		intent.Quote,
 	)
 
 	defer log.Printf(
@@ -3503,7 +3542,7 @@ func (t *Trader) startCase3AReplacement(
 	)
 
 	sourceEntryOrderID := strings.TrimSpace(
-		repl.SourceEntryOrderID,
+		intent.SourceEntryOrderID,
 	)
 
 	if sourceEntryOrderID == "" {
@@ -3511,11 +3550,6 @@ func (t *Trader) startCase3AReplacement(
 			"Case3A replacement: missing SourceEntryOrderID",
 		)
 	}
-
-	// ReplacementRequest has been absorbed into PendingIntent.
-	// Preserve the complete recovery intent and only enforce
-	// Case3A-specific ownership/runtime metadata here.
-	intent := repl
 
 	intent.Producer = EntryProducerCase3AReplacement
 	intent.ProductID = t.cfg.ProductID
@@ -3553,10 +3587,10 @@ func (t *Trader) startCase3AReplacement(
 			"[TRACE] Case3A.replacement.failed "+
 				"side=%s price=%.8f base=%.8f "+
 				"method=%s err=%v",
-			repl.Side,
-			repl.LimitPx,
-			repl.BaseAtLimit,
-			repl.RecoveryMethod.String(),
+			entry.Side,
+			entry.Intent.LimitPx,
+			entry.Intent.BaseAtLimit,
+			entry.Intent.RecoveryMethod.String(),
 			err,
 		)
 
@@ -3578,7 +3612,7 @@ func (t *Trader) startCase3AReplacement(
 		entry.Side,
 		entry.Intent.LimitPx,
 		entry.Intent.BaseAtLimit,
-		repl.RecoveryMethod.String(),
+		entry.Intent.RecoveryMethod.String(),
 	)
 
 	return entry.OrderID, nil
@@ -3759,10 +3793,21 @@ func (t *Trader) validatePendingIntent(
 			intent.ProfitGateUSD,
 		)
 	}
+	if intent.Producer == EntryProducerNone {
+		return errors.New(
+			"validate pending intent: missing Producer",
+		)
+	}
 
 	if strings.TrimSpace(intent.ProducerReason) == "" {
 		return errors.New(
 			"validate pending intent: missing Reason",
+		)
+	}
+	if intent.PendingCancelPolicy == PendingSignalCancelUnspecified {
+		return fmt.Errorf(
+			"validate pending intent: missing PendingCancelPolicy for Producer=%q",
+			intent.Producer,
 		)
 	}
 
@@ -3815,8 +3860,9 @@ func (t *Trader) submitPendingIntent(
 		intent.LimitPx,
 		intent.BaseAtLimit,
 	)
+	orderID = strings.TrimSpace(orderID)
 	if err != nil {
-		return "", fmt.Errorf(
+		return orderID, fmt.Errorf(
 			"submit pending intent: place post-only order: "+
 				"product=%s side=%s limit=%.8f base=%.8f: %w",
 			intent.ProductID,
@@ -3827,7 +3873,6 @@ func (t *Trader) submitPendingIntent(
 		)
 	}
 
-	orderID = strings.TrimSpace(orderID)
 	if orderID == "" {
 		return "", fmt.Errorf(
 			"submit pending intent: broker returned empty order ID: "+
@@ -3871,11 +3916,12 @@ func (t *Trader) buildPendingEntry(
 	}
 
 	entry := &PendingEntry{
-		Side:           intent.Side,
-		Producer:       intent.Producer,
-		ProducerReason: intent.ProducerReason,
-		OrderID:        intent.OrderID,
-		Intent:         intent,
+		Side:                intent.Side,
+		Producer:            intent.Producer,
+		ProducerReason:      intent.ProducerReason,
+		PendingCancelPolicy: intent.PendingCancelPolicy,
+		OrderID:             intent.OrderID,
+		Intent:              intent,
 
 		ResultC: make(chan OpenResult, 1),
 
@@ -4195,10 +4241,12 @@ poll:
 				if t.pendingEntryCancelRequested(entry) {
 					log.Printf(
 						"[TRACE] postonly.reprice.skip.cancel_requested "+
-							"producer=%s side=%s order_id=%s",
+							"producer=%s side=%s order_id=%s "+
+							"last_status=%s",
 						entry.Producer,
 						side,
 						orderID,
+						status,
 					)
 
 					lastReprice = time.Now()

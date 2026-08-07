@@ -379,7 +379,7 @@ Example direction:
 
         intent := entry.Intent
 
-        switch entry.Side {
+        switch entry.Intent.Side {
         case SideSell:
             if t.cfg.RequireBaseForShort {
                 reservedLongBase += intent.BaseAtLimit

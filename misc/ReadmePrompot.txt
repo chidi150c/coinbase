@@ -771,7 +771,7 @@ func (t *Trader) registerCase3APendingEntry(
 	log.Printf(
 		"[TRACE] Case3A.pending.register id=%s side=%s source_entry_order_id=%s replacement_order_id=%s",
 		entry.ID,
-		entry.Side,
+		entry.Intent.Side,
 		entry.SourceEntryOrderID,
 		pending.OrderID,
 	)
@@ -901,7 +901,7 @@ func (t *Trader) drainPendingEntry(
 		return
 	}
 
-	side := entry.Side
+	side := entry.Intent.Side
 	pending := entry.Pending
 	book := entry.Book
 
@@ -1147,7 +1147,7 @@ func (t *Trader) commitEntryFill(
 		return fmt.Errorf("filled result missing execution")
 	}
 
-	side := entry.Side
+	side := entry.Intent.Side
 	pending := entry.Pending
 	book := entry.Book
 

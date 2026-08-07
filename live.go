@@ -593,7 +593,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 					continue
 				}
 
-				// Cancel stale NORMAL pending opens if the current decision
+				// Apply each pending producer's declared signal-cancellation policy.
 				// no longer supports their side.
 				//
 				// Do NOT remove the PendingEntry here.
@@ -609,26 +609,39 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 						continue
 					}
 
-					// Case3A replacement lifecycle is not controlled by the
-					// current normal entry signal.
-					if entry.Producer == EntryProducerCase3AReplacement {
-						continue
-					}
+					cancel := false
 
-					stale := false
+					switch entry.Intent.PendingCancelPolicy {
 
-					switch entry.Side {
-					case SideBuy:
-						stale = res.Signal != Buy
+					case PendingSignalCancelOnFlatOrOpposite:
+						switch entry.Side {
+						case SideBuy:
+							cancel = res.Signal != Buy
+						case SideSell:
+							cancel = res.Signal != Sell
+						}
 
-					case SideSell:
-						stale = res.Signal != Sell
+					case PendingSignalCancelOnOpposite:
+						switch entry.Side {
+						case SideBuy:
+							cancel = res.Signal == Sell
+						case SideSell:
+							cancel = res.Signal == Buy
+						}
+
+					case PendingSignalCancelDisabled:
+						cancel = false
 
 					default:
+						log.Printf(
+							"[ERROR] pending.cancel unknown policy=%q producer=%s",
+							entry.Intent.PendingCancelPolicy,
+							entry.Producer,
+						)
 						continue
 					}
 
-					if !stale {
+					if !cancel {
 						continue
 					}
 
@@ -657,6 +670,18 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 							orderID,
 						)
 					}
+
+					log.Printf(
+						"[PRODUCER] stage=cancel_requested "+
+							"producer=%s side=%s order_id=%s "+
+							"policy=%s reason=decision_changed "+
+							"pending_side=%s",
+						entry.Producer,
+						entry.Side,
+						orderID,
+						entry.Intent.PendingCancelPolicy,
+						entry.Side,
+					)
 
 					switch entry.Side {
 					case SideBuy:
