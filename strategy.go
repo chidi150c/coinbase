@@ -207,43 +207,6 @@ func decisionExitReason(d ExitDecision) string {
 	return strings.Join(parts, "|")
 }
 
-type EntryProducer string
-
-const (
-	EntryProducerNone EntryProducer = ""
-
-	EntryProducerNormalLegacy EntryProducer = "NormalLegacy"
-
-	EntryProducerEquity EntryProducer = "Equity"
-
-	EntryProducerCase3AReplacement EntryProducer = "Case3AReplacement"
-
-	EntryProducerCase11APeakReversal EntryProducer = "Case11APeakReversal"
-
-	EntryProducerCase11BBottomReversal EntryProducer = "Case11BBottomReversal"
-
-	EntryProducerCase13APeakSell EntryProducer = "Case13APeakSell"
-
-	EntryProducerCase13BBottomBuy EntryProducer = "Case13BBottomBuy"
-
-	EntryProducerCase14BUptrendBuy EntryProducer = "Case14BUptrendBuy"
-)
-
-type PendingSignalCancelPolicy string
-
-const (
-	PendingSignalCancelUnspecified PendingSignalCancelPolicy = ""
-
-	// Cancel when the current decision becomes FLAT or opposite.
-	PendingSignalCancelOnFlatOrOpposite PendingSignalCancelPolicy = "CancelOnFlatOrOpposite"
-
-	// Ignore FLAT; cancel only when the current decision becomes opposite.
-	PendingSignalCancelOnOpposite PendingSignalCancelPolicy = "CancelOnOpposite"
-
-	// Do not cancel based on the ordinary entry decision signal.
-	PendingSignalCancelDisabled PendingSignalCancelPolicy = "Disabled"
-)
-
 // EquityRawResult preserves the complete direction-independent Equity
 // threshold snapshot.
 //

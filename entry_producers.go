@@ -71,6 +71,44 @@ import (
 	"time"
 )
 
+
+type EntryProducer string
+
+const (
+	EntryProducerNone EntryProducer = ""
+
+	EntryProducerNormalLegacy EntryProducer = "NormalLegacy"
+
+	EntryProducerEquity EntryProducer = "Equity"
+
+	EntryProducerCase3AReplacement EntryProducer = "Case3AReplacement"
+
+	EntryProducerCase11APeakReversal EntryProducer = "Case11APeakReversal"
+
+	EntryProducerCase11BBottomReversal EntryProducer = "Case11BBottomReversal"
+
+	EntryProducerCase13APeakSell EntryProducer = "Case13APeakSell"
+
+	EntryProducerCase13BBottomBuy EntryProducer = "Case13BBottomBuy"
+
+	EntryProducerCase14BUptrendBuy EntryProducer = "Case14BUptrendBuy"
+)
+
+type PendingSignalCancelPolicy string
+
+const (
+	PendingSignalCancelUnspecified PendingSignalCancelPolicy = ""
+
+	// Cancel when the current decision becomes FLAT or opposite.
+	PendingSignalCancelOnFlatOrOpposite PendingSignalCancelPolicy = "CancelOnFlatOrOpposite"
+
+	// Ignore FLAT; cancel only when the current decision becomes opposite.
+	PendingSignalCancelOnOpposite PendingSignalCancelPolicy = "CancelOnOpposite"
+
+	// Do not cancel based on the ordinary entry decision signal.
+	PendingSignalCancelDisabled PendingSignalCancelPolicy = "Disabled"
+)
+
 // applyNormalLegacyProducer evaluates the standard AI + Logic + Pyramid
 // entry producer.
 //
@@ -101,22 +139,22 @@ func applyNormalLegacyProducer(
 		produced :=
 			pyramid.Buy.GatePassed
 
-		log.Printf(
-			"[TRACE] normal_legacy.buy.evaluate "+
-				"ai_raw=%s logic=%s legacy=%s "+
-				"strong_negative=%t momentum_up=%t pattern_buy=%t "+
-				"spacing=%t adverse=%t gate=%t produced=%t",
-			ai.Raw,
-			legacy.LogicOpinion,
-			legacy.Signal,
-			macd.StrongNegative,
-			macd.MomentumUp,
-			ema.PatternBuy,
-			pyramid.Buy.SpacingPass,
-			pyramid.Buy.AdversePass,
-			pyramid.Buy.GatePassed,
-			produced,
-		)
+		// log.Printf(
+		// 	"[TRACE] normal_legacy.buy.evaluate "+
+		// 		"ai_raw=%s logic=%s legacy=%s "+
+		// 		"strong_negative=%t momentum_up=%t pattern_buy=%t "+
+		// 		"spacing=%t adverse=%t gate=%t produced=%t",
+		// 	ai.Raw,
+		// 	legacy.LogicOpinion,
+		// 	legacy.Signal,
+		// 	macd.StrongNegative,
+		// 	macd.MomentumUp,
+		// 	ema.PatternBuy,
+		// 	pyramid.Buy.SpacingPass,
+		// 	pyramid.Buy.AdversePass,
+		// 	pyramid.Buy.GatePassed,
+		// 	produced,
+		// )
 
 		if !produced {
 			return false
@@ -153,22 +191,22 @@ func applyNormalLegacyProducer(
 		produced :=
 			pyramid.Sell.GatePassed
 
-		log.Printf(
-			"[TRACE] normal_legacy.sell.evaluate "+
-				"ai_raw=%s logic=%s legacy=%s "+
-				"strong_positive=%t momentum_down=%t pattern_sell=%t "+
-				"spacing=%t adverse=%t gate=%t produced=%t",
-			ai.Raw,
-			legacy.LogicOpinion,
-			legacy.Signal,
-			macd.StrongPositive,
-			macd.MomentumDown,
-			ema.PatternSell,
-			pyramid.Sell.SpacingPass,
-			pyramid.Sell.AdversePass,
-			pyramid.Sell.GatePassed,
-			produced,
-		)
+		// log.Printf(
+		// 	"[TRACE] normal_legacy.sell.evaluate "+
+		// 		"ai_raw=%s logic=%s legacy=%s "+
+		// 		"strong_positive=%t momentum_down=%t pattern_sell=%t "+
+		// 		"spacing=%t adverse=%t gate=%t produced=%t",
+		// 	ai.Raw,
+		// 	legacy.LogicOpinion,
+		// 	legacy.Signal,
+		// 	macd.StrongPositive,
+		// 	macd.MomentumDown,
+		// 	ema.PatternSell,
+		// 	pyramid.Sell.SpacingPass,
+		// 	pyramid.Sell.AdversePass,
+		// 	pyramid.Sell.GatePassed,
+		// 	produced,
+		// )
 
 		if !produced {
 			return false
@@ -205,16 +243,16 @@ func applyNormalLegacyProducer(
 		return true
 
 	default:
-		log.Printf(
-			"[TRACE] normal_legacy.evaluate "+
-				"ai_raw=%s logic=%s legacy=%s "+
-				"normal_buy=%t normal_sell=%t produced=false",
-			ai.Raw,
-			legacy.LogicOpinion,
-			legacy.Signal,
-			legacy.NormalBuy,
-			legacy.NormalSell,
-		)
+		// log.Printf(
+		// 	"[TRACE] normal_legacy.evaluate "+
+		// 		"ai_raw=%s logic=%s legacy=%s "+
+		// 		"normal_buy=%t normal_sell=%t produced=false",
+		// 	ai.Raw,
+		// 	legacy.LogicOpinion,
+		// 	legacy.Signal,
+		// 	legacy.NormalBuy,
+		// 	legacy.NormalSell,
+		// )
 
 		return false
 	}
@@ -385,20 +423,20 @@ func applyEquityProducer(
 			pyramidPass &&
 				equityPass
 
-		log.Printf(
-			"[TRACE] equity.buy.evaluate "+
-				"ai_raw=%s logic=%s legacy=%s "+
-				"pyramid_gate=%t equity_trigger=%t produced=%t "+
-				"equity=%.2f baseline=%.2f",
-			ai.Raw,
-			legacy.LogicOpinion,
-			legacy.Signal,
-			pyramidPass,
-			equityPass,
-			produced,
-			equity.Raw.EquityUSD,
-			equity.Raw.BaselineUSD,
-		)
+		// log.Printf(
+		// 	"[TRACE] equity.buy.evaluate "+
+		// 		"ai_raw=%s logic=%s legacy=%s "+
+		// 		"pyramid_gate=%t equity_trigger=%t produced=%t "+
+		// 		"equity=%.2f baseline=%.2f",
+		// 	ai.Raw,
+		// 	legacy.LogicOpinion,
+		// 	legacy.Signal,
+		// 	pyramidPass,
+		// 	equityPass,
+		// 	produced,
+		// 	equity.Raw.EquityUSD,
+		// 	equity.Raw.BaselineUSD,
+		// )
 
 		if !produced {
 			return false
@@ -448,20 +486,20 @@ func applyEquityProducer(
 			pyramidPass &&
 				equityPass
 
-		log.Printf(
-			"[TRACE] equity.sell.evaluate "+
-				"ai_raw=%s logic=%s legacy=%s "+
-				"pyramid_gate=%t equity_trigger=%t produced=%t "+
-				"equity=%.2f baseline=%.2f",
-			ai.Raw,
-			legacy.LogicOpinion,
-			legacy.Signal,
-			pyramidPass,
-			equityPass,
-			produced,
-			equity.Raw.EquityUSD,
-			equity.Raw.BaselineUSD,
-		)
+		// log.Printf(
+		// 	"[TRACE] equity.sell.evaluate "+
+		// 		"ai_raw=%s logic=%s legacy=%s "+
+		// 		"pyramid_gate=%t equity_trigger=%t produced=%t "+
+		// 		"equity=%.2f baseline=%.2f",
+		// 	ai.Raw,
+		// 	legacy.LogicOpinion,
+		// 	legacy.Signal,
+		// 	pyramidPass,
+		// 	equityPass,
+		// 	produced,
+		// 	equity.Raw.EquityUSD,
+		// 	equity.Raw.BaselineUSD,
+		// )
 
 		if !produced {
 			return false
@@ -579,34 +617,34 @@ func applyCase11ReversalProducer(
 	d.MACDPreBottomZone = macdPreBottomZone
 	d.BottomReversalBuy = bottomReversalBuy
 
-	log.Printf(
-		"[TRACE] case11A.peak_reversal_sell.evaluate "+
-			"macd_idx6=%.6f eps=%.6f buffer=%.2f threshold=%.6f "+
-			"macd_zone=%t ema_high_peak=%t "+
-			"pyramid_sell=%t pyramid_reason=%s",
-		macd.LinePrev6,
-		macd.EPS,
-		macdPeakBuffer,
-		macdPrePeakThreshold,
-		macdPrePeakZone,
-		ema.HighPeak,
-		pyramid.Sell.GatePassed,
-		pyramid.Sell.Reason,
-	)
-	log.Printf(
-		"[TRACE] case11B.bottom_reversal_buy.evaluate "+
-			"macd_idx6=%.6f eps=%.6f buffer=%.2f threshold=%.6f "+
-			"macd_zone=%t ema_low_bottom=%t "+
-			"pyramid_buy=%t pyramid_reason=%s",
-		macd.LinePrev6,
-		macd.EPS,
-		macdBottomBuffer,
-		macdPreBottomThreshold,
-		macdPreBottomZone,
-		ema.LowBottom,
-		pyramid.Buy.GatePassed,
-		pyramid.Buy.Reason,
-	)
+	// log.Printf(
+	// 	"[TRACE] case11A.peak_reversal_sell.evaluate "+
+	// 		"macd_idx6=%.6f eps=%.6f buffer=%.2f threshold=%.6f "+
+	// 		"macd_zone=%t ema_high_peak=%t "+
+	// 		"pyramid_sell=%t pyramid_reason=%s",
+	// 	macd.LinePrev6,
+	// 	macd.EPS,
+	// 	macdPeakBuffer,
+	// 	macdPrePeakThreshold,
+	// 	macdPrePeakZone,
+	// 	ema.HighPeak,
+	// 	pyramid.Sell.GatePassed,
+	// 	pyramid.Sell.Reason,
+	// )
+	// log.Printf(
+	// 	"[TRACE] case11B.bottom_reversal_buy.evaluate "+
+	// 		"macd_idx6=%.6f eps=%.6f buffer=%.2f threshold=%.6f "+
+	// 		"macd_zone=%t ema_low_bottom=%t "+
+	// 		"pyramid_buy=%t pyramid_reason=%s",
+	// 	macd.LinePrev6,
+	// 	macd.EPS,
+	// 	macdBottomBuffer,
+	// 	macdPreBottomThreshold,
+	// 	macdPreBottomZone,
+	// 	ema.LowBottom,
+	// 	pyramid.Buy.GatePassed,
+	// 	pyramid.Buy.Reason,
+	// )
 
 	// Case 11A has priority over Case 11B if both somehow evaluate true.
 	if peakReversalSell {
@@ -748,6 +786,7 @@ func applyCase13APeakProducer(
 	const (
 		minConfidence  = 0.65
 		maxNearPeakPct = 0.10
+		profitGateMultiplier = 0.50
 	)
 
 	// Case 12 extension for Case 13A:
@@ -810,38 +849,39 @@ func applyCase13APeakProducer(
 		peakSellArm &&
 			ema.HighPeak
 
-	log.Printf(
-		"[TRACE] case13A.peak_sell.evaluate "+
-			"ai_raw=%s confidence=%.2f min_confidence=%.2f regime=%s "+
-			"price=%.8f recent_peak=%.8f near_peak_pct=%.6f "+
-			"price_near_peak=%t "+
-			"macd_idx6=%.6f macd_line=%.6f macd_hist=%.6f "+
-			"ema_high_peak=%t "+
-			"pyramid_spacing=%t "+
-			"pending_count=%d adverse_required=%t "+
-			"sell_latched=%.8f adverse_reached=%t adverse_pass=%t "+
-			"arm=%t producer=%t",
-		ai.Raw,
-		ai.Confidence,
-		minConfidence,
-		regime,
-		price,
-		recentHigh,
-		nearPeakPct,
-		priceNearRecentHigh,
-		macd.LinePrev6,
-		macd.Line,
-		macd.Hist,
-		ema.HighPeak,
-		pyramid.Sell.SpacingPass,
-		case13APending,
-		case13AAdverseRequired,
-		pyramid.Sell.Latched,
-		sellAdverseReached,
-		case13AAdversePass,
-		peakSellArm,
-		peakSell,
-	)
+	// log.Printf(
+	// 	"[TRACE] case13A.peak_sell.evaluate "+
+	// 		"ai_raw=%s confidence=%.2f min_confidence=%.2f regime=%s "+
+	// 		"price=%.8f recent_peak=%.8f near_peak_pct=%.6f "+
+	// 		"price_near_peak=%t "+
+	// 		"macd_idx6=%.6f macd_line=%.6f macd_hist=%.6f "+
+	// 		"ema_high_peak=%t "+
+	// 		"pyramid_spacing=%t "+
+	// 		"pending_count=%d adverse_required=%t "+
+	// 		"sell_latched=%.8f adverse_reached=%t adverse_pass=%t "+
+	// 		"arm=%t producer=%t|profit_gate_mult=%.2f",
+	// 	ai.Raw,
+	// 	ai.Confidence,
+	// 	minConfidence,
+	// 	regime,
+	// 	price,
+	// 	recentHigh,
+	// 	nearPeakPct,
+	// 	priceNearRecentHigh,
+	// 	macd.LinePrev6,
+	// 	macd.Line,
+	// 	macd.Hist,
+	// 	ema.HighPeak,
+	// 	pyramid.Sell.SpacingPass,
+	// 	case13APending,
+	// 	case13AAdverseRequired,
+	// 	pyramid.Sell.Latched,
+	// 	sellAdverseReached,
+	// 	case13AAdversePass,
+	// 	peakSellArm,
+	// 	peakSell,
+	// 	profitGateMultiplier,
+	// )
 
 	if !peakSell {
 		return false
@@ -856,6 +896,8 @@ func applyCase13APeakProducer(
 	// 	pyramid.Sell.SpacingPass &&
 	// 		case13AAdversePass
 	d.PyramidReason = pyramid.Sell.Reason
+	
+	d.ProfitGateMultiplier = profitGateMultiplier
 	d.Producer = EntryProducerCase13APeakSell
 	d.PendingCancelPolicy = PendingSignalCancelDisabled
 	d.ProducerReason = fmt.Sprintf(
@@ -869,7 +911,7 @@ func applyCase13APeakProducer(
 			"adverse_required=%t|"+
 			"sell_latched=%.8f|"+
 			"adverse_reached=%t|"+
-			"adverse_pass=%t",
+			"adverse_pass=%t|profit_gate_mult=%.2f",
 		ai.Confidence,
 		regime,
 		nearPeakPct,
@@ -883,6 +925,7 @@ func applyCase13APeakProducer(
 		pyramid.Sell.Latched,
 		sellAdverseReached,
 		case13AAdversePass,
+		profitGateMultiplier,
 	)
 
 	return true
@@ -902,6 +945,7 @@ func applyCase13BBottomProducer(
 	const (
 		minConfidence = 0.65
 		maxNearLowPct = 0.10
+		profitGateMultiplier = 0.50
 	)
 
 	// Case 12 extension for Case 13B:
@@ -964,39 +1008,40 @@ func applyCase13BBottomProducer(
 		bottomBuyArm &&
 			ema.LowBottom
 
-	log.Printf(
-		"[TRACE] case13B.bottom_buy.evaluate "+
-			"ai_raw=%s confidence=%.2f min_confidence=%.2f regime=%s "+
-			"price=%.8f recent_low=%.8f near_low_pct=%.6f "+
-			"max_near_low_pct=%.2f price_near_low=%t "+
-			"macd_idx6=%.6f macd_line=%.6f macd_hist=%.6f "+
-			"ema_low_bottom=%t "+
-			"pyramid_buy_spacing=%t "+
-			"pending_count=%d adverse_required=%t "+
-			"buy_latched=%.8f adverse_reached=%t adverse_pass=%t "+
-			"arm=%t producer=%t ",
-		ai.Raw,
-		ai.Confidence,
-		minConfidence,
-		regime,
-		price,
-		recentLow,
-		nearLowPct,
-		maxNearLowPct,
-		priceNearRecentLow,
-		macd.LinePrev6,
-		macd.Line,
-		macd.Hist,
-		ema.LowBottom,
-		pyramid.Buy.SpacingPass,
-		case13BPending,
-		case13BAdverseRequired,
-		pyramid.Buy.Latched,
-		buyAdverseReached,
-		case13BAdversePass,
-		bottomBuyArm,
-		bottomBuy,
-	)
+	// log.Printf(
+	// 	"[TRACE] case13B.bottom_buy.evaluate "+
+	// 		"ai_raw=%s confidence=%.2f min_confidence=%.2f regime=%s "+
+	// 		"price=%.8f recent_low=%.8f near_low_pct=%.6f "+
+	// 		"max_near_low_pct=%.2f price_near_low=%t "+
+	// 		"macd_idx6=%.6f macd_line=%.6f macd_hist=%.6f "+
+	// 		"ema_low_bottom=%t "+
+	// 		"pyramid_buy_spacing=%t "+
+	// 		"pending_count=%d adverse_required=%t "+
+	// 		"buy_latched=%.8f adverse_reached=%t adverse_pass=%t|profit_gate_mult=%.2f"+
+	// 		"arm=%t producer=%t ",
+	// 	ai.Raw,
+	// 	ai.Confidence,
+	// 	minConfidence,
+	// 	regime,
+	// 	price,
+	// 	recentLow,
+	// 	nearLowPct,
+	// 	maxNearLowPct,
+	// 	priceNearRecentLow,
+	// 	macd.LinePrev6,
+	// 	macd.Line,
+	// 	macd.Hist,
+	// 	ema.LowBottom,
+	// 	pyramid.Buy.SpacingPass,
+	// 	case13BPending,
+	// 	case13BAdverseRequired,
+	// 	pyramid.Buy.Latched,
+	// 	buyAdverseReached,
+	// 	case13BAdversePass,
+	// 	bottomBuyArm,
+	// 	bottomBuy,
+	// 	profitGateMultiplier,
+	// )
 
 	if !bottomBuy {
 		return false
@@ -1013,6 +1058,7 @@ func applyCase13BBottomProducer(
 	d.PyramidReason = pyramid.Buy.Reason
 	d.Producer = EntryProducerCase13BBottomBuy
 	d.PendingCancelPolicy = PendingSignalCancelDisabled
+	d.ProfitGateMultiplier = profitGateMultiplier
 	d.ProducerReason = fmt.Sprintf(
 		"bottom_buy|"+
 			"confidence=%.2f|regime=%s|"+
@@ -1020,7 +1066,7 @@ func applyCase13BBottomProducer(
 			"macd_idx6=%.6f|macd_line=%.6f|macd_hist=%.6f|"+
 			"ema_low_bottom=%t|spacing=%t|"+
 			"pending=%d|adverse_required=%t|"+
-			"buy_latched=%.8f|adverse_reached=%t|adverse_pass=%t",
+			"buy_latched=%.8f|adverse_reached=%t|adverse_pass=%t|profit_gate_mult=%.2f",
 		ai.Confidence,
 		regime,
 		price,
@@ -1036,6 +1082,7 @@ func applyCase13BBottomProducer(
 		pyramid.Buy.Latched,
 		buyAdverseReached,
 		case13BAdversePass,
+		profitGateMultiplier,
 	)
 
 	return true
@@ -1130,34 +1177,34 @@ func applyCase14BUptrendBuyProducer(
 			ema.PatternBuy &&
 			pyramid.Buy.SpacingPass
 
-	log.Printf(
-		"[TRACE] case14B.uptrend_buy.evaluate "+
-			"ai_raw=%s confidence=%.2f min_confidence=%.2f "+
-			"legacy=%s logic=%s regime=%s pattern_buy=%t "+
-			"price=%.8f latch=%.8f buffered_latch=%.8f "+
-			"buffer_pct=%.4f actual_latch_reached=%t "+
-			"within_latch_window=%t spacing=%t "+
-			"pending_count=%d available=%t "+
-			"profit_gate_mult=%.2f produced=%t",
-		ai.Raw,
-		ai.Confidence,
-		minConfidence,
-		legacy.Signal,
-		legacy.LogicOpinion,
-		regime,
-		ema.PatternBuy,
-		price,
-		pyramid.Buy.Latched,
-		bufferedLatch,
-		nearLatchBufferPct,
-		actualLatchReached,
-		withinLatchWindow,
-		pyramid.Buy.SpacingPass,
-		case14BPending,
-		case14BAvailable,
-		profitGateMultiplier,
-		uptrendBuy,
-	)
+	// log.Printf(
+	// 	"[TRACE] case14B.uptrend_buy.evaluate "+
+	// 		"ai_raw=%s confidence=%.2f min_confidence=%.2f "+
+	// 		"legacy=%s logic=%s regime=%s pattern_buy=%t "+
+	// 		"price=%.8f latch=%.8f buffered_latch=%.8f "+
+	// 		"buffer_pct=%.4f actual_latch_reached=%t "+
+	// 		"within_latch_window=%t spacing=%t "+
+	// 		"pending_count=%d available=%t "+
+	// 		"profit_gate_mult=%.2f produced=%t",
+	// 	ai.Raw,
+	// 	ai.Confidence,
+	// 	minConfidence,
+	// 	legacy.Signal,
+	// 	legacy.LogicOpinion,
+	// 	regime,
+	// 	ema.PatternBuy,
+	// 	price,
+	// 	pyramid.Buy.Latched,
+	// 	bufferedLatch,
+	// 	nearLatchBufferPct,
+	// 	actualLatchReached,
+	// 	withinLatchWindow,
+	// 	pyramid.Buy.SpacingPass,
+	// 	case14BPending,
+	// 	case14BAvailable,
+	// 	profitGateMultiplier,
+	// 	uptrendBuy,
+	// )
 
 	if !uptrendBuy {
 		return false
