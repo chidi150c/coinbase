@@ -1,1361 +1,670 @@
-Currently I have the followings configured[
-	// Process completed asynchronous maker exits before making any new decisions.
-	//
-	// Poller goroutines only report completion through pendingExitCh.
-	// All state mutation (lot removal, partial handling, P/L, exit records,
-	// runner updates, state save, etc.) is performed here on the main trading
-	// thread so Trader state remains single-writer and deterministic.
-	//
-	// This keeps the main loop non-blocking while ensuring completed exits are
-	// reflected before evaluating new entries, exits, or pyramiding decisions.
-	t.drainPendingExitCh(ctx, execHistory, livePrice)
+Implement the BOT OPS Producer Monitor persistence and observability changes exactly as specified below.
 
-	// Case3A fills are committed only after source exits have had a chance
-	// to commit during this tick.
-	t.drainPendingCase3AEntries(
-		now,
-		wallNow,
-	)
+CRITICAL RULE
 
-	// -------------------------------------------------------------------------------------------------
-	// Drain: Unified pending-entry drain.
-	// The unified drain handles the complete asynchronous maker-first entry lifecycle:
-	//   - receive async broker result
-	//   - validate current/history order IDs
-	//   - apply refund-service adjustments
-	//   - restore PendingOpen decision metadata
-	//   - create Position from actual execution
-	//   - update inventory/accounting
-	//   - assign runner (if applicable)
-	//   - reset entry gates
-	//   - update equity baseline
-	//   - persist state
-	//   - clear pending lifecycle
-	//
-	// BUY and SELL now simply invoke the common implementation with the appropriate side.
-	// This also provides the foundation for Case3A replacement entries to reuse
-	// the exact same lifecycle instead of maintaining a third copy.
-	// -------------------------------------------------------------------------------------------------
-	if entry := t.pendingEntryForSide(SideBuy); entry != nil {
-		t.drainPendingEntry(entry, now, wallNow)
-	}
+Every question BOT OPS can answer today must continue to be answerable.
 
-	if entry := t.pendingEntryForSide(SideSell); entry != nil {
-		t.drainPendingEntry(entry, now, wallNow)
-	}] ... [
-type PendingEntry struct {
-	ID     string
-	Side   OrderSide
-	Source EntryProducer
+Every new capability must be additive or a mutation/evolution of an existing capability. Do not remove, replace, weaken, or regress any existing Producer Monitor feature.
 
-	Pending *PendingOpen
-	ResultC <-chan OpenResult
-	Cancel  context.CancelFunc
+Do not redesign unrelated BOT OPS areas.
 
-	Book           *SideBook
-	PendingRecheck *bool
-	SpareUSD       *float64
-	LastAdd        *time.Time
-	WinExtreme     *float64
-	LatchedGate    *float64
+==================================================
+1. CURRENT PRODUCER MONITOR BEHAVIOR TO PRESERVE
+==================================================
 
-	EquityTriggered bool
+The existing Producer Monitor currently exposes producer lifecycle information such as:
 
-	SourceEntryOrderID string
-	Completed          bool
+- Produced
+- Pending accepted
+- Filled
+- Committed
+- Cancel requested
+- Entry failed
+- Cleanup cancelled
+- Cleanup cancel failed
+- Latest canonical event
 
-	clearOwner func()
+Preserve all of these capabilities and existing producer names/cards.
+
+Existing producers include at least:
+
+- NormalLegacy
+- Equity
+- Case3AReplacement
+- Case11APeakReversal
+- Case11BBottomReversal
+- Case13APeakSell
+- Case13BBottomBuy
+- Case14BUptrendBuy
+
+Do not remove existing stages, counters, lifecycle correlation, cleanup behavior, or display information.
+
+==================================================
+2. PROBLEM TO FIX
+==================================================
+
+Today the Producer Monitor is effectively reconstructed from a limited log tail.
+
+For example, the UI can show:
+
+Canonical events in scan window: 0
+Scan window: 20,000,000 bytes
+
+and then each producer shows:
+
+No canonical events
+
+This causes previously visible producer information to disappear after it falls outside the current log tail.
+
+The Producer Monitor must no longer depend on the current log tail as its authoritative source of operational state.
+
+==================================================
+3. NEW ARCHITECTURE
+==================================================
+
+Mutate the Producer Monitor from log-tail reconstruction into persistent Producer Monitor state.
+
+Use a state-file persistence approach similar to the existing bot state-file mechanism.
+
+Do NOT store this inside the trading state itself.
+
+Create a separate BOT OPS Producer Monitor state file so observability cannot interfere with trading state.
+
+Conceptually:
+
+Producer lifecycle event
+    ->
+update Producer Monitor state
+    ->
+persist Producer Monitor state
+    ->
+BOT OPS backend reads state
+    ->
+existing Producer Monitor cards are derived and displayed
+
+Raw logs remain available for forensic debugging but are no longer the primary source of truth for the Producer Monitor.
+
+Reuse the existing state-file safety mechanism where practical, including synchronization and atomic write/replace behavior.
+
+==================================================
+4. DECISION ID IS THE ATTEMPT CORRELATION KEY
+==================================================
+
+A producer decision already has a DecisionID created at decision creation time.
+
+DecisionID format is conceptually:
+
+Producer + formatted timestamp to millisecond precision
+
+Example:
+
+Case13APeakSell_20260807T214512.347
+
+All lifecycle events belonging to the same producer attempt must retain the same DecisionID.
+
+Examples:
+
+DecisionID=X stage=produced
+DecisionID=X stage=pending_accepted
+DecisionID=X stage=filled
+DecisionID=X stage=committed
+
+or:
+
+DecisionID=Y stage=produced
+DecisionID=Y stage=entry_failed
+
+The DecisionID is the primary correlation key for one producer attempt.
+
+Do not correlate different attempts merely by producer + stage.
+
+==================================================
+5. STATE MODEL
+==================================================
+
+Use a model equivalent to:
+
+map[EntryProducer]map[string]*ProducerAttempt
+
+where the second map key is DecisionID.
+
+Example:
+
+producerHistory[Case13APeakSell][decisionID]
+
+A ProducerAttempt should contain at least:
+
+type ProducerAttempt struct {
+    DecisionID string
+    Producer   EntryProducer
+    Side       string
+    CreatedAt  time.Time
+
+    Events map[ProducerStage]ProducerEvent
 }
 
-type EntryProducer string
+Use the existing canonical stage type if one already exists. Do not introduce duplicate stage enums unnecessarily.
+
+CreatedAt must represent the original decision creation time.
+
+Although the DecisionID contains a timestamp, keep CreatedAt explicitly as time.Time and use CreatedAt for retention/expiry logic. Do not repeatedly parse time out of DecisionID.
+
+==================================================
+6. PRODUCER EVENT MODEL
+==================================================
+
+Persist the factual canonical event data required to reconstruct the existing cards and answer the new questions.
+
+A model equivalent to this is appropriate:
+
+type ProducerEvent struct {
+    Time     time.Time
+    Producer EntryProducer
+    Side     string
+    Stage    ProducerStage
+
+    DecisionID string
+    OrderID    string
+
+    Reason string
+
+    ErrorCode       EntryProduceErrorCode
+    Error           string
+    CleanupRequired bool
+
+    PnL float64
+}
+
+Adapt field types/names to existing code instead of duplicating existing types.
+
+Only persist factual event data.
+
+Do not persist derived card counters as the authoritative source.
+
+==================================================
+7. RETENTION MODEL
+==================================================
+
+Producer attempts are retained for a rolling 24-hour operational window.
+
+The retention unit is the whole ProducerAttempt / DecisionID.
+
+If:
+
+attempt.CreatedAt < now - 24h
+
+remove the entire attempt.
+
+Do NOT expire individual stage events independently.
+
+All stages of one DecisionID must disappear together so lifecycle correlation is never broken.
+
+Example:
+
+produced
+pending_accepted
+entry_failed
+
+must remain together until the attempt itself ages beyond 24 hours.
+
+Conceptually:
+
+cutoff := time.Now().Add(-24 * time.Hour)
+
+for producer, attempts := range producerHistory {
+    for decisionID, attempt := range attempts {
+        if attempt.CreatedAt.Before(cutoff) {
+            delete(attempts, decisionID)
+        }
+    }
+
+    if len(attempts) == 0 {
+        delete(producerHistory, producer)
+    }
+}
+
+Perform cleanup safely and periodically and/or during state mutation.
+
+==================================================
+8. EXISTING CARD VALUES MUST BE DERIVED
+==================================================
+
+Do not treat the UI card as persisted state.
+
+The existing Producer Monitor card should be rebuilt from the retained ProducerAttempt map.
+
+For each producer, derive:
+
+- Produced
+- Pending accepted
+- Filled
+- Committed
+- Cancel requested
+- Entry failed
+- Cleanup cancelled
+- Cleanup cancel failed
+- Latest canonical event
+
+The semantics of these counters must remain compatible with the existing Producer Monitor.
+
+Do not silently change what the existing counts mean.
+
+Because attempts are keyed by DecisionID, count lifecycle occurrence per attempt correctly and do not double-count repeated rendering or persistence.
+
+==================================================
+9. FAILURE ANALYSIS
+==================================================
+
+Add the ability for a Producer Monitor card to answer:
+
+"Why did a producer fail after stage=produced?"
+
+Use the existing EntryProduceError as the authoritative trading-side failure model.
+
+Existing structure:
+
+type EntryProduceError struct {
+    Code EntryProduceErrorCode
+
+    Producer EntryProducer
+    Side     string
+    OrderID  string
+
+    CleanupRequired bool
+
+    Cause error
+}
+
+Do NOT invent a separate unrelated BOT OPS failure interpretation.
+
+Translate EntryProduceError into the appropriate ProducerEvent fields:
+
+- ErrorCode
+- Error
+- CleanupRequired
+- Producer
+- Side
+- OrderID
+- DecisionID
+- Stage
+
+==================================================
+10. EXPAND ENTRY PRODUCE ERROR CODES
+==================================================
+
+The current error codes are broad:
 
 const (
-	EntrySourceNormalBuy  EntryProducer = "normal_buy"
-	EntrySourceNormalSell EntryProducer = "normal_sell"
-	EntrySourceCase3A     EntryProducer = "Case3A"
+    EntryProduceErrInvalidIntent EntryProduceErrorCode = "invalid_intent"
+    EntryProduceErrSubmit        EntryProduceErrorCode = "submit_failed"
+    EntryProduceErrBuild         EntryProduceErrorCode = "build_failed"
+    EntryProduceErrRegister      EntryProduceErrorCode = "register_failed"
+    EntryProduceErrPersist       EntryProduceErrorCode = "persist_failed"
+    EntryProduceErrCleanupCancel EntryProduceErrorCode = "cleanup_cancel_failed"
 )
 
-func (t *Trader) pendingEntryForSide(side OrderSide) *PendingEntry {
-	switch side {
+Expand them where the code can reliably distinguish exact causes.
 
-	case SideBuy:
-		if t.pendingBuy == nil && t.pendingBuyCh == nil {
-			return nil
-		}
+Examples of useful stable categories include, where applicable:
 
-		entry := &PendingEntry{
-			ID:     pendingEntryID(side, ""),
-			Side:   SideBuy,
-			Source: EntrySourceNormalBuy,
+- invalid_intent
+- invalid_side
+- invalid_size
+- insufficient_balance
+- build_order_failed
+- invalid_price
+- invalid_quantity
+- submit_network_failed
+- submit_timeout
+- exchange_rejected
+- post_only_rejected
+- rate_limited
+- register_failed
+- persist_failed
+- cleanup_cancel_failed
 
-			Pending: t.pendingBuy,
-			ResultC: t.pendingBuyCh,
-			Cancel:  t.pendingBuyCancel,
+Do not fabricate distinctions the code cannot actually determine.
 
-			Book:            t.book(SideBuy),
-			PendingRecheck:  &t.pendingRecheckBuy,
-			SpareUSD:        &t.SpareBuyUSD,
-			LastAdd:         &t.lastAddBuy,
-			WinExtreme:      &t.winLowBuy,
-			LatchedGate:     &t.latchedGateBuy,
-			EquityTriggered: t.pendingBuy != nil && t.pendingBuy.EquityBuy,
-		}
+Preserve compatibility with existing error handling where possible.
 
-		if t.pendingBuy != nil {
-			entry.ID = pendingEntryID(side, t.pendingBuy.OrderID)
-		}
+EntryProduceErrorCode must remain stable and machine-readable.
 
-		entry.clearOwner = func() {
-			t.pendingBuy = nil
-			t.pendingBuyCh = nil
-			t.pendingBuyCtx = nil
-			t.pendingBuyCancel = nil
-		}
+Cause/Error remains the detailed human-readable explanation.
 
-		return entry
+==================================================
+11. FAILURE SUMMARY IS DERIVED, NOT STORED
+==================================================
 
-	case SideSell:
-		if t.pendingSell == nil && t.pendingSellCh == nil {
-			return nil
-		}
+Do not persist a FailureSummary as another source of truth.
 
-		entry := &PendingEntry{
-			ID:     pendingEntryID(side, ""),
-			Side:   SideSell,
-			Source: EntrySourceNormalSell,
+Derive it from retained ProducerAttempts and ProducerEvents.
 
-			Pending: t.pendingSell,
-			ResultC: t.pendingSellCh,
-			Cancel:  t.pendingSellCancel,
+A derived model may look like:
 
-			Book:            t.book(SideSell),
-			PendingRecheck:  &t.pendingRecheckSell,
-			SpareUSD:        &t.SpareSellUSD,
-			LastAdd:         &t.lastAddSell,
-			WinExtreme:      &t.winHighSell,
-			LatchedGate:     &t.latchedGateSell,
-			EquityTriggered: t.pendingSell != nil && t.pendingSell.EquitySell,
-		}
+type ProducerFailureSummary struct {
+    FailedAfterProduced int
 
-		if t.pendingSell != nil {
-			entry.ID = pendingEntryID(side, t.pendingSell.OrderID)
-		}
+    ByErrorCode map[EntryProduceErrorCode]int
 
-		entry.clearOwner = func() {
-			t.pendingSell = nil
-			t.pendingSellCh = nil
-			t.pendingSellCtx = nil
-			t.pendingSellCancel = nil
-		}
-
-		return entry
-	}
-
-	return nil
+    LatestFailure *ProducerEvent
 }
 
-func (t *Trader) drainPendingEntry(
-	entry *PendingEntry,
-	now time.Time,
-	wallNow time.Time,
-) {
-	if entry == nil || entry.Completed {
-		return
-	}
-
-	if entry.ResultC == nil {
-		return
-	}
-
-	side := entry.Intent.Side
-	pending := entry.Pending
-	book := entry.Book
-
-	/*
-		Finish the pending lifecycle after a terminal broker result.
-
-		The owner-specific cleanup is supplied when the PendingEntry is
-		constructed, so this generic drain does not need to know whether
-		the entry came from normal BUY, normal SELL, Case3A, or another
-		entry source.
-	*/
-	finish := func() {
-		if entry.Cancel != nil {
-			entry.Cancel()
-		}
-
-		if entry.clearOwner != nil {
-			entry.clearOwner()
-		}
-
-		entry.Pending = nil
-		entry.ResultC = nil
-		entry.Cancel = nil
-		entry.Completed = true
-
-		if err := t.saveStateNoLock(); err != nil {
-			log.Printf(
-				"[WARN] saveState (drain %s source=%s id=%s): %v",
-				side,
-				entry.Source,
-				entry.ID,
-				err,
-			)
-		}
-	}
-
-	select {
-	case res, ok := <-entry.ResultC:
-		if !ok {
-			log.Printf(
-				"[WARN] postonly.drain.channel_closed side=%s source=%s id=%s",
-				side,
-				entry.Source,
-				entry.ID,
-			)
-
-			finish()
-			return
-		}
-
-		log.Printf(
-			"[TRACE] postonly.drain.recv side=%s source=%s id=%s order_id=%s filled=%v placed_nil=%v",
-			side,
-			entry.Source,
-			entry.ID,
-			res.OrderID,
-			res.Filled,
-			res.Placed == nil,
-		)
-
-		// Decide whether this asynchronous result is safe to apply.
-		//
-		// Repricing may create several exchange order IDs. Accept a fill
-		// when it matches:
-		//   1. the current pending order ID; or
-		//   2. an order ID recorded in PendingOpen.History.
-		//
-		// When pending state is missing but the broker reports a real fill,
-		// accept it rather than orphaning an exchange position.
-		accept := false
-
-		if res.Filled && res.Placed != nil {
-			log.Printf(
-				"[TRACE] postonly.drain.placed side=%s source=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f",
-				side,
-				entry.Source,
-				res.OrderID,
-				res.Placed.Price,
-				res.Placed.BaseSize,
-				res.Placed.QuoteSpent,
-				res.Placed.CommissionUSD,
-			)
-
-			if pending != nil {
-				if res.OrderID == pending.OrderID {
-					accept = true
-				} else {
-					for _, historicalID := range pending.History {
-						if res.OrderID == historicalID {
-							accept = true
-							break
-						}
-					}
-				}
-			} else {
-				accept = true
-
-				log.Printf(
-					"[WARN] postonly.fill.without_pending side=%s source=%s order_id=%s",
-					side,
-					entry.Source,
-					res.OrderID,
-				)
-			}
-		}
-
-		if accept {
-			if book == nil {
-				/*
-					A real fill exists, so silently discarding it would be
-					dangerous. Do not mark the PendingEntry completed.
-
-					This requires reconciliation because the exchange fill
-					cannot currently be committed into a position book.
-				*/
-				log.Printf(
-					"[ERROR] postonly.fill.book_nil side=%s source=%s id=%s order_id=%s reconciliation_required=true",
-					side,
-					entry.Source,
-					entry.ID,
-					res.OrderID,
-				)
-
-				return
-			}
-
-			if err := t.commitEntryFill(
-				entry,
-				res,
-				now,
-				wallNow,
-			); err != nil {
-
-				log.Printf(
-					"[ERROR] postonly.commit side=%s source=%s order_id=%s: %v",
-					side,
-					entry.Source,
-					res.OrderID,
-					err,
-				)
-
-				return
-			}
-		} else {
-			/*
-				A non-fill terminal result allows the normal entry path to
-				reconsider the order unless cancellation was requested because
-				the signal changed.
-			*/
-			cancelRequested :=
-				pending != nil &&
-					pending.CancelRequested
-
-			if entry.PendingRecheck == nil {
-				log.Printf(
-					"[WARN] postonly.recheck.pointer_nil side=%s source=%s order_id=%s cancel_requested=%v",
-					side,
-					entry.Source,
-					res.OrderID,
-					cancelRequested,
-				)
-			} else if cancelRequested {
-				*entry.PendingRecheck = false
-
-				log.Printf(
-					"[TRACE] postonly.cancel.ack side=%s source=%s order_id=%s fallback=false reason=signal_changed",
-					side,
-					entry.Source,
-					res.OrderID,
-				)
-			} else {
-				*entry.PendingRecheck = true
-
-				log.Printf(
-					"[TRACE] postonly.recheck side=%s source=%s set=true reason=timeout_or_error order_id=%s",
-					side,
-					entry.Source,
-					res.OrderID,
-				)
-			}
-		}
-
-		finish()
-
-	default:
-		// No asynchronous result is available for this entry this tick.
-	}
-}
-
-func (t *Trader) commitEntryFill(
-	entry *PendingEntry,
-	res OpenResult,
-	now time.Time,
-	wallNow time.Time,
-) error {
-
-	if entry == nil {
-		return fmt.Errorf("nil pending entry")
-	}
-
-	if entry.Pending == nil {
-		return fmt.Errorf("nil PendingOpen")
-	}
-
-	if entry.Book == nil {
-		return fmt.Errorf("nil position book")
-	}
-
-	if res.Placed == nil {
-		return fmt.Errorf("filled result missing execution")
-	}
-
-	side := entry.Intent.Side
-	pending := entry.Pending
-	book := entry.Book
-
-	priceToUse := res.Placed.Price
-	baseToUse := res.Placed.BaseSize
-	quoteSpent := res.Placed.QuoteSpent
-	entryFee := res.Placed.CommissionUSD
-
-	if priceToUse <= 0 {
-		return fmt.Errorf("invalid execution price %.8f", priceToUse)
-	}
-
-	if baseToUse <= 0 {
-		return fmt.Errorf("invalid execution base %.8f", baseToUse)
-	}
-
-	if t.positionExistsByEntryOrderID(res.OrderID) {
-		log.Printf(
-			"[TRACE] postonly.commit.duplicate side=%s source=%s order_id=%s",
-			side,
-			entry.Source,
-			res.OrderID,
-		)
-		return nil
-	}
-
-	if entryFee <= 0 {
-		entryFee = quoteSpent * (t.cfg.FeeRatePct / 100.0)
-	}
-
-	/*
-		Refund-service adjustment.
-	*/
-	if pending.RefundPortionUSD > 0 {
-
-		originalBase := baseToUse
-		originalQuote := quoteSpent
-		originalFee := entryFee
-
-		refundBase := pending.RefundPortionUSD / priceToUse
-
-		if refundBase > baseToUse {
-			refundBase = baseToUse
-		}
-
-		if refundBase < 0 {
-			refundBase = 0
-		}
-
-		keptBase := baseToUse - refundBase
-
-		if keptBase < 0 {
-			keptBase = 0
-		}
-
-		keptQuote := quoteSpent
-		keptFee := entryFee
-		refundQuote := pending.RefundPortionUSD
-		refundFee := refundQuote * (t.cfg.FeeRatePct / 100.0)
-
-		if originalBase > 0 {
-
-			keptRatio := keptBase / originalBase
-			refundRatio := refundBase / originalBase
-
-			keptQuote = originalQuote * keptRatio
-			keptFee = originalFee * keptRatio
-			refundQuote = originalQuote * refundRatio
-			refundFee = originalFee * refundRatio
-		}
-
-		t.creditRefundService(
-			side,
-			refundQuote,
-			refundFee,
-		)
-
-		baseToUse = keptBase
-		quoteSpent = keptQuote
-		entryFee = keptFee
-	}
-
-	if baseToUse <= 0 || quoteSpent <= 0 {
-
-		log.Printf(
-			"[TRACE] postonly.fill.refund_consumed_all side=%s source=%s order_id=%s",
-			side,
-			entry.Source,
-			res.OrderID,
-		)
-
-		return nil
-	}
-
-	newLot := &Position{
-		OpenPrice:       priceToUse,
-		Side:            side,
-		SizeBase:        baseToUse,
-		OpenTime:        now,
-		EntryFee:        entryFee,
-		OpenNotionalUSD: quoteSpent,
-		Reason:          pending.Reason,
-		Take:            pending.Take,
-		Version:         Version,
-		EntryOrderID:    res.OrderID,
-
-		RefundPortionUSD: pending.RefundPortionUSD,
-		ConfidenceMult:   pending.ConfidenceMult,
-		EntryMethod:      pending.EntryMethod,
-		ProfitGateUSD:    pending.ProfitGateUSD,
-	}
-
-	if newLot.ConfidenceMult <= 0 {
-		newLot.ConfidenceMult = 0
-	}
-
-	if newLot.EntryMethod == "" {
-		newLot.EntryMethod = "UNKNOWN"
-	}
-
-	if newLot.ProfitGateUSD <= 0 {
-		newLot.ProfitGateUSD = t.cfg.ProfitGateUSD
-	}
-
-	log.Printf(
-		"[KPI] lot.created side=%s source=%s mode=%s conf=%.2f gate=%.2f order_id=%s",
-		newLot.Side,
-		entry.Source,
-		newLot.EntryMethod,
-		newLot.ConfidenceMult,
-		newLot.ProfitGateUSD,
-		newLot.EntryOrderID,
-	)
-
-	book.Lots = append(book.Lots, newLot)
-
-	t.consolidateDust(
-		book,
-		priceToUse,
-		t.cfg.MinNotional,
-	)
-
-	t.archiveOrphanDust(
-		book,
-		priceToUse,
-		t.cfg.MinNotional,
-	)
-
-	t.didConsolidateStartup = false
-
-	if entry.SpareUSD != nil {
-
-		*entry.SpareUSD -= quoteSpent
-
-		if *entry.SpareUSD < 0 {
-			*entry.SpareUSD = 0
-		}
-
-	} else {
-
-		log.Printf(
-			"[WARN] postonly.fill.spare_pointer_nil side=%s source=%s order_id=%s",
-			side,
-			entry.Source,
-			res.OrderID,
-		)
-	}
-
-	if entry.EquityTriggered {
-
-		newIndex := len(book.Lots) - 1
-
-		addRunner(book, newIndex)
-
-		runner := book.Lots[newIndex]
-
-		runner.TrailActive = false
-		runner.TrailPeak = runner.OpenPrice
-		runner.TrailStop = 0
-
-		t.applyRunnerTargets(runner)
-
-		log.Printf(
-			"[TRACE] runner.assign idx=%d side=%s source=%s open=%.8f take=%.8f",
-			newIndex,
-			side,
-			entry.Source,
-			runner.OpenPrice,
-			runner.Take,
-		)
-	}
-
-	if entry.LastAdd != nil {
-		*entry.LastAdd = wallNow
-	}
-
-	if entry.WinExtreme != nil {
-		*entry.WinExtreme = priceToUse
-	}
-
-	if entry.LatchedGate != nil {
-		*entry.LatchedGate = 0
-	}
-
-	oldEquityBaseline := t.lastAddEquity
-	t.lastAddEquity = t.equityUSD
-
-	log.Printf(
-		"[TRACE] equity.baseline.set side=%s source=%s old=%.2f new=%.2f",
-		side,
-		entry.Source,
-		oldEquityBaseline,
-		t.lastAddEquity,
-	)
-
-	message := fmt.Sprintf(
-		"[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
-		side,
-		quoteSpent,
-		newLot.Take,
-		entryFee,
-		newLot.Reason,
-		"async postonly filled",
-	)
-
-	if t.cfg.UseDirectSlack {
-		postSlack(message)
-	}
-
-	if err := t.saveStateNoLock(); err != nil {
-		return fmt.Errorf("saveStateNoLock: %w", err)
-	}
-
-	return nil
-}
-
-func (t *Trader) positionExistsByEntryOrderID(orderID string) bool {
-	if t == nil || orderID == "" {
-		return false
-	}
-
-	for _, side := range []OrderSide{SideBuy, SideSell} {
-		book := t.book(side)
-		if book == nil {
-			continue
-		}
-
-		for _, lot := range book.Lots {
-			if lot == nil {
-				continue
-			}
-
-			if lot.EntryOrderID == orderID {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-func pendingEntryID(side OrderSide, orderID string) string {
-	if orderID == "" {
-		return string(side)
-	}
-	return fmt.Sprintf("%s:%s", side, orderID)
-}
-func (t *Trader) ensurePendingEntryMaps() {
-	if t.pendingCase3A == nil {
-		t.pendingCase3A = make(map[string]*PendingEntry)
-	}
-}
-func (t *Trader) registerCase3APendingEntry(
-	pending *PendingOpen,
-	resultC <-chan OpenResult,
-	cancel context.CancelFunc,
-	sourceEntryOrderID string,
-) (*PendingEntry, error) {
-	if t == nil {
-		return nil, errors.New("register Case3A entry: nil Trader")
-	}
-
-	if pending == nil {
-		return nil, errors.New("register Case3A entry: nil PendingOpen")
-	}
-
-	if resultC == nil {
-		return nil, errors.New("register Case3A entry: nil result channel")
-	}
-
-	if sourceEntryOrderID == "" {
-		return nil, errors.New(
-			"register Case3A entry: missing source entry order ID",
-		)
-	}
-
-	if pending.OrderID == "" {
-		return nil, errors.New(
-			"register Case3A entry: missing replacement order ID",
-		)
-	}
-
-	if pending.Side != SideBuy && pending.Side != SideSell {
-		return nil, fmt.Errorf(
-			"register Case3A entry: invalid side %q",
-			pending.Side,
-		)
-	}
-
-	t.ensurePendingEntryMaps()
-
-	id := pendingEntryID(
-		pending.Side,
-		pending.OrderID,
-	)
-
-	if _, exists := t.pendingCase3A[id]; exists {
-		return nil, fmt.Errorf(
-			"Case3A pending entry already exists: %s",
-			id,
-		)
-	}
-
-	entry := &PendingEntry{
-		ID:                 id,
-		Side:               pending.Side,
-		Source:             EntrySourceCase3A,
-		Pending:            pending,
-		ResultC:            resultC,
-		Cancel:             cancel,
-		Book:               t.book(pending.Side),
-		SourceEntryOrderID: sourceEntryOrderID,
-	}
-
-	entry.clearOwner = func() {
-		delete(t.pendingCase3A, id)
-	}
-
-	t.pendingCase3A[id] = entry
-
-	log.Printf(
-		"[TRACE] Case3A.pending.register id=%s side=%s source_entry_order_id=%s replacement_order_id=%s",
-		entry.ID,
-		entry.Intent.Side,
-		entry.SourceEntryOrderID,
-		pending.OrderID,
-	)
-
-	return entry, nil
-}
-
-func (t *Trader) drainPendingCase3AEntries(
-	now time.Time,
-	wallNow time.Time,
-) {
-	if t == nil || len(t.pendingCase3A) == 0 {
-		return
-	}
-
-	/*
-		Take a snapshot before draining.
-
-		drainPendingEntry may call entry.clearOwner(), which removes the
-		entry from pendingCase3A. A snapshot keeps iteration independent
-		of those map mutations and ensures entries registered during this
-		drain wait until the next tick.
-	*/
-	entries := make([]*PendingEntry, 0, len(t.pendingCase3A))
-
-	for _, entry := range t.pendingCase3A {
-		if entry == nil {
-			continue
-		}
-
-		entries = append(entries, entry)
-	}
-
-	for _, entry := range entries {
-		t.drainPendingEntry(
-			entry,
-			now,
-			wallNow,
-		)
-	}
-}
-func (t *Trader) startCase3AReplacement(
-	ctx context.Context,
-	repl ReplacementRequest,
-) (string, error) {
-	if !repl.Enabled {
-		log.Printf(
-			"[TRACE] Case3A.replacement.disabled side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
-			repl.Side,
-			repl.Method.String(),
-			repl.Base,
-			repl.EntryPrice,
-			repl.Base*repl.EntryPrice,
-		)
-		return "", nil
-	}
-
-	log.Printf(
-		"[TRACE] Case3A.replacement.enter side=%s method=%s base=%.8f entry=%.8f notional=%.2f",
-		repl.Side,
-		repl.Method.String(),
-		repl.Base,
-		repl.EntryPrice,
-		repl.Base*repl.EntryPrice,
-	)
-
-	defer log.Printf("[TRACE] Case3A.replacement.leave")
-
-	started, err := t.startPendingReplacementEntry(ctx, repl)
-	if err != nil {
-		log.Printf(
-			"[TRACE] Case3A.replacement.failed side=%s price=%.8f base=%.8f method=%s err=%v",
-			repl.Side,
-			repl.EntryPrice,
-			repl.Base,
-			repl.Method.String(),
-			err,
-		)
-		return "", err
-	}
-	if started == nil {
-		return "", fmt.Errorf(
-			"startPendingReplacementEntry returned nil StartedPendingEntry",
-		)
-	}
-	if strings.TrimSpace(repl.SourceEntryOrderID) == "" {
-		return t.cancelCase3AAttempt(
-			ctx,
-			started,
-			nil,
-			"missing SourceEntryOrderID",
-		)
-	}
-	if started.Pending == nil {
-		return t.cancelCase3AAttempt(
-			ctx,
-			started,
-			nil,
-			"startPendingReplacementEntry returned nil PendingOpen",
-		)
-	}
-
-	if started.ResultC == nil {
-		return t.cancelCase3AAttempt(
-			ctx,
-			started,
-			nil,
-			"startPendingReplacementEntry returned nil ResultC",
-		)
-	}
-
-	if strings.TrimSpace(started.OrderID) == "" {
-		return t.cancelCase3AAttempt(
-			ctx,
-			started,
-			nil,
-			"startPendingReplacementEntry returned empty OrderID",
-		)
-	}
-
-	_, err = t.registerCase3APendingEntry(
-		started.Pending,
-		started.ResultC,
-		started.Cancel,
-		repl.SourceEntryOrderID,
-	)
-
-	if err != nil {
-		return t.cancelCase3AAttempt(
-			ctx,
-			started,
-			err,
-			"register Case3A replacement",
-		)
-	}
-
-	log.Printf(
-		"[TRACE] Case3A.replacement.started order_id=%s source_entry_order_id=%s side=%s price=%.8f base=%.8f method=%s",
-		started.OrderID,
-		repl.SourceEntryOrderID,
-		repl.Side,
-		repl.EntryPrice,
-		repl.Base,
-		repl.Method.String(),
-	)
-
-	return started.OrderID, nil
-}
-
-
-func (t *Trader) cancelCase3AAttempt(
-	ctx context.Context,
-	started *StartedPendingEntry,
-	cause error,
-	msg string,
-) (string, error) {
-	if started != nil && started.Cancel != nil {
-		started.Cancel()
-	}
-
-	if started != nil && started.OrderID != "" {
-		_ = t.broker.CancelOrder(
-			ctx,
-			t.cfg.ProductID,
-			started.OrderID,
-		)
-	}
-
-	if cause != nil {
-		return "", fmt.Errorf("%s: %w", msg, cause)
-	}
-
-	return "", fmt.Errorf("%s", msg)
-}
-
-type StartedPendingEntry struct {
-	OrderID string
-
-	Pending *PendingOpen
-	ResultC <-chan OpenResult
-	Cancel  context.CancelFunc
-}
-
-func (t *Trader) startPendingReplacementEntry(
-	ctx context.Context,
-	repl ReplacementRequest,
-) (*StartedPendingEntry, error) {
-	if !repl.Enabled {
-		return nil, nil
-	}
-
-	if repl.Side != SideSell && repl.Side != SideBuy {
-		return nil, fmt.Errorf("replacement unsupported side=%s", repl.Side)
-	}
-
-	if repl.EntryPrice <= 0 || repl.Base <= 0 {
-		return nil, fmt.Errorf(
-			"invalid replacement entry price/base price=%.8f base=%.8f",
-			repl.EntryPrice,
-			repl.Base,
-		)
-	}
-
-	if repl.Side == SideSell && t.pendingSell != nil {
-		return nil, fmt.Errorf("replacement blocked: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
-	}
-	if repl.Side == SideBuy && t.pendingBuy != nil {
-		return nil, fmt.Errorf("replacement blocked: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
-	}
-
-	limitPx := repl.EntryPrice
-	if t.cfg.PriceTick > 0 {
-		if repl.Side == SideSell {
-			limitPx = math.Ceil(limitPx/t.cfg.PriceTick) * t.cfg.PriceTick
-		} else {
-			limitPx = math.Floor(limitPx/t.cfg.PriceTick) * t.cfg.PriceTick
-		}
-	}
-
-	if limitPx <= 0 {
-		return nil, fmt.Errorf("invalid replacement limit price after tick snap: %.8f", limitPx)
-	}
-
-	if repl.Base*limitPx < t.cfg.MinNotional {
-		return nil, fmt.Errorf(
-			"replacement below min notional side=%s notional=%.2f min=%.2f base=%.8f limit=%.8f",
-			repl.Side,
-			repl.Base*limitPx,
-			t.cfg.MinNotional,
-			repl.Base,
-			limitPx,
-		)
-	}
-
-	log.Printf(
-		"[TRACE] Case3A.replacement.before_postonly side=%s limit=%.8f base=%.8f notional=%.2f method=%s",
-		repl.Side,
-		limitPx,
-		repl.Base,
-		repl.Base*limitPx,
-		repl.Method.String(),
-	)
-
-	t.mu.Unlock()
-	orderID, err := t.broker.PlaceLimitPostOnly(ctx, t.cfg.ProductID, repl.Side, limitPx, repl.Base)
-	t.mu.Lock()
-
-	log.Printf(
-		"[TRACE] Case3A.replacement.after_postonly side=%s order_id=%s err=%v",
-		repl.Side,
-		orderID,
-		err,
-	)
-
-	if err != nil {
-		return &StartedPendingEntry{OrderID: orderID}, err
-	}
-
-	orderID = strings.TrimSpace(orderID)
-	if orderID == "" {
-		return nil, fmt.Errorf("empty replacement order id")
-	}
-
-	if repl.Side == SideSell && t.pendingSell != nil {
-		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, orderID)
-		return nil, fmt.Errorf("replacement blocked after post: pending SELL already exists order_id=%s", t.pendingSell.OrderID)
-	}
-	if repl.Side == SideBuy && t.pendingBuy != nil {
-		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, orderID)
-		return nil, fmt.Errorf("replacement blocked after post: pending BUY already exists order_id=%s", t.pendingBuy.OrderID)
-	}
-
-	if repl.ProfitGateUSD <= 0 {
-		repl.ProfitGateUSD = t.cfg.ProfitGateUSD
-	}
-
-	now := time.Now().UTC()
-	deadline := now.Add(time.Duration(t.cfg.LimitTimeoutSec) * time.Second)
-
-	pctx, cancel := context.WithCancel(ctx)
-
-	pend := &PendingOpen{
-		Side:             repl.Side,
-		LimitPx:          limitPx,
-		BaseAtLimit:      repl.Base,
-		Quote:            repl.Base * limitPx,
-		Take:             0,
-		Reason:           repl.Reason,
-		ProductID:        t.cfg.ProductID,
-		CreatedAt:        now,
-		Deadline:         deadline,
-		OrderID:          orderID,
-		History:          make([]string, 0, 5),
-		ConfidenceMult:   1.0,
-		ProfitGateUSD:    repl.ProfitGateUSD,
-		EntryMethod:      repl.Method.String(),
-		RefundPortionUSD: 0,
-	}
-
-	var ch chan OpenResult
-
-	if repl.Side == SideSell {
-		if t.pendingSellCh == nil {
-			t.pendingSellCh = make(chan OpenResult, 1)
-		}
-		t.pendingSellCtx = pctx
-		t.pendingSellCancel = cancel
-		t.pendingSell = pend
-		ch = t.pendingSellCh
-	} else {
-		if t.pendingBuyCh == nil {
-			t.pendingBuyCh = make(chan OpenResult, 1)
-		}
-		t.pendingBuyCtx = pctx
-		t.pendingBuyCancel = cancel
-		t.pendingBuy = pend
-		ch = t.pendingBuyCh
-	}
-
-	log.Printf(
-		"[TRACE] postonly.pending.set side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f dl=%s reason=%s",
-		repl.Side,
-		orderID,
-		limitPx,
-		repl.Base,
-		repl.Base*limitPx,
-		deadline.Format(time.RFC3339),
-		repl.Reason,
-	)
-
-	if err := t.saveStateNoLock(); err != nil {
-		log.Printf("[WARN] saveState replacement pending: %v", err)
-	}
-
-	offsetBps := t.cfg.LimitPriceOffsetBps
-	initOrderID := orderID
-	initLimitPx := limitPx
-	initBaseAtLimit := repl.Base
-	side := repl.Side
-
-	go func(
-		initOrderID string,
-		side OrderSide,
-		deadline time.Time,
-		initLimitPx float64,
-		initBaseAtLimit float64,
-		pend *PendingOpen,
-		ch chan OpenResult,
-		pctx context.Context,
-	) {
-		log.Printf(
-			"[TRACE] postonly.poll.start side=%s init_id=%s init_limit=%.8f init_base=%.8f deadline=%s offset_bps=%.3f",
-			side,
-			initOrderID,
-			initLimitPx,
-			initBaseAtLimit,
-			deadline.Format(time.RFC3339),
-			offsetBps,
-		)
-		defer func() {
-			log.Printf("[TRACE] postonly.poll.stopped side=%s initial_id=%s", side, initOrderID)
-		}()
-
-		orderID := initOrderID
-		lastLimitPx := initLimitPx
-		lastReprice := time.Now()
-
-		var sessBase, sessQuote, sessFee float64
-		var lastSeenBase, lastSeenQuote, lastSeenFee float64
-		var repriceCount int
-
-	poll:
-		for time.Now().Before(deadline) {
-			select {
-			case <-pctx.Done():
-				log.Printf("[TRACE] postonly.poll.cancelled side=%s last_id=%s", side, orderID)
-				break poll
-			default:
-			}
-
-			ord, gErr := t.broker.GetOrder(pctx, t.cfg.ProductID, orderID)
-			if gErr == nil && ord != nil {
-				dBase := ord.BaseSize - lastSeenBase
-				dQuote := ord.QuoteSpent - lastSeenQuote
-				dFee := ord.CommissionUSD - lastSeenFee
-
-				if dBase < 0 {
-					dBase = 0
-				}
-				if dQuote < 0 {
-					dQuote = 0
-				}
-				if dFee < 0 {
-					dFee = 0
-				}
-
-				sessBase += dBase
-				sessQuote += dQuote
-				sessFee += dFee
-
-				lastSeenBase = ord.BaseSize
-				lastSeenQuote = ord.QuoteSpent
-				lastSeenFee = ord.CommissionUSD
-
-				status := strings.ToUpper(strings.TrimSpace(ord.Status))
-
-				log.Printf(
-					"[TRACE] postonly.poll.tick side=%s order_id=%s status=%s price=%.8f base=%.8f quote=%.2f fee=%.6f sess_agg[base=%.8f quote=%.2f fee=%.6f] reprices=%d",
-					side,
-					orderID,
-					status,
-					ord.Price,
-					ord.BaseSize,
-					ord.QuoteSpent,
-					ord.CommissionUSD,
-					sessBase,
-					sessQuote,
-					sessFee,
-					repriceCount,
-				)
-
-				switch status {
-				case "FILLED":
-					vwap := 0.0
-					if sessBase > 0 {
-						vwap = sessQuote / sessBase
-					}
-
-					placed := &PlacedOrder{
-						Price:         vwap,
-						BaseSize:      sessBase,
-						QuoteSpent:    sessQuote,
-						CommissionUSD: sessFee,
-					}
-
-					log.Printf("[TRACE] postonly.filled order_id=%s price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
-						orderID, ord.Price, ord.BaseSize, ord.QuoteSpent, ord.CommissionUSD)
-
-					log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
-						side, orderID, true, sessBase, sessQuote, sessFee)
-
-					log.Printf("[KPI] maker.open.filled side=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f order_id=%s",
-						side, placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD, orderID)
-
-					safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
-					return
-
-				case "PARTIALLY_FILLED":
-					if t.pendingCancelRequested(side) {
-						log.Printf("[TRACE] postonly.reprice.skip.cancel_requested side=%s order_id=%s", side, orderID)
-						lastReprice = time.Now()
-						break
-					}
-
-					if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
-						log.Printf("[TRACE] postonly.reprice.try.partially side=%s order_id=%s last_limit=%.8f reprice_count=%d",
-							side, orderID, lastLimitPx, repriceCount)
-
-						newID, newLastLimitPx, newRepriceCount, did := t.maybeRepriceOnce(
-							pctx,
-							side,
-							orderID,
-							initLimitPx,
-							initBaseAtLimit,
-							lastLimitPx,
-							offsetBps,
-							pend,
-							repriceCount,
-						)
-
-						if did && newID != orderID {
-							log.Printf("[TRACE] postonly.reprice.swap.partially side=%s old_id=%s new_id=%s new_limit=%.8f count=%d",
-								side, orderID, newID, newLastLimitPx, newRepriceCount)
-							orderID = newID
-							lastLimitPx = newLastLimitPx
-							repriceCount = newRepriceCount
-							lastSeenBase, lastSeenQuote, lastSeenFee = 0, 0, 0
-						} else {
-							log.Printf("[TRACE] postonly.reprice.skip.partially side=%s order_id=%s reason=no_guard_or_no_improve last_limit=%.8f count=%d",
-								side, orderID, lastLimitPx, repriceCount)
-							lastLimitPx = newLastLimitPx
-							repriceCount = newRepriceCount
-						}
-
-						lastReprice = time.Now()
-					}
-
-				case "NEW", "PENDING_CANCEL":
-					if t.pendingCancelRequested(side) {
-						log.Printf("[TRACE] postonly.reprice.skip.cancel_requested side=%s order_id=%s", side, orderID)
-						lastReprice = time.Now()
-						break
-					}
-
-					if time.Since(lastReprice) >= time.Duration(t.cfg.RepriceIntervalMs)*time.Millisecond {
-						log.Printf("[TRACE] postonly.reprice.try.new side=%s order_id=%s last_limit=%.8f reprice_count=%d",
-							side, orderID, lastLimitPx, repriceCount)
-
-						newID, newLastLimitPx, newRepriceCount, did := t.maybeRepriceOnce(
-							pctx,
-							side,
-							orderID,
-							initLimitPx,
-							initBaseAtLimit,
-							lastLimitPx,
-							offsetBps,
-							pend,
-							repriceCount,
-						)
-
-						if did && newID != orderID {
-							log.Printf("[TRACE] postonly.reprice.swap.new side=%s old_id=%s new_id=%s new_limit=%.8f count=%d",
-								side, orderID, newID, newLastLimitPx, newRepriceCount)
-							orderID = newID
-							lastLimitPx = newLastLimitPx
-							repriceCount = newRepriceCount
-							lastSeenBase, lastSeenQuote, lastSeenFee = 0, 0, 0
-						} else {
-							log.Printf("[TRACE] postonly.reprice.skip.new side=%s order_id=%s reason=no_guard_or_no_improve last_limit=%.8f count=%d",
-								side, orderID, lastLimitPx, repriceCount)
-							lastLimitPx = newLastLimitPx
-							repriceCount = newRepriceCount
-						}
-
-						lastReprice = time.Now()
-					}
-
-				case "CANCELED", "REJECTED", "EXPIRED":
-					if sessBase > 0 || sessQuote > 0 {
-						vwap := 0.0
-						if sessBase > 0 {
-							vwap = sessQuote / sessBase
-						}
-
-						placed := &PlacedOrder{
-							Price:         vwap,
-							BaseSize:      sessBase,
-							QuoteSpent:    sessQuote,
-							CommissionUSD: sessFee,
-						}
-
-						log.Printf("[KPI] maker.open.filled side=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f order_id=%s status=%s",
-							side, vwap, sessBase, sessQuote, sessFee, orderID, status)
-
-						log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
-							side, orderID, true, sessBase, sessQuote, sessFee)
-
-						safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
-					} else {
-						log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
-							side, orderID, false, sessBase, sessQuote, sessFee)
-
-						safeSend(ch, OpenResult{Filled: false, Placed: nil, OrderID: orderID})
-					}
-
-					log.Printf("[TRACE] postonly.poll.done side=%s order_id=%s final=%s vwap=%.8f base=%.8f quote=%.2f fee=%.6f",
-						side,
-						orderID,
-						status,
-						func() float64 {
-							if sessBase > 0 {
-								return sessQuote / sessBase
-							}
-							return 0
-						}(),
-						sessBase,
-						sessQuote,
-						sessFee,
-					)
-
-					return
-				}
-			}
-
-			select {
-			case <-pctx.Done():
-				log.Printf("[TRACE] postonly.poll.cancelled side=%s last_id=%s", side, orderID)
-				break poll
-			case <-time.After(200 * time.Millisecond):
-			}
-		}
-
-		_ = t.broker.CancelOrder(pctx, t.cfg.ProductID, orderID)
-
-		log.Printf("[TRACE] postonly.poll.timeout side=%s last_id=%s sess_base=%.8f sess_quote=%.2f sess_fee=%.6f",
-			side, orderID, sessBase, sessQuote, sessFee)
-
-		log.Printf("[TRACE] postonly.timeout order_id=%s", orderID)
-
-		if sessBase > 0 || sessQuote > 0 {
-			vwap := 0.0
-			if sessBase > 0 {
-				vwap = sessQuote / sessBase
-			}
-
-			placed := &PlacedOrder{
-				Price:         vwap,
-				BaseSize:      sessBase,
-				QuoteSpent:    sessQuote,
-				CommissionUSD: sessFee,
-			}
-
-			log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
-				side, orderID, true, sessBase, sessQuote, sessFee)
-
-			safeSend(ch, OpenResult{Filled: true, Placed: placed, OrderID: orderID})
-		} else {
-			log.Printf("[TRACE] postonly.poll.emit side=%s order_id=%s filled=%v base=%.8f quote=%.2f fee=%.6f",
-				side, orderID, false, sessBase, sessQuote, sessFee)
-
-			safeSend(ch, OpenResult{Filled: false, Placed: nil, OrderID: orderID})
-		}
-	}(initOrderID, side, deadline, initLimitPx, initBaseAtLimit, pend, ch, pctx)
-
-	log.Printf(
-		"[TRACE] Case3A.replacement.posted side=%s order_id=%s limit=%.8f base=%.8f quote=%.2f method=%s gate=%.6f reason=%s",
-		repl.Side,
-		orderID,
-		limitPx,
-		repl.Base,
-		repl.Base*limitPx,
-		repl.Method.String(),
-		repl.ProfitGateUSD,
-		repl.Reason,
-	)
-
-	return &StartedPendingEntry{
-		OrderID: orderID,
-		Pending: pend,
-		ResultC: ch,
-		Cancel:  cancel,
-	}, nil
-}
-]
+For example, if Case13APeakSell has:
+
+Decision A:
+produced
+pending_accepted
+filled
+committed
+
+Decision B:
+produced
+entry_failed
+ErrorCode=insufficient_balance
+
+Decision C:
+produced
+pending_accepted
+entry_failed
+ErrorCode=submit_timeout
+CleanupRequired=true
+
+then the card should be able to display:
+
+Failure Summary
+
+Failed after produced: 2
+
+Reasons
+Insufficient Balance: 1
+Submit Timeout: 1
+
+Latest Failure
+Stage: entry_failed
+ErrorCode: submit_timeout
+Error: <actual cause string>
+Cleanup Required: YES
+Order ID: <if available>
+Decision ID: <decision id>
+
+The summary must be derived from the same correlated attempt state.
+
+==================================================
+12. PERFORMANCE / PNL SUPPORT
+==================================================
+
+Add the data required for BOT OPS to answer:
+
+"Which producer is making money and which one is making loss and why?"
+
+Do not remove any current card fields.
+
+Use retained producer attempts/events and existing trade lifecycle information to derive producer-level performance.
+
+At minimum, support:
+
+- realized PnL attributable to producer
+- unrealized PnL where reliable/currently available
+- winning vs losing completed attempts/trades
+- aggregate PnL by producer
+- explanation using entry/exit/failure reasons already captured by the system
+
+Do not guess PnL attribution.
+
+Correlate using DecisionID and/or order IDs using existing authoritative trade state.
+
+If full PnL attribution requires existing exit records outside ProducerEvent, integrate with the authoritative existing source rather than duplicating trading accounting.
+
+==================================================
+13. DORMANCY SUPPORT
+==================================================
+
+Add support for:
+
+"Which producer hasn't fired in two weeks and why?"
+
+The 24-hour Producer Monitor state alone cannot prove two-week dormancy, so preserve or add a lightweight longer-lived per-producer observation needed for this question.
+
+At minimum retain:
+
+- last produced time for every producer
+- last evaluation/rejection/blocker information if the existing strategy exposes it
+- stable blocker/rejection reason counts where available
+
+Do not claim why a producer has not fired unless the code has actual blocker/evaluation evidence.
+
+If the system only knows the last produced time, report that and explicitly state that no blocker evidence is available.
+
+Do not use absence of a produced event alone as proof of a specific failure.
+
+This dormancy support must be additive and must not interfere with the 24-hour attempt map.
+
+==================================================
+14. FRONTEND / BACKEND OWNERSHIP
+==================================================
+
+The BOT OPS frontend does NOT own ProducerHistory.
+
+The frontend only renders data returned by the BOT OPS backend.
+
+The backend/state manager owns:
+
+- updating ProducerMonitorState
+- adding/updating ProducerAttempt
+- recording ProducerEvent
+- removing attempts older than 24h
+- persisting state
+- rebuilding state after restart
+- deriving card statistics
+- deriving FailureSummary
+- providing producer performance/dormancy information
+
+The frontend should remain a presentation layer.
+
+==================================================
+15. RESTART DURABILITY
+==================================================
+
+Producer information must survive BOT OPS/bot restart within the retention period.
+
+On startup:
+
+- load Producer Monitor state file
+- validate it
+- discard attempts older than 24 hours
+- rebuild any derived indexes/caches
+- continue using the retained attempts
+
+Do not depend on the dashboard having remained open.
+
+==================================================
+16. STATE PERSISTENCE SAFETY
+==================================================
+
+Reuse the proven existing state-file mechanism where practical.
+
+Requirements:
+
+- synchronized access
+- atomic write pattern
+- temporary file + replace/rename where already used
+- avoid partial/corrupt state becoming authoritative
+- preserve startup compatibility where reasonable
+- observability persistence failure must not crash or corrupt live trading logic unless current project policy explicitly requires it
+
+Log Producer Monitor state persistence failures clearly.
+
+==================================================
+17. DO NOT REVERT TO LOG-TAIL AUTHORITY
+==================================================
+
+The existing [PRODUCER] logs may remain.
+
+They are useful for forensic debugging.
+
+However:
+
+- the normal Producer Monitor display must not depend on scanning the latest 20 MB of logs
+- log rotation must no longer make producer card information disappear
+- "No canonical events in current log tail" must not be used as the authoritative producer status if retained Producer Monitor state exists
+
+If retained state has events, display them.
+
+==================================================
+18. ACCEPTANCE TESTS
+==================================================
+
+Add/update tests covering at least these scenarios.
+
+A. Existing lifecycle still works
+
+One decision:
+
+produced
+pending_accepted
+filled
+committed
+
+Expected existing card:
+
+Produced=1
+Pending accepted=1
+Filled=1
+Committed=1
+
+B. Multiple attempts from same producer
+
+Decision A:
+produced -> committed
+
+Decision B:
+produced -> entry_failed
+
+Expected:
+
+Produced=2
+Committed=1
+Entry failed=1
+
+Neither attempt overwrites the other.
+
+C. Failure summary
+
+Decision B:
+
+produced
+entry_failed
+ErrorCode=insufficient_balance
+
+Expected:
+
+FailedAfterProduced=1
+ByErrorCode[insufficient_balance]=1
+LatestFailure=Decision B failure
+
+D. Different failure causes
+
+Decision B -> insufficient_balance
+Decision C -> submit_timeout
+
+Expected:
+
+FailedAfterProduced=2
+insufficient_balance=1
+submit_timeout=1
+
+E. Cleanup required
+
+EntryProduceError has:
+
+CleanupRequired=true
+OrderID=<id>
+
+Expected failure event and UI summary retain both fields.
+
+F. 24-hour expiry
+
+Decision A CreatedAt = now - 25h
+Decision B CreatedAt = now - 23h
+
+After cleanup:
+
+Decision A removed entirely.
+Decision B retained entirely.
+
+No individual stages from Decision A remain.
+
+G. Restart persistence
+
+Persist Decision B.
+Restart/load state.
+
+Expected:
+
+Decision B restored and existing Producer Monitor counters remain correct.
+
+H. Log rotation independence
+
+Producer state contains Decision B.
+Current log tail contains no canonical [PRODUCER] events.
+
+Expected:
+
+Producer Monitor still shows Decision B-derived counts and latest event.
+
+I. Existing features regression
+
+Run all existing Producer Monitor tests.
+
+They must continue to pass unless a test must be mutated to reflect the new persistent source while preserving the same observable behavior.
+
+==================================================
+19. IMPLEMENTATION DISCIPLINE
+==================================================
+
+Before editing:
+
+1. Inspect the existing Producer Monitor implementation.
+2. Inspect the existing state-file persistence mechanism.
+3. Inspect EntryProduceError and all sites constructing it.
+4. Inspect DecisionID creation and propagation.
+5. Inspect existing ProducerStage/canonical [PRODUCER] event structures.
+6. Inspect current frontend API payload and card rendering.
+7. Identify exactly which code owns producer lifecycle events today.
+
+Then implement the minimum coherent mutation.
+
+Prefer reuse over parallel implementations.
+
+Do not introduce duplicate enums/types if suitable types already exist.
+
+Do not change trading strategy behavior.
+
+Do not change producer eligibility logic.
+
+Do not alter order sizing, order placement, stop loss, take profit, recovery logic, pyramid logic, or strategy thresholds unless required only to propagate observability metadata.
+
+==================================================
+20. FINAL DELIVERY
+==================================================
+
+When finished, report:
+
+1. Files changed.
+2. New/changed structs and fields.
+3. Where Producer Monitor state is owned.
+4. State-file path and persistence mechanism.
+5. How DecisionID correlation works.
+6. How 24-hour expiry works.
+7. How EntryProduceError is captured.
+8. Exact EntryProduceErrorCode changes.
+9. How existing card counters are derived.
+10. How FailureSummary is derived.
+11. How PnL/performance is derived.
+12. How dormancy is supported.
+13. How restart recovery works.
+14. Tests added/updated.
+15. Confirmation that existing Producer Monitor features were preserved.
+16. Any limitation where the current code does not provide enough evidence to answer a "why" question.
+
+Do not claim completion until tests pass and you have verified that no existing Producer Monitor capability was lost.

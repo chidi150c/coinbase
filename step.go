@@ -77,7 +77,7 @@ import (
 	"time"
 )
 
-const Version = 163
+const Version = 164
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -139,12 +139,12 @@ func safeSend(ch chan OpenResult, res OpenResult) {
 	select {
 	case ch <- res:
 	default:
-		log.Printf("[TRACE] fallback.buffer.full: empty the buffer (drop stale) and resending")
+		// log.Printf("[TRACE] fallback.buffer.full: empty the buffer (drop stale) and resending")
 		select {
 		case <-ch:
 		default:
 		}
-		log.Printf("[TRACE] fallback.buffer.emptied: emptied buffer and resending")
+		// log.Printf("[TRACE] fallback.buffer.emptied: emptied buffer and resending")
 		ch <- res
 	}
 }
@@ -171,14 +171,14 @@ func (t *Trader) creditRefundService(side OrderSide, refundQuote, refundFee floa
 
 	if side == SideBuy {
 		t.SpareSellUSD += refundNet
-		log.Printf("[TRACE] refund.sell.service_credited side=%s gross=%.8f fee=%.8f net=%.8f spareSell_after=%.8f",
-			side, refundQuote, refundFee, refundNet, t.SpareSellUSD)
+		// log.Printf("[TRACE] refund.sell.service_credited side=%s gross=%.8f fee=%.8f net=%.8f spareSell_after=%.8f",
+		// side, refundQuote, refundFee, refundNet, t.SpareSellUSD)
 		return
 	}
 
 	t.SpareBuyUSD += refundNet
-	log.Printf("[TRACE] refund.buy.service_credited side=%s gross=%.8f fee=%.8f net=%.8f spareBuy_after=%.8f",
-		side, refundQuote, refundFee, refundNet, t.SpareBuyUSD)
+	// log.Printf("[TRACE] refund.buy.service_credited side=%s gross=%.8f fee=%.8f net=%.8f spareBuy_after=%.8f",
+	// side, refundQuote, refundFee, refundNet, t.SpareBuyUSD)
 }
 
 // Return this lot's effective profit gate.
@@ -262,13 +262,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		if sourceEntryOrderID != "" &&
 			t.positionExistsByEntryOrderID(sourceEntryOrderID) {
 
-			log.Printf(
-				"[TRACE] Case3A.retry.wait "+
-					"source_entry_id=%s wait_exit_id=%s reason=%s",
-				sourceEntryOrderID,
-				retry.WaitForExitOrderID,
-				retry.Reason,
-			)
+			// log.Printf(
+			// "[TRACE] Case3A.retry.wait "+
+			// "source_entry_id=%s wait_exit_id=%s reason=%s",
+			// sourceEntryOrderID,
+			// retry.WaitForExitOrderID,
+			// retry.Reason,
+			// )
 
 		} else {
 			// produceEntry() ultimately calls registerPendingEntry(),
@@ -283,13 +283,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			t.mu.Lock()
 
 			if err != nil {
-				log.Printf(
-					"[TRACE] Case3A.retry.failed "+
-						"method=%s source_entry_id=%s err=%v",
-					repl.RecoveryMethod.String(),
-					sourceEntryOrderID,
-					err,
-				)
+				// log.Printf(
+				// "[TRACE] Case3A.retry.failed "+
+				// "method=%s source_entry_id=%s err=%v",
+				// repl.RecoveryMethod.String(),
+				// sourceEntryOrderID,
+				// err,
+				// )
 
 			} else {
 				log.Printf(
@@ -303,12 +303,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				t.PendingReplacementRetry.Enabled = false
 
 				if err := t.saveStateNoLock(); err != nil {
-					log.Printf(
-						"[TRACE] Case3A.retry.state_save_failed "+
-							"replacement_order_id=%s err=%v",
-						orderID,
-						err,
-					)
+					// log.Printf(
+					// "[TRACE] Case3A.retry.state_save_failed "+
+					// "replacement_order_id=%s err=%v",
+					// orderID,
+					// err,
+					// )
 				}
 			}
 		}
@@ -321,31 +321,31 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		t.equityStageBuy = 0
 		t.equityStageSell = 0
 
-		log.Printf(
-			"[TRACE] equity.baseline.initialized equity=%.2f",
-			t.lastAddEquity,
-		)
+		// log.Printf(
+		// "[TRACE] equity.baseline.initialized equity=%.2f",
+		// t.lastAddEquity,
+		// )
 
 		if err := t.saveStateNoLock(); err != nil {
-			log.Printf(
-				"[TRACE] equity.baseline.initial_state_save_failed err=%v",
-				err,
-			)
+			// log.Printf(
+			// "[TRACE] equity.baseline.initial_state_save_failed err=%v",
+			// err,
+			// )
 		}
 	}
 
 	// --- NEW: walk-forward (re)fit guard hook (no-op other than the guard) ---
 	_ = t.shouldRefit(len(execHistory)) // intentionally unused here (guard only)
 
-	log.Printf("[TRACE] hotpath.after_drain elapsed_ms=%d",
-		time.Since(hotStart).Milliseconds())
+	// log.Printf("[TRACE] hotpath.after_drain elapsed_ms=%d",
+	// time.Since(hotStart).Milliseconds())
 
 	// TODO: remove TRACE
 	lsb := len(t.book(SideBuy).Lots)
 	lss := len(t.book(SideSell).Lots)
-	log.Printf("[TRACE] step.start ts=%s livePrice=%.8f candleClose=%.8f lotsBuy=%d lotsSell=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f recentLow=%.8f recentHigh=%.8f elapsed_Hours_Buy=%.1f elapsed_Hours_Sell=%.1f",
-		now.Format(time.RFC3339), livePrice, execHistory[len(execHistory)-1].Close, lsb, lss,
-		t.lastAddBuy.Format(time.RFC3339), t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell, t.RecentLow, t.RecentHigh, time.Since(t.lastAddBuy).Hours(), time.Since(t.lastAddSell).Hours())
+	// log.Printf("[TRACE] step.start ts=%s livePrice=%.8f candleClose=%.8f lotsBuy=%d lotsSell=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f recentLow=%.8f recentHigh=%.8f elapsed_Hours_Buy=%.1f elapsed_Hours_Sell=%.1f",
+	// now.Format(time.RFC3339), livePrice, execHistory[len(execHistory)-1].Close, lsb, lss,
+	// t.lastAddBuy.Format(time.RFC3339), t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell, t.RecentLow, t.RecentHigh, time.Since(t.lastAddBuy).Hours(), time.Since(t.lastAddSell).Hours())
 
 	price := livePrice
 
@@ -379,8 +379,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		return StepResult{Msg: msg}, err
 	}
 
-	log.Printf("[TRACE] hotpath.after_dust elapsed_ms=%d",
-		time.Since(hotStart).Milliseconds())
+	// log.Printf("[TRACE] hotpath.after_dust elapsed_ms=%d",
+	// time.Since(hotStart).Milliseconds())
 
 	// --------------------------------------------------------------------------------------------------------
 	// EXIT path: fee-aware per-lot exit management.
@@ -567,14 +567,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							lot.ProfitTrailActive = true
 							lot.ProfitPeakUSD = net
 
-							log.Printf(
-								"[TRACE] case4.armed side=%s idx=%d entry_id=%s net=%.6f gate=%.6f",
-								lot.Side,
-								i,
-								lot.EntryOrderID,
-								net,
-								gateUSD,
-							)
+							// log.Printf(
+							// "[TRACE] case4.armed side=%s idx=%d entry_id=%s net=%.6f gate=%.6f",
+							// lot.Side,
+							// i,
+							// lot.EntryOrderID,
+							// net,
+							// gateUSD,
+							// )
 						}
 
 						if net > lot.ProfitPeakUSD {
@@ -629,17 +629,17 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 					profitL2 = append(profitL2, cand)
 
-					log.Printf(
-						"[TRACE] case4.protection_exit side=%s idx=%d entry_id=%s net=%.6f gate=%.6f peak=%.6f floor=%.6f take=%.8f",
-						lot.Side,
-						i,
-						lot.EntryOrderID,
-						net,
-						gateUSD,
-						lot.ProfitPeakUSD,
-						protectedFloor,
-						lot.Take,
-					)
+					// log.Printf(
+					// "[TRACE] case4.protection_exit side=%s idx=%d entry_id=%s net=%.6f gate=%.6f peak=%.6f floor=%.6f take=%.8f",
+					// lot.Side,
+					// i,
+					// lot.EntryOrderID,
+					// net,
+					// gateUSD,
+					// lot.ProfitPeakUSD,
+					// protectedFloor,
+					// lot.Take,
+					// )
 					lot.ProfitTrailActive = false
 					lot.ProfitPeakUSD = 0
 					i++
@@ -649,16 +649,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					// Protection was armed, but price moved through the protected positive
 					// range before an exit could be scheduled. Do not classify this as profit.
 					// Continue into the ordinary stop-loss path below.
-					log.Printf(
-						"[TRACE] case4.protection_missed side=%s idx=%d entry_id=%s net=%.6f gate=%.6f peak=%.6f floor=%.6f",
-						lot.Side,
-						i,
-						lot.EntryOrderID,
-						net,
-						gateUSD,
-						lot.ProfitPeakUSD,
-						protectedFloor,
-					)
+					// log.Printf(
+					// "[TRACE] case4.protection_missed side=%s idx=%d entry_id=%s net=%.6f gate=%.6f peak=%.6f floor=%.6f",
+					// lot.Side,
+					// i,
+					// lot.EntryOrderID,
+					// net,
+					// gateUSD,
+					// lot.ProfitPeakUSD,
+					// protectedFloor,
+					// )
 				}
 
 				strongProfitExit := net >= gateUSD*strongProfitMult
@@ -732,9 +732,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							if !lot.FixedTPWorking || (lot.Side == SideBuy && makerExitPx < lot.Take) || (lot.Side == SideSell && makerExitPx > lot.Take) {
 								lot.Take = makerExitPx
 								lot.FixedTPWorking = true
-								log.Printf("[TRACE] stop_l1.post side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
+								// log.Printf("[TRACE] stop_l1.post side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
 							} else {
-								log.Printf("[TRACE] stop_l1.repost side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
+								// log.Printf("[TRACE] stop_l1.repost side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
 							}
 						}
 						i++
@@ -802,21 +802,21 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						exitD.ExitClass = "L1_PROFIT_GATE"
 					}
 
-					log.Printf(
-						"[TRACE] exit.allow lot_side=%s idx=%d net=%.4f gate=%.6f "+
-							"entry_id=%s livePrice=%.8f mode=%s exitReason=%s "+
-							"strongProfit=%t exitClass=%s",
-						lot.Side,
-						i,
-						net,
-						gateUSD,
-						lot.EntryOrderID,
-						livePrice,
-						lot.ExitMode,
-						exitD.ExitReason,
-						strongProfitExit,
-						exitD.ExitClass,
-					)
+					// log.Printf(
+					// "[TRACE] exit.allow lot_side=%s idx=%d net=%.4f gate=%.6f "+
+					// "entry_id=%s livePrice=%.8f mode=%s exitReason=%s "+
+					// "strongProfit=%t exitClass=%s",
+					// lot.Side,
+					// i,
+					// net,
+					// gateUSD,
+					// lot.EntryOrderID,
+					// livePrice,
+					// lot.ExitMode,
+					// exitD.ExitReason,
+					// strongProfitExit,
+					// exitD.ExitClass,
+					// )
 
 					offBps := t.cfg.TPMakerOffsetBps
 					makerExitPx := price
@@ -835,23 +835,23 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						lot.Take = makerExitPx
 						lot.FixedTPWorking = true
 
-						log.Printf(
-							"[TRACE] tp.post side=%s idx=%d price=%.8f net=%.6f entry_id=%s",
-							lot.Side,
-							i,
-							lot.Take,
-							net,
-							lot.EntryOrderID,
-						)
+						// log.Printf(
+						// "[TRACE] tp.post side=%s idx=%d price=%.8f net=%.6f entry_id=%s",
+						// lot.Side,
+						// i,
+						// lot.Take,
+						// net,
+						// lot.EntryOrderID,
+						// )
 					} else {
-						log.Printf(
-							"[TRACE] tp.repost side=%s idx=%d price=%.8f net=%.6f entry_id=%s",
-							lot.Side,
-							i,
-							lot.Take,
-							net,
-							lot.EntryOrderID,
-						)
+						// log.Printf(
+						// "[TRACE] tp.repost side=%s idx=%d price=%.8f net=%.6f entry_id=%s",
+						// lot.Side,
+						// i,
+						// lot.Take,
+						// net,
+						// lot.EntryOrderID,
+						// )
 					}
 
 					notional := lot.SizeBase * price
@@ -876,16 +876,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						profitL1 = append(profitL1, cand)
 					}
 
-					log.Printf(
-						"[TRACE] tp.queue side=%s idx=%d price=%.8f net=%.6f "+
-							"exit_class=%s entry_id=%s",
-						lot.Side,
-						i,
-						lot.Take,
-						net,
-						exitD.ExitClass,
-						lot.EntryOrderID,
-					)
+					// log.Printf(
+					// "[TRACE] tp.queue side=%s idx=%d price=%.8f net=%.6f "+
+					// "exit_class=%s entry_id=%s",
+					// lot.Side,
+					// i,
+					// lot.Take,
+					// net,
+					// exitD.ExitClass,
+					// lot.EntryOrderID,
+					// )
 
 					i++
 					continue
@@ -955,14 +955,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 
 		if len(selected) > 0 {
-			log.Printf(
-				"[TRACE] exit.fanout.batch candidates=%d stop_l2=%d profit_l2=%d stop_l1=%d profit_l1=%d",
-				len(selected),
-				len(stopL2),
-				len(profitL2),
-				len(stopL1),
-				len(profitL1),
-			)
+			// log.Printf(
+			// "[TRACE] exit.fanout.batch candidates=%d stop_l2=%d profit_l2=%d stop_l1=%d profit_l1=%d",
+			// len(selected),
+			// len(stopL2),
+			// len(profitL2),
+			// len(stopL1),
+			// len(profitL1),
+			// )
 
 			// Workers acquire t.mu individually.
 			// Never wait for them while step() still holds the trader lock.
@@ -984,26 +984,26 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				if res.Err != nil {
 					failed++
 
-					log.Printf(
-						"[TRACE] exit.fanout.failed side=%s entry_id=%s reason=%s err=%v",
-						res.Side,
-						res.EntryOrderID,
-						res.Reason,
-						res.Err,
-					)
+					// log.Printf(
+					// "[TRACE] exit.fanout.failed side=%s entry_id=%s reason=%s err=%v",
+					// res.Side,
+					// res.EntryOrderID,
+					// res.Reason,
+					// res.Err,
+					// )
 
 					continue
 				}
 
 				succeeded++
 
-				log.Printf(
-					"[TRACE] exit.fanout.done side=%s entry_id=%s reason=%s msg=%q",
-					res.Side,
-					res.EntryOrderID,
-					res.Reason,
-					res.Msg,
-				)
+				// log.Printf(
+				// "[TRACE] exit.fanout.done side=%s entry_id=%s reason=%s msg=%q",
+				// res.Side,
+				// res.EntryOrderID,
+				// res.Reason,
+				// res.Msg,
+				// )
 
 				if strings.TrimSpace(res.Msg) != "" {
 					msgs = append(msgs, res.Msg)
@@ -1037,10 +1037,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	}
 
-	log.Printf(
-		"[TRACE] hotpath.after_exit_scan elapsed_ms=%d",
-		time.Since(hotStart).Milliseconds(),
-	)
+	// log.Printf(
+	// "[TRACE] hotpath.after_exit_scan elapsed_ms=%d",
+	// time.Since(hotStart).Milliseconds(),
+	// )
 
 	feeMult := 1.0 + (t.cfg.FeeRatePct / 100.0)
 
@@ -1134,11 +1134,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// Validate them:
 	// --------------------------------------------------------
 	if aiResult.Err != nil {
-		log.Printf(
-			"[TRACE] case5.ai.failed elapsed_ms=%d err=%v",
-			aiResult.Elapsed.Milliseconds(),
-			aiResult.Err,
-		)
+		// log.Printf(
+		// "[TRACE] case5.ai.failed elapsed_ms=%d err=%v",
+		// aiResult.Elapsed.Milliseconds(),
+		// aiResult.Err,
+		// )
 
 		t.mu.Unlock()
 
@@ -1149,11 +1149,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}, nil
 	}
 	if macdSnapshot.Err != nil {
-		log.Printf(
-			"[TRACE] case5.macd.failed elapsed_ms=%d err=%v",
-			macdSnapshot.Elapsed.Milliseconds(),
-			macdSnapshot.Err,
-		)
+		// log.Printf(
+		// "[TRACE] case5.macd.failed elapsed_ms=%d err=%v",
+		// macdSnapshot.Elapsed.Milliseconds(),
+		// macdSnapshot.Err,
+		// )
 
 		t.mu.Unlock()
 
@@ -1164,11 +1164,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}, nil
 	}
 	if emaResult.Err != nil {
-		log.Printf(
-			"[TRACE] case5.ema.failed elapsed_ms=%d err=%v",
-			emaResult.Elapsed.Milliseconds(),
-			emaResult.Err,
-		)
+		// log.Printf(
+		// "[TRACE] case5.ema.failed elapsed_ms=%d err=%v",
+		// emaResult.Elapsed.Milliseconds(),
+		// emaResult.Err,
+		// )
 
 		t.mu.Unlock()
 
@@ -1179,11 +1179,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}, nil
 	}
 	if pyramidRaw.Err != nil {
-		log.Printf(
-			"[TRACE] case5.pyramid.failed elapsed_ms=%d err=%v",
-			pyramidRaw.Elapsed.Milliseconds(),
-			pyramidRaw.Err,
-		)
+		// log.Printf(
+		// "[TRACE] case5.pyramid.failed elapsed_ms=%d err=%v",
+		// pyramidRaw.Elapsed.Milliseconds(),
+		// pyramidRaw.Err,
+		// )
 
 		t.mu.Unlock()
 
@@ -1223,11 +1223,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		aiResult.Confidence,
 	)
 	if pyramidResult.Err != nil {
-		log.Printf(
-			"[TRACE] case5.pyramid_interpret.failed elapsed_ms=%d err=%v",
-			pyramidResult.Elapsed.Milliseconds(),
-			pyramidResult.Err,
-		)
+		// log.Printf(
+		// "[TRACE] case5.pyramid_interpret.failed elapsed_ms=%d err=%v",
+		// pyramidResult.Elapsed.Milliseconds(),
+		// pyramidResult.Err,
+		// )
 
 		t.mu.Unlock()
 
@@ -1288,10 +1288,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		pendingCounts,
 	)
 
-	log.Printf(
-		"[TRACE] hotpath.after_decision elapsed_ms=%d",
-		time.Since(hotStart).Milliseconds(),
-	)
+	// log.Printf(
+	// "[TRACE] hotpath.after_decision elapsed_ms=%d",
+	// time.Since(hotStart).Milliseconds(),
+	// )
 
 	d := entryDecision
 
@@ -1317,12 +1317,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	side, ok := d.SignalToSide()
 	if !ok {
-		log.Printf(
-			"[TRACE] signal.no_side signal=%s raw=%s final=%s",
-			d.Signal,
-			d.Raw,
-			d.Signal,
-		)
+		// log.Printf(
+		// "[TRACE] signal.no_side signal=%s raw=%s final=%s",
+		// d.Signal,
+		// d.Raw,
+		// d.Signal,
+		// )
 
 		t.mu.Unlock()
 
@@ -1393,25 +1393,25 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		spare = executionBalance.SpareBase
 	}
 
-	log.Printf(
-		"[TRACE] balance.execution_cache.hit "+
-			"side=%s producer=%s final=%s age_ms=%d "+
-			"quote=%.8f quoteStep=%.8f base=%.8f baseStep=%.8f",
-		side,
-		d.Producer,
-		d.Signal,
-		time.Since(executionBalance.Snapshot.UpdatedAt).Milliseconds(),
-		availQuote,
-		quoteStep,
-		availBase,
-		baseStep,
-	)
+	// log.Printf(
+	// "[TRACE] balance.execution_cache.hit "+
+	// "side=%s producer=%s final=%s age_ms=%d "+
+	// "quote=%.8f quoteStep=%.8f base=%.8f baseStep=%.8f",
+	// side,
+	// d.Producer,
+	// d.Signal,
+	// time.Since(executionBalance.Snapshot.UpdatedAt).Milliseconds(),
+	// availQuote,
+	// quoteStep,
+	// availBase,
+	// baseStep,
+	// )
 
-	log.Printf(
-		"[TRACE] hotpath.after_execution_balance elapsed_ms=%d final=%s",
-		time.Since(hotStart).Milliseconds(),
-		d.Signal,
-	)
+	// log.Printf(
+	// "[TRACE] hotpath.after_execution_balance elapsed_ms=%d final=%s",
+	// time.Since(hotStart).Milliseconds(),
+	// d.Signal,
+	// )
 	// --------------------------------------------------------------------------------------------------------
 	//---ADD path continues-----
 	// --------------------------------------------------------------------------------------------------------
@@ -1471,13 +1471,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			last.PNLUSD < 0 &&
 			price > last.ClosePrice {
 
-			log.Printf(
-				"[TRACE] Case3B.block_buy regime=%s buy_price=%.8f last_exit_sell_price=%.8f last_exit_net=%.6f",
-				t.MarketRegime,
-				price,
-				last.ClosePrice,
-				last.PNLUSD,
-			)
+			// log.Printf(
+			// "[TRACE] Case3B.block_buy regime=%s buy_price=%.8f last_exit_sell_price=%.8f last_exit_net=%.6f",
+			// t.MarketRegime,
+			// price,
+			// last.ClosePrice,
+			// last.PNLUSD,
+			// )
 
 			t.mu.Unlock()
 			return StepResult{Msg: "HOLD Case3B block BUY above last loss-exit SELL price", Raw: d.Raw, Signal: d.Signal}, nil
@@ -1501,13 +1501,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			last.PNLUSD < 0 &&
 			price < last.ClosePrice {
 
-			log.Printf(
-				"[TRACE] Case3B.block_sell regime=%s sell_price=%.8f last_exit_buy_price=%.8f last_exit_net=%.6f",
-				t.MarketRegime,
-				price,
-				last.ClosePrice,
-				last.PNLUSD,
-			)
+			// log.Printf(
+			// "[TRACE] Case3B.block_sell regime=%s sell_price=%.8f last_exit_buy_price=%.8f last_exit_net=%.6f",
+			// t.MarketRegime,
+			// price,
+			// last.ClosePrice,
+			// last.PNLUSD,
+			// )
 
 			t.mu.Unlock()
 			return StepResult{Msg: "HOLD Case3B block SELL below last loss-exit BUY price", Raw: d.Raw, Signal: d.Signal}, nil
@@ -1537,7 +1537,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				log.Printf("[WARN] saveState (startup consolidate): %v", err)
 			}
 			t.didConsolidateStartup = true
-			log.Printf("[TRACE] consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
+			// log.Printf("[TRACE] consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
 		}
 		t.mu.Unlock()
 		log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", t.cfg.MaxConcurrentLots)
@@ -1556,11 +1556,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 
 		if d.Signal == Buy || d.Signal == Sell {
-			log.Printf(
-				"[TRACE] pyramid.spacing since_last=%.1fs need>=%ds",
-				pyramidSide.ElapsedSec,
-				pyramidSide.Raw.SpacingNeed,
-			)
+			// log.Printf(
+			// "[TRACE] pyramid.spacing since_last=%.1fs need>=%ds",
+			// pyramidSide.ElapsedSec,
+			// pyramidSide.Raw.SpacingNeed,
+			// )
 
 			if !pyramidSide.SpacingPass {
 				log.Printf(
@@ -1572,26 +1572,26 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 			if pyramidSide.SpacingPass {
 				if pyramidSide.Raw.DecayLambda > 0 {
-					log.Printf(
-						"[TRACE] pyramid.conf_gate side=%s confidence=%.4f gateMult=%.4f decayedPct=%.4f effPct=%.4f",
-						pyramidSide.Side,
-						pyramidSide.Confidence,
-						pyramidSide.GateMult,
-						pyramidSide.DecayedPct,
-						pyramidSide.EffPct,
-					)
+					// log.Printf(
+					// "[TRACE] pyramid.conf_gate side=%s confidence=%.4f gateMult=%.4f decayedPct=%.4f effPct=%.4f",
+					// pyramidSide.Side,
+					// pyramidSide.Confidence,
+					// pyramidSide.GateMult,
+					// pyramidSide.DecayedPct,
+					// pyramidSide.EffPct,
+					// )
 				}
 
-				log.Printf(
-					"[TRACE] pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
-					pyramidSide.Side,
-					pyramidSide.ElapsedMin,
-					pyramidSide.BasePct,
-					pyramidSide.EffPct,
-					pyramidSide.Raw.DecayLambda,
-					pyramidSide.Raw.DecayFloor,
-					pyramidSide.TFloorMin,
-				)
+				// log.Printf(
+				// "[TRACE] pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
+				// pyramidSide.Side,
+				// pyramidSide.ElapsedMin,
+				// pyramidSide.BasePct,
+				// pyramidSide.EffPct,
+				// pyramidSide.Raw.DecayLambda,
+				// pyramidSide.Raw.DecayFloor,
+				// pyramidSide.TFloorMin,
+				// )
 
 				if pyramidSide.UsedSoftGate {
 					switch d.Signal {
@@ -1652,13 +1652,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							pyramidSide.EffectiveGatePrice,
 						)
 
-						log.Printf(
-							"[TRACE] pyramid.block.buy price=%.8f gate=%.8f last=%.8f effPct=%.4f",
-							pyramidSide.CurrentPrice,
-							pyramidSide.EffectiveGatePrice,
-							pyramidSide.LastAnchor,
-							pyramidSide.EffPct,
-						)
+						// log.Printf(
+						// "[TRACE] pyramid.block.buy price=%.8f gate=%.8f last=%.8f effPct=%.4f",
+						// pyramidSide.CurrentPrice,
+						// pyramidSide.EffectiveGatePrice,
+						// pyramidSide.LastAnchor,
+						// pyramidSide.EffPct,
+						// )
 
 					case Sell:
 						log.Printf(
@@ -1667,21 +1667,21 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							pyramidSide.EffectiveGatePrice,
 						)
 
-						log.Printf(
-							"[TRACE] pyramid.block.sell price=%.8f gate=%.8f last=%.8f effPct=%.4f",
-							pyramidSide.CurrentPrice,
-							pyramidSide.EffectiveGatePrice,
-							pyramidSide.LastAnchor,
-							pyramidSide.EffPct,
-						)
+						// log.Printf(
+						// "[TRACE] pyramid.block.sell price=%.8f gate=%.8f last=%.8f effPct=%.4f",
+						// pyramidSide.CurrentPrice,
+						// pyramidSide.EffectiveGatePrice,
+						// pyramidSide.LastAnchor,
+						// pyramidSide.EffPct,
+						// )
 					}
 				}
 			}
 		}
 	}
 
-	log.Printf("[TRACE] hotpath.before_sizing elapsed_ms=%d",
-		time.Since(hotStart).Milliseconds())
+	// log.Printf("[TRACE] hotpath.before_sizing elapsed_ms=%d",
+	// time.Since(hotStart).Milliseconds())
 
 	// --- Fixed-USD risk sizing & ramping (no equity dependency) ---
 	// Base dollar size for the first lot
@@ -1830,20 +1830,20 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		producerProfitGateUSD +
 			recoveryAddUSD
 
-	log.Printf(
-		"[TRACE] entry.profit_gate "+
-			"producer=%s confidence=%.2f "+
-			"base_usd=%.4f multiplier=%.4f "+
-			"producer_usd=%.4f recovery_add_usd=%.4f "+
-			"resolved_usd=%.4f",
-		d.Producer,
-		confMult,
-		baseEntryProfitGateUSD,
-		profitGateMultiplier,
-		producerProfitGateUSD,
-		recoveryAddUSD,
-		entryProfitGateUSD,
-	)
+	// log.Printf(
+	// "[TRACE] entry.profit_gate "+
+	// "producer=%s confidence=%.2f "+
+	// "base_usd=%.4f multiplier=%.4f "+
+	// "producer_usd=%.4f recovery_add_usd=%.4f "+
+	// "resolved_usd=%.4f",
+	// d.Producer,
+	// confMult,
+	// baseEntryProfitGateUSD,
+	// profitGateMultiplier,
+	// producerProfitGateUSD,
+	// recoveryAddUSD,
+	// entryProfitGateUSD,
+	// )
 
 	//Applying confidence multiplier to scalp, that of equity comes later
 	if !(equityTriggerSell || equityTriggerBuy) {
@@ -1928,7 +1928,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	}
 
 	// TODO: remove TRACE
-	log.Printf("[TRACE] sizing.pre side=%s eq=%.2f quote=%.2f price=%.8f base=%.8f", side, t.equityUSD, quote, price, base)
+	// log.Printf("[TRACE] sizing.pre side=%s eq=%.2f quote=%.2f price=%.8f base=%.8f", side, t.equityUSD, quote, price, base)
 
 	// Unified epsilon for spare checks
 	const spareEps = 1e-9
@@ -1939,8 +1939,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// --- BUY gating (require spare quote after reserving open shorts) ---
 	if side == SideBuy {
 		// TODO: remove TRACE
-		log.Printf("[TRACE] buy.gate.pre availQuote=%.2f reservedShort=%.2f needQuoteRaw=%.2f quoteStep=%.8f",
-			availQuote, reservedShortQuoteWithFee, quote, quoteStep)
+		// log.Printf("[TRACE] buy.gate.pre availQuote=%.2f reservedShort=%.2f needQuoteRaw=%.2f quoteStep=%.8f",
+		// availQuote, reservedShortQuoteWithFee, quote, quoteStep)
 
 		// Floor the needed quote to step.
 		neededQuote := quote
@@ -1970,7 +1970,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
 					log.Printf("[DEBUG] GATE BUY: need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
 						neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
-					log.Printf("[TRACE] buy.gate.block minNotional need=%.2f spare=%.2f", neededQuote, spare)
+					// log.Printf("[TRACE] buy.gate.block minNotional need=%.2f spare=%.2f", neededQuote, spare)
 
 					short := neededQuote - spare
 					if short > 0 {
@@ -1986,7 +1986,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			quote = neededQuote
 			base = quote / price
 
-			log.Printf("[TRACE] buy.gate.post needQuote=%.2f spare=%.2f base=%.8f", quote, spare, base)
+			// log.Printf("[TRACE] buy.gate.post needQuote=%.2f spare=%.2f base=%.8f", quote, spare, base)
 		} else {
 			// Slow path: we don't have enough to fund neededQuote → try to degrade to available spare
 			log.Printf("[WARN] FUNDS_SHORT BUY need=%.2f quote, spare=%.2f → attempting degrade-to-spare",
@@ -2021,15 +2021,15 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			quote = useQuote
 			base = quote / price
 
-			log.Printf("[TRACE] buy.gate.post.degraded useQuote=%.2f spare=%.2f base=%.8f", quote, spare, base)
+			// log.Printf("[TRACE] buy.gate.post.degraded useQuote=%.2f spare=%.2f base=%.8f", quote, spare, base)
 		}
 	}
 
 	// If SELL, require spare base inventory (spot safe)
 	if side == SideSell && t.cfg.RequireBaseForShort {
 		// TODO: remove TRACE
-		log.Printf("[TRACE] sell.gate.pre availBase=%.8f reservedLong=%.8f needBaseRaw=%.8f baseStep=%.8f",
-			availBase, reservedLongBase, base, baseStep)
+		// log.Printf("[TRACE] sell.gate.pre availBase=%.8f reservedLong=%.8f needBaseRaw=%.8f baseStep=%.8f",
+		// availBase, reservedLongBase, base, baseStep)
 
 		// Floor the *needed* base to baseStep (if known)
 		neededBase := base
@@ -2068,7 +2068,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						base, spare, availBase, reservedLongBase, baseStep)
 					log.Printf("[DEBUG] GATE SELL: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
 						base, spare, availBase, reservedLongBase, baseStep)
-					log.Printf("[TRACE] sell.gate.block minNotional need=%.8f spare=%.8f", base, spare)
+					// log.Printf("[TRACE] sell.gate.block minNotional need=%.8f spare=%.8f", base, spare)
 
 					// convert the short to USD at current price so we can reuse later on BUY
 					shortBase := base - spare
@@ -2081,7 +2081,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				}
 			}
 
-			log.Printf("[TRACE] sell.gate.post needBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
+			// log.Printf("[TRACE] sell.gate.post needBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
 		} else {
 			// Slow path: not enough spare for neededBase → try degrade-to-spare
 			log.Printf("[WARN] FUNDS_SHORT SELL need=%.8f base, spare=%.8f → attempting degrade-to-spare",
@@ -2118,7 +2118,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			base = useBase
 			quote = base * price
 
-			log.Printf("[TRACE] sell.gate.post.degraded useBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
+			// log.Printf("[TRACE] sell.gate.post.degraded useBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
 		}
 	}
 
@@ -2213,8 +2213,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 		}
 	} else if t.refundBuyUSD > 0 && side == SideSell && confMult < refundMinConf {
-		log.Printf("[TRACE] refund.block side=%s conf=%.2f need>=%.2f refundBuyUSD=%.2f",
-			side, confMult, refundMinConf, t.refundBuyUSD)
+		// log.Printf("[TRACE] refund.block side=%s conf=%.2f need>=%.2f refundBuyUSD=%.2f",
+		// side, confMult, refundMinConf, t.refundBuyUSD)
 	}
 
 	if t.refundSellUSD > 0 && side == SideBuy && confMult >= refundMinConf {
@@ -2254,8 +2254,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 		}
 	} else if t.refundSellUSD > 0 && side == SideBuy && confMult < refundMinConf {
-		log.Printf("[TRACE] refund.block side=%s conf=%.2f need>=%.2f refundSellUSD=%.2f",
-			side, confMult, refundMinConf, t.refundSellUSD)
+		// log.Printf("[TRACE] refund.block side=%s conf=%.2f need>=%.2f refundSellUSD=%.2f",
+		// side, confMult, refundMinConf, t.refundSellUSD)
 	}
 
 	if side == SideBuy {
@@ -2309,10 +2309,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	if wantLimit && recheckNow {
 		wantLimit = false
 
-		log.Printf(
-			"[TRACE] postonly.skip reason=recheck_market_next_tick side=%s",
-			side,
-		)
+		// log.Printf(
+		// "[TRACE] postonly.skip reason=recheck_market_next_tick side=%s",
+		// side,
+		// )
 	}
 
 	// Maker-first entry production now routes through the unified producer:
@@ -2349,13 +2349,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 
 		if limitPx <= 0 {
-			log.Printf(
-				"[TRACE] postonly.invalid_limit "+
-					"side=%s limit=%.8f live=%.8f",
-				side,
-				limitPx,
-				price,
-			)
+			// log.Printf(
+			// "[TRACE] postonly.invalid_limit "+
+			// "side=%s limit=%.8f live=%.8f",
+			// side,
+			// limitPx,
+			// price,
+			// )
 
 			return StepResult{
 				Msg:    "HOLD",
@@ -2373,26 +2373,26 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					t.cfg.BaseStep
 		}
 
-		log.Printf(
-			"[TRACE] hotpath.before_submit "+
-				"elapsed_ms=%d side=%s limit=%.2f live=%.2f",
-			time.Since(hotStart).Milliseconds(),
-			side,
-			limitPx,
-			price,
-		)
+		// log.Printf(
+		// "[TRACE] hotpath.before_submit "+
+		// "elapsed_ms=%d side=%s limit=%.2f live=%.2f",
+		// time.Since(hotStart).Milliseconds(),
+		// side,
+		// limitPx,
+		// price,
+		// )
 
 		if baseAtLimit > 0 &&
 			baseAtLimit*limitPx >= minNotional {
 
-			log.Printf(
-				"[TRACE] postonly.place "+
-					"side=%s limit=%.8f baseReq=%.8f timeout_sec=%d",
-				side,
-				limitPx,
-				baseAtLimit,
-				limitWait,
-			)
+			// log.Printf(
+			// "[TRACE] postonly.place "+
+			// "side=%s limit=%.8f baseReq=%.8f timeout_sec=%d",
+			// side,
+			// limitPx,
+			// baseAtLimit,
+			// limitWait,
+			// )
 
 			var (
 				entry *PendingEntry
@@ -2440,28 +2440,28 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 
 			if err == nil && entry != nil {
-				log.Printf(
-					"[TRACE] hotpath.order.done "+
-						"elapsed_ms=%d orderID=%s",
-					time.Since(hotStart).Milliseconds(),
-					entry.OrderID,
-				)
+				// log.Printf(
+				// "[TRACE] hotpath.order.done "+
+				// "elapsed_ms=%d orderID=%s",
+				// time.Since(hotStart).Milliseconds(),
+				// entry.OrderID,
+				// )
 
-				log.Printf(
-					"[TRACE] postonly.pending.set "+
-						"producer=%s side=%s order_id=%s "+
-						"limit=%.8f base=%.8f quote=%.2f "+
-						"dl=%s eqFlags[buy=%v sell=%v]",
-					entry.Producer,
-					entry.Side,
-					entry.OrderID,
-					entry.Intent.LimitPx,
-					entry.Intent.BaseAtLimit,
-					entry.Intent.Quote,
-					entry.Intent.Deadline.Format(time.RFC3339),
-					entry.Intent.EquityBuy,
-					entry.Intent.EquitySell,
-				)
+				// log.Printf(
+				// "[TRACE] postonly.pending.set "+
+				// "producer=%s side=%s order_id=%s "+
+				// "limit=%.8f base=%.8f quote=%.2f "+
+				// "dl=%s eqFlags[buy=%v sell=%v]",
+				// entry.Producer,
+				// entry.Side,
+				// entry.OrderID,
+				// entry.Intent.LimitPx,
+				// entry.Intent.BaseAtLimit,
+				// entry.Intent.Quote,
+				// entry.Intent.Deadline.Format(time.RFC3339),
+				// entry.Intent.EquityBuy,
+				// entry.Intent.EquitySell,
+				// )
 
 				return StepResult{
 					Msg: fmt.Sprintf(
@@ -2474,19 +2474,19 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 
 			if err != nil {
-				log.Printf(
-					"[TRACE] postonly.error "+
-						"hold_for_recheck side=%s err=%v",
-					side,
-					err,
-				)
+				// log.Printf(
+				// "[TRACE] postonly.error "+
+				// "hold_for_recheck side=%s err=%v",
+				// side,
+				// err,
+				// )
 			} else {
-				log.Printf(
-					"[TRACE] postonly.error "+
-						"hold_for_recheck side=%s "+
-						"err=nil_pending_entry",
-					side,
-				)
+				// log.Printf(
+				// "[TRACE] postonly.error "+
+				// "hold_for_recheck side=%s "+
+				// "err=nil_pending_entry",
+				// side,
+				// )
 			}
 		}
 	}
@@ -2504,23 +2504,23 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// If maker path did not result in a fill (or was skipped), fall back to market path (baseline behavior).
 	if placed == nil {
 		if !allowMarket {
-			log.Printf("[TRACE] postonly.market_fallback.blocked side=%s reason=recheck_flag_not_set", side)
+			// log.Printf("[TRACE] postonly.market_fallback.blocked side=%s reason=recheck_flag_not_set", side)
 			return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
 		}
 
 		// before order submit
-		log.Printf("[TRACE] hotpath.before_submit.market_quote elapsed_ms=%d side=%s live=%.2f",
-			time.Since(hotStart).Milliseconds(), side, price)
+		// log.Printf("[TRACE] hotpath.before_submit.market_quote elapsed_ms=%d side=%s live=%.2f",
+		// time.Since(hotStart).Milliseconds(), side, price)
 
 		var err error
 		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
 		// TODO: remove TRACE
-		log.Printf("[TRACE] order.open request side=%s quote=%.2f baseEst=%.8f priceSnap=%.8f take=%.8f",
-			side, quote, base, price, take)
-		log.Printf("[TRACE] postonly.market_fallback.go side=%s quote=%.2f", side, quote)
-		log.Printf("[KPI] taker.open side=%s quote=%.2f reason=market_fallback", side, quote)
-		log.Printf("[TRACE] hotpath.order.done elapsed_ms=%d",
-			time.Since(hotStart).Milliseconds())
+		// log.Printf("[TRACE] order.open request side=%s quote=%.2f baseEst=%.8f priceSnap=%.8f take=%.8f",
+		// side, quote, base, price, take)
+		// log.Printf("[TRACE] postonly.market_fallback.go side=%s quote=%.2f", side, quote)
+		// log.Printf("[KPI] taker.open side=%s quote=%.2f reason=market_fallback", side, quote)
+		// log.Printf("[TRACE] hotpath.order.done elapsed_ms=%d",
+		// time.Since(hotStart).Milliseconds())
 
 		if err != nil {
 			// Retry once with ORDER_MIN_USD on insufficient-funds style failures.
@@ -2530,7 +2530,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				quote = minNotional
 				base = quote / price
 				// TODO: remove TRACE
-				log.Printf("[TRACE] order.open retry side=%s quote=%.2f baseEst=%.8f", side, quote, base)
+				// log.Printf("[TRACE] order.open retry side=%s quote=%.2f baseEst=%.8f", side, quote, base)
 				placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
 			}
 			if err != nil {
@@ -2542,8 +2542,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 		// TODO: remove TRACE
 		if placed != nil {
-			log.Printf("[TRACE] order.open placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
-				placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
+			// log.Printf("[TRACE] order.open placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
+			// placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
 		}
 
 	}
@@ -2589,7 +2589,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			log.Printf("[WARN] partial fill: requested_base=%.8f filled_base=%.8f (%.2f%%)",
 				baseRequested, baseToUse, 100.0*(baseToUse/baseRequested))
 			// TODO: remove TRACE
-			log.Printf("[TRACE] fill.open partial requested=%.8f filled=%.8f", baseRequested, baseToUse)
+			// log.Printf("[TRACE] fill.open partial requested=%.8f filled=%.8f", baseRequested, baseToUse)
 		}
 	}
 
@@ -2661,14 +2661,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		Producer:         d.Producer,
 	}
 
-	log.Printf(
-		"[KPI] lot.created producer=%s side=%s mode=%s conf=%.2f gate=%.2f",
-		newLot.Producer,
-		newLot.Side,
-		newLot.EntryMethod,
-		newLot.ConfidenceMult,
-		newLot.ProfitGateUSD,
-	)
+	// log.Printf(
+	// "[KPI] lot.created producer=%s side=%s mode=%s conf=%.2f gate=%.2f",
+	// newLot.Producer,
+	// newLot.Side,
+	// newLot.EntryMethod,
+	// newLot.ConfidenceMult,
+	// newLot.ProfitGateUSD,
+	// )
 
 	book.Lots = append(book.Lots, newLot)
 	t.consolidateDust(book, priceToUse, minNotional)
@@ -2715,7 +2715,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		r.TrailStop = 0
 		// Apply runner targets (stretched TP)
 		t.applyRunnerTargets(r)
-		log.Printf("[TRACE] runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
+		// log.Printf("[TRACE] runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
 	}
 	// --- NEW (minimal): promote equity-triggered BUY add to runner ---
 	if equityTriggerBuy && side == SideBuy {
@@ -2726,7 +2726,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		r.TrailPeak = r.OpenPrice
 		r.TrailStop = 0
 		t.applyRunnerTargets(r)
-		log.Printf("[TRACE] runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
+		// log.Printf("[TRACE] runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
 	}
 	// (If not equityTriggerSell/equityTriggerBuy, leave RunnerIDs unchanged so first lot is NOT the runner.)
 
@@ -2740,10 +2740,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// persist new state (no locking while writing; snapshot constructed here under lock)
 	if err := t.saveStateNoLock(); err != nil {
 		log.Printf("[WARN] saveState: %v", err)
-		log.Printf("[TRACE] state.save error=%v", err)
+		// log.Printf("[TRACE] state.save error=%v", err)
 	}
-	log.Printf("[KPI] summary equity=%.2f daily_pnl=%.2f lots_buy=%d lots_sell=%d product=%s",
-		t.equityUSD, t.dailyPnL, len(t.book(SideBuy).Lots), len(t.book(SideSell).Lots), t.cfg.ProductID)
+	// log.Printf("[KPI] summary equity=%.2f daily_pnl=%.2f lots_buy=%d lots_sell=%d product=%s",
+	// t.equityUSD, t.dailyPnL, len(t.book(SideBuy).Lots), len(t.book(SideSell).Lots), t.cfg.ProductID)
 	t.mu.Unlock()
 	return StepResult{Msg: msg, Raw: d.Raw, Signal: d.Signal}, nil
 }
@@ -2910,15 +2910,15 @@ func (t *Trader) archiveOrphanDust(book *SideBook, px float64, minNotional float
 	book.Lots = nil
 	book.RunnerIDs = nil
 
-	log.Printf(
-		"[TRACE] dust.archive side=%s open=%.8f base=%.8f notional=%.4f minNotional=%.2f lastAddReset=%s",
-		side,
-		lot.OpenPrice,
-		lot.SizeBase,
-		lot.SizeBase*px,
-		minNotional,
-		wallNow.Format(time.RFC3339),
-	)
+	// log.Printf(
+	// "[TRACE] dust.archive side=%s open=%.8f base=%.8f notional=%.4f minNotional=%.2f lastAddReset=%s",
+	// side,
+	// lot.OpenPrice,
+	// lot.SizeBase,
+	// lot.SizeBase*px,
+	// minNotional,
+	// wallNow.Format(time.RFC3339),
+	// )
 }
 
 type balanceSnapshot struct {
@@ -3133,7 +3133,7 @@ func (t *Trader) startBalanceRefresher(ctx context.Context) {
 			for {
 				select {
 				case <-ctx.Done():
-					log.Printf("[TRACE] balance.cache.refresher.stopped")
+					// log.Printf("[TRACE] balance.cache.refresher.stopped")
 					return
 
 				case <-ticker.C:
@@ -3155,10 +3155,10 @@ func (t *Trader) startBalanceRefresher(ctx context.Context) {
 						continue
 					}
 
-					log.Printf(
-						"[TRACE] balance.cache.refreshed elapsed_ms=%d",
-						time.Since(started).Milliseconds(),
-					)
+					// log.Printf(
+					// "[TRACE] balance.cache.refreshed elapsed_ms=%d",
+					// time.Since(started).Milliseconds(),
+					// )
 				}
 			}
 		}()

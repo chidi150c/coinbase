@@ -71,7 +71,6 @@ import (
 	"time"
 )
 
-
 type EntryProducer string
 
 const (
@@ -784,8 +783,8 @@ func applyCase13APeakProducer(
 	pendingCounts PendingProducerCounts,
 ) bool {
 	const (
-		minConfidence  = 0.65
-		maxNearPeakPct = 0.10
+		minConfidence        = 0.65
+		maxNearPeakPct       = 0.10
 		profitGateMultiplier = 0.50
 	)
 
@@ -896,7 +895,7 @@ func applyCase13APeakProducer(
 	// 	pyramid.Sell.SpacingPass &&
 	// 		case13AAdversePass
 	d.PyramidReason = pyramid.Sell.Reason
-	
+
 	d.ProfitGateMultiplier = profitGateMultiplier
 	d.Producer = EntryProducerCase13APeakSell
 	d.PendingCancelPolicy = PendingSignalCancelDisabled
@@ -943,8 +942,8 @@ func applyCase13BBottomProducer(
 	pendingCounts PendingProducerCounts,
 ) bool {
 	const (
-		minConfidence = 0.65
-		maxNearLowPct = 0.10
+		minConfidence        = 0.65
+		maxNearLowPct        = 0.10
 		profitGateMultiplier = 0.50
 	)
 
