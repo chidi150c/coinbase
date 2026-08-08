@@ -540,13 +540,13 @@ func applyEquityProducer(
 		return true
 
 	default:
-		log.Printf(
-			"[TRACE] equity.evaluate "+
-				"ai_raw=%s logic=%s legacy=%s produced=false",
-			ai.Raw,
-			legacy.LogicOpinion,
-			legacy.Signal,
-		)
+		// log.Printf(
+		// 	"[TRACE] equity.evaluate "+
+		// 		"ai_raw=%s logic=%s legacy=%s produced=false",
+		// 	ai.Raw,
+		// 	legacy.LogicOpinion,
+		// 	legacy.Signal,
+		// )
 
 		return false
 	}

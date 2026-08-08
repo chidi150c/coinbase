@@ -1213,24 +1213,24 @@ func (t *Trader) applyPyramidRawTransitions(
 	state PyramidStateTransitions,
 ) {
 	if state.Buy.UpdateLastAdd {
-		log.Printf(
-			"[TRACE] pyramid.latch_extend side=BUY recentLow=%.2f prevRecentLow=%.2f elapsedResetAtHr=%.2f",
-			t.RecentLow,
-			t.PreviousRecentLow,
-			state.Buy.ElapsedBeforeResetHr,
-		)
+		// log.Printf(
+		// 	"[TRACE] pyramid.latch_extend side=BUY recentLow=%.2f prevRecentLow=%.2f elapsedResetAtHr=%.2f",
+		// 	t.RecentLow,
+		// 	t.PreviousRecentLow,
+		// 	state.Buy.ElapsedBeforeResetHr,
+		// )
 
 		t.lastAddBuy =
 			state.Buy.NextLastAdd
 	}
 
 	if state.Sell.UpdateLastAdd {
-		log.Printf(
-			"[TRACE] pyramid.latch_extend side=SELL recentHigh=%.2f prevRecentHigh=%.2f elapsedResetAtHr=%.2f",
-			t.RecentHigh,
-			t.PreviousRecentHigh,
-			state.Sell.ElapsedBeforeResetHr,
-		)
+		// log.Printf(
+		// 	"[TRACE] pyramid.latch_extend side=SELL recentHigh=%.2f prevRecentHigh=%.2f elapsedResetAtHr=%.2f",
+		// 	t.RecentHigh,
+		// 	t.PreviousRecentHigh,
+		// 	state.Sell.ElapsedBeforeResetHr,
+		// )
 
 		t.lastAddSell =
 			state.Sell.NextLastAdd
@@ -1274,12 +1274,12 @@ func (t *Trader) applyPyramidDecisionTransitions(
 		}
 
 		if pyramid.Buy.LatchClampApplied {
-			log.Printf(
-				"[TRACE] pyramid.latch_clamp.buy old=%.8f last=%.8f new=%.8f",
-				pyramid.Buy.LatchBeforeClamp,
-				pyramid.Buy.LastAnchor,
-				pyramid.Buy.LatchAfterClamp,
-			)
+			// log.Printf(
+			// 	"[TRACE] pyramid.latch_clamp.buy old=%.8f last=%.8f new=%.8f",
+			// 	pyramid.Buy.LatchBeforeClamp,
+			// 	pyramid.Buy.LastAnchor,
+			// 	pyramid.Buy.LatchAfterClamp,
+			// )
 		}
 	}
 
@@ -1303,12 +1303,12 @@ func (t *Trader) applyPyramidDecisionTransitions(
 		}
 
 		if pyramid.Sell.LatchClampApplied {
-			log.Printf(
-				"[TRACE] pyramid.latch_clamp.sell old=%.8f last=%.8f new=%.8f",
-				pyramid.Sell.LatchBeforeClamp,
-				pyramid.Sell.LastAnchor,
-				pyramid.Sell.LatchAfterClamp,
-			)
+			// log.Printf(
+			// 	"[TRACE] pyramid.latch_clamp.sell old=%.8f last=%.8f new=%.8f",
+			// 	pyramid.Sell.LatchBeforeClamp,
+			// 	pyramid.Sell.LastAnchor,
+			// 	pyramid.Sell.LatchAfterClamp,
+			// )
 		}
 	}
 }
