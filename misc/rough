@@ -264,20 +264,24 @@ Use the existing EntryProduceError as the authoritative trading-side failure mod
 Existing structure:
 
 type EntryProduceError struct {
-    Code EntryProduceErrorCode
+    Code            EntryProduceErrorCode
 
-    Producer EntryProducer
-    Side     string
-    OrderID  string
+    Producer        EntryProducer
+    Side            string
+    OrderID         string
 
     CleanupRequired bool
 
-    Cause error
+    Err error // optional runtime-specific diagnostic
 }
 
 Do NOT invent a separate unrelated BOT OPS failure interpretation.
 
-Translate EntryProduceError into the appropriate ProducerEvent fields:
+Each producer helper constructs the authoritative EntryProduceError at the exact point where the failure becomes known.
+
+Higher-level producer orchestration must not reinterpret, classify, or replace that failure.
+
+produceEntry() (or the Producer Monitor state manager) translates the already-authoritative EntryProduceError into the appropriate ProducerEvent fields.
 
 - ErrorCode
 - Error
@@ -303,9 +307,23 @@ const (
     EntryProduceErrCleanupCancel EntryProduceErrorCode = "cleanup_cancel_failed"
 )
 
-Expand them where the code can reliably distinguish exact causes.
+Expand the error codes organically while mutating each producer helper.
 
-Examples of useful stable categories include, where applicable:
+Each producer helper is the authoritative owner of its own failure taxonomy.
+
+A helper must construct and return the most specific EntryProduceError it can determine at the point where the failure becomes known.
+
+Do not return generic errors and classify them later.
+
+Do not centralize failure classification inside produceEntry() or any higher-level orchestration function.
+
+The function that detects the failure is responsible for constructing the final EntryProduceError.
+
+Error codes should be discovered from the implementation rather than invented up front.
+
+While mutating each producer helper, introduce only the additional stable machine-readable codes that the helper can authoritatively distinguish.
+
+Examples include, where applicable:
 
 - invalid_intent
 - invalid_side
@@ -323,13 +341,54 @@ Examples of useful stable categories include, where applicable:
 - persist_failed
 - cleanup_cancel_failed
 
+Additional codes should continue to be introduced as later helpers are mutated and new distinct business-rule failures are discovered.
+
+Avoid speculative or placeholder error codes.
+
 Do not fabricate distinctions the code cannot actually determine.
 
 Preserve compatibility with existing error handling where possible.
 
 EntryProduceErrorCode must remain stable and machine-readable.
 
-Cause/Error remains the detailed human-readable explanation.
+Err remains the optional runtime-specific diagnostic. EntryProduceErrorCode is the stable machine-readable failure category. Err should only contain occurrence-specific information not already expressed by the error code.
+
+Error Code Ownership
+
+Each EntryProduceErrorCode should have a single authoritative owner.
+
+For example:
+
+validatePendingIntent()
+    owns:
+        invalid_side
+        invalid_price
+        missing_product_id
+        missing_pending_cancel_policy
+        ...
+
+submitPendingIntent()
+    owns:
+        post_only_submit_failed
+        submit_nil_broker
+        submitted_order_id_missing
+        ...
+
+buildPendingEntry()
+    owns:
+        build_missing_order_id
+        build_unsupported_side
+        ...
+
+registerPendingEntry()
+    owns:
+        register_duplicate_order_id
+        register_missing_order_id
+        ...
+
+The owning helper should construct and return the complete EntryProduceError.
+
+Higher-level functions should simply propagate it.
 
 ==================================================
 11. FAILURE SUMMARY IS DERIVED, NOT STORED
