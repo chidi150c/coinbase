@@ -44,6 +44,9 @@ const (
 	EntryProduceErrRegisterNilPendingIntent EntryProduceErrorCode = "register_nil_pending_intent"
 	EntryProduceErrRegisterMissingOrderID   EntryProduceErrorCode = "register_missing_order_id"
 	EntryProduceErrRegisterDuplicateOrderID EntryProduceErrorCode = "register_duplicate_order_id"
+
+	EntryProduceErrPersistState  EntryProduceErrorCode = "persist_state_failed"
+	EntryProduceErrCleanupCancel EntryProduceErrorCode = "cleanup_cancel_failed"
 )
 
 // EntryProduceError carries stable entry-production failure information

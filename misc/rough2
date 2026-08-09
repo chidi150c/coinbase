@@ -1,0 +1,402 @@
+We are continuing implementation of BOT OPS producer observability for a Go cryptocurrency trading bot.
+
+IMPORTANT: Do not redesign or replace the architecture below. Preserve all existing trading behavior. Every new observability capability must be additive and must not break any feature already working.
+
+CURRENT AGREED ARCHITECTURE
+
+1. Producer lifecycle
+
+A producer attempt has one immutable DecisionID created once at source-wrapper decision creation time.
+
+DecisionID format:
+
+    <Producer>_<YYYYMMDDTHHMMSS>M<mmm>
+
+Example:
+
+    Case13APeakSell_20260808T163003M123
+
+DecisionID is only a correlation identifier.
+
+Do NOT parse time back out of DecisionID.
+
+CreatedAt is the authoritative time.Time used for:
+- 24-hour retention
+- sorting
+- expiry
+
+ProducerEvent.Time is the time of the individual lifecycle event.
+
+2. Core types
+
+type ProducerStage string
+
+const (
+    ProducerStageProduced            ProducerStage = "produced"
+    ProducerStagePending             ProducerStage = "pending"
+    ProducerStageFilled              ProducerStage = "filled"
+    ProducerStageCommitted           ProducerStage = "committed"
+    ProducerStageCancelRequested     ProducerStage = "cancel_requested"
+    ProducerStageEntryFailed         ProducerStage = "entry_failed"
+    ProducerStageCleanupCancelled    ProducerStage = "cleanup_cancelled"
+    ProducerStageCleanupCancelFailed ProducerStage = "cleanup_cancel_failed"
+)
+
+type ProducerEvent struct {
+    Time      time.Time
+    CreatedAt time.Time
+
+    Producer EntryProducer
+    Side     string
+    Stage    ProducerStage
+
+    DecisionID string
+    OrderID    string
+
+    Reason string
+
+    ErrorCode       EntryProduceErrorCode
+    Error           string
+    CleanupRequired bool
+
+    PnL float64
+}
+
+type ProducerAttempt struct {
+    DecisionID string
+    CreatedAt  time.Time
+
+    Producer EntryProducer
+    Side     string
+
+    Events map[ProducerStage]ProducerEvent
+}
+
+type ProducerHistory struct {
+    Attempts map[string]*ProducerAttempt
+}
+
+Trader owns:
+
+    producerHistory map[EntryProducer]*ProducerHistory
+
+Logical structure:
+
+    producerHistory[producer]
+        .Attempts[decisionID]
+        .Events[stage]
+
+3. Entry production flow already implemented
+
+Source wrappers:
+
+    startProducerBuyEntry()
+    startProducerSellEntry()
+    startCase3AReplacement()
+
+create:
+
+    CreatedAt
+    DecisionID
+    stage=produced
+
+They call:
+
+    produceEntry()
+
+produceEntry() returns:
+
+    (*PendingEntry, *ProducerAttempt, error)
+
+produceEntry() collects:
+
+    pending
+or
+    entry_failed
+
+Entry helpers construct their own granular EntryProduceError at the exact point where the failure is known.
+
+Higher layers must not reclassify those errors.
+
+EntryProduceError:
+
+type EntryProduceError struct {
+    Code            EntryProduceErrorCode
+    Producer        EntryProducer
+    Side            string
+    OrderID         string
+    CleanupRequired bool
+    Err             error
+}
+
+produceEntry() converts EntryProduceError → ProducerEvent but still propagates the structured error upward.
+
+4. Cleanup handling already implemented
+
+handleEntryProduceError(
+    ctx,
+    intent,
+    attempt,
+    err,
+)
+
+owns immediate exchange cleanup after entry production failure.
+
+It may append:
+
+    cleanup_cancelled
+
+or:
+
+    cleanup_cancel_failed
+
+to the SAME ProducerAttempt / SAME DecisionID.
+
+It does NOT write producerHistory.
+
+5. Higher-level callers own recording attempts
+
+Normal BUY/SELL higher-level caller is Step().
+
+Case3A higher-level caller is closeLot() / Case3A retry flow.
+
+Those higher-level callers record attempts using:
+
+func (t *Trader) recordProducerAttemptLocked(
+    attempt *ProducerAttempt,
+)
+
+This helper:
+
+- requires t.mu already held
+- performs only the mechanical map update
+- does NOT perform retry policy
+- does NOT perform cleanup
+- does NOT persist state
+- does NOT mutate trading behavior
+
+It writes:
+
+    producerHistory[attempt.Producer].
+        Attempts[attempt.DecisionID] = attempt
+
+6. Case3A behavior must remain unchanged
+
+Case3A retry policy is handled above the source wrapper.
+
+handleCase3AReplacementError() distinguishes:
+
+Known retryable:
+    EntryProduceErrPostOnlySubmit
+    EntryProduceErrPersistState
+
+Cleanup uncertain:
+    EntryProduceErrCleanupCancel
+
+Known validation/build/register failures:
+    non-retryable
+
+Unknown/new error codes:
+    non-retryable by default
+    log exact ErrorCode and Err
+    classify deliberately later
+
+Deferred retries are executed from PendingReplacementRetry in Step().
+
+Every actual retry is a NEW ProducerAttempt with a NEW DecisionID.
+
+7. Locking rule
+
+Never call startCase3AReplacement()/produceEntry() while holding t.mu if the downstream path may acquire t.mu.
+
+closeLot() has already been mutated to release t.mu before Case3A replacement entry production, then reacquire it, refresh local lot state, and record ProducerAttempt.
+
+DO NOT undo this.
+
+CURRENT TASK — PRODUCER STATE MANAGER ONLY
+
+Do NOT mutate the pending-entry poller yet.
+
+Do NOT implement:
+
+    pending → filled → committed
+
+yet.
+
+We will continue that in a later phase.
+
+For this phase, implement only the Producer State Manager and persistence.
+
+GOAL
+
+producerHistory must survive bot restart and retain a rolling 24-hour producer history.
+
+BOT OPS should eventually read this persisted Producer History instead of reconstructing producer lifecycle from the current log tail.
+
+Producer observability persistence must remain separate from critical trading-state persistence.
+
+Do NOT embed producerHistory into the existing critical Trader state file.
+
+IMPLEMENT
+
+A. Producer state file
+
+Create a dedicated producer history state file mechanism analogous to the existing state-file mechanism, but independent of critical trading state.
+
+Suggested concept:
+
+    producer_history.json
+
+Use the project's existing safe file-writing / atomic state-file conventions where possible.
+
+Do not invent an unrelated persistence style if an existing state-file mechanism can be reused.
+
+B. Save
+
+Implement a function with semantics equivalent to:
+
+    func (t *Trader) saveProducerHistoryNoLock() error
+
+Requirements:
+
+- caller ownership/locking must be explicit
+- serialize producerHistory
+- write atomically/safely using existing project conventions
+- producer-history persistence failure must NOT corrupt or block critical trading-state persistence
+- do not silently discard errors
+- logging should identify producer-history persistence specifically
+
+C. Load
+
+Implement:
+
+    func (t *Trader) loadProducerHistory() error
+
+or the naming style that best matches the existing codebase.
+
+Requirements:
+
+- load at startup
+- missing file should normally initialize an empty history rather than fail startup
+- malformed/corrupt file should be handled deliberately and visibly
+- initialize nil nested maps safely
+- preserve ProducerAttempt / ProducerEvent data exactly
+
+D. 24-hour pruning
+
+Implement:
+
+    func (t *Trader) pruneProducerHistoryLocked(now time.Time)
+
+Retention rule:
+
+    now - attempt.CreatedAt <= 24 hours
+
+Delete attempts older than 24 hours.
+
+Use:
+
+    ProducerAttempt.CreatedAt
+
+Do NOT use:
+
+    ProducerEvent.Time
+
+Do NOT parse:
+
+    DecisionID
+
+After pruning, empty ProducerHistory containers may be removed if useful.
+
+E. Recording + persistence boundary
+
+Keep:
+
+    recordProducerAttemptLocked(attempt)
+
+as the mechanical in-memory map mutation.
+
+Do not overload it with strategy behavior.
+
+Decide whether persistence should be:
+
+Option A:
+    record attempt
+    prune
+    save immediately
+
+or
+
+Option B:
+    record attempt
+    mark state dirty
+    save at a controlled safe boundary
+
+Choose the option that best matches the existing state architecture and explain why.
+
+Do not introduce unnecessary hot-path blocking if the project already has a safer persistence mechanism.
+
+F. Startup integration
+
+Find the existing Trader startup/state-load path and integrate producer-history load there without disturbing existing trading-state loading.
+
+After load:
+
+    initialize maps
+    prune >24h attempts
+    optionally persist the pruned result
+
+G. BOT OPS contract
+
+The persisted structure should remain reconstructable as:
+
+    producer
+        → DecisionID
+            → ProducerAttempt
+                → Events[stage]
+
+Do NOT persist derived card counters as authoritative state.
+
+Counts such as:
+
+    Produced
+    Pending
+    Filled
+    Committed
+    Entry Failed
+    Cleanup Cancelled
+    Cleanup Cancel Failed
+
+must remain derivable from ProducerEvent facts.
+
+H. Preserve future lifecycle extension
+
+The Producer State Manager must support future addition of:
+
+    pending
+        → filled
+        → committed
+
+without changing the persistence schema architecture.
+
+Do not implement those poller mutations yet.
+
+DELIVERABLE
+
+Proceed step by step.
+
+First inspect the existing Trader state persistence functions and startup/load code.
+
+Then propose the minimum set of Producer State Manager functions and exact insertion points.
+
+Do not rewrite large unrelated sections.
+
+Do not change Case3A behavior.
+
+Do not change producer error taxonomy.
+
+Do not change DecisionID format.
+
+Do not change wrapper ownership.
+
+Do not start pending → filled → committed implementation yet.

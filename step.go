@@ -77,7 +77,7 @@ import (
 	"time"
 )
 
-const Version = 165
+const Version = 166
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -275,12 +275,30 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			// which acquires t.mu. Never call it while step() owns t.mu.
 			t.mu.Unlock()
 
-			orderID, err := t.startCase3AReplacement(
+			orderID, attempt, err := t.startCase3AReplacement(
 				ctx,
 				repl,
 			)
 
 			t.mu.Lock()
+
+			/*
+			   The retry itself is a new Case3A producer attempt.
+
+			   The Case3A wrapper has already completed any immediate cleanup it owns.
+			   This higher-level Step() retry executor records the returned attempt
+			   before deciding whether another retry will be needed.
+			*/
+			t.recordProducerAttemptLocked(attempt)
+			if err := t.saveProducerHistoryNoLock(); err != nil {
+				log.Printf(
+					"[WARN] producer history save failed "+
+						"producer=%s decision_id=%s err=%v",
+					attempt.Producer,
+					attempt.DecisionID,
+					err,
+				)
+			}
 
 			if err != nil {
 				// log.Printf(
@@ -2395,13 +2413,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			)
 
 			var (
-				entry *PendingEntry
-				err   error
+				entry   *PendingEntry
+				attempt *ProducerAttempt
+				err     error
 			)
 
 			switch side {
 			case SideBuy:
-				entry, err = t.startProducerBuyEntry(
+				entry, attempt, err = t.startProducerBuyEntry(
 					ctx,
 					limitPx,
 					baseAtLimit,
@@ -2417,7 +2436,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				)
 
 			case SideSell:
-				entry, err = t.startProducerSellEntry(
+				entry, attempt, err = t.startProducerSellEntry(
 					ctx,
 					limitPx,
 					baseAtLimit,
@@ -2437,6 +2456,39 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					"unsupported entry side: %s",
 					side,
 				)
+			}
+
+			/*
+				The BUY/SELL source wrapper has now completed the portion of the
+				producer lifecycle that it owns.
+
+				On success, attempt contains:
+				  - produced
+				  - pending
+
+				On entry-production failure, attempt contains:
+				  - produced
+				  - entry_failed
+				  - cleanup_cancelled or cleanup_cancel_failed, when applicable
+
+				This Step-level caller is above the source wrapper, so it owns
+				recording that completed/current ProducerAttempt into producerHistory.
+
+				recordProducerAttemptLocked() requires t.mu.
+			*/
+			if attempt != nil {
+				t.mu.Lock()
+				t.recordProducerAttemptLocked(attempt)
+				if err := t.saveProducerHistoryNoLock(); err != nil {
+					log.Printf(
+						"[WARN] producer history save failed "+
+							"producer=%s decision_id=%s err=%v",
+						attempt.Producer,
+						attempt.DecisionID,
+						err,
+					)
+				}
+				t.mu.Unlock()
 			}
 
 			if err == nil && entry != nil {

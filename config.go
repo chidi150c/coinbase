@@ -50,10 +50,11 @@ type Config struct {
 	QuoteStep float64 // quote asset step (QUOTE)
 
 	// Ops
-	Port              int
-	BridgeURL         string // optional: http://127.0.0.1:8787 (only when using the bridge)
-	MaxHistoryCandles int    // plural: loaded from MAX_HISTORY_CANDLES
-	StateFile         string // path to persist bot state
+	Port                int
+	BridgeURL           string // optional: http://127.0.0.1:8787 (only when using the bridge)
+	MaxHistoryCandles   int    // plural: loaded from MAX_HISTORY_CANDLES
+	StateFile           string // path to persist bot state
+	ProducerHistoryFile string // path to persist bot state
 
 	// Loop control (unprefixed; universal)
 	UseTickPrice    bool // enable tick-driven loop
@@ -172,10 +173,11 @@ func loadConfigFromEnv() Config {
 		BaseStep:  getEnvFloat("BASE_STEP", 0.000001),
 		QuoteStep: getEnvFloat("QUOTE_STEP", 0.01),
 
-		Port:              getEnvInt("PORT", 8080),
-		BridgeURL:         getEnv("BRIDGE_URL", ""),
-		MaxHistoryCandles: getEnvInt("MAX_HISTORY_CANDLES", 5000),
-		StateFile:         getEnv("STATE_FILE", "/opt/coinbase/state/bot_state.json"),
+		Port:                getEnvInt("PORT", 8080),
+		BridgeURL:           getEnv("BRIDGE_URL", ""),
+		MaxHistoryCandles:   getEnvInt("MAX_HISTORY_CANDLES", 5000),
+		StateFile:           getEnv("STATE_FILE", "/opt/coinbase/state/bot_state.json"),
+		ProducerHistoryFile: getEnv("PRODUCER_HISTORY_FILE", "/opt/coinbase/state/producer_history.json"),
 
 		// Loop control
 		UseTickPrice:    getEnvBool("USE_TICK_PRICE", false),

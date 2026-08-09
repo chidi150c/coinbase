@@ -267,12 +267,14 @@ type Trader struct {
 	balanceRefreshOnce sync.Once
 	balanceRefreshStop chan struct{}
 	// Unified asynchronous entry registry; key = exchange OrderID.
-	pendingEntries  map[string]*PendingEntry
-	pendingExits    map[string]*PendingExit
-	producerHistory map[EntryProducer]*ProducerHistory
+	pendingEntries      map[string]*PendingEntry
+	pendingExits        map[string]*PendingExit
+	producerHistory     map[EntryProducer]*ProducerHistory
+	producerHistoryFile string
 }
 
 func NewTrader(cfg Config, broker Broker) *Trader {
+	producerHistoryFile := cfg.ProducerHistoryFile
 	t := &Trader{
 		cfg:        cfg,
 		broker:     broker,
@@ -288,8 +290,12 @@ func NewTrader(cfg Config, broker Broker) *Trader {
 		pendingEntries: make(map[string]*PendingEntry),
 		pendingExits:   make(map[string]*PendingExit),
 
-		stateApplyCh: make(chan func(*Trader), 128),
-		MarketRegime: RegimeNormal,
+		stateApplyCh:        make(chan func(*Trader), 128),
+		MarketRegime:        RegimeNormal,
+		producerHistoryFile: producerHistoryFile,
+		producerHistory: make(
+			map[EntryProducer]*ProducerHistory,
+		),
 	}
 
 	// Start centralized state manager goroutine
@@ -320,6 +326,21 @@ func NewTrader(cfg Config, broker Broker) *Trader {
 					"mount /opt/coinbase/state into the container and ensure it's writable. "+
 					"Example docker-compose:\n  volumes:\n    - /opt/coinbase/state:/opt/coinbase/state",
 					t.stateFile)
+			}
+		}
+		if t.producerHistoryFile != "" {
+			if err := t.loadProducerHistory(); err != nil {
+				log.Printf(
+					"[WARN] producer history state not restored "+
+						"file=%s err=%v",
+					t.producerHistoryFile,
+					err,
+				)
+			} else {
+				log.Printf(
+					"[INFO] producer history restored from %s",
+					t.producerHistoryFile,
+				)
 			}
 		}
 	}
@@ -2601,53 +2622,119 @@ func (t *Trader) closeLot(
 		}
 	}
 
-	if repl.Enabled && repl.RecoveryMethod == RecoveryByPositionSize {
-		// Case 3A Mode A:
-		// Sufficient spare for normalBase + extraBase.
-		// Post replacement first, then continue to loss-exit.
+	// ============================================================================
+	// Case 3A Mode A - replacement must start before the losing SELL is closed.
+	// ============================================================================
+	//
+	// Mode A is only valid if the replacement entry is successfully started first.
+	// The Case3A source wrapper returns:
+	//   - replacement order ID;
+	//   - ProducerAttempt containing produced/pending/failure/cleanup events;
+	//   - error.
+	//
+	// closeLot() is the higher-level Case3A owner, so it records the returned
+	// ProducerAttempt into producerHistory after the wrapper has completed its
+	// immediate cleanup handling.
+	//
+	if repl.Enabled &&
+		repl.RecoveryMethod == RecoveryByPositionSize {
 
 		if lot.Case3AReplacementStarted {
-			// log.Printf(
-			// "[TRACE] Case3A.modeA.replacement_already_started side=%s source_entry_id=%s replacement_order_id=%s",
-			// lot.Side,
-			// lot.EntryOrderID,
-			// lot.Case3AReplacementOrderID,
-			// )
-		} else {
-			var err error
-			var oid string
-			if oid, err = t.startCase3AReplacement(ctx, repl); err != nil {
-				// log.Printf(
-				// "[TRACE] Case3A.modeA.replacement_failed side=%s entry_id=%s base=%.8f entry_price=%.8f recovery=%.6f err=%v",
-				// lot.Side,
-				// lot.EntryOrderID,
-				// repl.BaseAtLimit,
-				// repl.LimitPx,
-				// repl.RecoveryNetUSD,
-				// err,
-				// )
+			// Replacement already exists for this source lot.
+			// Do not create another Case3A producer attempt.
 
+		} else {
+			var (
+				oid     string
+				attempt *ProducerAttempt
+				err     error
+			)
+
+			/*
+				startCase3AReplacement() enters produceEntry(), whose registration
+				path acquires t.mu. closeLot() currently owns t.mu here, so release
+				it before entering the replacement pipeline to avoid a self-deadlock.
+
+				After the wrapper returns, reacquire t.mu before touching local lot
+				state or producerHistory.
+			*/
+			t.mu.Unlock()
+
+			oid, attempt, err = t.startCase3AReplacement(
+				ctx,
+				repl,
+			)
+
+			t.mu.Lock()
+
+			/*
+				The mutex was released while the exchange-facing replacement path
+				ran. Refresh the source lot by its stable EntryOrderID before
+				mutating it; never trust the old lot pointer across that unlock.
+			*/
+			book = t.book(side)
+			currentIdx := t.findLotIndexByEntryIDLocked(
+				side,
+				entryOrderID,
+			)
+			if currentIdx < 0 {
 				return "", fmt.Errorf(
-					"Case3A modeA replacement failed; loss exit aborted entry_id=%s: %w",
-					lot.EntryOrderID,
+					"Case3A modeA replacement returned but source lot disappeared "+
+						"side=%s entry_id=%s replacement_order_id=%s",
+					side,
+					entryOrderID,
+					oid,
+				)
+			}
+
+			localIdx = currentIdx
+			lot = book.Lots[localIdx]
+
+			/*
+				Record the Case3A attempt regardless of success or failure.
+
+				The attempt already contains:
+				  - stage=produced from startCase3AReplacement();
+				  - stage=pending or stage=entry_failed from produceEntry();
+				  - cleanup_cancelled / cleanup_cancel_failed when applicable.
+
+				closeLot() is the first higher-level owner above the Case3A wrapper.
+				t.mu is held again here, as required by recordProducerAttemptLocked().
+			*/
+			t.recordProducerAttemptLocked(attempt)
+			if err := t.saveProducerHistoryNoLock(); err != nil {
+				log.Printf(
+					"[WARN] producer history save failed "+
+						"producer=%s decision_id=%s err=%v",
+					attempt.Producer,
+					attempt.DecisionID,
 					err,
 				)
 			}
 
-			// log.Printf(
-			// "[TRACE] Case3A.modeA.replacement_started side=%s entry_id=%s base=%.8f entry_price=%.8f recovery=%.6f",
-			// lot.Side,
-			// lot.EntryOrderID,
-			// repl.BaseAtLimit,
-			// repl.LimitPx,
-			// repl.RecoveryNetUSD,
-			// )
+			if err != nil {
+				/*
+					Mode A requires the replacement to start successfully before
+					the losing SELL may close. The failed attempt has already been
+					recorded, so abort the loss exit and propagate the error.
+				*/
+				return "", fmt.Errorf(
+					"Case3A modeA replacement failed; "+
+						"loss exit aborted entry_id=%s: %w",
+					entryOrderID,
+					err,
+				)
+			}
 
+			// Replacement successfully started; mark the refreshed source lot.
 			lot.Case3AReplacementStarted = true
 			lot.Case3AReplacementOrderID = oid
 
 			if err := t.saveStateNoLock(); err != nil {
-				log.Printf("[WARN] saveState Case3A source flag: %v", err)
+				log.Printf(
+					"[WARN] saveState Case3A source flag: %v",
+					err,
+				)
 			}
 		}
 	}
@@ -2718,15 +2805,72 @@ func (t *Trader) closeLot(
 			return "", nil
 		}
 
-		if _, err := t.startCase3AReplacement(ctx, repl); err != nil {
-			t.handleCase3AReplacementError(
-				repl,
-				waitID,
+		/*
+			Case 3A Mode B - Recovery by Profit Target
+
+			Mode B applies when:
+			  - the losing position is a SELL;
+			  - the SELL is being stopped out at a loss;
+			  - Mode A cannot be used because there is not enough spare base;
+			  - the market regime is DOWN.
+
+			Strategy:
+			  - close the losing SELL;
+			  - open a normal-sized replacement SELL;
+			  - increase the replacement's profit target by the realized recovery amount;
+			  - allow the replacement to recover the prior loss through future profit.
+
+			If the replacement cannot be started immediately:
+			  - retry only failures explicitly classified as retryable;
+			  - do not blindly retry cleanup-uncertain, invalid, or unknown failures.
+
+			When the source SELL is using a pending maker exit, the replacement may be
+			prepared while that exit is pending, but any deferred Mode B retry must wait
+			until the originating losing position has actually committed its exit.
+		*/
+		t.mu.Unlock()
+
+		_, attempt, replErr := t.startCase3AReplacement(
+			ctx,
+			repl,
+		)
+
+		t.mu.Lock()
+
+		// t.mu is held again here; record the returned attempt mechanically.
+		t.recordProducerAttemptLocked(attempt)
+		if err := t.saveProducerHistoryNoLock(); err != nil {
+			log.Printf(
+				"[WARN] producer history save failed "+
+					"producer=%s decision_id=%s err=%v",
+				attempt.Producer,
+				attempt.DecisionID,
 				err,
 			)
 		}
 
-		return fmt.Sprintf("PENDING_EXIT %s side=%s entry_id=%s limit=%.2f base=%.8f reason=%s", exitTime.Format(time.RFC3339), lot.Side, lot.EntryOrderID, limitPx, baseRequested, exitReason), nil
+		if replErr != nil {
+			/*
+				The wrapper has already performed immediate cleanup when required.
+				This higher-level handler decides retry / non-retry /
+				cleanup-uncertain policy for the returned EntryProduceError.
+			*/
+			t.handleCase3AReplacementError(
+				repl,
+				waitID,
+				replErr,
+			)
+		}
+
+		return fmt.Sprintf(
+			"PENDING_EXIT %s side=%s entry_id=%s limit=%.2f base=%.8f reason=%s",
+			exitTime.Format(time.RFC3339),
+			side,
+			entryOrderID,
+			limitPx,
+			baseRequested,
+			exitReason,
+		), nil
 	}
 
 	// log.Printf(
@@ -2798,17 +2942,99 @@ func (t *Trader) closeLot(
 		}
 	}
 
-	// RecoveryByProfitTarget:
-	// The loss exit has been accepted by the exchange.
-	// Submit the replacement immediately before heavier exit bookkeeping.
-	if repl.Enabled && repl.RecoveryMethod == RecoveryByProfitTarget {
-		if _, rerr := t.startCase3AReplacement(ctx, repl); rerr != nil {
+	// ============================================================================
+	// Case 3A Mode B - replacement after the losing SELL exit was accepted.
+	// ============================================================================
+	//
+	// At this point the exchange has already accepted the source loss exit.
+	// The Case3A replacement is therefore attempted immediately before the
+	// heavier local exit bookkeeping.
+	//
+	// Unlike Mode A, a replacement failure does not roll back the already
+	// accepted source exit. Instead, Case3A policy decides whether the
+	// replacement is retryable.
+	//
+	if repl.Enabled &&
+		repl.RecoveryMethod == RecoveryByProfitTarget {
+
+		/*
+			The source loss exit has already been accepted by the exchange.
+			startCase3AReplacement() may acquire t.mu inside produceEntry(), so
+			release closeLot's lock while the replacement pipeline runs.
+		*/
+		t.mu.Unlock()
+
+		_, attempt, replErr := t.startCase3AReplacement(
+			ctx,
+			repl,
+		)
+
+		t.mu.Lock()
+
+		/*
+			Record the complete attempt returned by the Case3A wrapper before
+			applying retry policy.
+
+			If production failed, the attempt contains the exact granular
+			EntryProduceError-derived event and any cleanup outcome.
+		*/
+		t.recordProducerAttemptLocked(attempt)
+		if err := t.saveProducerHistoryNoLock(); err != nil {
+			log.Printf(
+				"[WARN] producer history save failed "+
+					"producer=%s decision_id=%s err=%v",
+				attempt.Producer,
+				attempt.DecisionID,
+				err,
+			)
+		}
+
+		if replErr != nil {
+			/*
+				Case3A policy is deliberately applied above the source wrapper.
+
+				Known retryable:
+				  - post_only_submit_failed
+				  - persist_state_failed
+
+				Cleanup uncertainty:
+				  - cleanup_cancel_failed
+
+				Known validation/build/register failures:
+				  - non-retryable
+
+				Unknown codes:
+				  - non-retryable by default and logged for later classification.
+			*/
 			t.handleCase3AReplacementError(
 				repl,
 				placedOrderID(placed),
-				rerr,
+				replErr,
 			)
 		}
+
+		/*
+			The mutex was released during replacement submission. Refresh the
+			source lot before applying the already-filled exit to local state.
+		*/
+		book = t.book(side)
+		currentIdx = t.findLotIndexByEntryIDLocked(
+			side,
+			entryOrderID,
+		)
+		if currentIdx < 0 {
+			return "", fmt.Errorf(
+				"Case3A modeB replacement returned but source lot disappeared "+
+					"side=%s entry_id=%s exit_id=%s",
+				side,
+				entryOrderID,
+				placedOrderID(placed),
+			)
+		}
+
+		localIdx = currentIdx
+		lot = book.Lots[localIdx]
+		wasNewest = localIdx == len(book.Lots)-1
 	}
 
 	msg, err := t.applyFilledExitLocked(
@@ -3389,15 +3615,15 @@ func (t *Trader) startProducerBuyEntry(
 	equityTriggered bool,
 	producer EntryProducer,
 	cancelPolicy PendingSignalCancelPolicy,
-) (*PendingEntry, error) {
+) (*PendingEntry, *ProducerAttempt, error) {
 
 	if producer == EntryProducerNone {
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"startProducerBuyEntry: missing entry producer",
 		)
 	}
 
-	// A producer attempt begins here.
+	// One producer attempt begins here.
 	createdAt := time.Now().UTC()
 
 	decisionID := FormatDecisionID(
@@ -3433,7 +3659,7 @@ func (t *Trader) startProducerBuyEntry(
 		ProfitGateUSD:  profitGateUSD,
 	}
 
-	// The produced event belongs to the source wrapper.
+	// stage=produced belongs to the source wrapper.
 	producedEvent := ProducerEvent{
 		Time:      createdAt,
 		CreatedAt: createdAt,
@@ -3452,7 +3678,7 @@ func (t *Trader) startProducerBuyEntry(
 		intent,
 	)
 
-	// Ensure an attempt exists so every DecisionID is retained.
+	// Ensure the wrapper can always propagate this attempt upward.
 	if attempt == nil {
 		attempt = &ProducerAttempt{
 			DecisionID: decisionID,
@@ -3465,14 +3691,20 @@ func (t *Trader) startProducerBuyEntry(
 	}
 
 	if attempt.Events == nil {
-		attempt.Events = make(
-			map[ProducerStage]ProducerEvent,
-		)
+		attempt.Events =
+			make(map[ProducerStage]ProducerEvent)
 	}
 
 	// Merge the wrapper-owned produced event.
 	attempt.Events[ProducerStageProduced] = producedEvent
 
+	/*
+		Cleanup remains at wrapper level, preserving the original
+		error-handling flow.
+
+		handleEntryProduceError() may append cleanup_cancelled or
+		cleanup_cancel_failed to this same ProducerAttempt.
+	*/
 	if err != nil {
 		err = t.handleEntryProduceError(
 			ctx,
@@ -3480,36 +3712,11 @@ func (t *Trader) startProducerBuyEntry(
 			attempt,
 			err,
 		)
+
+		return nil, attempt, err
 	}
 
-	// Update producer history.
-	t.mu.Lock()
-
-	if t.producerHistory == nil {
-		t.producerHistory =
-			make(map[EntryProducer]*ProducerHistory)
-	}
-
-	history := t.producerHistory[producer]
-	if history == nil {
-		history = &ProducerHistory{
-			Attempts: make(
-				map[string]*ProducerAttempt,
-			),
-		}
-
-		t.producerHistory[producer] = history
-	}
-
-	history.Attempts[decisionID] = attempt
-
-	t.mu.Unlock()
-
-	if err != nil {
-		return nil, err
-	}
-
-	return entry, nil
+	return entry, attempt, nil
 }
 
 // Sell Source Wrapper
@@ -3526,14 +3733,14 @@ func (t *Trader) startProducerSellEntry(
 	equityTriggered bool,
 	producer EntryProducer,
 	cancelPolicy PendingSignalCancelPolicy,
-) (*PendingEntry, error) {
+) (*PendingEntry, *ProducerAttempt, error) {
 	if producer == EntryProducerNone {
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"startProducerSellEntry: missing entry producer",
 		)
 	}
 
-	// A producer attempt begins here.
+	// One producer attempt begins here.
 	createdAt := time.Now().UTC()
 
 	decisionID := FormatDecisionID(
@@ -3569,7 +3776,7 @@ func (t *Trader) startProducerSellEntry(
 		EntryMethod:    entryAIMode,
 	}
 
-	// The produced event belongs to the source wrapper.
+	// stage=produced belongs to the source wrapper.
 	producedEvent := ProducerEvent{
 		Time:      createdAt,
 		CreatedAt: createdAt,
@@ -3588,7 +3795,7 @@ func (t *Trader) startProducerSellEntry(
 		intent,
 	)
 
-	// Ensure an attempt exists for this DecisionID.
+	// Ensure the wrapper can always return the attempt it created.
 	if attempt == nil {
 		attempt = &ProducerAttempt{
 			DecisionID: decisionID,
@@ -3601,16 +3808,19 @@ func (t *Trader) startProducerSellEntry(
 	}
 
 	if attempt.Events == nil {
-		attempt.Events = make(
-			map[ProducerStage]ProducerEvent,
-		)
+		attempt.Events =
+			make(map[ProducerStage]ProducerEvent)
 	}
 
 	// Merge the wrapper-owned produced event.
 	attempt.Events[ProducerStageProduced] = producedEvent
 
-	// Cleanup handling must mutate the same attempt so every lifecycle
-	// event remains correlated under this DecisionID.
+	/*
+		Cleanup remains at wrapper level, exactly as before.
+
+		handleEntryProduceError() may add cleanup_cancelled or
+		cleanup_cancel_failed to this same attempt.
+	*/
 	if err != nil {
 		err = t.handleEntryProduceError(
 			ctx,
@@ -3618,57 +3828,29 @@ func (t *Trader) startProducerSellEntry(
 			attempt,
 			err,
 		)
+
+		return nil, attempt, err
 	}
 
-	// The source wrapper owns insertion into producer history.
-	t.mu.Lock()
-
-	if t.producerHistory == nil {
-		t.producerHistory =
-			make(map[EntryProducer]*ProducerHistory)
-	}
-
-	history := t.producerHistory[producer]
-	if history == nil {
-		history = &ProducerHistory{
-			Attempts: make(
-				map[string]*ProducerAttempt,
-			),
-		}
-
-		t.producerHistory[producer] = history
-	}
-
-	if history.Attempts == nil {
-		history.Attempts =
-			make(map[string]*ProducerAttempt)
-	}
-
-	history.Attempts[decisionID] = attempt
-
-	t.mu.Unlock()
-
-	if err != nil {
-		return nil, err
-	}
-
-	return entry, nil
+	return entry, attempt, nil
 }
 
 // Case3A Source Wrapper
 func (t *Trader) startCase3AReplacement(
 	ctx context.Context,
 	intent PendingIntent,
-) (string, error) {
+) (string, *ProducerAttempt, error) {
 	if !intent.Enabled {
-		return "", nil
+		return "", nil, nil
 	}
 
 	sourceEntryOrderID := strings.TrimSpace(
 		intent.SourceEntryOrderID,
 	)
 	if sourceEntryOrderID == "" {
-		return "",ErrNilProducedEntry
+		return "", nil, errors.New(
+			"Case3A replacement: missing SourceEntryOrderID",
+		)
 	}
 
 	/*
@@ -3676,9 +3858,11 @@ func (t *Trader) startCase3AReplacement(
 
 		CreatedAt is created once.
 		DecisionID is created once from:
+
 		    Producer + CreatedAt to millisecond precision
 
 		Example:
+
 		    Case3AReplacement_20260808T163003M123
 	*/
 	createdAt := time.Now().UTC()
@@ -3715,9 +3899,7 @@ func (t *Trader) startCase3AReplacement(
 				intent.BaseAtLimit
 	}
 
-	/*
-		stage=produced belongs to this source wrapper.
-	*/
+	// stage=produced belongs to this source wrapper.
 	producedEvent := ProducerEvent{
 		Time:      createdAt,
 		CreatedAt: createdAt,
@@ -3736,11 +3918,7 @@ func (t *Trader) startCase3AReplacement(
 		&intent,
 	)
 
-	/*
-		Normally produceEntry() returns the ProducerAttempt.
-		Keep this defensive fallback so the wrapper still owns the
-		attempt identified by this DecisionID.
-	*/
+	// Ensure this wrapper can always propagate its attempt upward.
 	if attempt == nil {
 		attempt = &ProducerAttempt{
 			DecisionID: intent.DecisionID,
@@ -3757,15 +3935,17 @@ func (t *Trader) startCase3AReplacement(
 			make(map[ProducerStage]ProducerEvent)
 	}
 
-	/*
-		Merge the wrapper-owned produced stage with the events collected
-		by produceEntry().
-	*/
+	// Merge the wrapper-owned produced stage.
 	attempt.Events[ProducerStageProduced] = producedEvent
 
 	/*
-		Cleanup must mutate this same ProducerAttempt so cleanup events
-		remain under the same DecisionID.
+		Cleanup remains at wrapper level.
+
+		handleEntryProduceError() may append:
+		  - cleanup_cancelled
+		  - cleanup_cancel_failed
+
+		to this same ProducerAttempt / DecisionID.
 	*/
 	if err != nil {
 		err = t.handleEntryProduceError(
@@ -3774,57 +3954,24 @@ func (t *Trader) startCase3AReplacement(
 			attempt,
 			err,
 		)
+
+		return "", attempt, err
 	}
 
 	/*
-		The producer wrapper owns:
+		This is an internal invariant check, not an EntryProduceError.
 
-		    producerHistory[producer]
-		        .Attempts[decisionID]
-
-		BOT OPS later reads this persisted producer history.
+		If produceEntry() returned nil error, it must have produced
+		a non-nil PendingEntry.
 	*/
-	t.mu.Lock()
-
-	if t.producerHistory == nil {
-		t.producerHistory =
-			make(map[EntryProducer]*ProducerHistory)
-	}
-
-	history := t.producerHistory[intent.Producer]
-	if history == nil {
-		history = &ProducerHistory{
-			Attempts: make(
-				map[string]*ProducerAttempt,
-			),
-		}
-
-		t.producerHistory[intent.Producer] = history
-	}
-
-	if history.Attempts == nil {
-		history.Attempts =
-			make(map[string]*ProducerAttempt)
-	}
-
-	history.Attempts[intent.DecisionID] = attempt
-
-	t.mu.Unlock()
-
-	if err != nil {
-		return "", err
-	}
-
+	var ErrNilProducedEntry = errors.New(
+		"produceEntry returned nil entry with nil error",
+	)
 	if entry == nil {
-		return "", &EntryProduceError{
-			Code:     EntryProduceErrCase3ANilProducedEntry,
-			Producer: intent.Producer,
-			Side:     fmt.Sprint(intent.Side),
-			OrderID:  "",
-		}
+		return "", attempt, ErrNilProducedEntry
 	}
 
-	return entry.OrderID, nil
+	return entry.OrderID, attempt, nil
 }
 
 //Entry Producer:
@@ -6617,8 +6764,8 @@ func (t *Trader) handleCase3AReplacementError(
 	if errors.As(err, &produceErr) {
 		switch produceErr.Code {
 
-		case EntryProduceErrSubmit,
-			EntryProduceErrPersist:
+		case EntryProduceErrPostOnlySubmit,
+			EntryProduceErrPersistState:
 
 			t.markCase3AReplacementRetryLocked(
 				repl,
@@ -6630,6 +6777,7 @@ func (t *Trader) handleCase3AReplacementError(
 			)
 
 		case EntryProduceErrCleanupCancel:
+
 			log.Printf(
 				"[ERROR] Case3A.replacement.cleanup_uncertain "+
 					"method=%s anchor_id=%s order_id=%s err=%v",
@@ -6639,9 +6787,22 @@ func (t *Trader) handleCase3AReplacementError(
 				err,
 			)
 
-		case EntryProduceErrInvalidIntent,
-			EntryProduceErrBuild,
-			EntryProduceErrRegister:
+		case EntryProduceErrInvalidSide,
+			EntryProduceErrMissingProductID,
+			EntryProduceErrInvalidPrice,
+			EntryProduceErrInvalidQuantity,
+			EntryProduceErrInvalidQuote,
+			EntryProduceErrInvalidTake,
+			EntryProduceErrInvalidRefundPortion,
+			EntryProduceErrInvalidConfidenceMult,
+			EntryProduceErrInvalidProfitGate,
+			EntryProduceErrMissingProducer,
+			EntryProduceErrMissingProducerReason,
+			EntryProduceErrMissingPendingCancelPolicy,
+			EntryProduceErrBuildMissingOrderID,
+			EntryProduceErrBuildUnsupportedSide,
+			EntryProduceErrRegisterMissingOrderID,
+			EntryProduceErrRegisterDuplicateOrderID:
 
 			log.Printf(
 				"[ERROR] Case3A.replacement.non_retryable "+
@@ -6655,25 +6816,33 @@ func (t *Trader) handleCase3AReplacementError(
 			)
 
 		default:
-			t.markCase3AReplacementRetryLocked(
-				repl,
+
+			log.Printf(
+				"[ERROR] Case3A.replacement.unclassified_non_retryable "+
+					"code=%s method=%s anchor_id=%s "+
+					"order_id=%s err=%v",
+				produceErr.Code,
+				repl.RecoveryMethod.String(),
 				anchorID,
-				fmt.Sprintf(
-					"initial_modeB_replacement_unclassified: %v",
-					err,
-				),
+				produceErr.OrderID,
+				err,
 			)
 		}
 
 		return
 	}
 
-	t.markCase3AReplacementRetryLocked(
-		repl,
+	/*
+		Non-EntryProduceError failures are also non-retryable by default.
+
+		They remain visible in the log so they can be investigated and
+		classified deliberately later rather than being retried blindly.
+	*/
+	log.Printf(
+		"[ERROR] Case3A.replacement.unclassified_non_retryable "+
+			"method=%s anchor_id=%s err=%v",
+		repl.RecoveryMethod.String(),
 		anchorID,
-		fmt.Sprintf(
-			"initial_modeB_replacement_unclassified: %v",
-			err,
-		),
+		err,
 	)
 }
