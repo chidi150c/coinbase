@@ -381,6 +381,11 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 		// Continue refreshing independently of the trading tick loop.
 		trader.startBalanceRefresher(ctx)
 
+		log.Printf(
+			"[INFO] producer_history.config file=%q",
+			trader.producerHistoryFile,
+		)
+
 		for {
 			select {
 			case <-ctx.Done():
