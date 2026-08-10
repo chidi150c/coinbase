@@ -25,6 +25,19 @@ const (
 
 	ProducerStageCleanupCancelled    ProducerStage = "cleanup_cancelled"
 	ProducerStageCleanupCancelFailed ProducerStage = "cleanup_cancel_failed"
+
+	ProducerStagePollerGetOrderFailed ProducerStage = "poller_get_order_failed"
+	ProducerStageRejected             ProducerStage = "rejected"
+	ProducerStageExpired              ProducerStage = "expired"
+
+	ProducerStageDrainMissingProducer    ProducerStage = "drain_missing_producer"
+	ProducerStageDrainProducerMismatch   ProducerStage = "drain_producer_mismatch"
+	ProducerStageDrainChannelClosed      ProducerStage = "drain_channel_closed"
+	ProducerStageFillOrderMismatch       ProducerStage = "fill_order_mismatch"
+	ProducerStageCommitFailed            ProducerStage = "commit_failed"
+	ProducerStageDrainPersistStateFailed ProducerStage = "drain_persist_state_failed"
+	ProducerStageCommitSparePointerNil   ProducerStage = "commit_spare_pointer_nil"
+	ProducerStageRefundConsumed          ProducerStage = "refund_consumed"
 )
 
 type ProducerHistory struct {

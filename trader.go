@@ -152,8 +152,10 @@ type BotState struct {
 type OpenResult struct {
 	Filled  bool
 	Placed  *PlacedOrder
-	Err     error
 	OrderID string
+
+	ProducerEvents map[ProducerStage]ProducerEvent
+	ProduceErr     *EntryProduceError
 }
 
 type PendingExit struct {
@@ -4437,7 +4439,16 @@ func (t *Trader) buildPendingEntry(
 	now := time.Now().UTC()
 
 	intent.OrderID = orderID
-	intent.CreatedAt = now
+
+	/*
+	   CreatedAt belongs to the producer decision and was created once
+	   by the source wrapper.
+
+	   buildPendingEntry() must never regenerate or overwrite it.
+
+	   The local time here is used only to establish the pending-order
+	   deadline.
+	*/
 	intent.Deadline = now.Add(
 		time.Duration(t.cfg.LimitTimeoutSec) * time.Second,
 	)
@@ -4582,38 +4593,6 @@ func (t *Trader) registerPendingEntry(
 	// )
 
 	return nil
-}
-
-func (t *Trader) startEntryPoller(
-	parentCtx context.Context,
-	entry *PendingEntry,
-) {
-	if parentCtx == nil {
-		return
-	}
-
-	if entry == nil || entry.Intent == nil {
-		return
-	}
-
-	pollCtx, cancel := context.WithCancel(parentCtx)
-	entry.Cancel = cancel
-
-	if entry.ResultC == nil {
-		entry.ResultC = make(chan OpenResult, 1)
-	}
-
-	go t.runPendingEntryPoller(
-		pollCtx,
-		entry,
-		entry.ResultC,
-		entry.OrderID,
-		entry.Side,
-		entry.Intent.Deadline,
-		entry.Intent.LimitPx,
-		entry.Intent.BaseAtLimit,
-		t.cfg.LimitPriceOffsetBps,
-	)
 }
 
 func (t *Trader) handleEntryProduceError(
@@ -4761,7 +4740,65 @@ func (t *Trader) handleEntryProduceError(
 	return produceErr
 }
 
-// Entry Producer Main Helper internal helps
+func (t *Trader) startEntryPoller(
+	parentCtx context.Context,
+	entry *PendingEntry,
+) {
+	if parentCtx == nil {
+		return
+	}
+
+	if entry == nil || entry.Intent == nil {
+		return
+	}
+
+	/*
+		The producer attempt already exists before polling begins.
+
+		The poller receives the same PendingEntry and therefore retains
+		the permanent producer correlation through:
+
+		    entry.Intent.DecisionID
+		    entry.Intent.CreatedAt
+		    entry.Producer
+		    entry.Side
+		    entry.OrderID
+		    entry.ProducerReason
+
+		The poller must never create a new ProducerAttempt or DecisionID.
+
+		Any producer lifecycle facts discovered asynchronously, including
+		granular failure classifications discovered by the poller, are
+		returned through:
+
+		OpenResult.ProducerEvents["ProducerStage"]
+
+		Failure details are carried inside ProducerEvent through:
+
+			ErrorCode
+			Error
+			CleanupRequired
+	*/
+	pollCtx, cancel := context.WithCancel(parentCtx)
+	entry.Cancel = cancel
+
+	if entry.ResultC == nil {
+		entry.ResultC = make(chan OpenResult, 1)
+	}
+
+	go t.runPendingEntryPoller(
+		pollCtx,
+		entry,
+		entry.ResultC,
+		entry.OrderID,
+		entry.Side,
+		entry.Intent.Deadline,
+		entry.Intent.LimitPx,
+		entry.Intent.BaseAtLimit,
+		t.cfg.LimitPriceOffsetBps,
+	)
+}
+
 func (t *Trader) runPendingEntryPoller(
 	pollCtx context.Context,
 	entry *PendingEntry,
@@ -4809,6 +4846,106 @@ func (t *Trader) runPendingEntryPoller(
 
 	var repriceCount int
 
+	/*
+		The poller may discover multiple producer lifecycle events before
+		it produces one terminal OpenResult.
+
+		The wrapper-created correlation remains authoritative:
+
+		    entry.Intent.DecisionID
+		    entry.Intent.CreatedAt
+		    entry.Producer
+		    entry.Side
+
+		The poller must never:
+		  - create a ProducerAttempt;
+		  - create or change DecisionID;
+		  - mutate producerHistory;
+		  - persist producerHistory.
+
+		Instead, every lifecycle fact discovered here is transported in:
+
+		    OpenResult.ProducerEvents[ProducerStage]
+
+		The drain later merges these events into the already-existing
+		ProducerAttempt.
+	*/
+	producerEvents := make(
+		map[ProducerStage]ProducerEvent,
+	)
+
+	/*
+		addProducerEvent converts a lifecycle fact, and when applicable
+		an already-authoritative EntryProduceError, into the ProducerEvent
+		transported by OpenResult.
+
+		By default, the first event discovered for a stage is retained.
+
+		replace=true is used only when the same lifecycle stage is
+		intentionally updated, such as stage=pending after repricing.
+	*/
+	addProducerEvent := func(
+		stage ProducerStage,
+		eventOrderID string,
+		produceErr *EntryProduceError,
+		replace bool,
+	) {
+		if entry == nil || entry.Intent == nil {
+			return
+		}
+
+		decisionID := strings.TrimSpace(
+			entry.Intent.DecisionID,
+		)
+		if decisionID == "" {
+			/*
+				DecisionID belongs to the source wrapper.
+
+				The poller must never manufacture producer correlation.
+			*/
+			return
+		}
+
+		if _, exists := producerEvents[stage]; exists &&
+			!replace {
+
+			return
+		}
+
+		event := ProducerEvent{
+			Time:      time.Now().UTC(),
+			CreatedAt: entry.Intent.CreatedAt,
+
+			Producer: entry.Producer,
+			Side:     fmt.Sprint(entry.Side),
+			Stage:    stage,
+
+			DecisionID: decisionID,
+			OrderID:    eventOrderID,
+
+			Reason: entry.ProducerReason,
+		}
+
+		/*
+			Failure classification is discovered at the exact failure
+			point and arrives here as EntryProduceError.
+
+			No error classification occurs inside addProducerEvent().
+		*/
+		if produceErr != nil {
+			event.ErrorCode = produceErr.Code
+			event.CleanupRequired =
+				produceErr.CleanupRequired
+
+			if produceErr.Err != nil {
+				event.Error =
+					produceErr.Err.Error()
+			}
+		}
+
+		producerEvents[stage] = event
+	}
+
 poll:
 	for time.Now().Before(deadline) {
 		select {
@@ -4831,6 +4968,37 @@ poll:
 			entry.Intent.ProductID,
 			orderID,
 		)
+
+		if getErr != nil {
+			/*
+				GetOrder failed during asynchronous entry polling.
+
+				This exact failure is discovered here.
+
+				Existing trading behavior is preserved:
+				the poller does not terminate because of this error and
+				may successfully retrieve the order on a later poll.
+			*/
+			produceErr := &EntryProduceError{
+				Code: EntryProduceErrPollerGetOrderFailed,
+
+				Producer: entry.Producer,
+				Side:     fmt.Sprint(entry.Side),
+				OrderID:  orderID,
+
+				CleanupRequired: false,
+
+				// Variable/runtime diagnostic detail.
+				Err: getErr,
+			}
+
+			addProducerEvent(
+				ProducerStagePollerGetOrderFailed,
+				orderID,
+				produceErr,
+				false,
+			)
+		}
 
 		if getErr == nil && ord != nil {
 			dBase := ord.BaseSize - lastSeenBase
@@ -4886,11 +5054,24 @@ poll:
 			// )
 
 			switch status {
+
 			case "FILLED":
 				placed := placedOrderFromAggregate(
 					sessionBase,
 					sessionQuote,
 					sessionFee,
+				)
+
+				/*
+					The exchange has authoritatively reported FILLED.
+
+					This is a lifecycle fact, not a failure.
+				*/
+				addProducerEvent(
+					ProducerStageFilled,
+					orderID,
+					nil,
+					false,
 				)
 
 				// log.Printf(
@@ -4926,13 +5107,32 @@ poll:
 						Filled:  true,
 						Placed:  placed,
 						OrderID: orderID,
+
+						ProducerEvents: producerEvents,
 					},
 				)
 
 				return
 
-			case "PARTIALLY_FILLED", "NEW", "PENDING_CANCEL":
+			case "PARTIALLY_FILLED",
+				"NEW",
+				"PENDING_CANCEL":
+
 				if t.pendingEntryCancelRequested(entry) {
+					/*
+						The existing trading logic has already requested
+						cancellation.
+
+						Record only the lifecycle fact. Do not issue another
+						cancel or alter existing cancellation behavior.
+					*/
+					addProducerEvent(
+						ProducerStageCancelRequested,
+						orderID,
+						nil,
+						false,
+					)
+
 					// log.Printf(
 					// "[TRACE] postonly.reprice.skip.cancel_requested "+
 					// "producer=%s side=%s order_id=%s "+
@@ -4951,7 +5151,9 @@ poll:
 					t.cfg.RepriceIntervalMs,
 				) * time.Millisecond
 
-				if time.Since(lastReprice) < repriceAfter {
+				if time.Since(lastReprice) <
+					repriceAfter {
+
 					break
 				}
 
@@ -4982,7 +5184,9 @@ poll:
 					repriceCount,
 				)
 
-				if didReprice && newID != orderID {
+				if didReprice &&
+					newID != orderID {
+
 					// log.Printf(
 					// "[TRACE] postonly.reprice.swap "+
 					// "producer=%s side=%s old_id=%s "+
@@ -5004,9 +5208,28 @@ poll:
 					lastSeenBase = 0
 					lastSeenQuote = 0
 					lastSeenFee = 0
+
+					/*
+						Repricing is still the same producer decision.
+
+						Update the transported pending stage so the drain can
+						update the existing ProducerAttempt's pending event
+						with the currently-live exchange OrderID.
+
+						No new ProducerAttempt or DecisionID is created.
+					*/
+					addProducerEvent(
+						ProducerStagePending,
+						newID,
+						nil,
+						true,
+					)
+
 					log.Printf(
 						"[PRODUCER] stage=pending "+
-							"producer=%s side=%s order_id=%s reason=%q repriced=%t",
+							"producer=%s side=%s "+
+							"order_id=%s reason=%q "+
+							"repriced=%t",
 						entry.Producer,
 						entry.Side,
 						newID,
@@ -5038,12 +5261,116 @@ poll:
 
 				lastReprice = time.Now()
 
-			case "CANCELED", "REJECTED", "EXPIRED":
-				if sessionBase > 0 || sessionQuote > 0 {
+			case "CANCELED",
+				"REJECTED",
+				"EXPIRED":
+
+				switch status {
+
+				case "CANCELED":
+					/*
+						CANCELED is not automatically a failure.
+
+						If the existing trading path requested cancellation,
+						the exchange has now confirmed successful completion
+						of that cancellation.
+
+						Ensure both lifecycle facts are represented even if
+						the exchange moved to CANCELED before the poller
+						previously observed PENDING_CANCEL.
+					*/
+					if t.pendingEntryCancelRequested(
+						entry,
+					) {
+						addProducerEvent(
+							ProducerStageCancelRequested,
+							orderID,
+							nil,
+							false,
+						)
+
+						addProducerEvent(
+							ProducerStageCleanupCancelled,
+							orderID,
+							nil,
+							false,
+						)
+					}
+
+				case "REJECTED":
+					/*
+						The exchange has authoritatively rejected the
+						pending entry order.
+
+						The enum itself carries the stable human/machine
+						classification. No variable Err detail is required
+						here.
+					*/
+					produceErr := &EntryProduceError{
+						Code: EntryProduceErrPollerRejected,
+
+						Producer: entry.Producer,
+						Side:     fmt.Sprint(entry.Side),
+						OrderID:  orderID,
+
+						CleanupRequired: false,
+					}
+
+					addProducerEvent(
+						ProducerStageRejected,
+						orderID,
+						produceErr,
+						false,
+					)
+
+				case "EXPIRED":
+					/*
+						The exchange has authoritatively expired the
+						pending entry order.
+
+						The enum itself carries the stable classification.
+						No variable Err detail is required here.
+					*/
+					produceErr := &EntryProduceError{
+						Code: EntryProduceErrPollerExpired,
+
+						Producer: entry.Producer,
+						Side:     fmt.Sprint(entry.Side),
+						OrderID:  orderID,
+
+						CleanupRequired: false,
+					}
+
+					addProducerEvent(
+						ProducerStageExpired,
+						orderID,
+						produceErr,
+						false,
+					)
+				}
+
+				if sessionBase > 0 ||
+					sessionQuote > 0 {
+
 					placed := placedOrderFromAggregate(
 						sessionBase,
 						sessionQuote,
 						sessionFee,
+					)
+
+					/*
+						The terminal exchange status was not FILLED, but
+						actual execution accumulated.
+
+						The existing trading behavior already reports this
+						as Filled=true, so observability records the same
+						factual filled lifecycle stage.
+					*/
+					addProducerEvent(
+						ProducerStageFilled,
+						orderID,
+						nil,
+						false,
 					)
 
 					// log.Printf(
@@ -5067,6 +5394,8 @@ poll:
 							Filled:  true,
 							Placed:  placed,
 							OrderID: orderID,
+
+							ProducerEvents: producerEvents,
 						},
 					)
 				} else {
@@ -5076,6 +5405,8 @@ poll:
 							Filled:  false,
 							Placed:  nil,
 							OrderID: orderID,
+
+							ProducerEvents: producerEvents,
 						},
 					)
 				}
@@ -5114,17 +5445,34 @@ poll:
 
 			break poll
 
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(
+			200 * time.Millisecond,
+		):
 		}
 	}
 
 	/*
 		Use a non-cancelled context for the final exchange cancel.
-		The polling context may already be cancelled.
+
+		The polling context may already have been cancelled.
 	*/
 	cancelCtx, cancel := context.WithTimeout(
 		context.Background(),
 		5*time.Second,
+	)
+
+	/*
+		The existing poller has reached its final cancellation path.
+
+		Discover cancel_requested before executing the existing CancelOrder.
+
+		This is observability only; it does not change cancellation behavior.
+	*/
+	addProducerEvent(
+		ProducerStageCancelRequested,
+		orderID,
+		nil,
+		false,
 	)
 
 	cancelErr := t.broker.CancelOrder(
@@ -5136,13 +5484,46 @@ poll:
 	cancel()
 
 	if cancelErr != nil {
-		log.Printf(
-			"[WARN] postonly.poll.timeout_cancel_failed "+
-				"producer=%s side=%s order_id=%s err=%v",
-			entry.Producer,
-			side,
+		/*
+			The poller's own final CancelOrder failed.
+
+			This failure is distinct from EntryProduceErrCleanupCancel,
+			which was discovered in handleEntryProduceError() during the
+			earlier entry-production cleanup path.
+
+			Construct the poller's exact failure here.
+		*/
+		produceErr := &EntryProduceError{
+			Code: EntryProduceErrPollerCancelFailed,
+
+			Producer: entry.Producer,
+			Side:     fmt.Sprint(entry.Side),
+			OrderID:  orderID,
+
+			CleanupRequired: true,
+
+			// Variable/runtime diagnostic detail.
+			Err: cancelErr,
+		}
+
+		addProducerEvent(
+			ProducerStageCleanupCancelFailed,
 			orderID,
-			cancelErr,
+			produceErr,
+			false,
+		)
+	} else {
+		/*
+			The existing final CancelOrder succeeded.
+
+			Any execution that accumulated before cancellation remains
+			a separate lifecycle fact handled below.
+		*/
+		addProducerEvent(
+			ProducerStageCleanupCancelled,
+			orderID,
+			nil,
+			false,
 		)
 	}
 
@@ -5158,11 +5539,27 @@ poll:
 	// sessionFee,
 	// )
 
-	if sessionBase > 0 || sessionQuote > 0 {
+	if sessionBase > 0 ||
+		sessionQuote > 0 {
+
 		placed := placedOrderFromAggregate(
 			sessionBase,
 			sessionQuote,
 			sessionFee,
+		)
+
+		/*
+			Execution accumulated before the final cancellation path.
+
+			Existing trading behavior reports Filled=true, therefore
+			observability discovers stage=filled as part of the same
+			OpenResult.
+		*/
+		addProducerEvent(
+			ProducerStageFilled,
+			orderID,
+			nil,
+			false,
 		)
 
 		safeSend(
@@ -5171,6 +5568,8 @@ poll:
 				Filled:  true,
 				Placed:  placed,
 				OrderID: orderID,
+
+				ProducerEvents: producerEvents,
 			},
 		)
 
@@ -5183,9 +5582,12 @@ poll:
 			Filled:  false,
 			Placed:  nil,
 			OrderID: orderID,
+
+			ProducerEvents: producerEvents,
 		},
 	)
 }
+
 func vwapFromAggregate(
 	base float64,
 	quote float64,
@@ -5606,11 +6008,13 @@ func (t *Trader) drainPendingEntry(
 	if entry == nil ||
 		entry.Completed ||
 		entry.ResultC == nil {
+
 		return
 	}
 
 	if entry.CommitEligible != nil &&
 		!entry.CommitEligible(entry) {
+
 		return
 	}
 
@@ -5618,6 +6022,12 @@ func (t *Trader) drainPendingEntry(
 	pending := entry.Intent
 	book := entry.Book
 
+	/*
+		Producer correlation must still be available here because this
+		drain owns the final asynchronous producer lifecycle.
+
+		The drain never creates another ProducerAttempt or DecisionID.
+	*/
 	if entry.Producer == EntryProducerNone {
 		log.Printf(
 			"[ERROR] postonly.drain.missing_producer "+
@@ -5625,11 +6035,102 @@ func (t *Trader) drainPendingEntry(
 			side,
 			entry.OrderID,
 		)
+
+		/*
+			No producer exists, therefore there is no valid
+			producerHistory[producer] location into which this failure
+			can be correlated.
+
+			The failure code is still authoritative for this discovery
+			point, but no ProducerEvent can be attached without inventing
+			producer ownership.
+		*/
+		_ = &EntryProduceError{
+			Code: EntryProduceErrDrainMissingProducer,
+
+			Producer: EntryProducerNone,
+			Side:     fmt.Sprint(side),
+			OrderID:  entry.OrderID,
+
+			CleanupRequired: false,
+		}
+
 		return
 	}
 
 	if pending != nil &&
 		entry.Producer != pending.Producer {
+
+		produceErr := &EntryProduceError{
+			Code: EntryProduceErrDrainProducerMismatch,
+
+			Producer: entry.Producer,
+			Side:     fmt.Sprint(side),
+			OrderID:  entry.OrderID,
+
+			CleanupRequired: false,
+
+			Err: fmt.Errorf(
+				"entry producer=%s intent producer=%s",
+				entry.Producer,
+				pending.Producer,
+			),
+		}
+
+		/*
+			The entry-side producer remains the lookup owner because
+			that is the producer under which the attempt was originally
+			recorded.
+		*/
+		decisionID := strings.TrimSpace(
+			pending.DecisionID,
+		)
+
+		if decisionID != "" {
+			if history := t.producerHistory[entry.Producer]; history != nil &&
+				history.Attempts != nil {
+
+				if attempt := history.Attempts[decisionID]; attempt != nil {
+
+					if attempt.Events == nil {
+						attempt.Events =
+							make(map[ProducerStage]ProducerEvent)
+					}
+
+					attempt.Events[ProducerStageDrainProducerMismatch] =
+						ProducerEvent{
+							Time:      time.Now().UTC(),
+							CreatedAt: attempt.CreatedAt,
+
+							Producer: attempt.Producer,
+							Side:     attempt.Side,
+							Stage:    ProducerStageDrainProducerMismatch,
+
+							DecisionID: attempt.DecisionID,
+							OrderID:    entry.OrderID,
+
+							Reason: pending.ProducerReason,
+
+							ErrorCode: produceErr.Code,
+							Error:     produceErr.Err.Error(),
+
+							CleanupRequired: false,
+						}
+
+					if err := t.saveProducerHistoryNoLock(); err != nil {
+						log.Printf(
+							"[ERROR] producer.history.save_failed "+
+								"producer=%s decision_id=%s "+
+								"stage=%s err=%v",
+							entry.Producer,
+							decisionID,
+							ProducerStageDrainProducerMismatch,
+							err,
+						)
+					}
+				}
+			}
+		}
 
 		log.Printf(
 			"[ERROR] postonly.drain.producer_mismatch "+
@@ -5642,6 +6143,166 @@ func (t *Trader) drainPendingEntry(
 		)
 
 		return
+	}
+
+	/*
+		Append one drain-discovered event to the already-existing
+		ProducerAttempt.
+
+		This helper:
+		  - never creates ProducerAttempt;
+		  - never creates DecisionID;
+		  - never changes CreatedAt;
+		  - never changes trading behavior.
+
+		The caller already owns t.mu while drainPendingEntry() executes.
+	*/
+	addDrainProducerEvent := func(
+		stage ProducerStage,
+		orderID string,
+		produceErr *EntryProduceError,
+		replace bool,
+	) {
+		if pending == nil {
+			return
+		}
+
+		decisionID := strings.TrimSpace(
+			pending.DecisionID,
+		)
+		if decisionID == "" {
+			return
+		}
+
+		history := t.producerHistory[entry.Producer]
+		if history == nil ||
+			history.Attempts == nil {
+
+			return
+		}
+
+		attempt := history.Attempts[decisionID]
+		if attempt == nil {
+			return
+		}
+
+		if attempt.Events == nil {
+			attempt.Events =
+				make(map[ProducerStage]ProducerEvent)
+		}
+
+		if _, exists := attempt.Events[stage]; exists && !replace {
+
+			return
+		}
+
+		event := ProducerEvent{
+			Time:      time.Now().UTC(),
+			CreatedAt: attempt.CreatedAt,
+
+			Producer: attempt.Producer,
+			Side:     attempt.Side,
+			Stage:    stage,
+
+			DecisionID: attempt.DecisionID,
+			OrderID:    orderID,
+
+			Reason: pending.ProducerReason,
+		}
+
+		if produceErr != nil {
+			event.ErrorCode =
+				produceErr.Code
+
+			event.CleanupRequired =
+				produceErr.CleanupRequired
+
+			if produceErr.Err != nil {
+				event.Error =
+					produceErr.Err.Error()
+			}
+		}
+
+		attempt.Events[stage] = event
+	}
+
+	/*
+		Merge lifecycle facts discovered by runPendingEntryPoller().
+
+		These events already contain their authoritative:
+		  - ProducerStage;
+		  - ErrorCode;
+		  - Error;
+		  - CleanupRequired;
+		  - DecisionID;
+		  - CreatedAt.
+
+		The drain must not recreate or reclassify them.
+	*/
+	mergePollerProducerEvents := func(
+		events map[ProducerStage]ProducerEvent,
+	) {
+		if pending == nil ||
+			len(events) == 0 {
+
+			return
+		}
+
+		decisionID := strings.TrimSpace(
+			pending.DecisionID,
+		)
+		if decisionID == "" {
+			return
+		}
+
+		history := t.producerHistory[entry.Producer]
+		if history == nil ||
+			history.Attempts == nil {
+
+			return
+		}
+
+		attempt := history.Attempts[decisionID]
+		if attempt == nil {
+			return
+		}
+
+		if attempt.Events == nil {
+			attempt.Events =
+				make(map[ProducerStage]ProducerEvent)
+		}
+
+		for stage, event := range events {
+			/*
+				The poller already owns classification.
+
+				Merge the stage exactly as transported.
+			*/
+			attempt.Events[stage] = event
+		}
+	}
+
+	/*
+		Persist producer-history changes independently from trader state.
+
+		A producer-history save failure must never change trading behavior.
+	*/
+	saveProducerHistory := func() {
+		if err := t.saveProducerHistoryNoLock(); err != nil {
+			log.Printf(
+				"[ERROR] producer.history.save_failed "+
+					"producer=%s decision_id=%s err=%v",
+				entry.Producer,
+				func() string {
+					if pending == nil {
+						return ""
+					}
+
+					return pending.DecisionID
+				}(),
+				err,
+			)
+		}
 	}
 
 	/*
@@ -5667,8 +6328,36 @@ func (t *Trader) drainPendingEntry(
 		entry.Completed = true
 
 		if err := t.saveStateNoLock(); err != nil {
+			/*
+				This persistence failure is discovered by the drain,
+				not by produceEntry().
+
+				Therefore it uses its own granular error code rather
+				than EntryProduceErrPersistState.
+			*/
+			produceErr := &EntryProduceError{
+				Code: EntryProduceErrDrainPersistStateFailed,
+
+				Producer: entry.Producer,
+				Side:     fmt.Sprint(side),
+				OrderID:  entry.OrderID,
+
+				CleanupRequired: false,
+				Err:             err,
+			}
+
+			addDrainProducerEvent(
+				ProducerStageDrainPersistStateFailed,
+				entry.OrderID,
+				produceErr,
+				false,
+			)
+
+			saveProducerHistory()
+
 			log.Printf(
-				"[WARN] saveState (drain %s producer=%s id=%s): %v",
+				"[ERROR] saveState "+
+					"(drain %s producer=%s id=%s): %v",
 				side,
 				entry.Producer,
 				entry.OrderID,
@@ -5680,8 +6369,32 @@ func (t *Trader) drainPendingEntry(
 	select {
 	case res, ok := <-entry.ResultC:
 		if !ok {
+			produceErr := &EntryProduceError{
+				Code: EntryProduceErrDrainChannelClosed,
+
+				Producer: entry.Producer,
+				Side:     fmt.Sprint(side),
+				OrderID:  entry.OrderID,
+
+				CleanupRequired: false,
+
+				Err: errors.New(
+					"pending entry result channel closed",
+				),
+			}
+
+			addDrainProducerEvent(
+				ProducerStageDrainChannelClosed,
+				entry.OrderID,
+				produceErr,
+				false,
+			)
+
+			saveProducerHistory()
+
 			log.Printf(
-				"[WARN] postonly.drain.channel_closed side=%s producer=%s id=%s",
+				"[ERROR] postonly.drain.channel_closed "+
+					"side=%s producer=%s id=%s",
 				side,
 				entry.Producer,
 				entry.OrderID,
@@ -5692,8 +6405,24 @@ func (t *Trader) drainPendingEntry(
 			t.mu.Unlock()
 			finish()
 			t.mu.Lock()
+
 			return
 		}
+
+		/*
+			The asynchronous poller has now delivered its terminal result.
+
+			First merge every lifecycle event it discovered into the same
+			ProducerAttempt before any commit processing occurs.
+
+			This is critical because commit may fail and return early.
+			Poller lifecycle visibility must not depend on commit success.
+		*/
+		mergePollerProducerEvents(
+			res.ProducerEvents,
+		)
+
+		saveProducerHistory()
 
 		// log.Printf(
 		// "[TRACE] postonly.drain.recv side=%s producer=%s id=%s order_id=%s filled=%v placed_nil=%v",
@@ -5705,18 +6434,22 @@ func (t *Trader) drainPendingEntry(
 		// res.Placed == nil,
 		// )
 
-		// Decide whether this asynchronous result is safe to apply.
-		//
-		// Repricing may create several exchange order IDs. Accept a fill
-		// when it matches:
-		//   1. the current pending order ID; or
-		//   2. an order ID recorded in PendingOpen.History.
-		//
-		// When pending state is missing but the broker reports a real fill,
-		// accept it rather than orphaning an exchange position.
+		/*
+			Decide whether this asynchronous result is safe to apply.
+
+			Repricing may create several exchange order IDs. Accept a fill
+			when it matches:
+			  1. the current pending order ID; or
+			  2. an order ID recorded in PendingIntent.History.
+
+			When pending state is missing but the broker reports a real fill,
+			accept it rather than orphaning an exchange position.
+		*/
 		accept := false
 
-		if res.Filled && res.Placed != nil {
+		if res.Filled &&
+			res.Placed != nil {
+
 			// log.Printf(
 			// "[TRACE] postonly.drain.placed side=%s producer=%s order_id=%s price=%.8f base=%.8f quote=%.2f fee=%.6f",
 			// side,
@@ -5729,21 +6462,68 @@ func (t *Trader) drainPendingEntry(
 			// )
 
 			if pending != nil {
-				if res.OrderID == pending.OrderID {
+				if res.OrderID ==
+					pending.OrderID {
+
 					accept = true
 				} else {
 					for _, historicalID := range pending.History {
-						if res.OrderID == historicalID {
+
+						if res.OrderID ==
+							historicalID {
+
 							accept = true
 							break
 						}
 					}
 				}
+
+				if !accept {
+					/*
+						A real fill was reported, but its OrderID does not
+						match either the current pending order or the
+						reprice history.
+
+						This is a distinct drain failure discovered here.
+					*/
+					produceErr := &EntryProduceError{
+						Code: EntryProduceErrDrainFillOrderMismatch,
+
+						Producer: entry.Producer,
+						Side:     fmt.Sprint(side),
+						OrderID:  res.OrderID,
+
+						CleanupRequired: false,
+
+						Err: fmt.Errorf(
+							"filled order %q does not match current pending order %q or history",
+							res.OrderID,
+							pending.OrderID,
+						),
+					}
+
+					addDrainProducerEvent(
+						ProducerStageFillOrderMismatch,
+						res.OrderID,
+						produceErr,
+						false,
+					)
+
+					saveProducerHistory()
+				}
 			} else {
+				/*
+					Existing behavior intentionally accepts a real exchange
+					fill when pending state is unavailable, rather than
+					orphaning the exchange position.
+
+					Do not change that trading behavior.
+				*/
 				accept = true
 
 				log.Printf(
-					"[WARN] postonly.fill.without_pending side=%s producer=%s order_id=%s",
+					"[WARN] postonly.fill.without_pending "+
+						"side=%s producer=%s order_id=%s",
 					side,
 					entry.Producer,
 					res.OrderID,
@@ -5754,14 +6534,39 @@ func (t *Trader) drainPendingEntry(
 		if accept {
 			if book == nil {
 				/*
-					A real fill exists, so silently discarding it would be
-					dangerous. Do not mark the PendingEntry completed.
+					A real exchange fill exists, but the drain cannot
+					commit it because its target position book is absent.
 
-					This requires reconciliation because the exchange fill
-					cannot currently be committed into a position book.
+					The PendingEntry deliberately remains incomplete so
+					existing reconciliation behavior is preserved.
 				*/
+				produceErr := &EntryProduceError{
+					Code: EntryProduceErrDrainBookNil,
+
+					Producer: entry.Producer,
+					Side:     fmt.Sprint(side),
+					OrderID:  res.OrderID,
+
+					CleanupRequired: false,
+
+					Err: errors.New(
+						"filled entry cannot be committed: position book is nil",
+					),
+				}
+
+				addDrainProducerEvent(
+					ProducerStageCommitFailed,
+					res.OrderID,
+					produceErr,
+					true,
+				)
+
+				saveProducerHistory()
+
 				log.Printf(
-					"[ERROR] postonly.fill.book_nil side=%s producer=%s id=%s order_id=%s reconciliation_required=true",
+					"[ERROR] postonly.fill.book_nil "+
+						"side=%s producer=%s id=%s "+
+						"order_id=%s reconciliation_required=true",
 					side,
 					entry.Producer,
 					entry.OrderID,
@@ -5771,6 +6576,12 @@ func (t *Trader) drainPendingEntry(
 				return
 			}
 
+			/*
+				stage=filled was already discovered by the poller and
+				delivered through res.ProducerEvents.
+
+				Do not create another filled event here.
+			*/
 			log.Printf(
 				"[PRODUCER] stage=filled "+
 					"producer=%s side=%s order_id=%s "+
@@ -5791,8 +6602,67 @@ func (t *Trader) drainPendingEntry(
 				wallNow,
 			); err != nil {
 
+				/*
+					commitEntryFill() owns classification of failures discovered
+					inside the commit path.
+
+					The drain owns only the lifecycle transition:
+
+					    stage=commit_failed
+
+					Do not replace the authoritative commit error code with a
+					generic drain error code.
+				*/
+				var produceErr *EntryProduceError
+
+				if errors.As(err, &produceErr) {
+					addDrainProducerEvent(
+						ProducerStageCommitFailed,
+						res.OrderID,
+						produceErr,
+						true,
+					)
+				} else {
+					/*
+						Defensive fallback only.
+
+						A plain error from commitEntryFill() is unexpected now that
+						its known failure points construct EntryProduceError.
+					*/
+					fallbackErr := &EntryProduceError{
+						Code: EntryProduceErrDrainCommitFailed,
+
+						Producer: entry.Producer,
+						Side:     fmt.Sprint(side),
+						OrderID:  res.OrderID,
+
+						CleanupRequired: false,
+						Err:             err,
+					}
+
+					addDrainProducerEvent(
+						ProducerStageCommitFailed,
+						res.OrderID,
+						fallbackErr,
+						true,
+					)
+				}
+
+				/*
+					commitEntryFill() may also have discovered non-fatal producer
+					events before returning.
+
+					Merge them before persisting producer history.
+				*/
+				mergePollerProducerEvents(
+					res.ProducerEvents,
+				)
+
+				saveProducerHistory()
+
 				log.Printf(
-					"[ERROR] postonly.commit side=%s producer=%s order_id=%s: %v",
+					"[ERROR] postonly.commit "+
+						"side=%s producer=%s order_id=%s: %v",
 					side,
 					entry.Producer,
 					res.OrderID,
@@ -5801,11 +6671,49 @@ func (t *Trader) drainPendingEntry(
 
 				return
 			}
+
+			/*
+			   commitEntryFill() may have discovered additional non-fatal
+			   lifecycle facts while successfully committing the fill, such as:
+
+			   	commit_spare_pointer_nil
+
+			   Merge those events into the existing ProducerAttempt before
+			   recording the final committed stage.
+			*/
+			mergePollerProducerEvents(
+				res.ProducerEvents,
+			)
+
+			/*
+			   commitEntryFill() returned successfully.
+
+			   This is the authoritative point at which the producer lifecycle
+			   can normally advance to committed.
+
+			   The same permanent DecisionID and ProducerAttempt are retained.
+			*/
+			addDrainProducerEvent(
+				ProducerStageCommitted,
+				res.OrderID,
+				nil,
+				false,
+			)
+
+			saveProducerHistory()
+
+			log.Printf(
+				"[PRODUCER] stage=committed "+
+					"producer=%s side=%s order_id=%s",
+				entry.Producer,
+				entry.Side,
+				res.OrderID,
+			)
 		} else {
 			/*
 				A non-fill terminal result allows the normal entry path to
-				reconsider the order unless cancellation was requested because
-				the signal changed.
+				reconsider the order unless cancellation was requested
+				because the signal changed.
 			*/
 			cancelRequested :=
 				pending != nil &&
@@ -5861,21 +6769,137 @@ func (t *Trader) commitEntryFill(
 	now time.Time,
 	wallNow time.Time,
 ) error {
+	/*
+		Commit lifecycle facts discovered here belong to the same
+		ProducerAttempt created by the source wrapper.
+
+		res.ProducerEvents is a map, so mutations made here remain visible
+		to the drain even though OpenResult itself is passed by value.
+
+		This helper must never create a ProducerAttempt or DecisionID.
+	*/
+	addCommitProducerEvent := func(
+		stage ProducerStage,
+		orderID string,
+		produceErr *EntryProduceError,
+		replace bool,
+	) {
+		if entry == nil ||
+			entry.Intent == nil {
+
+			return
+		}
+
+		if res.ProducerEvents == nil {
+			res.ProducerEvents =
+				make(map[ProducerStage]ProducerEvent)
+		}
+
+		if _, exists := res.ProducerEvents[stage]; exists && !replace {
+
+			return
+		}
+
+		decisionID := strings.TrimSpace(
+			entry.Intent.DecisionID,
+		)
+		if decisionID == "" {
+			/*
+				Producer correlation belongs to the wrapper.
+
+				Do not manufacture a DecisionID here.
+			*/
+			return
+		}
+
+		event := ProducerEvent{
+			Time:      time.Now().UTC(),
+			CreatedAt: entry.Intent.CreatedAt,
+
+			Producer: entry.Producer,
+			Side:     fmt.Sprint(entry.Side),
+			Stage:    stage,
+
+			DecisionID: decisionID,
+			OrderID:    orderID,
+
+			Reason: entry.ProducerReason,
+		}
+
+		if produceErr != nil {
+			event.ErrorCode =
+				produceErr.Code
+
+			event.CleanupRequired =
+				produceErr.CleanupRequired
+
+			if produceErr.Err != nil {
+				event.Error =
+					produceErr.Err.Error()
+			}
+		}
+
+		res.ProducerEvents[stage] = event
+	}
 
 	if entry == nil {
-		return fmt.Errorf("nil pending entry")
+		return &EntryProduceError{
+			Code: EntryProduceErrCommitNilPendingEntry,
+
+			CleanupRequired: false,
+
+			Err: errors.New(
+				"nil pending entry",
+			),
+		}
 	}
 
 	if entry.Intent == nil {
-		return fmt.Errorf("nil PendingOpen")
+		return &EntryProduceError{
+			Code: EntryProduceErrCommitNilPendingIntent,
+
+			Producer: entry.Producer,
+			Side:     fmt.Sprint(entry.Side),
+			OrderID:  res.OrderID,
+
+			CleanupRequired: false,
+
+			Err: errors.New(
+				"nil PendingIntent",
+			),
+		}
 	}
 
 	if entry.Book == nil {
-		return fmt.Errorf("nil position book")
+		return &EntryProduceError{
+			Code: EntryProduceErrCommitNilPositionBook,
+
+			Producer: entry.Producer,
+			Side:     fmt.Sprint(entry.Side),
+			OrderID:  res.OrderID,
+
+			CleanupRequired: false,
+
+			Err: errors.New(
+				"nil position book",
+			),
+		}
 	}
 
 	if res.Placed == nil {
-		return fmt.Errorf("filled result missing execution")
+		return &EntryProduceError{
+			Code: EntryProduceErrCommitMissingExecution,
+
+			Producer: entry.Producer,
+			Side:     fmt.Sprint(entry.Side),
+			OrderID:  res.OrderID,
+
+			CleanupRequired: false,
+
+			Err: errors.New(
+				"filled result missing execution",
+			),
+		}
 	}
 
 	side := entry.Side
@@ -5883,7 +6907,9 @@ func (t *Trader) commitEntryFill(
 	book := entry.Book
 
 	// policy := entryPolicyForSide(side)
-	policy := entryPolicyForSource(entry.Producer)
+	policy := entryPolicyForSource(
+		entry.Producer,
+	)
 
 	priceToUse := res.Placed.Price
 	baseToUse := res.Placed.BaseSize
@@ -5891,37 +6917,70 @@ func (t *Trader) commitEntryFill(
 	entryFee := res.Placed.CommissionUSD
 
 	if priceToUse <= 0 {
-		return fmt.Errorf("invalid execution price %.8f", priceToUse)
+		return &EntryProduceError{
+			Code: EntryProduceErrCommitInvalidExecutionPrice,
+
+			Producer: entry.Producer,
+			Side:     fmt.Sprint(side),
+			OrderID:  res.OrderID,
+
+			CleanupRequired: false,
+
+			Err: fmt.Errorf(
+				"invalid execution price %.8f",
+				priceToUse,
+			),
+		}
 	}
 
 	if baseToUse <= 0 {
-		return fmt.Errorf("invalid execution base %.8f", baseToUse)
+		return &EntryProduceError{
+			Code: EntryProduceErrCommitInvalidExecutionBase,
+
+			Producer: entry.Producer,
+			Side:     fmt.Sprint(side),
+			OrderID:  res.OrderID,
+
+			CleanupRequired: false,
+
+			Err: fmt.Errorf(
+				"invalid execution base %.8f",
+				baseToUse,
+			),
+		}
 	}
 
-	if t.positionExistsByEntryOrderID(res.OrderID) {
-		// log.Printf(
-		// "[TRACE] postonly.commit.duplicate side=%s producer=%s order_id=%s",
-		// side,
-		// entry.Producer,
-		// res.OrderID,
-		// )
+	if t.positionExistsByEntryOrderID(
+		res.OrderID,
+	) {
+		/*
+			Idempotent commit path.
+
+			The exchange fill has already been represented by an existing
+			position with this EntryOrderID.
+
+			This is not a commit failure.
+		*/
 		return nil
 	}
 
 	if entryFee <= 0 {
-		entryFee = quoteSpent * (t.cfg.FeeRatePct / 100.0)
+		entryFee =
+			quoteSpent *
+				(t.cfg.FeeRatePct / 100.0)
 	}
 
 	/*
 		Refund-service adjustment.
 	*/
 	if pending.RefundPortionUSD > 0 {
-
 		originalBase := baseToUse
 		originalQuote := quoteSpent
 		originalFee := entryFee
 
-		refundBase := pending.RefundPortionUSD / priceToUse
+		refundBase :=
+			pending.RefundPortionUSD /
+				priceToUse
 
 		if refundBase > baseToUse {
 			refundBase = baseToUse
@@ -5931,7 +6990,9 @@ func (t *Trader) commitEntryFill(
 			refundBase = 0
 		}
 
-		keptBase := baseToUse - refundBase
+		keptBase :=
+			baseToUse -
+				refundBase
 
 		if keptBase < 0 {
 			keptBase = 0
@@ -5939,18 +7000,38 @@ func (t *Trader) commitEntryFill(
 
 		keptQuote := quoteSpent
 		keptFee := entryFee
-		refundQuote := pending.RefundPortionUSD
-		refundFee := refundQuote * (t.cfg.FeeRatePct / 100.0)
+
+		refundQuote :=
+			pending.RefundPortionUSD
+
+		refundFee :=
+			refundQuote *
+				(t.cfg.FeeRatePct / 100.0)
 
 		if originalBase > 0 {
+			keptRatio :=
+				keptBase /
+					originalBase
 
-			keptRatio := keptBase / originalBase
-			refundRatio := refundBase / originalBase
+			refundRatio :=
+				refundBase /
+					originalBase
 
-			keptQuote = originalQuote * keptRatio
-			keptFee = originalFee * keptRatio
-			refundQuote = originalQuote * refundRatio
-			refundFee = originalFee * refundRatio
+			keptQuote =
+				originalQuote *
+					keptRatio
+
+			keptFee =
+				originalFee *
+					keptRatio
+
+			refundQuote =
+				originalQuote *
+					refundRatio
+
+			refundFee =
+				originalFee *
+					refundRatio
 		}
 
 		t.creditRefundService(
@@ -5964,7 +7045,8 @@ func (t *Trader) commitEntryFill(
 		entryFee = keptFee
 	}
 
-	if baseToUse <= 0 || quoteSpent <= 0 {
+	if baseToUse <= 0 ||
+		quoteSpent <= 0 {
 
 		// log.Printf(
 		// "[TRACE] postonly.fill.refund_consumed_all side=%s producer=%s order_id=%s",
@@ -5973,6 +7055,16 @@ func (t *Trader) commitEntryFill(
 		// res.OrderID,
 		// )
 
+		/*
+			Existing behavior intentionally returns success when the
+			refund service consumes the complete execution.
+
+			Do not classify this as commit_failed here.
+
+			Whether BOT OPS should eventually expose a distinct
+			fully-refunded lifecycle stage remains separate from the
+			error taxonomy.
+		*/
 		return nil
 	}
 
@@ -6005,7 +7097,8 @@ func (t *Trader) commitEntryFill(
 	}
 
 	if newLot.ProfitGateUSD <= 0 {
-		newLot.ProfitGateUSD = t.cfg.ProfitGateUSD
+		newLot.ProfitGateUSD =
+			t.cfg.ProfitGateUSD
 	}
 
 	// log.Printf(
@@ -6018,7 +7111,10 @@ func (t *Trader) commitEntryFill(
 	// newLot.EntryOrderID,
 	// )
 
-	book.Lots = append(book.Lots, newLot)
+	book.Lots = append(
+		book.Lots,
+		newLot,
+	)
 
 	t.consolidateDust(
 		book,
@@ -6035,38 +7131,63 @@ func (t *Trader) commitEntryFill(
 	t.didConsolidateStartup = false
 
 	if entry.SpareUSD != nil {
-
 		*entry.SpareUSD -= quoteSpent
 
 		if *entry.SpareUSD < 0 {
 			*entry.SpareUSD = 0
 		}
-
 	} else {
+		/*
+			This is not fatal.
 
-		log.Printf(
-			"[WARN] postonly.fill.spare_pointer_nil side=%s producer=%s order_id=%s",
-			side,
-			entry.Producer,
+			The position commit continues, but BOT OPS must retain the
+			anomaly rather than losing it in a log message.
+		*/
+		produceErr := &EntryProduceError{
+			Code: EntryProduceErrCommitSparePointerNil,
+
+			Producer: entry.Producer,
+			Side:     fmt.Sprint(side),
+			OrderID:  res.OrderID,
+
+			CleanupRequired: false,
+
+			Err: errors.New(
+				"SpareUSD pointer is nil",
+			),
+		}
+
+		addCommitProducerEvent(
+			ProducerStageCommitSparePointerNil,
 			res.OrderID,
+			produceErr,
+			false,
 		)
 	}
 
 	// Promote Equity-produced entries into runners. NormalLegacy entries
 	// remain scalp-only and therefore never receive runner assignment.
-	if policy.AllowRunner && entry.EquityTriggered {
+	if policy.AllowRunner &&
+		entry.EquityTriggered {
 
-		newIndex := len(book.Lots) - 1
+		newIndex :=
+			len(book.Lots) - 1
 
-		addRunner(book, newIndex)
+		addRunner(
+			book,
+			newIndex,
+		)
 
 		runner := book.Lots[newIndex]
 
 		runner.TrailActive = false
-		runner.TrailPeak = runner.OpenPrice
+		runner.TrailPeak =
+			runner.OpenPrice
 		runner.TrailStop = 0
 
-		t.applyRunnerTargets(runner)
+		t.applyRunnerTargets(
+			runner,
+		)
 
 		// log.Printf(
 		// "[TRACE] runner.assign idx=%d side=%s producer=%s open=%.8f take=%.8f",
@@ -6078,25 +7199,34 @@ func (t *Trader) commitEntryFill(
 		// )
 	}
 
-	if policy.ResetLastAdd && entry.LastAdd != nil {
+	if policy.ResetLastAdd &&
+		entry.LastAdd != nil {
+
 		*entry.LastAdd = wallNow
 	}
 
-	if policy.ResetWinExtreme && entry.WinExtreme != nil {
+	if policy.ResetWinExtreme &&
+		entry.WinExtreme != nil {
+
 		*entry.WinExtreme = priceToUse
 	}
 
-	if policy.ResetLatchedGate && entry.LatchedGate != nil {
+	if policy.ResetLatchedGate &&
+		entry.LatchedGate != nil {
+
 		*entry.LatchedGate = 0
 	}
 
 	if policy.UpdateEquityBaseline {
+		oldEquityBaseline :=
+			t.lastAddEquity
 
-		oldEquityBaseline := t.lastAddEquity
-		t.lastAddEquity = t.equityUSD
+		t.lastAddEquity =
+			t.equityUSD
 
 		log.Printf(
-			"[TRACE] equity.baseline.set side=%s producer=%s old=%.2f new=%.2f",
+			"[TRACE] equity.baseline.set "+
+				"side=%s producer=%s old=%.2f new=%.2f",
 			side,
 			entry.Producer,
 			oldEquityBaseline,
@@ -6116,10 +7246,13 @@ func (t *Trader) commitEntryFill(
 		Case3A replacements leave the regime unchanged because their
 		producer policy sets ResetRegime=false.
 	*/
-	if policy.ResetRegime && t.shouldResetRegime(side) {
+	if policy.ResetRegime &&
+		t.shouldResetRegime(side) {
+
 		t.toNormal(
 			fmt.Sprintf(
-				"successful_entry_fill producer=%s side=%s order_id=%s",
+				"successful_entry_fill "+
+					"producer=%s side=%s order_id=%s",
 				entry.Producer,
 				side,
 				res.OrderID,
@@ -6128,7 +7261,8 @@ func (t *Trader) commitEntryFill(
 	}
 
 	message := fmt.Sprintf(
-		"[LIVE ORDER] %s quote=%.2f take=%.2f fee=%.4f reason=%s [%s]",
+		"[LIVE ORDER] %s quote=%.2f "+
+			"take=%.2f fee=%.4f reason=%s [%s]",
 		side,
 		quoteSpent,
 		newLot.Take,
@@ -6142,7 +7276,18 @@ func (t *Trader) commitEntryFill(
 	}
 
 	if err := t.saveStateNoLock(); err != nil {
-		return fmt.Errorf("saveStateNoLock: %w", err)
+
+		return &EntryProduceError{
+			Code: EntryProduceErrCommitPersistState,
+
+			Producer: entry.Producer,
+			Side:     fmt.Sprint(side),
+			OrderID:  res.OrderID,
+
+			CleanupRequired: false,
+
+			Err: err,
+		}
 	}
 
 	log.Printf(
@@ -6160,6 +7305,7 @@ func (t *Trader) commitEntryFill(
 
 	return nil
 }
+
 func (t *Trader) Case3ACommitEligible(
 	entry *PendingEntry,
 ) bool {

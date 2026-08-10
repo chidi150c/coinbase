@@ -47,6 +47,30 @@ const (
 
 	EntryProduceErrPersistState  EntryProduceErrorCode = "persist_state_failed"
 	EntryProduceErrCleanupCancel EntryProduceErrorCode = "cleanup_cancel_failed"
+
+	EntryProduceErrPollerGetOrderFailed EntryProduceErrorCode = "poller_get_order_failed"
+	EntryProduceErrPollerRejected       EntryProduceErrorCode = "poller_order_rejected"
+	EntryProduceErrPollerExpired        EntryProduceErrorCode = "poller_order_expired"
+	EntryProduceErrPollerCancelFailed   EntryProduceErrorCode = "poller_cancel_failed"
+
+	EntryProduceErrDrainMissingProducer    EntryProduceErrorCode = "drain_missing_producer"
+	EntryProduceErrDrainProducerMismatch   EntryProduceErrorCode = "drain_producer_mismatch"
+	EntryProduceErrDrainChannelClosed      EntryProduceErrorCode = "drain_channel_closed"
+	EntryProduceErrDrainFillOrderMismatch  EntryProduceErrorCode = "drain_fill_order_mismatch"
+	EntryProduceErrDrainBookNil            EntryProduceErrorCode = "drain_book_nil"
+	EntryProduceErrDrainCommitFailed       EntryProduceErrorCode = "drain_commit_failed"
+	EntryProduceErrDrainPersistStateFailed EntryProduceErrorCode = "drain_persist_state_failed"
+
+	EntryProduceErrCommitNilPendingEntry       EntryProduceErrorCode = "commit_nil_pending_entry"
+	EntryProduceErrCommitNilPendingIntent      EntryProduceErrorCode = "commit_nil_pending_intent"
+	EntryProduceErrCommitNilPositionBook       EntryProduceErrorCode = "commit_nil_position_book"
+	EntryProduceErrCommitMissingExecution      EntryProduceErrorCode = "commit_missing_execution"
+	EntryProduceErrCommitInvalidExecutionPrice EntryProduceErrorCode = "commit_invalid_execution_price"
+	EntryProduceErrCommitInvalidExecutionBase  EntryProduceErrorCode = "commit_invalid_execution_base"
+	EntryProduceErrCommitNilSparePointer       EntryProduceErrorCode = "commit_nil_spare_pointer"
+	EntryProduceErrCommitPersistState          EntryProduceErrorCode = "commit_persist_state_failed"
+
+	EntryProduceErrCommitSparePointerNil EntryProduceErrorCode = "commit_spare_pointer_nil"
 )
 
 // EntryProduceError carries stable entry-production failure information
