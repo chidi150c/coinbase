@@ -1,5 +1,11 @@
 // FILE: observability.go
-
+// ProducerAttempt is the single lifecycle object keyed by DecisionID.
+// Events map[ProducerStage]ProducerEvent lets one attempt accumulate produced → pending → filled → committed, or failure/cleanup stages.
+// recordProducerAttemptLocked() is deliberately mechanical and does not classify failures or alter trading behavior.
+// Retention is correctly based on attempt.CreatedAt, not the latest event time.
+// Persistence is isolated in producerHistoryFile and uses temp-file + rename.
+// Loading repairs nil maps and prunes expired attempts.
+// The additional drain/poller/commit stages are compatible with the lifecycle work already in trader.go.
 package main
 
 import (
@@ -84,34 +90,93 @@ func FormatDecisionID(
 	)
 }
 
-// recordProducerAttemptLocked records one producer attempt in the in-memory
-// producer history. The caller MUST already hold t.mu.
+// recordProducerAttemptLocked registers or enriches one producer attempt in
+// the in-memory producer history.
 //
-// This helper owns only the mechanical producer -> DecisionID map update.
-// It does not apply retry policy, perform cleanup, persist state, or mutate
-// trading behavior. A nil attempt is intentionally ignored.
-func (t *Trader) recordProducerAttemptLocked(attempt *ProducerAttempt) {
+// The caller MUST already hold t.mu.
+//
+// Behavior 1 — register:
+// If DecisionID does not yet exist, store this ProducerAttempt as the
+// authoritative attempt for that producer decision.
+//
+// Behavior 2 — enrich:
+// If DecisionID already exists, preserve the original ProducerAttempt and
+// merge lifecycle events from the incoming attempt into its Events map.
+//
+// DecisionID, CreatedAt, Producer, and Side are permanent attempt identity.
+// They must never be regenerated or replaced during enrichment.
+//
+// This helper performs only the mechanical producer-history mutation.
+// It does not classify errors, apply retry policy, perform cleanup, persist
+// history, or alter trading behavior.
+func (t *Trader) recordProducerAttemptLocked(
+	attempt *ProducerAttempt,
+) {
 	if t == nil || attempt == nil {
 		return
 	}
 
 	if t.producerHistory == nil {
-		t.producerHistory = make(map[EntryProducer]*ProducerHistory)
+		t.producerHistory =
+			make(map[EntryProducer]*ProducerHistory)
 	}
 
 	history := t.producerHistory[attempt.Producer]
 	if history == nil {
 		history = &ProducerHistory{
-			Attempts: make(map[string]*ProducerAttempt),
+			Attempts: make(
+				map[string]*ProducerAttempt,
+			),
 		}
-		t.producerHistory[attempt.Producer] = history
+
+		t.producerHistory[attempt.Producer] =
+			history
 	}
 
 	if history.Attempts == nil {
-		history.Attempts = make(map[string]*ProducerAttempt)
+		history.Attempts =
+			make(map[string]*ProducerAttempt)
 	}
 
-	history.Attempts[attempt.DecisionID] = attempt
+	existingAttempt, exists :=
+		history.Attempts[attempt.DecisionID]
+
+	/*
+		Behavior 1 — REGISTER
+
+		This DecisionID has not been seen before.
+
+		The incoming ProducerAttempt becomes the authoritative attempt
+		whose identity remains fixed for the entire producer lifecycle.
+	*/
+	if !exists || existingAttempt == nil {
+		if attempt.Events == nil {
+			attempt.Events =
+				make(map[ProducerStage]ProducerEvent)
+		}
+
+		history.Attempts[attempt.DecisionID] =
+			attempt
+
+		return
+	}
+
+	/*
+		Behavior 2 — ENRICH
+
+		The producer decision already exists.
+
+		Never replace the original ProducerAttempt. Merge only lifecycle
+		events discovered later under the same permanent DecisionID.
+	*/
+	if existingAttempt.Events == nil {
+		existingAttempt.Events =
+			make(map[ProducerStage]ProducerEvent)
+	}
+
+	for stage, event := range attempt.Events {
+		existingAttempt.Events[stage] = event
+	}
 }
 
 const ProducerHistoryRetention = 24 * time.Hour
