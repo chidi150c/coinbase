@@ -267,9 +267,17 @@ type Trader struct {
 	balanceRefreshOnce sync.Once
 	balanceRefreshStop chan struct{}
 	// Unified asynchronous entry registry; key = exchange OrderID.
-	pendingEntries      map[string]*PendingEntry
-	pendingExits        map[string]*PendingExit
-	producerHistory     map[EntryProducer]*ProducerHistory
+	pendingEntries map[string]*PendingEntry
+	pendingExits   map[string]*PendingExit
+
+	producerHistory map[EntryProducer]*ProducerHistory
+
+	// Durable bounded producer-performance aggregate.
+	//
+	// Unlike producerHistory, this map does not grow with the number of
+	// decisions or trades. It contains one aggregate record per producer.
+	producerEconomics map[EntryProducer]*ProducerEconomics
+
 	producerHistoryFile string
 }
 
@@ -3245,7 +3253,35 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 
 	t.lastExits = append(t.lastExits, rec)
 
+	/*
+	   Producer economics must capture every authoritative realized exit
+	   contribution before any partial-exit residual is resized,
+	   consolidated, archived as dust, or otherwise transformed.
+
+	   This records realized NET PnL onto the SAME ProducerAttempt.
+
+	   It does NOT mark ProducerStageExited. A partial exit may still leave
+	   live producer exposure in SideBook.Lots.
+	*/
+	if t.recordProducerRealizedPnLLocked(
+		lot,
+		rec,
+	) {
+		if err := t.saveProducerHistoryNoLock(); err != nil {
+			log.Printf(
+				"[ERROR] producer.history.save_failed "+
+					"stage=realized_pnl producer=%s "+
+					"entry_order_id=%s exit_order_id=%s err=%v",
+				lot.Producer,
+				rec.EntryOrderID,
+				rec.ExitOrderID,
+				err,
+			)
+		}
+	}
+
 	capN := t.cfg.ExitHistorySize
+
 	if capN <= 0 {
 		capN = 8
 	}
@@ -3260,10 +3296,36 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 		if lot.EntryFee < 0 {
 			lot.EntryFee = 0
 		}
-		lot.OpenNotionalUSD = lot.SizeBase * lot.OpenPrice
+
 		if priceExec > 0 && minNotional > 0 {
 			t.consolidateDust(book, priceExec, minNotional)
 			t.archiveOrphanDust(book, priceExec, minNotional)
+		}
+
+		/*
+		   This was an exchange partial exit, but residual processing may have
+		   removed the original EntryOrderID from the authoritative SideBook.
+
+		   Realized PnL for this ExitRecord was already accumulated earlier.
+
+		   Only now, after residual sizing/dust handling, determine whether the
+		   original producer exposure is still live.
+		*/
+		if t.markProducerExitedIfNotLiveLocked(
+			lot,
+			rec,
+		) {
+			if err := t.saveProducerHistoryNoLock(); err != nil {
+				log.Printf(
+					"[ERROR] producer.history.save_failed "+
+						"stage=exited producer=%s "+
+						"entry_order_id=%s exit_order_id=%s err=%v",
+					lot.Producer,
+					rec.EntryOrderID,
+					rec.ExitOrderID,
+					err,
+				)
+			}
 		}
 
 		msg := fmt.Sprintf("EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)", exitTime.Format(time.RFC3339), priceExec, exitReason, lot.ProducerReason, pl, entryPortion+exitFee)
@@ -3293,6 +3355,35 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 	if priceExec > 0 && minNotional > 0 {
 		t.consolidateDust(book, priceExec, minNotional)
 		t.archiveOrphanDust(book, priceExec, minNotional)
+	}
+
+	/*
+	   This is the full-exit branch.
+
+	   The authoritative lot has already been removed from SideBook.Lots,
+	   and any subsequent dust/consolidation transformations for this tick
+	   have completed.
+
+	   Realized PnL for this ExitRecord was already accumulated earlier.
+
+	   If the original producer EntryOrderID is no longer present in either
+	   authoritative SideBook, mark the SAME ProducerAttempt exited.
+	*/
+	if t.markProducerExitedIfNotLiveLocked(
+		lot,
+		rec,
+	) {
+		if err := t.saveProducerHistoryNoLock(); err != nil {
+			log.Printf(
+				"[ERROR] producer.history.save_failed "+
+					"stage=exited producer=%s "+
+					"entry_order_id=%s exit_order_id=%s err=%v",
+				lot.Producer,
+				rec.EntryOrderID,
+				rec.ExitOrderID,
+				err,
+			)
+		}
 	}
 
 	if wasNewest {
