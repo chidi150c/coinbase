@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -23,6 +24,113 @@ import (
 type BinanceBridge struct {
 	base string
 	hc   *http.Client
+}
+
+type BinanceBridgeError struct {
+	HTTPStatus int
+
+	Exchange          string
+	Endpoint          string
+	BinanceHTTPStatus int
+	BinanceCode       int
+	BinanceMsg        string
+	Hint              string
+
+	Raw string
+}
+
+func (e *BinanceBridgeError) Error() string {
+	if e == nil {
+		return ""
+	}
+
+	if e.BinanceCode != 0 ||
+		e.BinanceMsg != "" {
+
+		return fmt.Sprintf(
+			"binance bridge http=%d binance_http=%d code=%d msg=%s",
+			e.HTTPStatus,
+			e.BinanceHTTPStatus,
+			e.BinanceCode,
+			e.BinanceMsg,
+		)
+	}
+
+	return fmt.Sprintf(
+		"binance bridge http=%d: %s",
+		e.HTTPStatus,
+		e.Raw,
+	)
+}
+
+func newBinanceBridgeError(
+	status int,
+	body []byte,
+) error {
+
+	raw := strings.TrimSpace(
+		string(body),
+	)
+
+	var payload struct {
+		Detail struct {
+			Exchange    string `json:"exchange"`
+			Endpoint    string `json:"endpoint"`
+			HTTPStatus  int    `json:"http_status"`
+			BinanceCode int    `json:"binance_code"`
+			BinanceMsg  string `json:"binance_msg"`
+			Hint        string `json:"hint"`
+		} `json:"detail"`
+	}
+
+	_ = json.Unmarshal(
+		body,
+		&payload,
+	)
+
+	return &BinanceBridgeError{
+		HTTPStatus: status,
+
+		Exchange:          payload.Detail.Exchange,
+		Endpoint:          payload.Detail.Endpoint,
+		BinanceHTTPStatus: payload.Detail.HTTPStatus,
+		BinanceCode:       payload.Detail.BinanceCode,
+		BinanceMsg: strings.TrimSpace(
+			payload.Detail.BinanceMsg,
+		),
+		Hint: strings.TrimSpace(
+			payload.Detail.Hint,
+		),
+
+		Raw: raw,
+	}
+}
+
+func isBinanceInsufficientBalance(
+	err error,
+) bool {
+	if err == nil {
+		return false
+	}
+
+	var binanceErr *BinanceBridgeError
+
+	if !errors.As(
+		err,
+		&binanceErr,
+	) {
+		return false
+	}
+
+	msg :=
+		strings.TrimSpace(
+			binanceErr.BinanceMsg,
+		)
+
+	return (binanceErr.BinanceCode == -2010 ||
+		binanceErr.BinanceCode == -1010) &&
+		msg ==
+			"Account has insufficient balance for requested action."
 }
 
 func NewBinanceBridge(base string) *BinanceBridge {
@@ -214,9 +322,17 @@ func (b *BinanceBridge) PlaceMarketQuote(ctx context.Context, product string, si
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode >= 300 {
-		xb, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("bridge order/market %d: %s", resp.StatusCode, string(xb))
+		xb, _ := io.ReadAll(
+			resp.Body,
+		)
+
+		return nil,
+			newBinanceBridgeError(
+				resp.StatusCode,
+				xb,
+			)
 	}
 
 	// Decode into stringly-typed JSON and then build PlacedOrder to tolerate string-number fields.
@@ -294,9 +410,15 @@ func (b *BinanceBridge) PlaceMarketBase(ctx context.Context, product string, sid
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
-		xb, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("bridge order/market_base %d: %s",
-			resp.StatusCode, string(xb))
+		xb, _ := io.ReadAll(
+			resp.Body,
+		)
+
+		return nil,
+			newBinanceBridgeError(
+				resp.StatusCode,
+				xb,
+			)
 	}
 
 	// Decode the immediate response.
@@ -373,10 +495,19 @@ func (b *BinanceBridge) PlaceLimitPostOnly(ctx context.Context, product string, 
 		return "", err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode >= 300 {
-		xb, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("bridge order/limit_post_only %d: %s", resp.StatusCode, string(xb))
+		xb, _ := io.ReadAll(
+			resp.Body,
+		)
+
+		return "",
+			newBinanceBridgeError(
+				resp.StatusCode,
+				xb,
+			)
 	}
+
 	var out struct {
 		OrderID string `json:"order_id"`
 	}

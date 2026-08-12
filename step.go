@@ -69,6 +69,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -77,7 +78,7 @@ import (
 	"time"
 )
 
-const Version = 168
+const Version = 169
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -271,25 +272,53 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			// )
 
 		} else {
+			/*
+				The retry is a fresh Case3A producer lifecycle.
+
+				Create its lifecycle identity before entering the wrapper.
+				The wrapper will enrich this same ProducerAttempt with
+				produced / pending / failure / cleanup events.
+			*/
+			attempt :=
+				newProducerIntentLifecycle(
+					&repl,
+				)
+
+			if attempt == nil {
+				log.Printf(
+					"[ERROR] Case3A.retry.lifecycle_create_failed "+
+						"source_entry_id=%s",
+					sourceEntryOrderID,
+				)
+
+				t.PendingReplacementRetry.Enabled = false
+
+				return StepResult{
+					Msg: "HOLD",
+				}, nil
+			}
+
 			// produceEntry() ultimately calls registerPendingEntry(),
 			// which acquires t.mu. Never call it while step() owns t.mu.
 			t.mu.Unlock()
 
-			orderID, attempt, err := t.startCase3AReplacement(
-				ctx,
-				repl,
-			)
+			orderID, err :=
+				t.startCase3AReplacement(
+					ctx,
+					&repl,
+					attempt,
+				)
 
 			t.mu.Lock()
 
 			/*
-			   The retry itself is a new Case3A producer attempt.
+				The wrapper enriched the SAME ProducerAttempt created above.
 
-			   The Case3A wrapper has already completed any immediate cleanup it owns.
-			   This higher-level Step() retry executor records the returned attempt
-			   before deciding whether another retry will be needed.
+				Record it before applying retry-success / retry-failure policy.
 			*/
-			t.recordProducerAttemptLocked(attempt)
+			t.recordProducerAttemptLocked(
+				attempt,
+			)
 			if err := t.saveProducerHistoryNoLock(); err != nil {
 				log.Printf(
 					"[WARN] producer history save failed "+
@@ -1320,6 +1349,33 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		)
 	}
 
+	intent, attempt := newProducerDecisionLifecycle(
+		&d,
+	)
+
+	if attempt != nil &&
+		intent != nil &&
+		(d.Signal == Buy || d.Signal == Sell) {
+
+		t.addDecisionProducerEvent(
+			intent,
+			attempt,
+			ProducerStageDecision,
+			"",
+			nil,
+			false,
+			false,
+		)
+
+		log.Printf(
+			"[PRODUCER] stage=decision "+
+				"producer=%s side=%s reason=%q",
+			d.Producer,
+			d.Signal,
+			d.ProducerReason,
+		)
+	}
+
 	totalLots := lsb + lss
 
 	log.Printf(
@@ -1335,12 +1391,18 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	side, ok := d.SignalToSide()
 	if !ok {
-		// log.Printf(
-		// "[TRACE] signal.no_side signal=%s raw=%s final=%s",
-		// d.Signal,
-		// d.Raw,
-		// d.Signal,
-		// )
+		t.addDecisionProducerEvent(
+			intent,
+			attempt,
+			ProducerStageDecisionFailed,
+			EntryProduceErrInvalidSide,
+			fmt.Errorf(
+				"decision signal cannot map to order side: %v",
+				d.Signal,
+			),
+			false,
+			true,
+		)
 
 		t.mu.Unlock()
 
@@ -1349,16 +1411,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			Raw:    d.Raw,
 			Signal: d.Signal,
 		}, nil
-	}
-
-	if d.Signal == Buy || d.Signal == Sell {
-		log.Printf(
-			"[PRODUCER] stage=produced "+
-				"producer=%s side=%s reason=%q",
-			d.Producer,
-			d.Signal,
-			d.ProducerReason,
-		)
 	}
 
 	executionBalance, executionCacheOK :=
@@ -1385,6 +1437,19 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			d.Producer,
 			d.Signal,
 			ageMS,
+		)
+
+		t.addDecisionProducerEvent(
+			intent,
+			attempt,
+			ProducerStageDecisionFailed,
+			EntryProduceErrDecisionBalanceUnavailable,
+			fmt.Errorf(
+				"execution balance unavailable age_ms=%d",
+				ageMS,
+			),
+			false,
+			true,
 		)
 
 		t.mu.Unlock()
@@ -1450,16 +1515,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	equitySpareBase :=
 		equityResult.ProposedSellBase
 
-	// Existing execution classification.
-	isAdd :=
-		len(book.Lots) > 0 &&
-			t.cfg.AllowPyramiding &&
-			(d.Signal == Buy || d.Signal == Sell)
-
-	skipPyramidGates :=
-		equityTriggerSell ||
-			equityTriggerBuy
-
 	// Prevent duplicate opens while pending on this side (exits already ran) ---
 	// Extra belt-and-suspenders: if a pending exists and we haven't hit its Deadline, keep waiting.
 	// if side == SideBuy && entry.Intent != nil && time.Now().Before(entry.Intent.Deadline) {
@@ -1489,13 +1544,18 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			last.PNLUSD < 0 &&
 			price > last.ClosePrice {
 
-			// log.Printf(
-			// "[TRACE] Case3B.block_buy regime=%s buy_price=%.8f last_exit_sell_price=%.8f last_exit_net=%.6f",
-			// t.MarketRegime,
-			// price,
-			// last.ClosePrice,
-			// last.PNLUSD,
-			// )
+			t.addDecisionProducerEvent(
+				intent,
+				attempt,
+				ProducerStageDecisionBlocked,
+				EntryProduceErrDecisionCase3BBlocked,
+				fmt.Errorf(
+					"Case3B BUY blocked above previous threshold-stop loss exit price %.8f",
+					last.ClosePrice,
+				),
+				false,
+				true,
+			)
 
 			t.mu.Unlock()
 			return StepResult{Msg: "HOLD Case3B block BUY above last loss-exit SELL price", Raw: d.Raw, Signal: d.Signal}, nil
@@ -1519,13 +1579,18 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			last.PNLUSD < 0 &&
 			price < last.ClosePrice {
 
-			// log.Printf(
-			// "[TRACE] Case3B.block_sell regime=%s sell_price=%.8f last_exit_buy_price=%.8f last_exit_net=%.6f",
-			// t.MarketRegime,
-			// price,
-			// last.ClosePrice,
-			// last.PNLUSD,
-			// )
+			t.addDecisionProducerEvent(
+				intent,
+				attempt,
+				ProducerStageDecisionBlocked,
+				EntryProduceErrDecisionCase3BBlocked,
+				fmt.Errorf(
+					"Case3B SELL blocked below previous threshold-stop loss exit price %.8f",
+					last.ClosePrice,
+				),
+				false,
+				true,
+			)
 
 			t.mu.Unlock()
 			return StepResult{Msg: "HOLD Case3B block SELL below last loss-exit BUY price", Raw: d.Raw, Signal: d.Signal}, nil
@@ -1534,6 +1599,17 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 	// Long-only veto for SELL when flat; unchanged behavior.
 	if d.Signal == Sell && t.cfg.LongOnly {
+		t.addDecisionProducerEvent(
+			intent,
+			attempt,
+			ProducerStageDecisionBlocked,
+			EntryProduceErrDecisionLongOnlyBlocked,
+			fmt.Errorf(
+				"SELL blocked because LongOnly is enabled",
+			),
+			false,
+			true,
+		)
 		t.mu.Unlock()
 		return StepResult{Msg: fmt.Sprintf("FLAT (long-only) [%s]", decisionEntryReason(d)), Raw: d.Raw, Signal: d.Signal}, nil
 	}
@@ -1557,145 +1633,22 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			t.didConsolidateStartup = true
 			// log.Printf("[TRACE] consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
 		}
+		t.addDecisionProducerEvent(
+			intent,
+			attempt,
+			ProducerStageDecisionBlocked,
+			EntryProduceErrDecisionLotCapReached,
+			fmt.Errorf(
+				"entry blocked by max concurrent lot cap current=%d max=%d",
+				lsb+lss,
+				t.cfg.MaxConcurrentLots,
+			),
+			false,
+			true,
+		)
 		t.mu.Unlock()
 		log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", t.cfg.MaxConcurrentLots)
 		return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
-	}
-
-	if isAdd && !skipPyramidGates {
-		var pyramidSide PyramidSideResult
-
-		switch d.Signal {
-		case Buy:
-			pyramidSide = pyramidResult.Buy
-
-		case Sell:
-			pyramidSide = pyramidResult.Sell
-		}
-
-		if d.Signal == Buy || d.Signal == Sell {
-			// log.Printf(
-			// "[TRACE] pyramid.spacing since_last=%.1fs need>=%ds",
-			// pyramidSide.ElapsedSec,
-			// pyramidSide.Raw.SpacingNeed,
-			// )
-
-			if !pyramidSide.SpacingPass {
-				log.Printf(
-					"[DEBUG] GATE2 pyramid: blocked by spacing; since_last=%vHours need>=%ds",
-					fmt.Sprintf("%.1f", pyramidSide.ElapsedHr),
-					pyramidSide.Raw.SpacingNeed,
-				)
-			}
-
-			if pyramidSide.SpacingPass {
-				if pyramidSide.Raw.DecayLambda > 0 {
-					// log.Printf(
-					// "[TRACE] pyramid.conf_gate side=%s confidence=%.4f gateMult=%.4f decayedPct=%.4f effPct=%.4f",
-					// pyramidSide.Side,
-					// pyramidSide.Confidence,
-					// pyramidSide.GateMult,
-					// pyramidSide.DecayedPct,
-					// pyramidSide.EffPct,
-					// )
-				}
-
-				// log.Printf(
-				// "[TRACE] pyramid.adverse side=%s lastAddAgoMin=%.2f basePct=%.4f effPct=%.4f lambda=%.5f floor=%.4f tFloorMin=%.2f",
-				// pyramidSide.Side,
-				// pyramidSide.ElapsedMin,
-				// pyramidSide.BasePct,
-				// pyramidSide.EffPct,
-				// pyramidSide.Raw.DecayLambda,
-				// pyramidSide.Raw.DecayFloor,
-				// pyramidSide.TFloorMin,
-				// )
-
-				if pyramidSide.UsedSoftGate {
-					switch d.Signal {
-					case Buy:
-						log.Printf(
-							"[DEBUG] SOFT GATE BUY: elapsedMin=%.1f tFloorMin=%.2f old_gate=%.2f recentLow=%.2f soft_gate=%.2f winLow=%.2f price=%.2f",
-							pyramidSide.ElapsedMin,
-							pyramidSide.TFloorMin,
-							pyramidSide.BaselineGatePrice,
-							pyramidSide.Raw.RecentExtreme,
-							pyramidSide.SoftGatePrice,
-							pyramidSide.WinExtreme,
-							pyramidSide.CurrentPrice,
-						)
-
-					case Sell:
-						log.Printf(
-							"[DEBUG] SOFT GATE SELL: elapsedMin=%.1f tFloorMin=%.2f old_gate=%.2f recentHigh=%.2f soft_gate=%.2f winHigh=%.2f price=%.2f",
-							pyramidSide.ElapsedMin,
-							pyramidSide.TFloorMin,
-							pyramidSide.BaselineGatePrice,
-							pyramidSide.Raw.RecentExtreme,
-							pyramidSide.SoftGatePrice,
-							pyramidSide.WinExtreme,
-							pyramidSide.CurrentPrice,
-						)
-					}
-				}
-
-				if pyramidSide.GatePassed {
-					switch d.Signal {
-					case Buy:
-						log.Printf(
-							"[DEBUG] pyramid: BUY baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
-							pyramidSide.CurrentPrice,
-							pyramidSide.EffectiveGatePrice,
-							pyramidSide.LastAnchor,
-							pyramidSide.EffPct,
-							pyramidSide.ElapsedMin,
-						)
-
-					case Sell:
-						log.Printf(
-							"[DEBUG] pyramid: SELL baseline met price=%.2f gatePrice=%.2f last=%.2f eff_pct=%.3f elapsedMin=%.1f",
-							pyramidSide.CurrentPrice,
-							pyramidSide.EffectiveGatePrice,
-							pyramidSide.LastAnchor,
-							pyramidSide.EffPct,
-							pyramidSide.ElapsedMin,
-						)
-					}
-				} else {
-					switch d.Signal {
-					case Buy:
-						log.Printf(
-							"[DEBUG] pyramid: blocked by last gate (BUY): price=%.2f gatePrice=%.2f",
-							pyramidSide.CurrentPrice,
-							pyramidSide.EffectiveGatePrice,
-						)
-
-						// log.Printf(
-						// "[TRACE] pyramid.block.buy price=%.8f gate=%.8f last=%.8f effPct=%.4f",
-						// pyramidSide.CurrentPrice,
-						// pyramidSide.EffectiveGatePrice,
-						// pyramidSide.LastAnchor,
-						// pyramidSide.EffPct,
-						// )
-
-					case Sell:
-						log.Printf(
-							"[DEBUG] pyramid: blocked by last gate (SELL): price=%.2f gatePrice=%.2f",
-							pyramidSide.CurrentPrice,
-							pyramidSide.EffectiveGatePrice,
-						)
-
-						// log.Printf(
-						// "[TRACE] pyramid.block.sell price=%.8f gate=%.8f last=%.8f effPct=%.4f",
-						// pyramidSide.CurrentPrice,
-						// pyramidSide.EffectiveGatePrice,
-						// pyramidSide.LastAnchor,
-						// pyramidSide.EffPct,
-						// )
-					}
-				}
-			}
-		}
 	}
 
 	log.Printf("[TRACE] hotpath.before_sizing elapsed_ms=%d",
@@ -1800,6 +1753,19 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			t.nearestTakeSell,
 			t.nearestNetSell,
 			t.nearestIdxSell,
+		)
+
+		t.addDecisionProducerEvent(
+			intent,
+			attempt,
+			ProducerStageDecisionFailed,
+			EntryProduceErrDecisionInvalidConfidence,
+			fmt.Errorf(
+				"decision confidence must be > 0: %.8f",
+				confMult,
+			),
+			false,
+			true,
 		)
 
 		t.mu.Unlock()
@@ -1995,6 +1961,20 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						// remember that a BUY was blocked by this amount
 						t.refundBuyUSD = short
 					}
+					t.addDecisionProducerEvent(
+						intent,
+						attempt,
+						ProducerStageDecisionFailed,
+						EntryProduceErrDecisionInsufficientFunds,
+						fmt.Errorf(
+							"BUY insufficient funds after min-notional adjustment: needed_quote=%.8f spare_quote=%.8f min_notional=%.8f",
+							neededQuote,
+							spare,
+							minNotional,
+						),
+						false,
+						true,
+					)
 					t.mu.Unlock()
 					return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
 				}
@@ -2031,13 +2011,40 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					// only now (true failure) remember that a BUY was blocked
 					t.refundBuyUSD = short
 				}
+				t.addDecisionProducerEvent(
+					intent,
+					attempt,
+					ProducerStageDecisionFailed,
+					EntryProduceErrDecisionInsufficientFunds,
+					fmt.Errorf(
+						"BUY insufficient funds after degrade-to-spare: requested_quote=%.8f usable_quote=%.8f spare_quote=%.8f min_notional=%.8f",
+						neededQuote,
+						useQuote,
+						spare,
+						minNotional,
+					),
+					false,
+					true,
+				)
 				t.mu.Unlock()
 				return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
 			}
 
-			// ok, we can place a smaller order using the spare
+			// SUCCESSFUL DEGRADE-TO-SPARE PATH
 			quote = useQuote
 			base = quote / price
+
+			// add sizing_reduced event HERE
+
+			t.addDecisionProducerEvent(
+				intent,
+				attempt,
+				ProducerStageSizingReduced,
+				"",
+				nil,
+				false,
+				false,
+			)
 
 			// log.Printf("[TRACE] buy.gate.post.degraded useQuote=%.2f spare=%.2f base=%.8f", quote, spare, base)
 		}
@@ -2094,6 +2101,22 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					if shortUSD > 0 {
 						t.refundSellUSD = shortUSD
 					}
+
+					t.addDecisionProducerEvent(
+						intent,
+						attempt,
+						ProducerStageDecisionFailed,
+						EntryProduceErrDecisionInsufficientFunds,
+						fmt.Errorf(
+							"SELL insufficient funds after min-notional adjustment: needed_base=%.8f spare_base=%.8f min_notional=%.8f",
+							base,
+							spare,
+							minNotional,
+						),
+						false,
+						true,
+					)
+
 					t.mu.Unlock()
 					return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
 				}
@@ -2128,15 +2151,43 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				if shortUSD > 0 {
 					t.refundSellUSD = shortUSD
 				}
+
+				t.addDecisionProducerEvent(
+					intent,
+					attempt,
+					ProducerStageDecisionFailed,
+					EntryProduceErrDecisionInsufficientFunds,
+					fmt.Errorf(
+						"SELL insufficient funds after degrade-to-spare: requested_base=%.8f usable_base=%.8f spare_base=%.8f min_notional=%.8f",
+						neededBase,
+						useBase,
+						spare,
+						minNotional,
+					),
+					false,
+					true,
+				)
+
 				t.mu.Unlock()
 				return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
 			}
 
-			// ok, we can place a smaller order using the spare
+			// SUCCESSFUL DEGRADE-TO-SPARE PATH
 			base = useBase
 			quote = base * price
 
+			t.addDecisionProducerEvent(
+				intent,
+				attempt,
+				ProducerStageSizingReduced,
+				"",
+				nil,
+				false,
+				false,
+			)
+
 			// log.Printf("[TRACE] sell.gate.post.degraded useBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
+
 		}
 	}
 
@@ -2229,6 +2280,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			} else {
 				d.ProducerReason = strings.TrimSpace(gatesReason + "|refund=buy-partial")
 			}
+			intent.ProducerReason =
+				d.ProducerReason
 		}
 	} else if t.refundBuyUSD > 0 && side == SideSell && confMult < refundMinConf {
 		// log.Printf("[TRACE] refund.block side=%s conf=%.2f need>=%.2f refundBuyUSD=%.2f",
@@ -2270,6 +2323,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			} else {
 				d.ProducerReason = strings.TrimSpace(gatesReason + "|refund=sell-partial")
 			}
+			intent.ProducerReason =
+				d.ProducerReason
 		}
 	} else if t.refundSellUSD > 0 && side == SideBuy && confMult < refundMinConf {
 		// log.Printf("[TRACE] refund.block side=%s conf=%.2f need>=%.2f refundSellUSD=%.2f",
@@ -2368,12 +2423,31 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 		if limitPx <= 0 {
 			log.Printf(
-				"[TRACE] postonly.invalid_limit "+
+				"[DEBUG] postonly.invalid_limit "+
 					"side=%s limit=%.8f live=%.8f",
 				side,
 				limitPx,
 				price,
 			)
+
+			t.mu.Lock()
+
+			t.addDecisionProducerEvent(
+				intent,
+				attempt,
+				ProducerStageDecisionFailed,
+				EntryProduceErrInvalidPrice,
+				fmt.Errorf(
+					"invalid maker limit price: side=%s limit_price=%.8f live_price=%.8f",
+					side,
+					limitPx,
+					price,
+				),
+				false,
+				true,
+			)
+
+			t.mu.Unlock()
 
 			return StepResult{
 				Msg:    "HOLD",
@@ -2412,44 +2486,70 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				limitWait,
 			)
 
+			/*
+				Complete the execution-specific fields on the SAME PendingIntent
+				created at Decision stage.
+
+				Do not create a new intent or ProducerAttempt here.
+			*/
+			intent.Side = side
+			intent.LimitPx = limitPx
+			intent.BaseAtLimit = baseAtLimit
+			intent.Quote = baseAtLimit * limitPx
+			intent.Take = take
+
+			intent.ProductID = t.cfg.ProductID
+			intent.EntryMethod = entryAIMode
+
+			intent.RefundPortionUSD =
+				refundFromOpposite
+
+			intent.ConfidenceMult =
+				confMult
+
+			intent.ProfitGateUSD =
+				entryProfitGateUSD
+
+			intent.PendingCancelPolicy =
+				d.PendingCancelPolicy
+
+			intent.ProducerReason =
+				d.ProducerReason
+
+			intent.EquityBuy =
+				equityTriggerBuy &&
+					side == SideBuy
+
+			intent.EquitySell =
+				equityTriggerSell &&
+					side == SideSell
+
+			if intent.History == nil {
+				intent.History =
+					make([]string, 0, 5)
+			}
+
 			var (
-				entry   *PendingEntry
-				attempt *ProducerAttempt
-				err     error
+				entry *PendingEntry
+				err   error
 			)
 
 			switch side {
 			case SideBuy:
-				entry, attempt, err = t.startProducerBuyEntry(
-					ctx,
-					limitPx,
-					baseAtLimit,
-					take,
-					d.ProducerReason,
-					refundFromOpposite,
-					confMult,
-					entryProfitGateUSD,
-					entryAIMode,
-					equityTriggerBuy,
-					d.Producer,
-					d.PendingCancelPolicy,
-				)
+				entry, err =
+					t.startProducerBuyEntry(
+						ctx,
+						intent,
+						attempt,
+					)
 
 			case SideSell:
-				entry, attempt, err = t.startProducerSellEntry(
-					ctx,
-					limitPx,
-					baseAtLimit,
-					take,
-					d.ProducerReason,
-					refundFromOpposite,
-					confMult,
-					entryProfitGateUSD,
-					entryAIMode,
-					equityTriggerSell,
-					d.Producer,
-					d.PendingCancelPolicy,
-				)
+				entry, err =
+					t.startProducerSellEntry(
+						ctx,
+						intent,
+						attempt,
+					)
 
 			default:
 				err = fmt.Errorf(
@@ -2527,19 +2627,80 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 			if err != nil {
 				log.Printf(
-					"[TRACE] postonly.error "+
+					"[DEBUG] postonly.error "+
 						"hold_for_recheck side=%s err=%v",
 					side,
 					err,
 				)
-			} else {
-				log.Printf(
-					"[TRACE] postonly.error "+
-						"hold_for_recheck side=%s "+
-						"err=nil_pending_entry",
-					side,
-				)
+
+				/*
+					The wrapper has already completed this producer lifecycle:
+
+						decision
+						→ produced
+						→ entry_failed
+						→ optional cleanup stage
+
+					and the attempt was recorded above.
+
+					Do not continue this same failed lifecycle into market fallback
+					or append another terminal/deferred outcome.
+				*/
+				return StepResult{
+					Msg:    "HOLD",
+					Raw:    d.Raw,
+					Signal: d.Signal,
+				}, nil
 			}
+
+			if entry == nil {
+				/*
+					Nil entry with nil error is an internal invariant violation.
+					The normal wrappers should never return this combination.
+				*/
+				t.mu.Lock()
+
+				t.addDecisionProducerEvent(
+					intent,
+					attempt,
+					ProducerStageEntryFailed,
+					EntryProduceErrBuildOrder,
+					fmt.Errorf(
+						"producer wrapper returned nil PendingEntry with nil error",
+					),
+					false,
+					true,
+				)
+
+				t.mu.Unlock()
+
+				return StepResult{
+					Msg:    "HOLD",
+					Raw:    d.Raw,
+					Signal: d.Signal,
+				}, nil
+			}
+
+		} else {
+			/*
+				The maker order became ineligible after base-step snapping.
+
+				No maker submission occurred, so there is nothing to wait for
+				or recheck. Allow this SAME Decision lifecycle to continue
+				directly to the market fallback path.
+			*/
+			log.Printf(
+				"[DEBUG] postonly.skip "+
+					"reason=snapped_size_below_min "+
+					"side=%s base=%.8f limit=%.8f notional=%.8f min_notional=%.8f",
+				side,
+				baseAtLimit,
+				limitPx,
+				baseAtLimit*limitPx,
+				minNotional,
+			)
+
+			wantLimit = false
 		}
 	}
 
@@ -2553,19 +2714,83 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 	}
 
-	// If maker path did not result in a fill (or was skipped), fall back to market path (baseline behavior).
+	// If maker path did not result in a fill (or was skipped), fall back to market path.
 	if placed == nil {
 		if !allowMarket {
-			log.Printf("[TRACE] postonly.market_fallback.blocked side=%s reason=recheck_flag_not_set", side)
-			return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
+			log.Printf(
+				"[DEBUG] postonly.market_fallback.blocked "+
+					"side=%s reason=recheck_flag_not_set",
+				side,
+			)
+
+			t.mu.Lock()
+
+			t.addDecisionProducerEvent(
+				intent,
+				attempt,
+				ProducerStageDecisionDeferred,
+				"",
+				nil,
+				false,
+				true,
+			)
+
+			t.mu.Unlock()
+
+			return StepResult{
+				Msg:    "HOLD",
+				Raw:    d.Raw,
+				Signal: d.Signal,
+			}, nil
 		}
 
 		// before order submit
-		log.Printf("[TRACE] hotpath.before_submit.market_quote elapsed_ms=%d side=%s live=%.2f",
-			time.Since(hotStart).Milliseconds(), side, price)
+		log.Printf(
+			"[TRACE] hotpath.before_submit.market_quote elapsed_ms=%d side=%s live=%.2f",
+			time.Since(hotStart).Milliseconds(),
+			side,
+			price,
+		)
+
+		/*
+		   The direct market fallback is also a producer production attempt.
+
+		   It therefore uses the SAME Decision-created ProducerAttempt and
+		   adds stage=produced before submitting to the broker.
+		*/
+		if attempt != nil &&
+			intent != nil {
+
+			if attempt.Events == nil {
+				attempt.Events =
+					make(map[ProducerStage]ProducerEvent)
+			}
+
+			attempt.Events[ProducerStageProduced] =
+				ProducerEvent{
+					Time:      time.Now().UTC(),
+					CreatedAt: intent.CreatedAt,
+
+					Producer: intent.Producer,
+					Side:     attempt.Side,
+					Stage:    ProducerStageProduced,
+
+					DecisionID: intent.DecisionID,
+
+					Reason: intent.ProducerReason,
+				}
+		}
 
 		var err error
-		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
+
+		placed, err =
+			t.broker.PlaceMarketQuote(
+				ctx,
+				t.cfg.ProductID,
+				side,
+				quote,
+			)
+
 		// TODO: remove TRACE
 		log.Printf("[TRACE] order.open request side=%s quote=%.2f baseEst=%.8f priceSnap=%.8f take=%.8f",
 			side, quote, base, price, take)
@@ -2576,22 +2801,139 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 		if err != nil {
 			// Retry once with ORDER_MIN_USD on insufficient-funds style failures.
-			e := strings.ToLower(err.Error())
-			if quote > minNotional && (strings.Contains(e, "insufficient") || strings.Contains(e, "funds") || strings.Contains(e, "400")) {
-				log.Printf("[WARN] open order %.2f USD failed (%v); retrying with ORDER_MIN_USD=%.2f", quote, err, minNotional)
+
+			if quote > minNotional &&
+				isBinanceInsufficientBalance(err) {
+
+				log.Printf(
+					"[WARN] open order %.2f USD failed with Binance insufficient balance (%v); retrying with ORDER_MIN_USD=%.2f",
+					quote,
+					err,
+					minNotional,
+				)
+
 				quote = minNotional
 				base = quote / price
+
 				// TODO: remove TRACE
-				log.Printf("[TRACE] order.open retry side=%s quote=%.2f baseEst=%.8f", side, quote, base)
-				placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, side, quote)
+				log.Printf(
+					"[TRACE] order.open retry side=%s quote=%.2f baseEst=%.8f",
+					side,
+					quote,
+					base,
+				)
+
+				placed, err =
+					t.broker.PlaceMarketQuote(
+						ctx,
+						t.cfg.ProductID,
+						side,
+						quote,
+					)
 			}
+
 			if err != nil {
 				if t.cfg.UseDirectSlack {
-					postSlack(fmt.Sprintf("ERR step: %v", err))
+					postSlack(
+						fmt.Sprintf(
+							"ERR step: %v",
+							err,
+						),
+					)
 				}
-				return StepResult{Msg: "", Raw: d.Raw, Signal: d.Signal}, err
+
+				code :=
+					EntryProduceErrSubmitNetworkFailed
+
+				var binanceErr *BinanceBridgeError
+
+				if errors.As(
+					err,
+					&binanceErr,
+				) {
+					msg :=
+						strings.TrimSpace(
+							binanceErr.BinanceMsg,
+						)
+
+					switch {
+					case (binanceErr.BinanceCode == -2010 ||
+						binanceErr.BinanceCode == -1010) &&
+						msg ==
+							"Account has insufficient balance for requested action.":
+
+						code =
+							EntryProduceErrInsufficientBalance
+
+					case binanceErr.BinanceCode == -1007:
+
+						code =
+							EntryProduceErrSubmitTimeout
+
+					case binanceErr.BinanceCode == -1003:
+
+						code =
+							EntryProduceErrRateLimited
+
+					default:
+						code =
+							EntryProduceErrExchangeRejected
+					}
+				}
+
+				t.mu.Lock()
+
+				t.addDecisionProducerEvent(
+					intent,
+					attempt,
+					ProducerStageEntryFailed,
+					code,
+					fmt.Errorf(
+						"direct market entry submission failed: side=%s quote=%.8f: %w",
+						side,
+						quote,
+						err,
+					),
+					false,
+					true,
+				)
+
+				t.mu.Unlock()
+
+				return StepResult{
+					Msg:    "",
+					Raw:    d.Raw,
+					Signal: d.Signal,
+				}, err
 			}
+
 		}
+
+		if attempt != nil &&
+			intent != nil &&
+			placed != nil {
+
+			if attempt.Events == nil {
+				attempt.Events =
+					make(map[ProducerStage]ProducerEvent)
+			}
+
+			attempt.Events[ProducerStageFilled] =
+				ProducerEvent{
+					Time:      time.Now().UTC(),
+					CreatedAt: intent.CreatedAt,
+
+					Producer: intent.Producer,
+					Side:     attempt.Side,
+					Stage:    ProducerStageFilled,
+
+					DecisionID: intent.DecisionID,
+					OrderID:    placed.ID,
+
+					Reason: intent.ProducerReason,
+				}
+		}
+
 		// TODO: remove TRACE
 		if placed != nil {
 			log.Printf("[TRACE] order.open placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
@@ -2789,11 +3131,78 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	if t.cfg.UseDirectSlack {
 		postSlack(msg)
 	}
-	// persist new state (no locking while writing; snapshot constructed here under lock)
+
+	// Persist the newly committed local position state.
 	if err := t.saveStateNoLock(); err != nil {
-		log.Printf("[WARN] saveState: %v", err)
-		// log.Printf("[TRACE] state.save error=%v", err)
+		log.Printf(
+			"[WARN] saveState: %v",
+			err,
+		)
+
+		t.addDecisionProducerEvent(
+			intent,
+			attempt,
+			ProducerStageEntryFailed,
+			EntryProduceErrPersistState,
+			fmt.Errorf(
+				"direct market entry filled but local state persistence failed: order_id=%s: %w",
+				placedOrderID(placed),
+				err,
+			),
+			true,
+			true,
+		)
+
+		t.mu.Unlock()
+
+		return StepResult{
+			Msg:    "",
+			Raw:    d.Raw,
+			Signal: d.Signal,
+		}, err
 	}
+
+	// Exchange fill is now represented by a successfully persisted local Position.
+	// The producer lifecycle can therefore advance to committed.
+	if attempt != nil &&
+		intent != nil {
+
+		if attempt.Events == nil {
+			attempt.Events =
+				make(map[ProducerStage]ProducerEvent)
+		}
+
+		attempt.Events[ProducerStageCommitted] =
+			ProducerEvent{
+				Time:      time.Now().UTC(),
+				CreatedAt: intent.CreatedAt,
+
+				Producer: intent.Producer,
+				Side:     attempt.Side,
+				Stage:    ProducerStageCommitted,
+
+				DecisionID: intent.DecisionID,
+				OrderID:    placedOrderID(placed),
+
+				Reason: intent.ProducerReason,
+			}
+
+		t.recordProducerAttemptLocked(
+			attempt,
+		)
+
+		if err := t.saveProducerHistoryNoLock(); err != nil {
+			log.Printf(
+				"[ERROR] producer.history.save_failed "+
+					"stage=%s producer=%s decision_id=%s err=%v",
+				ProducerStageCommitted,
+				attempt.Producer,
+				attempt.DecisionID,
+				err,
+			)
+		}
+	}
+
 	// log.Printf("[KPI] summary equity=%.2f daily_pnl=%.2f lots_buy=%d lots_sell=%d product=%s",
 	// t.equityUSD, t.dailyPnL, len(t.book(SideBuy).Lots), len(t.book(SideSell).Lots), t.cfg.ProductID)
 	t.mu.Unlock()

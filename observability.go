@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ import (
 type ProducerStage string
 
 const (
+	ProducerStageDecision  ProducerStage = "decision"
 	ProducerStageProduced  ProducerStage = "produced"
 	ProducerStagePending   ProducerStage = "pending"
 	ProducerStageFilled    ProducerStage = "filled"
@@ -28,6 +30,11 @@ const (
 	ProducerStageCancelRequested ProducerStage = "cancel_requested"
 
 	ProducerStageEntryFailed ProducerStage = "entry_failed"
+
+	ProducerStageDecisionFailed   ProducerStage = "decision_failed"
+	ProducerStageDecisionBlocked  ProducerStage = "decision_blocked"
+	ProducerStageDecisionDeferred ProducerStage = "decision_deferred"
+	ProducerStageSizingReduced    ProducerStage = "sizing_reduced"
 
 	ProducerStageCleanupCancelled    ProducerStage = "cleanup_cancelled"
 	ProducerStageCleanupCancelFailed ProducerStage = "cleanup_cancel_failed"
@@ -88,6 +95,152 @@ func FormatDecisionID(
 		createdAt.Format("20060102T150405"),
 		createdAt.Nanosecond()/1_000_000,
 	)
+}
+
+func newProducerDecisionLifecycle(
+	d *EntryDecision,
+) (*PendingIntent, *ProducerAttempt) {
+	if d == nil ||
+		d.Producer == EntryProducerNone {
+
+		return nil, nil
+	}
+
+	createdAt := time.Now().UTC()
+
+	var side OrderSide
+
+	if resolvedSide, ok := d.SignalToSide(); ok {
+		side = resolvedSide
+	}
+
+	intent := &PendingIntent{
+		CreatedAt: createdAt,
+		DecisionID: FormatDecisionID(
+			d.Producer,
+			createdAt,
+		),
+
+		Producer:            d.Producer,
+		PendingCancelPolicy: d.PendingCancelPolicy,
+		ProducerReason:      d.ProducerReason,
+
+		Side: side,
+	}
+
+	attemptSide := fmt.Sprint(d.Signal)
+
+	if side == SideBuy ||
+		side == SideSell {
+
+		attemptSide =
+			fmt.Sprint(side)
+	}
+
+	attempt := &ProducerAttempt{
+		DecisionID: intent.DecisionID,
+		CreatedAt:  intent.CreatedAt,
+
+		Producer: intent.Producer,
+		Side:     attemptSide,
+
+		Events: make(
+			map[ProducerStage]ProducerEvent,
+		),
+	}
+
+	return intent, attempt
+}
+
+func newProducerIntentLifecycle(
+	intent *PendingIntent,
+) *ProducerAttempt {
+	if intent == nil ||
+		intent.Producer == EntryProducerNone {
+
+		return nil
+	}
+
+	createdAt := time.Now().UTC()
+
+	intent.CreatedAt = createdAt
+	intent.DecisionID = FormatDecisionID(
+		intent.Producer,
+		createdAt,
+	)
+
+	return &ProducerAttempt{
+		DecisionID: intent.DecisionID,
+		CreatedAt:  intent.CreatedAt,
+		Producer:   intent.Producer,
+		Side:       fmt.Sprint(intent.Side),
+
+		Events: make(
+			map[ProducerStage]ProducerEvent,
+		),
+	}
+}
+
+func (t *Trader) addDecisionProducerEvent(
+	intent *PendingIntent,
+	attempt *ProducerAttempt,
+	stage ProducerStage,
+	code EntryProduceErrorCode,
+	err error,
+	cleanupRequired bool,
+	persist bool,
+) {
+	if t == nil ||
+		intent == nil ||
+		attempt == nil {
+		return
+	}
+
+	if attempt.Events == nil {
+		attempt.Events =
+			make(map[ProducerStage]ProducerEvent)
+	}
+
+	errorText := ""
+	if err != nil {
+		errorText = err.Error()
+	}
+
+	attempt.Events[stage] = ProducerEvent{
+		Time:      time.Now().UTC(),
+		CreatedAt: intent.CreatedAt,
+
+		Producer: intent.Producer,
+		Side:     fmt.Sprint(intent.Side),
+		Stage:    stage,
+
+		DecisionID: intent.DecisionID,
+
+		Reason: intent.ProducerReason,
+
+		ErrorCode:       code,
+		Error:           errorText,
+		CleanupRequired: cleanupRequired,
+	}
+
+	if !persist {
+		return
+	}
+
+	t.recordProducerAttemptLocked(
+		attempt,
+	)
+
+	if err := t.saveProducerHistoryNoLock(); err != nil {
+		log.Printf(
+			"[ERROR] producer.history.save_failed "+
+				"stage=%s producer=%s decision_id=%s err=%v",
+			stage,
+			attempt.Producer,
+			attempt.DecisionID,
+			err,
+		)
+	}
 }
 
 // recordProducerAttemptLocked registers or enriches one producer attempt in

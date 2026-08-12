@@ -70,7 +70,24 @@ const (
 	EntryProduceErrCommitNilSparePointer       EntryProduceErrorCode = "commit_nil_spare_pointer"
 	EntryProduceErrCommitPersistState          EntryProduceErrorCode = "commit_persist_state_failed"
 
-	EntryProduceErrCommitSparePointerNil EntryProduceErrorCode = "commit_spare_pointer_nil"
+	EntryProduceErrCommitSparePointerNil       EntryProduceErrorCode = "commit_spare_pointer_nil"
+	EntryProduceErrExecutionBalanceUnavailable EntryProduceErrorCode = "execution_balance_unavailable"
+	EntryProduceErrDecisionBalanceUnavailable  EntryProduceErrorCode = "decision_balance_unavailable"
+	EntryProduceErrDecisionCase3BBlocked       EntryProduceErrorCode = "decision_case3b_blocked"
+	EntryProduceErrDecisionLongOnlyBlocked     EntryProduceErrorCode = "decision_long_only_blocked"
+	EntryProduceErrDecisionLotCapReached       EntryProduceErrorCode = "decision_lot_cap_reached"
+	EntryProduceErrDecisionInvalidConfidence   EntryProduceErrorCode = "decision_invalid_confidence"
+	EntryProduceErrDecisionInsufficientFunds   EntryProduceErrorCode = "decision_insufficient_funds"
+	EntryProduceErrDecisionInvalidPrice        EntryProduceErrorCode = "decision_invalid_price"
+
+	EntryProduceErrInsufficientBalance EntryProduceErrorCode = "insufficient_balance"
+	EntryProduceErrPostOnlyRejected    EntryProduceErrorCode = "post_only_rejected"
+	EntryProduceErrSubmitTimeout       EntryProduceErrorCode = "submit_timeout"
+	EntryProduceErrRateLimited         EntryProduceErrorCode = "rate_limited"
+	EntryProduceErrExchangeRejected    EntryProduceErrorCode = "exchange_rejected"
+
+	EntryProduceErrSubmitNetworkFailed EntryProduceErrorCode = "submit_network_failed"
+	EntryProduceErrBuildOrder          EntryProduceErrorCode = "build_order"
 )
 
 // EntryProduceError carries stable entry-production failure information

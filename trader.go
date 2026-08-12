@@ -2627,10 +2627,10 @@ func (t *Trader) closeLot(
 	// ============================================================================
 	//
 	// Mode A is only valid if the replacement entry is successfully started first.
-	// The Case3A source wrapper returns:
-	//   - replacement order ID;
-	//   - ProducerAttempt containing produced/pending/failure/cleanup events;
-	//   - error.
+	// The Case3A source wrapper:
+	//   - receives the existing ProducerAttempt;
+	//   - enriches it with produced/pending/failure/cleanup events;
+	//   - returns replacement order ID and error.
 	//
 	// closeLot() is the higher-level Case3A owner, so it records the returned
 	// ProducerAttempt into producerHistory after the wrapper has completed its
@@ -2644,11 +2644,14 @@ func (t *Trader) closeLot(
 			// Do not create another Case3A producer attempt.
 
 		} else {
-			var (
-				oid     string
-				attempt *ProducerAttempt
-				err     error
+			attempt := newProducerIntentLifecycle(
+				&repl,
 			)
+			if attempt == nil {
+				return "", errors.New(
+					"Case3A modeA: failed to create producer lifecycle",
+				)
+			}
 
 			/*
 				startCase3AReplacement() enters produceEntry(), whose registration
@@ -2660,9 +2663,10 @@ func (t *Trader) closeLot(
 			*/
 			t.mu.Unlock()
 
-			oid, attempt, err = t.startCase3AReplacement(
+			oid, err := t.startCase3AReplacement(
 				ctx,
-				repl,
+				&repl,
+				attempt,
 			)
 
 			t.mu.Lock()
@@ -2828,16 +2832,26 @@ func (t *Trader) closeLot(
 			prepared while that exit is pending, but any deferred Mode B retry must wait
 			until the originating losing position has actually committed its exit.
 		*/
+		attempt := newProducerIntentLifecycle(
+			&repl,
+		)
+		if attempt == nil {
+			return "", errors.New(
+				"Case3A modeB pending-exit: failed to create producer lifecycle",
+			)
+		}
+
 		t.mu.Unlock()
 
-		_, attempt, replErr := t.startCase3AReplacement(
+		_, replErr := t.startCase3AReplacement(
 			ctx,
-			repl,
+			&repl,
+			attempt,
 		)
 
 		t.mu.Lock()
 
-		// t.mu is held again here; record the returned attempt mechanically.
+		// t.mu is held again here; record the same enriched attempt mechanically.
 		t.recordProducerAttemptLocked(attempt)
 		if err := t.saveProducerHistoryNoLock(); err != nil {
 			log.Printf(
@@ -2962,21 +2976,29 @@ func (t *Trader) closeLot(
 			startCase3AReplacement() may acquire t.mu inside produceEntry(), so
 			release closeLot's lock while the replacement pipeline runs.
 		*/
+		attempt := newProducerIntentLifecycle(
+			&repl,
+		)
+		if attempt == nil {
+			return "", errors.New(
+				"Case3A modeB market-exit: failed to create producer lifecycle",
+			)
+		}
+
 		t.mu.Unlock()
 
-		_, attempt, replErr := t.startCase3AReplacement(
+		_, replErr := t.startCase3AReplacement(
 			ctx,
-			repl,
+			&repl,
+			attempt,
 		)
 
 		t.mu.Lock()
 
 		/*
-			Record the complete attempt returned by the Case3A wrapper before
-			applying retry policy.
-
-			If production failed, the attempt contains the exact granular
-			EntryProduceError-derived event and any cleanup outcome.
+			Record the same ProducerAttempt that was created before the
+			Case3A wrapper and enriched by produced / pending / failure /
+			cleanup lifecycle handling.
 		*/
 		t.recordProducerAttemptLocked(attempt)
 		if err := t.saveProducerHistoryNoLock(); err != nil {
@@ -3601,93 +3623,35 @@ func (t *Trader) ensurePendingEntries() {
 	generic commit
 */
 // Buy Source Wrapper
-// Buy Source Wrapper
 func (t *Trader) startProducerBuyEntry(
 	ctx context.Context,
-	limitPx float64,
-	baseAtLimit float64,
-	take float64,
-	producerReason string,
-	refundPortionUSD float64,
-	confidenceMult float64,
-	profitGateUSD float64,
-	entryAIMode string,
-	equityTriggered bool,
-	producer EntryProducer,
-	cancelPolicy PendingSignalCancelPolicy,
-) (*PendingEntry, *ProducerAttempt, error) {
+	intent *PendingIntent,
+	attempt *ProducerAttempt,
+) (*PendingEntry, error) {
 
-	if producer == EntryProducerNone {
-		return nil, nil, fmt.Errorf(
+	if intent == nil {
+		return nil, fmt.Errorf(
+			"startProducerBuyEntry: nil intent",
+		)
+	}
+
+	if attempt == nil {
+		return nil, fmt.Errorf(
+			"startProducerBuyEntry: nil producer attempt",
+		)
+	}
+
+	if intent.Producer == EntryProducerNone {
+		return nil, fmt.Errorf(
 			"startProducerBuyEntry: missing entry producer",
 		)
 	}
 
-	// One producer attempt begins here.
-	createdAt := time.Now().UTC()
-
-	decisionID := FormatDecisionID(
-		producer,
-		createdAt,
-	)
-
-	intent := &PendingIntent{
-		DecisionID: decisionID,
-		CreatedAt:  createdAt,
-
-		Producer:            producer,
-		PendingCancelPolicy: cancelPolicy,
-
-		Side:        SideBuy,
-		LimitPx:     limitPx,
-		BaseAtLimit: baseAtLimit,
-		Quote:       baseAtLimit * limitPx,
-		Take:        take,
-		ProductID:   t.cfg.ProductID,
-		EntryMethod: entryAIMode,
-
-		ProducerReason: producerReason,
-
-		RefundPortionUSD: refundPortionUSD,
-
-		EquityBuy:  equityTriggered,
-		EquitySell: false,
-
-		History: make([]string, 0, 5),
-
-		ConfidenceMult: confidenceMult,
-		ProfitGateUSD:  profitGateUSD,
-	}
-
-	// stage=produced belongs to the source wrapper.
-	producedEvent := ProducerEvent{
-		Time:      createdAt,
-		CreatedAt: createdAt,
-
-		Producer: producer,
-		Side:     fmt.Sprint(SideBuy),
-		Stage:    ProducerStageProduced,
-
-		DecisionID: decisionID,
-
-		Reason: producerReason,
-	}
-
-	entry, attempt, err := t.produceEntry(
-		ctx,
-		intent,
-	)
-
-	// Ensure the wrapper can always propagate this attempt upward.
-	if attempt == nil {
-		attempt = &ProducerAttempt{
-			DecisionID: decisionID,
-			CreatedAt:  createdAt,
-			Producer:   producer,
-			Side:       fmt.Sprint(SideBuy),
-
-			Events: make(map[ProducerStage]ProducerEvent),
-		}
+	if intent.Side != SideBuy {
+		return nil, fmt.Errorf(
+			"startProducerBuyEntry: invalid side=%s",
+			intent.Side,
+		)
 	}
 
 	if attempt.Events == nil {
@@ -3695,16 +3659,26 @@ func (t *Trader) startProducerBuyEntry(
 			make(map[ProducerStage]ProducerEvent)
 	}
 
-	// Merge the wrapper-owned produced event.
-	attempt.Events[ProducerStageProduced] = producedEvent
+	attempt.Events[ProducerStageProduced] =
+		ProducerEvent{
+			Time:      time.Now().UTC(),
+			CreatedAt: intent.CreatedAt,
 
-	/*
-		Cleanup remains at wrapper level, preserving the original
-		error-handling flow.
+			Producer: intent.Producer,
+			Side:     fmt.Sprint(intent.Side),
+			Stage:    ProducerStageProduced,
 
-		handleEntryProduceError() may append cleanup_cancelled or
-		cleanup_cancel_failed to this same ProducerAttempt.
-	*/
+			DecisionID: intent.DecisionID,
+
+			Reason: intent.ProducerReason,
+		}
+
+	entry, err := t.produceEntry(
+		ctx,
+		intent,
+		attempt,
+	)
+
 	if err != nil {
 		err = t.handleEntryProduceError(
 			ctx,
@@ -3713,98 +3687,42 @@ func (t *Trader) startProducerBuyEntry(
 			err,
 		)
 
-		return nil, attempt, err
+		return nil, err
 	}
 
-	return entry, attempt, nil
+	return entry, nil
 }
 
 // Sell Source Wrapper
 func (t *Trader) startProducerSellEntry(
 	ctx context.Context,
-	limitPx float64,
-	baseAtLimit float64,
-	take float64,
-	producerReason string,
-	refundPortionUSD float64,
-	confidenceMult float64,
-	profitGateUSD float64,
-	entryAIMode string,
-	equityTriggered bool,
-	producer EntryProducer,
-	cancelPolicy PendingSignalCancelPolicy,
-) (*PendingEntry, *ProducerAttempt, error) {
-	if producer == EntryProducerNone {
-		return nil, nil, fmt.Errorf(
+	intent *PendingIntent,
+	attempt *ProducerAttempt,
+) (*PendingEntry, error) {
+
+	if intent == nil {
+		return nil, fmt.Errorf(
+			"startProducerSellEntry: nil intent",
+		)
+	}
+
+	if attempt == nil {
+		return nil, fmt.Errorf(
+			"startProducerSellEntry: nil producer attempt",
+		)
+	}
+
+	if intent.Producer == EntryProducerNone {
+		return nil, fmt.Errorf(
 			"startProducerSellEntry: missing entry producer",
 		)
 	}
 
-	// One producer attempt begins here.
-	createdAt := time.Now().UTC()
-
-	decisionID := FormatDecisionID(
-		producer,
-		createdAt,
-	)
-
-	intent := &PendingIntent{
-		DecisionID: decisionID,
-		CreatedAt:  createdAt,
-
-		Producer:            producer,
-		PendingCancelPolicy: cancelPolicy,
-		ProducerReason:      producerReason,
-
-		Side:        SideSell,
-		LimitPx:     limitPx,
-		BaseAtLimit: baseAtLimit,
-		Quote:       baseAtLimit * limitPx,
-		Take:        take,
-
-		RefundPortionUSD: refundPortionUSD,
-
-		ProductID: t.cfg.ProductID,
-
-		EquityBuy:  false,
-		EquitySell: equityTriggered,
-
-		History: make([]string, 0, 5),
-
-		ConfidenceMult: confidenceMult,
-		ProfitGateUSD:  profitGateUSD,
-		EntryMethod:    entryAIMode,
-	}
-
-	// stage=produced belongs to the source wrapper.
-	producedEvent := ProducerEvent{
-		Time:      createdAt,
-		CreatedAt: createdAt,
-
-		Producer: producer,
-		Side:     fmt.Sprint(SideSell),
-		Stage:    ProducerStageProduced,
-
-		DecisionID: decisionID,
-
-		Reason: producerReason,
-	}
-
-	entry, attempt, err := t.produceEntry(
-		ctx,
-		intent,
-	)
-
-	// Ensure the wrapper can always return the attempt it created.
-	if attempt == nil {
-		attempt = &ProducerAttempt{
-			DecisionID: decisionID,
-			CreatedAt:  createdAt,
-			Producer:   producer,
-			Side:       fmt.Sprint(SideSell),
-
-			Events: make(map[ProducerStage]ProducerEvent),
-		}
+	if intent.Side != SideSell {
+		return nil, fmt.Errorf(
+			"startProducerSellEntry: invalid side=%s",
+			intent.Side,
+		)
 	}
 
 	if attempt.Events == nil {
@@ -3812,14 +3730,44 @@ func (t *Trader) startProducerSellEntry(
 			make(map[ProducerStage]ProducerEvent)
 	}
 
-	// Merge the wrapper-owned produced event.
-	attempt.Events[ProducerStageProduced] = producedEvent
+	/*
+		stage=produced belongs to this source wrapper.
+
+		Time is when the wrapper is actually reached.
+
+		CreatedAt and DecisionID remain the original Decision-stage
+		lifecycle identity.
+	*/
+	attempt.Events[ProducerStageProduced] =
+		ProducerEvent{
+			Time:      time.Now().UTC(),
+			CreatedAt: intent.CreatedAt,
+
+			Producer: intent.Producer,
+			Side:     fmt.Sprint(intent.Side),
+			Stage:    ProducerStageProduced,
+
+			DecisionID: intent.DecisionID,
+
+			Reason: intent.ProducerReason,
+		}
 
 	/*
-		Cleanup remains at wrapper level, exactly as before.
+		produceEntry() continues the SAME ProducerAttempt.
 
-		handleEntryProduceError() may add cleanup_cancelled or
-		cleanup_cancel_failed to this same attempt.
+		It must not create or return another ProducerAttempt.
+	*/
+	entry, err := t.produceEntry(
+		ctx,
+		intent,
+		attempt,
+	)
+
+	/*
+		Cleanup remains wrapper-owned.
+
+		handleEntryProduceError() enriches this same attempt with
+		cleanup_cancelled / cleanup_cancel_failed when applicable.
 	*/
 	if err != nil {
 		err = t.handleEntryProduceError(
@@ -3829,50 +3777,43 @@ func (t *Trader) startProducerSellEntry(
 			err,
 		)
 
-		return nil, attempt, err
+		return nil, err
 	}
 
-	return entry, attempt, nil
+	return entry, nil
 }
 
 // Case3A Source Wrapper
 func (t *Trader) startCase3AReplacement(
 	ctx context.Context,
-	intent PendingIntent,
-) (string, *ProducerAttempt, error) {
+	intent *PendingIntent,
+	attempt *ProducerAttempt,
+) (string, error) {
+
+	if intent == nil {
+		return "", errors.New(
+			"Case3A replacement: nil intent",
+		)
+	}
+
+	if attempt == nil {
+		return "", errors.New(
+			"Case3A replacement: nil producer attempt",
+		)
+	}
+
 	if !intent.Enabled {
-		return "", nil, nil
+		return "", nil
 	}
 
 	sourceEntryOrderID := strings.TrimSpace(
 		intent.SourceEntryOrderID,
 	)
 	if sourceEntryOrderID == "" {
-		return "", nil, errors.New(
+		return "", errors.New(
 			"Case3A replacement: missing SourceEntryOrderID",
 		)
 	}
-
-	/*
-		A concrete Case3A producer attempt begins here.
-
-		CreatedAt is created once.
-		DecisionID is created once from:
-
-		    Producer + CreatedAt to millisecond precision
-
-		Example:
-
-		    Case3AReplacement_20260808T163003M123
-	*/
-	createdAt := time.Now().UTC()
-
-	intent.Producer = EntryProducerCase3AReplacement
-	intent.CreatedAt = createdAt
-	intent.DecisionID = FormatDecisionID(
-		intent.Producer,
-		createdAt,
-	)
 
 	intent.ProductID = t.cfg.ProductID
 	intent.SourceEntryOrderID = sourceEntryOrderID
@@ -3886,7 +3827,8 @@ func (t *Trader) startCase3AReplacement(
 	}
 
 	if intent.History == nil {
-		intent.History = make([]string, 0, 5)
+		intent.History =
+			make([]string, 0, 5)
 	}
 
 	// Quote must agree with the actual Case3A price/size.
@@ -3899,79 +3841,67 @@ func (t *Trader) startCase3AReplacement(
 				intent.BaseAtLimit
 	}
 
-	// stage=produced belongs to this source wrapper.
-	producedEvent := ProducerEvent{
-		Time:      createdAt,
-		CreatedAt: createdAt,
-
-		Producer: intent.Producer,
-		Side:     fmt.Sprint(intent.Side),
-		Stage:    ProducerStageProduced,
-
-		DecisionID: intent.DecisionID,
-
-		Reason: intent.ProducerReason,
-	}
-
-	entry, attempt, err := t.produceEntry(
-		ctx,
-		&intent,
-	)
-
-	// Ensure this wrapper can always propagate its attempt upward.
-	if attempt == nil {
-		attempt = &ProducerAttempt{
-			DecisionID: intent.DecisionID,
-			CreatedAt:  intent.CreatedAt,
-			Producer:   intent.Producer,
-			Side:       fmt.Sprint(intent.Side),
-
-			Events: make(map[ProducerStage]ProducerEvent),
-		}
-	}
-
 	if attempt.Events == nil {
 		attempt.Events =
 			make(map[ProducerStage]ProducerEvent)
 	}
 
-	// Merge the wrapper-owned produced stage.
-	attempt.Events[ProducerStageProduced] = producedEvent
+	/*
+		stage=produced belongs to this source wrapper.
+
+		Time is when Case3A production is actually attempted.
+
+		CreatedAt and DecisionID remain the original lifecycle
+		identity created before this wrapper.
+	*/
+	attempt.Events[ProducerStageProduced] =
+		ProducerEvent{
+			Time:      time.Now().UTC(),
+			CreatedAt: intent.CreatedAt,
+
+			Producer: intent.Producer,
+			Side:     fmt.Sprint(intent.Side),
+			Stage:    ProducerStageProduced,
+
+			DecisionID: intent.DecisionID,
+
+			Reason: intent.ProducerReason,
+		}
+
+	entry, err := t.produceEntry(
+		ctx,
+		intent,
+		attempt,
+	)
 
 	/*
-		Cleanup remains at wrapper level.
+		Cleanup remains wrapper-owned.
 
-		handleEntryProduceError() may append:
-		  - cleanup_cancelled
-		  - cleanup_cancel_failed
-
-		to this same ProducerAttempt / DecisionID.
+		handleEntryProduceError() enriches this same attempt with
+		cleanup_cancelled / cleanup_cancel_failed when applicable.
 	*/
 	if err != nil {
 		err = t.handleEntryProduceError(
 			ctx,
-			&intent,
+			intent,
 			attempt,
 			err,
 		)
 
-		return "", attempt, err
+		return "", err
 	}
 
 	/*
-		This is an internal invariant check, not an EntryProduceError.
-
-		If produceEntry() returned nil error, it must have produced
-		a non-nil PendingEntry.
+		Internal invariant:
+		nil error from produceEntry() must imply a non-nil entry.
 	*/
-	var ErrNilProducedEntry = errors.New(
-		"produceEntry returned nil entry with nil error",
-	)
 	if entry == nil {
-		return "", attempt, ErrNilProducedEntry
+		return "", errors.New(
+			"produceEntry returned nil entry with nil error",
+		)
 	}
 
-	return entry.OrderID, attempt, nil
+	return entry.OrderID, nil
 }
 
 //Entry Producer:
@@ -3988,141 +3918,188 @@ startEntryPoller()
 func (t *Trader) produceEntry(
 	ctx context.Context,
 	intent *PendingIntent,
-) (*PendingEntry, *ProducerAttempt, error) {
+	attempt *ProducerAttempt,
+) (*PendingEntry, error) {
 
-	/*
-		DecisionID and CreatedAt are created by the producer wrapper
-		at decision creation time.
+	if intent == nil {
+		return nil, fmt.Errorf(
+			"produceEntry: nil intent",
+		)
+	}
 
-		produceEntry() must never create or regenerate either one.
-	*/
-	var attempt *ProducerAttempt
+	if attempt == nil {
+		return nil, fmt.Errorf(
+			"produceEntry: nil producer attempt",
+		)
+	}
 
-	if intent != nil {
-		attempt = &ProducerAttempt{
-			DecisionID: intent.DecisionID,
-			CreatedAt:  intent.CreatedAt,
-			Producer:   intent.Producer,
-			Side:       fmt.Sprint(intent.Side),
-
-			Events: make(map[ProducerStage]ProducerEvent),
-		}
+	if attempt.Events == nil {
+		attempt.Events =
+			make(map[ProducerStage]ProducerEvent)
 	}
 
 	/*
-		Convert an already-authoritative EntryProduceError into the
-		canonical ProducerEvent for this producer attempt.
+		DecisionID, CreatedAt, ProducerAttempt, and PendingIntent
+		were already created at Decision stage.
 
-		No error classification occurs here.
+		produceEntry() continues that SAME lifecycle.
+
+		It must never:
+		  - create a new DecisionID;
+		  - regenerate CreatedAt;
+		  - create a replacement ProducerAttempt.
 	*/
-	addFailureEvent := func(produceErr *EntryProduceError) {
-		if attempt == nil || produceErr == nil {
+
+	addFailureEvent := func(
+		produceErr *EntryProduceError,
+	) {
+		if produceErr == nil {
 			return
 		}
 
 		event := ProducerEvent{
 			Time:      time.Now().UTC(),
-			CreatedAt: attempt.CreatedAt,
+			CreatedAt: intent.CreatedAt,
 
-			Producer: produceErr.Producer,
-			Side:     produceErr.Side,
+			Producer: intent.Producer,
+			Side:     fmt.Sprint(intent.Side),
 			Stage:    ProducerStageEntryFailed,
 
-			DecisionID: attempt.DecisionID,
+			DecisionID: intent.DecisionID,
 			OrderID:    produceErr.OrderID,
+
+			Reason: intent.ProducerReason,
 
 			ErrorCode:       produceErr.Code,
 			CleanupRequired: produceErr.CleanupRequired,
 		}
 
-		if intent != nil {
-			event.Reason = intent.ProducerReason
-		}
-
 		if produceErr.Err != nil {
-			event.Error = produceErr.Err.Error()
+			event.Error =
+				produceErr.Err.Error()
 		}
 
-		attempt.Events[event.Stage] = event
+		attempt.Events[event.Stage] =
+			event
 	}
 
 	// Validation helper owns and constructs its exact failure.
-	if produceErr := t.validatePendingIntent(intent); produceErr != nil {
-		addFailureEvent(produceErr)
+	if produceErr :=
+		t.validatePendingIntent(
+			intent,
+		); produceErr != nil {
 
-		return nil, attempt, produceErr
+		addFailureEvent(
+			produceErr,
+		)
+
+		return nil, produceErr
 	}
 
 	// Submission helper owns and constructs its exact failure.
-	orderID, produceErr := t.submitPendingIntent(
-		ctx,
-		intent,
-	)
-	if produceErr != nil {
-		addFailureEvent(produceErr)
+	orderID, produceErr :=
+		t.submitPendingIntent(
+			ctx,
+			intent,
+		)
 
-		return nil, attempt, produceErr
+	if produceErr != nil {
+		addFailureEvent(
+			produceErr,
+		)
+
+		return nil, produceErr
 	}
 
 	// Build helper owns and constructs its exact failure.
-	entry, produceErr := t.buildPendingEntry(
-		intent,
-		orderID,
-	)
-	if produceErr != nil {
-		addFailureEvent(produceErr)
+	entry, produceErr :=
+		t.buildPendingEntry(
+			intent,
+			orderID,
+		)
 
-		return nil, attempt, produceErr
+	if produceErr != nil {
+		addFailureEvent(
+			produceErr,
+		)
+
+		return nil, produceErr
 	}
 
 	// Registration helper owns and constructs its exact failure.
-	if produceErr := t.registerPendingEntry(entry); produceErr != nil {
-		addFailureEvent(produceErr)
+	if produceErr :=
+		t.registerPendingEntry(
+			entry,
+		); produceErr != nil {
 
-		return nil, attempt, produceErr
+		addFailureEvent(
+			produceErr,
+		)
+
+		return nil, produceErr
 	}
 
-	// Registration succeeded. Advance the same-side latch immediately so
-	// another same-side pending entry must achieve additional adverse price
-	// movement before qualifying again. Save the latch together with the
-	// newly registered pending entry so both remain consistent.
-	oldBuyLatch := t.latchedGateBuy
-	oldSellLatch := t.latchedGateSell
+	/*
+		Registration succeeded.
 
-	nextLatch := pendingRegistrationLatchPrice(
-		intent.Side,
-		intent.LimitPx,
-		intent.BaseAtLimit,
-		t.cfg.FeeRatePct,
-	)
+		Advance the same-side latch immediately so another same-side
+		pending entry must achieve additional adverse movement before
+		qualifying again.
+
+		Save the latch together with the newly registered pending entry.
+	*/
+	oldBuyLatch :=
+		t.latchedGateBuy
+
+	oldSellLatch :=
+		t.latchedGateSell
+
+	nextLatch :=
+		pendingRegistrationLatchPrice(
+			intent.Side,
+			intent.LimitPx,
+			intent.BaseAtLimit,
+			t.cfg.FeeRatePct,
+		)
 
 	switch intent.Side {
 	case SideBuy:
-		// BUY latch may only move farther downward (more adverse).
 		if t.latchedGateBuy == 0 ||
 			nextLatch < t.latchedGateBuy {
 
-			t.latchedGateBuy = nextLatch
+			t.latchedGateBuy =
+				nextLatch
 		}
 
 	case SideSell:
-		// SELL latch may only move farther upward (more adverse).
 		if t.latchedGateSell == 0 ||
 			nextLatch > t.latchedGateSell {
 
-			t.latchedGateSell = nextLatch
+			t.latchedGateSell =
+				nextLatch
 		}
 	}
 
-	if err := t.saveStateNoLock(); err != nil {
-		// Roll back only the local state mutated by produceEntry().
-		t.latchedGateBuy = oldBuyLatch
-		t.latchedGateSell = oldSellLatch
+	if err :=
+		t.saveStateNoLock(); err != nil {
+
+		/*
+			Roll back only the local state mutated by produceEntry().
+		*/
+		t.latchedGateBuy =
+			oldBuyLatch
+
+		t.latchedGateSell =
+			oldSellLatch
 
 		t.mu.Lock()
 
-		current, exists := t.pendingEntries[orderID]
-		if exists && current == entry {
+		current, exists :=
+			t.pendingEntries[orderID]
+
+		if exists &&
+			current == entry {
+
 			delete(
 				t.pendingEntries,
 				orderID,
@@ -4131,42 +4108,59 @@ func (t *Trader) produceEntry(
 
 		t.mu.Unlock()
 
-		produceErr := &EntryProduceError{
-			Code:            EntryProduceErrPersistState,
-			Producer:        intent.Producer,
-			Side:            fmt.Sprint(intent.Side),
-			OrderID:         orderID,
-			CleanupRequired: true,
-			Err:             err,
-		}
+		produceErr :=
+			&EntryProduceError{
+				Code: EntryProduceErrPersistState,
 
-		addFailureEvent(produceErr)
+				Producer: intent.Producer,
 
-		return nil, attempt, produceErr
+				Side: fmt.Sprint(
+					intent.Side,
+				),
+
+				OrderID: orderID,
+
+				CleanupRequired: true,
+
+				Err: err,
+			}
+
+		addFailureEvent(
+			produceErr,
+		)
+
+		return nil, produceErr
 	}
 
 	/*
-		The entry has now been successfully produced and accepted into
-		pending-entry state.
+		The entry has now been successfully produced and registered
+		as a pending asynchronous entry.
 
-		This is the canonical pending lifecycle event belonging to the
-		same DecisionID created by the producer wrapper.
+		This pending event belongs to the SAME DecisionID and
+		ProducerAttempt created at Decision stage.
 	*/
-	pendingEvent := ProducerEvent{
-		Time:      time.Now().UTC(),
-		CreatedAt: intent.CreatedAt,
+	pendingEvent :=
+		ProducerEvent{
+			Time: time.Now().UTC(),
 
-		Producer: intent.Producer,
-		Side:     fmt.Sprint(intent.Side),
-		Stage:    ProducerStagePending,
+			CreatedAt: intent.CreatedAt,
 
-		DecisionID: intent.DecisionID,
-		OrderID:    entry.OrderID,
+			Producer: intent.Producer,
 
-		Reason: intent.ProducerReason,
-	}
+			Side: fmt.Sprint(
+				intent.Side,
+			),
 
-	attempt.Events[pendingEvent.Stage] = pendingEvent
+			Stage: ProducerStagePending,
+
+			DecisionID: intent.DecisionID,
+
+			OrderID: entry.OrderID,
+
+			Reason: intent.ProducerReason,
+		}
+
+	attempt.Events[ProducerStagePending] = pendingEvent
 
 	log.Printf(
 		"[PRODUCER] stage=pending "+
@@ -4182,7 +4176,7 @@ func (t *Trader) produceEntry(
 		entry,
 	)
 
-	return entry, attempt, nil
+	return entry, nil
 }
 
 // Entry Producer Main Helpers
@@ -4388,8 +4382,79 @@ func (t *Trader) submitPendingIntent(
 	orderID = strings.TrimSpace(orderID)
 
 	if err != nil {
+		code :=
+			EntryProduceErrPostOnlySubmit
+
+		var binanceErr *BinanceBridgeError
+
+		if errors.As(
+			err,
+			&binanceErr,
+		) {
+			msg :=
+				strings.TrimSpace(
+					binanceErr.BinanceMsg,
+				)
+
+			switch {
+			/*
+				Binance matching-engine rejection:
+
+				-2010 is broad, so the message is required to
+				authoritatively identify insufficient balance.
+			*/
+			case binanceErr.BinanceCode == -2010 &&
+				msg ==
+					"Account has insufficient balance for requested action.":
+
+				code =
+					EntryProduceErrInsufficientBalance
+
+			/*
+				LIMIT_MAKER would immediately execute.
+
+				This is Binance's authoritative post-only rejection.
+			*/
+			case (binanceErr.BinanceCode == -2010 ||
+				binanceErr.BinanceCode == -1010) &&
+				msg ==
+					"Order would immediately match and take.":
+
+				code =
+					EntryProduceErrPostOnlyRejected
+
+			/*
+				Binance timeout.
+
+				Execution status may be unknown, so this remains
+				a submission failure requiring higher-level handling.
+			*/
+			case binanceErr.BinanceCode == -1007:
+
+				code =
+					EntryProduceErrSubmitTimeout
+
+			/*
+				Too many requests / rate limiting.
+			*/
+			case binanceErr.BinanceCode == -1003:
+
+				code =
+					EntryProduceErrRateLimited
+
+			/*
+				Any other structured Binance rejection is still
+				authoritatively an exchange rejection, even though its
+				more specific business meaning is not classified here.
+			*/
+			default:
+				code =
+					EntryProduceErrExchangeRejected
+			}
+		}
+
 		return orderID, &EntryProduceError{
-			Code:            EntryProduceErrPostOnlySubmit,
+			Code:            code,
 			Producer:        intent.Producer,
 			Side:            fmt.Sprint(intent.Side),
 			OrderID:         orderID,
@@ -7934,8 +7999,22 @@ func (t *Trader) handleCase3AReplacementError(
 		switch produceErr.Code {
 
 		case EntryProduceErrPostOnlySubmit,
+			EntryProduceErrSubmitNetworkFailed,
+			EntryProduceErrInsufficientBalance,
+			EntryProduceErrPostOnlyRejected,
+			EntryProduceErrSubmitTimeout,
+			EntryProduceErrRateLimited,
+			EntryProduceErrExchangeRejected,
 			EntryProduceErrPersistState:
 
+			/*
+				These granular submission classifications all originate from
+				the same submission failure family that was previously represented
+				by EntryProduceErrPostOnlySubmit.
+
+				Keep existing Case3A retry behavior unchanged while preserving the
+				more precise observability ErrorCode.
+			*/
 			t.markCase3AReplacementRetryLocked(
 				repl,
 				anchorID,

@@ -1,0 +1,1043 @@
+We are continuing implementation of Producer Observability Lifecycle in a Go Binance spot-trading bot.
+
+Do not redesign this architecture. Continue from the exact state described below and make mutations incrementally. When proposing code changes, tell me exactly WHAT CODE TO FIND and WHAT TO REPLACE IT WITH so I do not have to infer the mutation myself.
+
+======================================================================
+OBJECTIVE
+======================================================================
+
+We have extended producer observability upstream of the existing `produced` stage WITHOUT creating a second lifecycle.
+
+Previously observability effectively began at:
+
+produced
+    ↓
+pending
+    ↓
+poller
+    ↓
+filled / cancelled / rejected / expired
+    ↓
+drain / committed
+
+Now the SAME lifecycle begins earlier, when a concrete producer Decision exists:
+
+decision
+    ↓
+CreatedAt + DecisionID
+    ↓
+PendingIntent
+    ↓
+ProducerAttempt
+    ↓
+Decision-stage observability
+    ↓
+policy / sizing / spare / funding
+    ↓
+produced                 ← wrapper actually reached
+    ↓
+pending
+    ↓
+poller
+    ↓
+filled / cancelled / rejected / expired
+    ↓
+drain / committed
+
+This remains ONE ProducerAttempt and ONE DecisionID for the entire lifecycle.
+
+======================================================================
+1. DECISION IS NOW THE LIFECYCLE CREATION POINT
+======================================================================
+
+After:
+
+entryDecision := t.combineEntryRawMaterials(
+    aiResult,
+    macdResult,
+    emaResult,
+    pyramidResult,
+    equityResult,
+    price,
+    pendingCounts,
+)
+
+d := entryDecision
+
+the concrete producer decision has already finalized important fields including:
+
+d.Signal
+d.LogicOpinion
+d.LegacySignal
+d.PyramidPass
+d.PyramidReason
+d.Producer
+d.PendingCancelPolicy
+d.ProducerReason
+
+At this point we create the lifecycle.
+
+We introduced:
+
+newProducerDecisionLifecycle(
+    d *Decision,
+) (*PendingIntent, *ProducerAttempt)
+
+Conceptually it does:
+
+createdAt := time.Now().UTC()
+
+intent := &PendingIntent{
+    CreatedAt: createdAt,
+    DecisionID: FormatDecisionID(
+        d.Producer,
+        createdAt,
+    ),
+
+    Producer:            d.Producer,
+    PendingCancelPolicy: d.PendingCancelPolicy,
+    ProducerReason:      d.ProducerReason,
+    Side:                d.Signal,
+}
+
+attempt := &ProducerAttempt{
+    DecisionID: intent.DecisionID,
+    CreatedAt:  intent.CreatedAt,
+    Producer:   intent.Producer,
+    Side:       fmt.Sprint(intent.Side),
+
+    Events: make(
+        map[ProducerStage]ProducerEvent,
+    ),
+}
+
+IMPORTANT:
+
+This helper DOES NOT create `produced`.
+
+`produced` keeps its original semantic meaning:
+
+    wrapper was actually reached and production was attempted.
+
+Therefore:
+
+decision != produced
+
+Decision is the upstream lifecycle stage.
+Produced remains in the producer wrapper.
+
+======================================================================
+2. DECISION EVENT
+======================================================================
+
+After lifecycle creation we currently do:
+
+intent, attempt := newProducerDecisionLifecycle(
+    &d,
+)
+
+if attempt != nil &&
+    intent != nil &&
+    (d.Signal == Buy || d.Signal == Sell) {
+
+    t.addDecisionProducerEvent(
+        intent,
+        attempt,
+        ProducerStageDecision,
+        "",
+        nil,
+        false,
+        false,
+    )
+
+    log.Printf(
+        "[PRODUCER] stage=decision "+
+            "producer=%s side=%s reason=%q",
+        d.Producer,
+        d.Signal,
+        d.ProducerReason,
+    )
+}
+
+This creates the initial non-terminal Decision event.
+
+It is NOT immediately persisted because normal execution is expected to continue toward the wrapper.
+
+======================================================================
+3. DECISION-STAGE EVENT HELPER
+======================================================================
+
+We introduced:
+
+func (t *Trader) addDecisionProducerEvent(
+    intent *PendingIntent,
+    attempt *ProducerAttempt,
+    stage ProducerStage,
+    code EntryProduceErrorCode,
+    err error,
+    cleanupRequired bool,
+    persist bool,
+) {
+    if t == nil ||
+        intent == nil ||
+        attempt == nil {
+        return
+    }
+
+    if attempt.Events == nil {
+        attempt.Events =
+            make(map[ProducerStage]ProducerEvent)
+    }
+
+    errorText := ""
+    if err != nil {
+        errorText = err.Error()
+    }
+
+    attempt.Events[stage] = ProducerEvent{
+        Time:      time.Now().UTC(),
+        CreatedAt: intent.CreatedAt,
+
+        Producer: intent.Producer,
+        Side:     fmt.Sprint(intent.Side),
+        Stage:    stage,
+
+        DecisionID: intent.DecisionID,
+
+        Reason: intent.ProducerReason,
+
+        ErrorCode:       code,
+        Error:           errorText,
+        CleanupRequired: cleanupRequired,
+    }
+
+    if !persist {
+        return
+    }
+
+    t.recordProducerAttemptLocked(
+        attempt,
+    )
+
+    if err := t.saveProducerHistoryNoLock(); err != nil {
+        log.Printf(
+            "[ERROR] producer.history.save_failed "+
+                "stage=%s producer=%s decision_id=%s err=%v",
+            stage,
+            attempt.Producer,
+            attempt.DecisionID,
+            err,
+        )
+    }
+}
+
+The helper assumes the caller holds `t.mu` whenever `persist=true`, because:
+
+recordProducerAttemptLocked()
+
+requires the lock.
+
+If the relevant code has already released `t.mu`, it must reacquire it before calling the helper with `persist=true`.
+
+======================================================================
+4. CORE OBSERVABILITY INVARIANT
+======================================================================
+
+Once the Decision lifecycle exists:
+
+NO terminal pre-wrapper path may silently do only:
+
+return
+continue
+break
+log.Printf(...)
+
+and lose the producer attempt.
+
+Every terminal pre-wrapper outcome must first determine its authoritative condition.
+
+If it is an actual failure or deliberate policy block:
+
+    add authoritative ProducerEvent
+        ↓
+    recordProducerAttemptLocked(attempt)
+        ↓
+    saveProducerHistoryNoLock()
+        ↓
+    return
+
+The helper performs the record/save when:
+
+persist=true
+
+Non-terminal observability events use:
+
+persist=false
+
+and execution continues.
+
+======================================================================
+5. PRODUCER ATTEMPT OWNERSHIP
+======================================================================
+
+There must NOT be a second ProducerAttempt created by the normal producer wrapper.
+
+The ProducerAttempt created at Decision stage is the same object that must eventually accumulate:
+
+decision
+sizing_reduced, if applicable
+produced
+pending
+poller stages
+filled
+cancelled
+rejected
+expired
+cleanup stages
+committed
+etc.
+
+Therefore the existing ProducerAttempt should be passed by pointer into the wrapper, just like PendingIntent.
+
+Target architecture:
+
+func (t *Trader) startProducerBuyEntry(
+    ctx context.Context,
+    intent *PendingIntent,
+    attempt *ProducerAttempt,
+    ...
+) (*PendingEntry, error)
+
+and symmetric SELL wrapper.
+
+Because `attempt` is already a pointer, the wrapper enriches the same object.
+
+It therefore DOES NOT need to return:
+
+*ProducerAttempt
+
+The wrapper should eventually stop doing its own:
+
+createdAt := time.Now().UTC()
+decisionID := FormatDecisionID(...)
+
+because those now belong to Decision lifecycle creation.
+
+IMPORTANT:
+
+This wrapper-signature conversion has NOT been completed yet.
+
+Current code still has old wrapper ownership in places, including a local `attempt` declaration and calls conceptually like:
+
+entry, attempt, err =
+    t.startProducerBuyEntry(...)
+
+Do NOT accidentally create a second lifecycle while converting this.
+
+======================================================================
+6. recordProducerAttemptLocked() SEMANTICS
+======================================================================
+
+This helper already has two behaviors against the SAME ProducerAttempt identity.
+
+Behavior 1 — REGISTER
+
+If DecisionID does not exist:
+
+producerHistory[producer].Attempts[decisionID] = attempt
+
+Behavior 2 — ENRICH
+
+If DecisionID already exists:
+
+existingAttempt.Events[stage] = event
+
+Identity fields are permanent:
+
+DecisionID
+CreatedAt
+Producer
+Side
+
+They must never be regenerated or replaced during enrichment.
+
+This is how one attempt accumulates:
+
+decision
+→ produced
+→ pending
+→ filled
+→ committed
+
+or failure/cancellation lifecycle stages.
+
+======================================================================
+7. EXISTING POLLER / POST-POLLER ARCHITECTURE
+======================================================================
+
+The existing downstream lifecycle already works approximately as:
+
+runPendingEntryPoller()
+    ↓
+builds ProducerEvents
+    ↓
+returns them through OpenResult
+
+drainPendingEntry()
+    ↓
+receives res.ProducerEvents
+    ↓
+constructs/enriches ProducerAttempt from pending context
+    ↓
+recordProducerAttemptLocked(attempt)
+
+We deliberately do NOT need to convert EntryProduceError into ProducerEvent in drainPendingEntry() merely to reconstruct poller lifecycle.
+
+Poller/local lifecycle code should construct ProducerEvent directly where appropriate.
+
+======================================================================
+8. DECISION-STAGE OUTCOMES ALREADY INSTRUMENTED
+======================================================================
+
+We have started discovering authoritative outcomes directly from the real code rather than inventing generic errors.
+
+The following are now instrumented.
+
+----------------------------------------------------------------------
+A. Invalid Signal → Side mapping
+----------------------------------------------------------------------
+
+Conceptual lifecycle:
+
+decision
+→ decision_failed
+→ invalid_side
+→ persisted
+→ return
+
+Code uses:
+
+EntryProduceErrInvalidSide
+
+before returning FLAT.
+
+----------------------------------------------------------------------
+B. Execution balance snapshot unavailable
+----------------------------------------------------------------------
+
+If:
+
+getBalanceSpare(...)
+
+cannot provide a usable execution snapshot:
+
+decision
+→ decision_failed
+→ decision_balance_unavailable
+→ persisted
+→ HOLD
+
+Code:
+
+EntryProduceErrDecisionBalanceUnavailable
+
+----------------------------------------------------------------------
+C. Case3B DOWN-regime BUY protection
+----------------------------------------------------------------------
+
+If previous exit was a losing BUY threshold-stop-loss and a new BUY is above that exit price while regime remains DOWN:
+
+decision
+→ decision_blocked
+→ decision_case3b_blocked
+→ persisted
+→ HOLD
+
+----------------------------------------------------------------------
+D. Case3B UP-regime SELL protection
+----------------------------------------------------------------------
+
+Symmetric SELL protection:
+
+decision
+→ decision_blocked
+→ decision_case3b_blocked
+→ persisted
+→ HOLD
+
+Both Case3B branches intentionally use `decision_blocked`, not `decision_failed`, because this is strategy policy protection.
+
+----------------------------------------------------------------------
+E. LongOnly SELL veto
+----------------------------------------------------------------------
+
+If:
+
+d.Signal == Sell && t.cfg.LongOnly
+
+we now record:
+
+decision
+→ decision_blocked
+→ decision_long_only_blocked
+→ persisted
+→ return
+
+Code:
+
+EntryProduceErrDecisionLongOnlyBlocked
+
+----------------------------------------------------------------------
+F. MaxConcurrentLots / lot-cap block
+----------------------------------------------------------------------
+
+When the lot-cap gate prevents entry:
+
+decision
+→ decision_blocked
+→ decision_lot_cap_reached
+→ persisted
+→ HOLD
+
+Code:
+
+EntryProduceErrDecisionLotCapReached
+
+----------------------------------------------------------------------
+G. Invalid confidence
+----------------------------------------------------------------------
+
+Current code:
+
+confMult := d.Confidence
+
+if confMult <= 0 {
+    ...
+}
+
+now records:
+
+decision
+→ decision_failed
+→ decision_invalid_confidence
+→ persisted
+→ HOLD
+
+Code:
+
+EntryProduceErrDecisionInvalidConfidence
+
+CleanupRequired=false because no order exists.
+
+======================================================================
+9. DUPLICATE PYRAMID DIAGNOSTIC BLOCK
+======================================================================
+
+We reviewed the large block:
+
+if isAdd && !skipPyramidGates {
+    ...
+}
+
+which re-read `pyramidResult` and logged:
+
+spacing
+soft gate
+GatePassed
+last-gate blocking
+etc.
+
+That block did not mutate `d`, did not return, and did not actually enforce the gate.
+
+Since the concrete Decision had already been finalized by:
+
+combineEntryRawMaterials()
+
+the block was identified as duplicate post-decision diagnostics rather than authoritative gating logic.
+
+It can be deleted so that `step()` consumes the finalized Decision rather than re-evaluating/re-logging pyramid state.
+
+If deleting it makes:
+
+isAdd
+skipPyramidGates
+
+unused, delete those declarations too.
+
+======================================================================
+10. BUY FUNDING OBSERVABILITY — IMPLEMENTED
+======================================================================
+
+BUY funding now distinguishes three outcomes.
+
+A. Enough spare
+
+Continue normally.
+
+B. Requested BUY cannot be fully funded, but available spare still satisfies exchange minimum
+
+This is NOT an error.
+
+After:
+
+quote = useQuote
+base = quote / price
+
+we add:
+
+t.addDecisionProducerEvent(
+    intent,
+    attempt,
+    ProducerStageSizingReduced,
+    "",
+    nil,
+    false,
+    false,
+)
+
+Lifecycle:
+
+decision
+→ sizing_reduced
+→ continue
+→ produced
+
+C. True insufficient funding
+
+Two authoritative terminal cases are instrumented:
+
+1. min-notional adjustment causes required quote to exceed spare
+2. degrade-to-spare still falls below minNotional
+
+Both record:
+
+decision
+→ decision_failed
+→ decision_insufficient_funds
+→ persisted
+→ HOLD
+
+using:
+
+EntryProduceErrDecisionInsufficientFunds
+
+This closes an important previous observability gap: capital constraints can now be distinguished between:
+
+    reduced execution size
+
+and:
+
+    producer opportunity that could not create exposure at all.
+
+======================================================================
+11. SELL FUNDING OBSERVABILITY — IMPLEMENTED
+======================================================================
+
+SELL now mirrors BUY.
+
+First terminal case:
+
+minimum-notional adjustment makes required base exceed spare base.
+
+It records:
+
+ProducerStageDecisionFailed
+EntryProduceErrDecisionInsufficientFunds
+
+with details such as:
+
+needed_base
+spare_base
+min_notional
+
+Second terminal case:
+
+degrade-to-spare produces:
+
+useBase <= 0
+
+or:
+
+useBase * price < minNotional
+
+It also records:
+
+decision_failed
+decision_insufficient_funds
+
+and persists before returning.
+
+Successful SELL degrade:
+
+base = useBase
+quote = base * price
+
+then:
+
+t.addDecisionProducerEvent(
+    intent,
+    attempt,
+    ProducerStageSizingReduced,
+    "",
+    nil,
+    false,
+    false,
+)
+
+and execution continues.
+
+So BUY and SELL are now symmetric:
+
+enough spare
+    → continue
+
+insufficient requested spare but reduced size is valid
+    → sizing_reduced
+    → continue
+
+insufficient spare and reduced size is invalid
+    → decision_failed
+    → decision_insufficient_funds
+    → persist
+    → HOLD
+
+======================================================================
+12. IMPORTANT ProducerReason SYNCHRONIZATION ISSUE
+======================================================================
+
+PendingIntent is created with:
+
+ProducerReason: d.ProducerReason
+
+But some downstream code later modifies:
+
+d.ProducerReason
+
+for example by appending refund state such as:
+
+|refund=buy-full
+|refund=buy-partial
+|refund=sell-full
+|refund=sell-partial
+
+This creates a possible divergence:
+
+d.ProducerReason      = updated reason
+intent.ProducerReason = old reason
+
+Because PendingIntent is becoming the lifecycle authority, downstream ProducerReason mutations must not leave intent stale.
+
+For the current mutation pass, when d.ProducerReason is changed, synchronize:
+
+intent.ProducerReason = d.ProducerReason
+
+Longer term we may make `intent.ProducerReason` the direct downstream authority.
+
+Do not ignore this issue during wrapper conversion.
+
+======================================================================
+13. NEXT DISCOVERED UNINSTRUMENTED TERMINAL PATH
+======================================================================
+
+The next known pre-wrapper terminal path is invalid maker limit price.
+
+Current code calculates `limitPx`, snaps it to tick, then has:
+
+if limitPx <= 0 {
+    log.Printf(...)
+    return StepResult{
+        Msg:    "HOLD",
+        Raw:    d.Raw,
+        Signal: d.Signal,
+    }, nil
+}
+
+At this point the Decision lifecycle already exists.
+
+This return must therefore be instrumented.
+
+IMPORTANT LOCK DETAIL:
+
+`step()` has already released `t.mu` before this live-order preparation section.
+
+Therefore before calling:
+
+addDecisionProducerEvent(... persist=true)
+
+we must reacquire `t.mu`.
+
+Expected lifecycle:
+
+decision
+→ decision_failed
+→ invalid_price
+→ persist
+→ HOLD
+
+Use the existing authoritative invalid-price error code if appropriate:
+
+EntryProduceErrInvalidPrice
+
+Do not invent a second equivalent code unless the existing taxonomy requires it.
+
+======================================================================
+14. WHAT REMAINS TO DO
+======================================================================
+
+Current work order:
+
+1. Instrument invalid `limitPx <= 0`.
+
+2. Continue auditing EVERY path between Decision lifecycle creation and wrapper entry.
+
+For every `return`, `continue`, `break`, or terminal condition ask:
+
+    Does a ProducerAttempt already exist?
+
+If yes:
+
+    Is this terminal?
+    What is the actual authoritative condition?
+    Is it a failure, policy block, cancellation, or non-terminal adjustment?
+    Does it need a ProducerEvent?
+    Must it persist before returning?
+
+Do not invent errors. Derive them from the actual code.
+
+3. Finish all Decision-stage/pre-wrapper observability BEFORE changing wrapper ownership.
+
+4. Then mutate wrapper signatures.
+
+Target:
+
+startProducerBuyEntry(
+    ctx,
+    intent,
+    attempt,
+    ...
+) (*PendingEntry, error)
+
+startProducerSellEntry(
+    ctx,
+    intent,
+    attempt,
+    ...
+) (*PendingEntry, error)
+
+The wrapper receives the existing pointers.
+
+5. Remove wrapper lifecycle identity creation:
+
+NO new CreatedAt
+NO new DecisionID
+NO second ProducerAttempt
+
+6. Keep `produced` exactly in the wrapper.
+
+When wrapper is reached:
+
+same attempt
+    ↓
+ProducerStageProduced added
+    ↓
+existing production logic continues
+
+7. Remove `*ProducerAttempt` from wrapper return values.
+
+Because caller and wrapper share the same pointer.
+
+8. Ensure PendingEntry / poller context carries the same:
+
+DecisionID
+CreatedAt
+Producer
+ProducerReason
+
+so downstream poller/drain events continue enriching the same lifecycle.
+
+9. Build and verify:
+
+go fmt .
+go build .
+
+Then inspect actual producer history to confirm a successful lifecycle looks like:
+
+DecisionID = SAME throughout
+
+decision
+→ possibly sizing_reduced
+→ produced
+→ pending
+→ filled
+→ committed
+
+and a pre-wrapper failure looks like:
+
+decision
+→ decision_failed / decision_blocked
+
+with NO fake `produced`.
+
+======================================================================
+15. BROADER PRODUCER OBSERVABILITY / ECONOMICS DESIGN ALREADY AGREED
+======================================================================
+
+Producer history retention is intended to distinguish two classes.
+
+A. NEVER CREATED EXPOSURE
+
+Examples:
+
+decision_failed
+decision_blocked
+produced only
+entry_failed
+pending → cancelled
+rejected
+expired
+cleanup_cancelled
+etc.
+
+Retention anchor:
+
+ProducerAttempt.CreatedAt
+
+Prune after the configured retention window, currently 24h.
+
+B. CREATED EXPOSURE
+
+If filled or partially filled resulted in committed exposure:
+
+DO NOT prune merely because ProducerAttempt.CreatedAt is older than 24h.
+
+Use entry OrderID to associate the attempt with the resulting position/trade.
+
+If position remains OPEN:
+
+keep ProducerAttempt regardless of age.
+
+If position EXITED:
+
+retention anchor becomes exit.Time
+
+and prune after exit.Time is older than 24h.
+
+At prune time we intend to update compact persistent aggregate producer economics.
+
+Desired per-producer aggregate includes:
+
+attempts
+fills
+cancelled attempts
+failed attempts
+
+open positions
+closed positions
+
+wins
+losses
+win rate
+
+gross/net realized PnL as appropriate to existing exit semantics
+
+average PnL per trade
+
+average individual trade percentage return
+
+The desired return metric is:
+
+average of each individual trades percentage return
+
+NOT:
+
+NetPnL / total deployed capital
+
+because sizing is not fundamentally capital-based in this bot and available spare may reduce proposed size or block an entry.
+
+For each closed trade conceptually:
+
+tradeReturnPct =
+    (realizedPnLUSD / entryOpenNotionalUSD) * 100
+
+Maintain a running sum:
+
+SumTradeReturnPct
+
+and derive:
+
+AverageReturnPct =
+    SumTradeReturnPct /
+    ClosedPositions
+
+Existing PNLUSD is intended to be fee-aware, so do not automatically double-count fees by subtracting them again.
+
+We also decided NOT to maintain a growing ProcessedExits dedupe map for this design. Aggregate economics are intended to be updated once when the corresponding attempt becomes eligible for pruning.
+
+Do not work on this economics/pruning phase yet unless the Decision/wrapper lifecycle work is complete.
+
+======================================================================
+16. CURRENT STATUS
+======================================================================
+
+DONE / IMPLEMENTED OR AGREED:
+
+✓ lifecycle starts at concrete Decision
+✓ one CreatedAt
+✓ one DecisionID
+✓ one PendingIntent
+✓ one ProducerAttempt
+✓ Decision event
+✓ produced retains original wrapper meaning
+✓ addDecisionProducerEvent()
+✓ terminal pre-wrapper persistence invariant
+✓ invalid-side observability
+✓ execution-balance-unavailable observability
+✓ Case3B BUY policy block
+✓ Case3B SELL policy block
+✓ LongOnly block
+✓ lot-cap block
+✓ invalid-confidence failure
+✓ BUY true insufficient-funds observability
+✓ BUY successful sizing-reduction observability
+✓ SELL true insufficient-funds observability
+✓ SELL successful sizing-reduction observability
+✓ duplicate post-decision pyramid diagnostic block identified for removal
+✓ wrapper pointer-ownership architecture agreed
+
+NOT YET COMPLETE:
+
+→ invalid maker limit-price terminal instrumentation
+→ exhaustive audit of remaining Decision→wrapper terminal paths
+→ wrapper signature conversion
+→ remove wrapper-created lifecycle identity
+→ remove *ProducerAttempt wrapper return
+→ pass same attempt through produced/pending/poller/drain
+→ end-to-end build verification
+→ runtime verification of DecisionID continuity
+→ later retention/pruning + producer economics implementation
+
+======================================================================
+HOW TO CONTINUE WITH ME
+======================================================================
+
+Continue from the invalid maker limit-price branch.
+
+Do NOT give me a broad redesign.
+
+For each mutation:
+
+1. identify the exact existing code I should FIND;
+2. give me the exact replacement code;
+3. explain briefly why that branch is terminal/non-terminal and why its stage/error code is authoritative;
+4. then stop and wait for me before moving to the next mutation.
+
+Do not make me infer where code belongs.
+
+Preserve the central invariant:
+
+ONE producer opportunity
+= ONE CreatedAt
+= ONE DecisionID
+= ONE PendingIntent
+= ONE ProducerAttempt
+= ONE lifecycle from decision through terminal outcome.
