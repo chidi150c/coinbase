@@ -304,6 +304,9 @@ func NewTrader(cfg Config, broker Broker) *Trader {
 		producerHistory: make(
 			map[EntryProducer]*ProducerHistory,
 		),
+		producerEconomics: make(
+			map[EntryProducer]*ProducerEconomics,
+		),
 	}
 
 	// Start centralized state manager goroutine
@@ -3296,6 +3299,10 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 		if lot.EntryFee < 0 {
 			lot.EntryFee = 0
 		}
+
+		// Keep the residual lot's persisted entry notional aligned with its
+		// remaining base after a partial exit.
+		lot.OpenNotionalUSD = lot.SizeBase * lot.OpenPrice
 
 		if priceExec > 0 && minNotional > 0 {
 			t.consolidateDust(book, priceExec, minNotional)

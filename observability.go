@@ -2,9 +2,9 @@
 // ProducerAttempt is the single lifecycle object keyed by DecisionID.
 // Events map[ProducerStage]ProducerEvent lets one attempt accumulate produced → pending → filled → committed, or failure/cleanup stages.
 // recordProducerAttemptLocked() is deliberately mechanical and does not classify failures or alter trading behavior.
-// Retention is correctly based on attempt.CreatedAt, not the latest event time.
+// Retention is exposure-aware: non-exposure attempts use CreatedAt; exited exposure uses the terminal exited event time.
 // Persistence is isolated in producerHistoryFile and uses temp-file + rename.
-// Loading repairs nil maps and prunes expired attempts.
+// Loading repairs nil maps, restores durable economics, and applies exposure-aware pruning.
 // The additional drain/poller/commit stages are compatible with the lifecycle work already in trader.go.
 package main
 
@@ -72,9 +72,18 @@ type ProducerEconomics struct {
 
 	NetPnLUSD float64
 
-	LastAttemptAt time.Time
-	LastFillAt    time.Time
-	LastExitAt    time.Time
+	LastAttemptAt  time.Time
+	LastProducedAt time.Time
+	LastFillAt     time.Time
+	LastExitAt     time.Time
+
+	// LastActivity* is bounded durable metadata for BOT OPS dormancy/
+	// "why has this producer not fired" checks after detailed attempts expire.
+	LastActivityAt        time.Time
+	LastActivityStage     ProducerStage
+	LastActivityReason    string
+	LastActivityErrorCode EntryProduceErrorCode
+	LastActivityError     string
 }
 
 // ProducerObservabilityState is the durable producer-observability snapshot.
@@ -90,6 +99,42 @@ type ProducerEconomics struct {
 type ProducerObservabilityState struct {
 	History   map[EntryProducer]*ProducerHistory
 	Economics map[EntryProducer]*ProducerEconomics
+}
+
+// ProducerOpsSummary is a read-only dashboard projection. It combines durable
+// folded economics with the currently retained detailed attempts without
+// mutating either store. Derived rates are calculated at read time.
+type ProducerOpsSummary struct {
+	Producer EntryProducer
+
+	Attempts          uint64
+	Fills             uint64
+	CancelledAttempts uint64
+	FailedAttempts    uint64
+
+	OpenPositions   uint64
+	ClosedPositions uint64
+	Wins            uint64
+	Losses          uint64
+
+	NetPnLUSD      float64
+	RealizedPnLUSD float64
+
+	WinRatePct    float64
+	AveragePnLUSD float64
+
+	LastAttemptAt  time.Time
+	LastProducedAt time.Time
+	LastFillAt     time.Time
+	LastExitAt     time.Time
+
+	LastActivityAt        time.Time
+	LastActivityStage     ProducerStage
+	LastActivityDecision  string
+	LastActivityOrderID   string
+	LastActivityReason    string
+	LastActivityErrorCode EntryProduceErrorCode
+	LastActivityError     string
 }
 type ProducerEvent struct {
 	Time      time.Time
@@ -295,6 +340,117 @@ func (t *Trader) addDecisionProducerEvent(
 	}
 }
 
+// producerAttemptEntryOrderID returns the best-known entry order ID for one
+// producer attempt. Committed correlation is preferred; filled is fallback.
+func producerAttemptEntryOrderID(
+	attempt *ProducerAttempt,
+) string {
+	if attempt == nil || attempt.Events == nil {
+		return ""
+	}
+
+	if event, ok := attempt.Events[ProducerStageCommitted]; ok {
+		if orderID := strings.TrimSpace(event.OrderID); orderID != "" {
+			return orderID
+		}
+	}
+
+	if event, ok := attempt.Events[ProducerStageFilled]; ok {
+		return strings.TrimSpace(event.OrderID)
+	}
+
+	return ""
+}
+
+// latestProducerEvent returns the newest canonical lifecycle event stored on
+// an attempt. Event.Time is authoritative; CreatedAt is fallback.
+func latestProducerEvent(
+	attempt *ProducerAttempt,
+) (ProducerEvent, bool) {
+	if attempt == nil || len(attempt.Events) == 0 {
+		return ProducerEvent{}, false
+	}
+
+	var latest ProducerEvent
+	found := false
+
+	for _, event := range attempt.Events {
+		eventTime := event.Time
+		if eventTime.IsZero() {
+			eventTime = event.CreatedAt
+		}
+
+		latestTime := latest.Time
+		if latestTime.IsZero() {
+			latestTime = latest.CreatedAt
+		}
+
+		if !found || eventTime.After(latestTime) {
+			latest = event
+			found = true
+		}
+	}
+
+	return latest, found
+}
+
+// producerAttemptFailed reports whether an attempt contains an authoritative
+// failure stage. Blocked/deferred decisions are not counted as failures.
+func producerAttemptFailed(
+	attempt *ProducerAttempt,
+) bool {
+	if attempt == nil || attempt.Events == nil {
+		return false
+	}
+
+	failureStages := [...]ProducerStage{
+		ProducerStageDecisionFailed,
+		ProducerStageEntryFailed,
+		ProducerStageRejected,
+		ProducerStageCleanupCancelFailed,
+		ProducerStageCommitFailed,
+	}
+
+	for _, stage := range failureStages {
+		if _, ok := attempt.Events[stage]; ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+// findProducerAttemptByEntryOrderIDLocked resolves an existing producer
+// attempt from producer ownership plus entry order correlation.
+//
+// The caller MUST already hold t.mu (read or write).
+func (t *Trader) findProducerAttemptByEntryOrderIDLocked(
+	producer EntryProducer,
+	entryOrderID string,
+) *ProducerAttempt {
+	if t == nil || producer == EntryProducerNone {
+		return nil
+	}
+
+	entryOrderID = strings.TrimSpace(entryOrderID)
+	if entryOrderID == "" {
+		return nil
+	}
+
+	history := t.producerHistory[producer]
+	if history == nil || history.Attempts == nil {
+		return nil
+	}
+
+	for _, attempt := range history.Attempts {
+		if producerAttemptEntryOrderID(attempt) == entryOrderID {
+			return attempt
+		}
+	}
+
+	return nil
+}
+
 // producerEntryOrderLiveLocked reports whether the original producer
 // EntryOrderID still exists in either authoritative live SideBook.
 //
@@ -398,49 +554,11 @@ func (t *Trader) markProducerExitedIfNotLiveLocked(
 		return false
 	}
 
-	history :=
-		t.producerHistory[lot.Producer]
-
-	if history == nil ||
-		history.Attempts == nil {
-
-		return false
-	}
-
-	var matchedAttempt *ProducerAttempt
-
-	for _, attempt := range history.Attempts {
-
-		if attempt == nil ||
-			attempt.Events == nil {
-
-			continue
-		}
-
-		if event, ok :=
-			attempt.Events[ProducerStageCommitted]; ok {
-
-			if strings.TrimSpace(
-				event.OrderID,
-			) == entryOrderID {
-
-				matchedAttempt = attempt
-				break
-			}
-		}
-
-		if event, ok :=
-			attempt.Events[ProducerStageFilled]; ok {
-
-			if strings.TrimSpace(
-				event.OrderID,
-			) == entryOrderID {
-
-				matchedAttempt = attempt
-				break
-			}
-		}
-	}
+	matchedAttempt :=
+		t.findProducerAttemptByEntryOrderIDLocked(
+			lot.Producer,
+			entryOrderID,
+		)
 
 	if matchedAttempt == nil {
 		return false
@@ -555,57 +673,11 @@ func (t *Trader) recordProducerRealizedPnLLocked(
 		return false
 	}
 
-	history :=
-		t.producerHistory[lot.Producer]
-
-	if history == nil ||
-		history.Attempts == nil {
-
-		return false
-	}
-
-	var matchedAttempt *ProducerAttempt
-
-	for _, attempt := range history.Attempts {
-
-		if attempt == nil ||
-			attempt.Events == nil {
-
-			continue
-		}
-
-		/*
-			Prefer committed because it represents exposure that was
-			successfully incorporated into local trading state.
-		*/
-		if event, ok :=
-			attempt.Events[ProducerStageCommitted]; ok {
-
-			if strings.TrimSpace(
-				event.OrderID,
-			) == entryOrderID {
-
-				matchedAttempt = attempt
-				break
-			}
-		}
-
-		/*
-			Filled is the fallback correlation for a lifecycle where the
-			exchange fill is known but committed is not available.
-		*/
-		if event, ok :=
-			attempt.Events[ProducerStageFilled]; ok {
-
-			if strings.TrimSpace(
-				event.OrderID,
-			) == entryOrderID {
-
-				matchedAttempt = attempt
-				break
-			}
-		}
-	}
+	matchedAttempt :=
+		t.findProducerAttemptByEntryOrderIDLocked(
+			lot.Producer,
+			entryOrderID,
+		)
 
 	if matchedAttempt == nil {
 		return false
@@ -732,6 +804,286 @@ func (t *Trader) recordProducerAttemptLocked(
 	}
 }
 
+// foldProducerAttemptEconomicsLocked folds one soon-to-be-pruned attempt into
+// the permanent bounded producer aggregate.
+//
+// The caller MUST already hold t.mu. Call this only immediately before deleting
+// that attempt from producerHistory; the attempt itself is the exact-once
+// accounting boundary.
+func (t *Trader) foldProducerAttemptEconomicsLocked(
+	producer EntryProducer,
+	attempt *ProducerAttempt,
+) {
+	if t == nil || attempt == nil {
+		return
+	}
+
+	if t.producerEconomics == nil {
+		t.producerEconomics =
+			make(map[EntryProducer]*ProducerEconomics)
+	}
+
+	econ := t.producerEconomics[producer]
+	if econ == nil {
+		econ = &ProducerEconomics{Producer: producer}
+		t.producerEconomics[producer] = econ
+	}
+
+	econ.Attempts++
+
+	if econ.LastAttemptAt.IsZero() || attempt.CreatedAt.After(econ.LastAttemptAt) {
+		econ.LastAttemptAt = attempt.CreatedAt
+	}
+
+	if produced, ok := attempt.Events[ProducerStageProduced]; ok {
+		if econ.LastProducedAt.IsZero() || produced.Time.After(econ.LastProducedAt) {
+			econ.LastProducedAt = produced.Time
+		}
+	}
+
+	if filled, ok := attempt.Events[ProducerStageFilled]; ok {
+		econ.Fills++
+		if econ.LastFillAt.IsZero() || filled.Time.After(econ.LastFillAt) {
+			econ.LastFillAt = filled.Time
+		}
+	}
+
+	if _, ok := attempt.Events[ProducerStageCleanupCancelled]; ok {
+		econ.CancelledAttempts++
+	}
+
+	if producerAttemptFailed(attempt) {
+		econ.FailedAttempts++
+	}
+
+	if exited, ok := attempt.Events[ProducerStageExited]; ok {
+		econ.ClosedPositions++
+		econ.NetPnLUSD += attempt.RealizedPnLUSD
+
+		switch {
+		case attempt.RealizedPnLUSD > 0:
+			econ.Wins++
+		case attempt.RealizedPnLUSD < 0:
+			econ.Losses++
+		}
+
+		if econ.LastExitAt.IsZero() || exited.Time.After(econ.LastExitAt) {
+			econ.LastExitAt = exited.Time
+		}
+	}
+
+	if latest, ok := latestProducerEvent(attempt); ok {
+		activityAt := latest.Time
+		if activityAt.IsZero() {
+			activityAt = latest.CreatedAt
+		}
+
+		if econ.LastActivityAt.IsZero() || activityAt.After(econ.LastActivityAt) {
+			econ.LastActivityAt = activityAt
+			econ.LastActivityStage = latest.Stage
+			econ.LastActivityReason = latest.Reason
+			econ.LastActivityErrorCode = latest.ErrorCode
+			econ.LastActivityError = latest.Error
+		}
+	}
+}
+
+// ProducerOpsSummaries returns dashboard-ready producer aggregates. It combines
+// permanent folded economics with retained detailed attempts, so BOT OPS does
+// not have to wait for the 24-hour prune boundary to show current activity.
+func (t *Trader) ProducerOpsSummaries() map[EntryProducer]ProducerOpsSummary {
+	if t == nil {
+		return map[EntryProducer]ProducerOpsSummary{}
+	}
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	return t.producerOpsSummariesLocked()
+}
+
+// producerOpsSummariesLocked is the lock-aware implementation used by future
+// BOT OPS/frontend handlers that already own t.mu.
+func (t *Trader) producerOpsSummariesLocked() map[EntryProducer]ProducerOpsSummary {
+	out := make(map[EntryProducer]ProducerOpsSummary)
+	if t == nil {
+		return out
+	}
+
+	for producer, econ := range t.producerEconomics {
+		if econ == nil {
+			continue
+		}
+
+		s := ProducerOpsSummary{
+			Producer:              producer,
+			Attempts:              econ.Attempts,
+			Fills:                 econ.Fills,
+			CancelledAttempts:     econ.CancelledAttempts,
+			FailedAttempts:        econ.FailedAttempts,
+			ClosedPositions:       econ.ClosedPositions,
+			Wins:                  econ.Wins,
+			Losses:                econ.Losses,
+			NetPnLUSD:             econ.NetPnLUSD,
+			RealizedPnLUSD:        econ.NetPnLUSD,
+			LastAttemptAt:         econ.LastAttemptAt,
+			LastProducedAt:        econ.LastProducedAt,
+			LastFillAt:            econ.LastFillAt,
+			LastExitAt:            econ.LastExitAt,
+			LastActivityAt:        econ.LastActivityAt,
+			LastActivityStage:     econ.LastActivityStage,
+			LastActivityReason:    econ.LastActivityReason,
+			LastActivityErrorCode: econ.LastActivityErrorCode,
+			LastActivityError:     econ.LastActivityError,
+		}
+
+		out[producer] = s
+	}
+
+	for producer, history := range t.producerHistory {
+		if history == nil || history.Attempts == nil {
+			continue
+		}
+
+		s := out[producer]
+		s.Producer = producer
+
+		for _, attempt := range history.Attempts {
+			if attempt == nil {
+				continue
+			}
+
+			s.Attempts++
+			if s.LastAttemptAt.IsZero() || attempt.CreatedAt.After(s.LastAttemptAt) {
+				s.LastAttemptAt = attempt.CreatedAt
+			}
+
+			if produced, ok := attempt.Events[ProducerStageProduced]; ok {
+				if s.LastProducedAt.IsZero() || produced.Time.After(s.LastProducedAt) {
+					s.LastProducedAt = produced.Time
+				}
+			}
+
+			if filled, ok := attempt.Events[ProducerStageFilled]; ok {
+				s.Fills++
+				if s.LastFillAt.IsZero() || filled.Time.After(s.LastFillAt) {
+					s.LastFillAt = filled.Time
+				}
+			}
+
+			if _, ok := attempt.Events[ProducerStageCleanupCancelled]; ok {
+				s.CancelledAttempts++
+			}
+
+			if producerAttemptFailed(attempt) {
+				s.FailedAttempts++
+			}
+
+			s.RealizedPnLUSD += attempt.RealizedPnLUSD
+
+			if exited, ok := attempt.Events[ProducerStageExited]; ok {
+				s.ClosedPositions++
+				s.NetPnLUSD += attempt.RealizedPnLUSD
+				switch {
+				case attempt.RealizedPnLUSD > 0:
+					s.Wins++
+				case attempt.RealizedPnLUSD < 0:
+					s.Losses++
+				}
+				if s.LastExitAt.IsZero() || exited.Time.After(s.LastExitAt) {
+					s.LastExitAt = exited.Time
+				}
+			} else if _, committed := attempt.Events[ProducerStageCommitted]; committed {
+				entryOrderID := producerAttemptEntryOrderID(attempt)
+				if entryOrderID != "" && t.producerEntryOrderLiveLocked(entryOrderID) {
+					s.OpenPositions++
+				}
+			}
+
+			if latest, ok := latestProducerEvent(attempt); ok {
+				activityAt := latest.Time
+				if activityAt.IsZero() {
+					activityAt = latest.CreatedAt
+				}
+				if s.LastActivityAt.IsZero() || activityAt.After(s.LastActivityAt) {
+					s.LastActivityAt = activityAt
+					s.LastActivityStage = latest.Stage
+					s.LastActivityDecision = latest.DecisionID
+					s.LastActivityOrderID = latest.OrderID
+					s.LastActivityReason = latest.Reason
+					s.LastActivityErrorCode = latest.ErrorCode
+					s.LastActivityError = latest.Error
+				}
+			}
+		}
+
+		out[producer] = s
+	}
+
+	for producer, s := range out {
+		if s.ClosedPositions > 0 {
+			s.WinRatePct = float64(s.Wins) / float64(s.ClosedPositions) * 100.0
+			s.AveragePnLUSD = s.NetPnLUSD / float64(s.ClosedPositions)
+		}
+		out[producer] = s
+	}
+
+	return out
+}
+
+// ProducerObservabilitySnapshot returns a deep read-only copy suitable for
+// API/BOT OPS serialization without exposing mutable in-memory maps.
+func (t *Trader) ProducerObservabilitySnapshot() ProducerObservabilityState {
+	state := ProducerObservabilityState{
+		History:   make(map[EntryProducer]*ProducerHistory),
+		Economics: make(map[EntryProducer]*ProducerEconomics),
+	}
+
+	if t == nil {
+		return state
+	}
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	for producer, history := range t.producerHistory {
+		if history == nil {
+			continue
+		}
+
+		historyCopy := &ProducerHistory{
+			Attempts: make(map[string]*ProducerAttempt),
+		}
+
+		for decisionID, attempt := range history.Attempts {
+			if attempt == nil {
+				continue
+			}
+
+			attemptCopy := *attempt
+			attemptCopy.Events = make(map[ProducerStage]ProducerEvent)
+			for stage, event := range attempt.Events {
+				attemptCopy.Events[stage] = event
+			}
+
+			historyCopy.Attempts[decisionID] = &attemptCopy
+		}
+
+		state.History[producer] = historyCopy
+	}
+
+	for producer, economics := range t.producerEconomics {
+		if economics == nil {
+			continue
+		}
+
+		economicsCopy := *economics
+		state.Economics[producer] = &economicsCopy
+	}
+
+	return state
+}
+
 const ProducerHistoryRetention = 24 * time.Hour
 
 func (t *Trader) pruneProducerHistoryLocked(
@@ -751,157 +1103,11 @@ func (t *Trader) pruneProducerHistoryLocked(
 	}
 
 	/*
-		Fold one ProducerAttempt into the permanent bounded aggregate.
-
-		This is called exactly once: immediately before the attempt is
-		deleted from producerHistory.
-
-		The ProducerAttempt itself is therefore the idempotency boundary.
-		No ProcessedExits map or other growing dedupe state is required.
+		ProducerAttempt deletion is the exact-once accounting boundary.
+		Every eligible attempt is folded immediately before deletion.
 	*/
-	foldEconomics := func(
-		producer EntryProducer,
-		attempt *ProducerAttempt,
-	) {
-		if attempt == nil {
-			return
-		}
 
-		econ := t.producerEconomics[producer]
-		if econ == nil {
-			econ = &ProducerEconomics{
-				Producer: producer,
-			}
-
-			t.producerEconomics[producer] = econ
-		}
-
-		econ.Attempts++
-
-		if econ.LastAttemptAt.IsZero() ||
-			attempt.CreatedAt.After(
-				econ.LastAttemptAt,
-			) {
-
-			econ.LastAttemptAt =
-				attempt.CreatedAt
-		}
-
-		/*
-			Fills counts actual producer fills, independently of whether
-			the resulting exposure was later committed.
-
-			This preserves visibility for:
-			  - successful committed entries;
-			  - refund-consumed fills;
-			  - other filled attempts.
-		*/
-		if filled, ok :=
-			attempt.Events[ProducerStageFilled]; ok {
-
-			econ.Fills++
-
-			if econ.LastFillAt.IsZero() ||
-				filled.Time.After(
-					econ.LastFillAt,
-				) {
-
-				econ.LastFillAt =
-					filled.Time
-			}
-		}
-
-		/*
-			A completed cancellation is counted only when cleanup
-			cancellation actually succeeded.
-
-			cancel_requested alone is not sufficient because cleanup may
-			have failed.
-		*/
-		if _, ok :=
-			attempt.Events[
-				ProducerStageCleanupCancelled
-			]; ok {
-
-			econ.CancelledAttempts++
-		}
-
-		/*
-			FailedAttempts represents authoritative failed producer
-			outcomes.
-
-			Do not classify decision_blocked or decision_deferred as
-			failures merely because they did not trade.
-		*/
-		_, decisionFailed :=
-			attempt.Events[
-				ProducerStageDecisionFailed
-			]
-
-		_, entryFailed :=
-			attempt.Events[
-				ProducerStageEntryFailed
-			]
-
-		_, rejected :=
-			attempt.Events[
-				ProducerStageRejected
-			]
-
-		_, cleanupFailed :=
-			attempt.Events[
-				ProducerStageCleanupCancelFailed
-			]
-
-		_, commitFailed :=
-			attempt.Events[
-				ProducerStageCommitFailed
-			]
-
-		if decisionFailed ||
-			entryFailed ||
-			rejected ||
-			cleanupFailed ||
-			commitFailed {
-
-			econ.FailedAttempts++
-		}
-
-		/*
-			Only ProducerStageExited represents completed producer
-			exposure economics.
-
-			RealizedPnLUSD already contains every authoritative partial
-			and final ExitRecord.PNLUSD contribution.
-		*/
-		if exited, ok := attempt.Events[ProducerStageExited]; ok {
-
-			econ.ClosedPositions++
-
-			econ.NetPnLUSD +=
-				attempt.RealizedPnLUSD
-
-			switch {
-			case attempt.RealizedPnLUSD > 0:
-				econ.Wins++
-
-			case attempt.RealizedPnLUSD < 0:
-				econ.Losses++
-			}
-
-			if econ.LastExitAt.IsZero() ||
-				exited.Time.After(
-					econ.LastExitAt,
-				) {
-
-				econ.LastExitAt =
-					exited.Time
-			}
-		}
-	}
-
-	for producer, history :=
-		range t.producerHistory {
+	for producer, history := range t.producerHistory {
 
 		if history == nil {
 			delete(
@@ -923,8 +1129,7 @@ func (t *Trader) pruneProducerHistoryLocked(
 			continue
 		}
 
-		for decisionID, attempt :=
-			range history.Attempts {
+		for decisionID, attempt := range history.Attempts {
 
 			if attempt == nil {
 				delete(
@@ -942,24 +1147,16 @@ func (t *Trader) pruneProducerHistoryLocked(
 			}
 
 			_, filled :=
-				attempt.Events[
-					ProducerStageFilled
-				]
+				attempt.Events[ProducerStageFilled]
 
 			_, committed :=
-				attempt.Events[
-					ProducerStageCommitted
-				]
+				attempt.Events[ProducerStageCommitted]
 
 			_, refundConsumed :=
-				attempt.Events[
-					ProducerStageRefundConsumed
-				]
+				attempt.Events[ProducerStageRefundConsumed]
 
 			exitedEvent, exited :=
-				attempt.Events[
-					ProducerStageExited
-				]
+				attempt.Events[ProducerStageExited]
 
 			/*
 				CASE A — NO COMMITTED EXPOSURE.
@@ -997,7 +1194,7 @@ func (t *Trader) pruneProducerHistoryLocked(
 					continue
 				}
 
-				foldEconomics(
+				t.foldProducerAttemptEconomicsLocked(
 					producer,
 					attempt,
 				)
@@ -1020,31 +1217,7 @@ func (t *Trader) pruneProducerHistoryLocked(
 				authoritative SideBook, keep the detailed attempt for as
 				long as necessary.
 			*/
-			entryOrderID := ""
-
-			if committedEvent, ok :=
-				attempt.Events[
-					ProducerStageCommitted
-				]; ok {
-
-				entryOrderID =
-					strings.TrimSpace(
-						committedEvent.OrderID,
-					)
-			}
-
-			if entryOrderID == "" {
-				if filledEvent, ok :=
-					attempt.Events[
-						ProducerStageFilled
-					]; ok {
-
-					entryOrderID =
-						strings.TrimSpace(
-							filledEvent.OrderID,
-						)
-				}
-			}
+			entryOrderID := producerAttemptEntryOrderID(attempt)
 
 			if entryOrderID != "" &&
 				t.producerEntryOrderLiveLocked(
@@ -1090,7 +1263,7 @@ func (t *Trader) pruneProducerHistoryLocked(
 				Because deletion occurs immediately after folding, this
 				attempt cannot be counted again by a later prune pass.
 			*/
-			foldEconomics(
+			t.foldProducerAttemptEconomicsLocked(
 				producer,
 				attempt,
 			)
@@ -1128,7 +1301,8 @@ func (t *Trader) pruneProducerHistoryLocked(
 // t.producerHistory is stable for the duration of pruning and serialization.
 //
 // This function:
-//   - prunes attempts older than ProducerHistoryRetention;
+//   - applies exposure-aware detailed retention;
+//   - folds pruned attempts into durable producer economics;
 //   - serializes only producer observability state;
 //   - writes through a temporary file and atomic rename;
 //   - does not mutate trading behavior or critical trader state.
@@ -1155,15 +1329,10 @@ func (t *Trader) saveProducerHistoryNoLock() error {
 
 	/*
 		Pruning remains inside the producer-observability persistence
-		boundary.
-
-		For now this still executes the current pruning policy.
-
-		The next pruning mutation will change that policy so:
-		  - non-exposure attempts expire from CreatedAt;
-		  - live exposure is retained;
-		  - exited exposure expires from ProducerStageExited.Time;
-		  - ProducerEconomics is updated immediately before deletion.
+		boundary. Non-exposure attempts expire from CreatedAt; committed
+		live exposure is retained; exited exposure expires from the
+		terminal ProducerStageExited time; economics is folded exactly
+		once immediately before detailed-attempt deletion.
 	*/
 	t.pruneProducerHistoryLocked(
 		time.Now().UTC(),
@@ -1211,7 +1380,6 @@ func (t *Trader) saveProducerHistoryNoLock() error {
 
 	return nil
 }
-
 
 func (t *Trader) loadProducerHistory() error {
 	if t == nil {
@@ -1339,8 +1507,7 @@ func (t *Trader) loadProducerHistory() error {
 
 		ProducerAttempt identity and lifecycle contents are preserved.
 	*/
-	for producer, producerHistory :=
-		range state.History {
+	for producer, producerHistory := range state.History {
 
 		if producerHistory == nil {
 			delete(
@@ -1355,8 +1522,7 @@ func (t *Trader) loadProducerHistory() error {
 				make(map[string]*ProducerAttempt)
 		}
 
-		for decisionID, attempt :=
-			range producerHistory.Attempts {
+		for decisionID, attempt := range producerHistory.Attempts {
 
 			if attempt == nil {
 				delete(
@@ -1380,8 +1546,7 @@ func (t *Trader) loadProducerHistory() error {
 		empty in persisted JSON, restore it from that key rather than
 		dropping the accumulated economics.
 	*/
-	for producer, economics :=
-		range state.Economics {
+	for producer, economics := range state.Economics {
 
 		if economics == nil {
 			delete(
@@ -1403,13 +1568,8 @@ func (t *Trader) loadProducerHistory() error {
 		state.Economics
 
 	/*
-		Startup retention cleanup.
-
-		IMPORTANT:
-		Until the next mutation, pruneProducerHistoryLocked() still
-		contains the old CreatedAt-only policy.
-
-		Do not deploy this intermediate revision by itself.
+		Startup retention cleanup uses the same exposure-aware policy as
+		normal producer-history persistence.
 	*/
 	t.pruneProducerHistoryLocked(
 		time.Now().UTC(),
