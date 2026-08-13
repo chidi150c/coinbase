@@ -5239,6 +5239,13 @@ poll:
 					false,
 				)
 
+				if event, exists :=
+					producerEvents[ProducerStageFilled]; exists {
+
+					event.Price = placed.Price
+					producerEvents[ProducerStageFilled] = event
+				}
+
 				// log.Printf(
 				// "[TRACE] postonly.filled "+
 				// "producer=%s order_id=%s "+
@@ -5538,6 +5545,13 @@ poll:
 						false,
 					)
 
+					if event, exists :=
+						producerEvents[ProducerStageFilled]; exists {
+
+						event.Price = placed.Price
+						producerEvents[ProducerStageFilled] = event
+					}
+
 					// log.Printf(
 					// "[KPI] maker.open.filled "+
 					// "producer=%s side=%s vwap=%.8f "+
@@ -5726,6 +5740,13 @@ poll:
 			nil,
 			false,
 		)
+
+		if event, exists :=
+			producerEvents[ProducerStageFilled]; exists {
+
+			event.Price = placed.Price
+			producerEvents[ProducerStageFilled] = event
+		}
 
 		safeSend(
 			resultC,

@@ -78,7 +78,7 @@ import (
 	"time"
 )
 
-const Version = 171
+const Version = 172
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -1379,6 +1379,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			false,
 			false,
 		)
+
+		if event, exists :=
+			attempt.Events[ProducerStageDecision]; exists {
+
+			event.Price = price
+			attempt.Events[ProducerStageDecision] = event
+		}
 
 		log.Printf(
 			"[PRODUCER] stage=decision "+
@@ -2944,6 +2951,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					OrderID:    placed.ID,
 
 					Reason: intent.ProducerReason,
+					Price:  placed.Price,
 				}
 		}
 

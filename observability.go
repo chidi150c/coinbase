@@ -153,7 +153,8 @@ type ProducerEvent struct {
 	Error           string
 	CleanupRequired bool
 
-	PnL float64
+	PnL   float64
+	Price float64
 }
 
 type ProducerAttempt struct {
