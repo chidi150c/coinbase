@@ -78,7 +78,7 @@ import (
 	"time"
 )
 
-const Version = 170
+const Version = 171
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -1341,6 +1341,19 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	)
 
 	d := entryDecision
+
+	/*
+		Gate Analysis telemetry reuses values already computed for this tick.
+
+		The helper only decides whether this tick belongs to the next 10-second
+		sample bucket. Disk persistence is asynchronous and does not hold t.mu.
+	*/
+	t.recordGateAnalysisPointLocked(
+		wallNow,
+		price,
+		d.LogicEPS,
+		d.LogicMACDTurn,
+	)
 
 	if d.Signal != Flat {
 		t.applyPyramidRebaseTransactions(

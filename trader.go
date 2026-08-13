@@ -279,6 +279,10 @@ type Trader struct {
 	producerEconomics map[EntryProducer]*ProducerEconomics
 
 	producerHistoryFile string
+
+	// Gate Analysis sampling throttle only. Historical points live on disk,
+	// not in the Trader heap.
+	gateAnalysisLastSampleUnix int64
 }
 
 func NewTrader(cfg Config, broker Broker) *Trader {
