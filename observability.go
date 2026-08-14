@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -84,6 +86,11 @@ type ProducerEconomics struct {
 	LastActivityReason    string
 	LastActivityErrorCode EntryProduceErrorCode
 	LastActivityError     string
+
+	// PrunedErrorCodeCounts is the durable histogram of ErrorCode values from
+	// every detailed attempt removed by either retention policy. Its key-space
+	// is bounded by EntryProduceErrorCode, so it does not grow with DecisionIDs.
+	PrunedErrorCodeCounts map[EntryProduceErrorCode]uint64
 }
 
 // ProducerObservabilityState is the durable producer-observability snapshot.
@@ -805,6 +812,190 @@ func (t *Trader) recordProducerAttemptLocked(
 	}
 }
 
+const ProducerHistoryMaxAttemptsPerProducer = 500
+
+func (t *Trader) foldProducerAttemptPrunedErrorCodesLocked(
+	producer EntryProducer,
+	attempt *ProducerAttempt,
+) {
+	if t == nil || attempt == nil {
+		return
+	}
+
+	if t.producerEconomics == nil {
+		t.producerEconomics =
+			make(map[EntryProducer]*ProducerEconomics)
+	}
+
+	econ := t.producerEconomics[producer]
+	if econ == nil {
+		econ = &ProducerEconomics{Producer: producer}
+		t.producerEconomics[producer] = econ
+	}
+
+	if econ.PrunedErrorCodeCounts == nil {
+		econ.PrunedErrorCodeCounts =
+			make(map[EntryProduceErrorCode]uint64)
+	}
+
+	// Events is keyed by ProducerStage, so one attempt can contribute at most
+	// one count for a particular stage's ErrorCode. Empty codes are ignored.
+	for _, event := range attempt.Events {
+		if event.ErrorCode == "" {
+			continue
+		}
+
+		econ.PrunedErrorCodeCounts[event.ErrorCode]++
+	}
+}
+
+type producerAttemptByAge struct {
+	decisionID string
+	attempt    *ProducerAttempt
+}
+
+// producerAttemptCountPruneSafeLocked protects unresolved/live exposure
+// evidence from count-based deletion. In normal operation these protected
+// attempts are few; the 500 limit applies to the prune-safe detailed history.
+func (t *Trader) producerAttemptCountPruneSafeLocked(
+	attempt *ProducerAttempt,
+) bool {
+	if attempt == nil || attempt.Events == nil {
+		return true
+	}
+
+	_, filled := attempt.Events[ProducerStageFilled]
+	_, committed := attempt.Events[ProducerStageCommitted]
+	_, refundConsumed := attempt.Events[ProducerStageRefundConsumed]
+	_, exited := attempt.Events[ProducerStageExited]
+
+	if !committed {
+		return !filled || refundConsumed
+	}
+
+	entryOrderID := producerAttemptEntryOrderID(attempt)
+	if entryOrderID != "" &&
+		t.producerEntryOrderLiveLocked(entryOrderID) {
+		return false
+	}
+
+	return exited
+}
+
+func (t *Trader) pruneProducerHistoryCountCapLocked(
+	producer EntryProducer,
+	history *ProducerHistory,
+) bool {
+	if t == nil ||
+		history == nil ||
+		history.Attempts == nil ||
+		ProducerHistoryMaxAttemptsPerProducer <= 0 ||
+		len(history.Attempts) <= ProducerHistoryMaxAttemptsPerProducer {
+		return false
+	}
+
+	ordered := make(
+		[]producerAttemptByAge,
+		0,
+		len(history.Attempts),
+	)
+
+	for decisionID, attempt := range history.Attempts {
+		ordered = append(
+			ordered,
+			producerAttemptByAge{
+				decisionID: decisionID,
+				attempt:    attempt,
+			},
+		)
+	}
+
+	sort.Slice(
+		ordered,
+		func(i, j int) bool {
+			left := ordered[i].attempt
+			right := ordered[j].attempt
+
+			if left == nil {
+				return right != nil
+			}
+			if right == nil {
+				return false
+			}
+
+			lt := left.CreatedAt
+			rt := right.CreatedAt
+
+			if lt.Equal(rt) {
+				return ordered[i].decisionID <
+					ordered[j].decisionID
+			}
+			if lt.IsZero() {
+				return true
+			}
+			if rt.IsZero() {
+				return false
+			}
+
+			return lt.Before(rt)
+		},
+	)
+
+	changed := false
+
+	for _, candidate := range ordered {
+		if len(history.Attempts) <=
+			ProducerHistoryMaxAttemptsPerProducer {
+			break
+		}
+
+		attempt, exists :=
+			history.Attempts[candidate.decisionID]
+		if !exists {
+			continue
+		}
+
+		if attempt == nil {
+			delete(history.Attempts, candidate.decisionID)
+			changed = true
+			continue
+		}
+
+		if !t.producerAttemptCountPruneSafeLocked(attempt) {
+			continue
+		}
+
+		// Exact-once accounting boundary for count-cap pruning: preserve the
+		// normal economics and the durable ErrorCode histogram before deletion.
+		t.foldProducerAttemptPrunedErrorCodesLocked(
+			producer,
+			attempt,
+		)
+
+		t.foldProducerAttemptEconomicsLocked(
+			producer,
+			attempt,
+		)
+
+		delete(history.Attempts, candidate.decisionID)
+		changed = true
+	}
+
+	if len(history.Attempts) >
+		ProducerHistoryMaxAttemptsPerProducer {
+		log.Printf(
+			"[WARN] producer.history.count_cap.protected "+
+				"producer=%s retained=%d cap=%d "+
+				"reason=protected_exposure_evidence",
+			producer,
+			len(history.Attempts),
+			ProducerHistoryMaxAttemptsPerProducer,
+		)
+	}
+
+	return changed
+}
+
 // foldProducerAttemptEconomicsLocked folds one soon-to-be-pruned attempt into
 // the permanent bounded producer aggregate.
 //
@@ -1079,6 +1270,15 @@ func (t *Trader) ProducerObservabilitySnapshot() ProducerObservabilityState {
 		}
 
 		economicsCopy := *economics
+
+		if economics.PrunedErrorCodeCounts != nil {
+			economicsCopy.PrunedErrorCodeCounts =
+				make(map[EntryProduceErrorCode]uint64, len(economics.PrunedErrorCodeCounts))
+			for code, count := range economics.PrunedErrorCodeCounts {
+				economicsCopy.PrunedErrorCodeCounts[code] = count
+			}
+		}
+
 		state.Economics[producer] = &economicsCopy
 	}
 
@@ -1195,6 +1395,11 @@ func (t *Trader) pruneProducerHistoryLocked(
 					continue
 				}
 
+				t.foldProducerAttemptPrunedErrorCodesLocked(
+					producer,
+					attempt,
+				)
+
 				t.foldProducerAttemptEconomicsLocked(
 					producer,
 					attempt,
@@ -1264,6 +1469,11 @@ func (t *Trader) pruneProducerHistoryLocked(
 				Because deletion occurs immediately after folding, this
 				attempt cannot be counted again by a later prune pass.
 			*/
+			t.foldProducerAttemptPrunedErrorCodesLocked(
+				producer,
+				attempt,
+			)
+
 			t.foldProducerAttemptEconomicsLocked(
 				producer,
 				attempt,
@@ -1274,6 +1484,18 @@ func (t *Trader) pruneProducerHistoryLocked(
 				decisionID,
 			)
 
+			changed = true
+		}
+
+		/*
+			Second retention bound: after normal 24-hour/exposure pruning,
+			prune the oldest safe attempts until this producer is at the
+			configured detailed-history count ceiling.
+		*/
+		if t.pruneProducerHistoryCountCapLocked(
+			producer,
+			history,
+		) {
 			changed = true
 		}
 
@@ -1294,6 +1516,66 @@ func (t *Trader) pruneProducerHistoryLocked(
 	}
 
 	return changed
+}
+
+func (t *Trader) producerHistoryControlDir() string {
+	if t == nil || strings.TrimSpace(t.producerHistoryFile) == "" {
+		return ""
+	}
+
+	return filepath.Join(
+		filepath.Dir(t.producerHistoryFile),
+		"producer_controls",
+	)
+}
+
+func producerResetRequestName(producer EntryProducer) string {
+	return fmt.Sprintf("reset_pruned_errors_%s.request", producer)
+}
+
+func (t *Trader) applyProducerObservabilityControlRequestsLocked() {
+	if t == nil || len(t.producerEconomics) == 0 {
+		return
+	}
+
+	dir := t.producerHistoryControlDir()
+	if dir == "" {
+		return
+	}
+
+	for producer, economics := range t.producerEconomics {
+		if economics == nil {
+			continue
+		}
+
+		requestPath := filepath.Join(
+			dir,
+			producerResetRequestName(producer),
+		)
+
+		if _, err := os.Stat(requestPath); err != nil {
+			continue
+		}
+
+		economics.PrunedErrorCodeCounts =
+			make(map[EntryProduceErrorCode]uint64)
+
+		if err := os.Remove(requestPath); err != nil &&
+			!os.IsNotExist(err) {
+			log.Printf(
+				"[WARN] producer.history.reset_request.remove_failed "+
+					"producer=%s path=%s err=%v",
+				producer,
+				requestPath,
+				err,
+			)
+		}
+
+		log.Printf(
+			"[PRODUCER] pruned_error_counts_reset producer=%s",
+			producer,
+		)
+	}
 }
 
 // saveProducerHistoryNoLock persists the current producer history.
@@ -1327,6 +1609,8 @@ func (t *Trader) saveProducerHistoryNoLock() error {
 		t.producerEconomics =
 			make(map[EntryProducer]*ProducerEconomics)
 	}
+
+	t.applyProducerObservabilityControlRequestsLocked()
 
 	/*
 		Pruning remains inside the producer-observability persistence
