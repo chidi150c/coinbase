@@ -25,12 +25,13 @@
 //  2. EXIT scan per side (BUY then SELL):
 //     - Compute fee-aware net PnL and check profit gate
 //     - If gate passes:
-//     • Runner/Scalp trailing: USD-based trailing; close on stop trigger
-//     • Fixed-TP scalp: maintain maker-friendly TP preview (emulated post-only)
+//     • Case 4 Protected Profit: common protection for normal lots and runners
+//     • Runner: bypass ordinary TP/threshold-stop-loss; exit only through Case 4
+//     • Normal lot: retain ordinary fixed-TP and threshold-stop-loss behavior
 //  3. OPEN evaluation (if no exit fired):
 //     - Pull balances/steps with lock released
 //     - Enforce MinNotional/OrderMinUSD and step/tick snapping symmetrically
-//     - Equity triggers may override pyramiding/ramping gates
+//     - Equity triggers may use staged sizing; runner assignment is producer-owned
 //     - If ORDER_TYPE=limit with offset+timeout → maker-first (async pending)
 //     else place market immediately
 //
@@ -46,8 +47,8 @@
 //
 // Pyramiding & Equity Triggers
 //   - Pyramiding adds are side-aware and gated by spacing (seconds) and adverse-move thresholds,
-//     with optional exponential decay & latching. Equity triggers can stage sizes (25/50/75/100%)
-//     and may auto-designate the new lot as the side’s runner.
+//     with optional exponential decay & latching. Equity triggers can stage sizes (25/50/75/100%).
+//   - Runner designation is explicit producer intent carried through AssignRunner.
 //
 // Fees, Notional & Sizing
 //   - Entry/exit PnL is fee-aware. Prefer broker-reported commission; fallback to FeeRatePct.
@@ -61,7 +62,7 @@
 //   - Simulates fees and adjusts equity locally; no broker calls.
 //
 // Logging & Metrics
-//   - TRACE/DEBUG breadcrumbs at key gates (spacing, latching, trailing, post-only lifecycle).
+//   - TRACE/DEBUG breadcrumbs at key gates (spacing, latching, protected profit, post-only lifecycle).
 //     Prometheus-style counters/gauges are updated for opens/exits.
 //
 // ---------------------------------------------------------------------------------------------
@@ -78,7 +79,7 @@ import (
 	"time"
 )
 
-const Version = 172
+const Version = 173
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -434,12 +435,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	//
 	// This block scans existing BUY and SELL lots before any new entry is considered.
 	// It computes each lot's current net PnL, applies its correct per-lot profit gate,
-	// manages runner/scalp exit behavior, and closes at most ONE lot per step.
+	// applies Case 4 protected-profit behavior plus normal-lot exits, and closes at most ONE lot per step.
 	//
 	// Important:
 	// - Profit gate is per-lot. AI-FLAT entries may have a reduced ProfitGateUSD.
-	// - ScalpFixedTP exits require profit gate + AI/logic exit approval.
-	// - RunnerTrailing uses runner activation/trailing rules.
+	// - Normal lots retain ordinary fixed-TP and threshold-stop-loss handling.
+	// - Runners bypass ordinary TP and threshold-stop-loss and exit only through Case 4.
 	// - nearestTakeBuy/Sell are diagnostic/Gate2 snapshots, not separate exit orders.
 	// --------------------------------------------------------------------------------------------------------
 	if (lsb > 0) || (lss > 0) {
@@ -451,53 +452,77 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		buyNet, sellNet := 0.0, 0.0
 		feeRatePct := t.cfg.FeeRatePct
 
-		// Human-readable label for the lot's current exit mode.
-		// Used only for logs/Gate2 snapshots.
-		modeLabel := func(m ExitMode) string {
-			switch m {
-			case ExitModeRunnerTrailing:
-				return "RunnerTrailing"
-			case ExitModeScalpFixedTP:
-				return "ScalpFixedTP"
-			default:
-				return "Unknown"
-			}
-		}
-
-		// Track nearest fee-aware exit/activation price per side.
+		// Track nearest fee-aware profit-gate price per side.
 		//
 		// BUY side:
-		//   lowest Take is nearest (price rises to reach it).
+		//
+		//	lowest candidate price is nearest.
 		//
 		// SELL side:
-		//   highest Take is nearest (price falls to reach it).
+		//
+		//	highest candidate price is nearest.
+		//
+		// For an unarmed lot, preview the fee-aware price required to reach
+		// that lot's ProfitGateUSD. This applies equally to normal lots and runners.
 		//
 		// Used for diagnostics/Gate2 context only.
-		updateNearest := func(book *SideBook, side OrderSide, idx int, lot *Position, net float64, price float64) {
+		updateNearest := func(
+			book *SideBook,
+			side OrderSide,
+			idx int,
+			lot *Position,
+			net float64,
+			price float64,
+		) {
+			if lot == nil {
+				return
+			}
+
 			cand := lot.Take
+
 			if cand <= 0 {
-				// lightweight preview if not armed: use lot’s gate (already set by setExitMode)
-				gate := lot.TrailActivateGateUSD
-				if gate > 0 {
-					cand = activationPrice(lot, gate, feeRatePct)
+				gateUSD := t.lotProfitGateUSD(lot)
+
+				if gateUSD > 0 {
+					cand =
+						activationPrice(
+							lot,
+							gateUSD,
+							feeRatePct,
+						)
 				}
 			}
+
 			if cand <= 0 {
 				return
 			}
 
+			mode := "ScalpFixedTP"
+
+			if isRunner(book, idx) {
+				mode = "Runner"
+			}
+
 			if side == SideBuy {
-				if nearestTakeBuy == 0 || cand < nearestTakeBuy {
+				if nearestTakeBuy == 0 ||
+					cand < nearestTakeBuy {
+
 					nearestTakeBuy = cand
 					buyNearestIdx = idx
-					buyModeLabel = modeLabel(lot.ExitMode)
+					buyModeLabel = mode
 					buyNet = net
 				}
-			} else {
-				if nearestTakeSell == 0 || cand > nearestTakeSell {
+
+				return
+			}
+
+			if side == SideSell {
+				if nearestTakeSell == 0 ||
+					cand > nearestTakeSell {
+
 					nearestTakeSell = cand
 					sellNearestIdx = idx
-					sellModeLabel = modeLabel(lot.ExitMode)
+					sellModeLabel = mode
 					sellNet = net
 				}
 			}
@@ -526,34 +551,30 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			return net, net >= gateUSD
 		}
 
-		// Classify exit mode and refresh fee-aware Take preview.
+		// Refresh the fee-aware profit-gate Take preview.
 		//
-		// Runner:
-		//   trailing activation + runner trail distance.
+		// All lots use their own ProfitGateUSD to derive the preview price.
+		// Runner status is managed separately through RunnerIDs.
 		//
-		// ScalpFixedTP:
-		//   fee-aware Take derived from this lot's ProfitGateUSD.
-		setExitMode := func(book *SideBook, idx int, lot *Position) {
-			feeRatePct := t.cfg.FeeRatePct
-
-			if isRunner(book, idx) {
-				// Runner: trailing; Take = fee-aware activation price for runner USD gate (preview only)
-				lot.ExitMode = ExitModeRunnerTrailing
-				lot.TrailDistancePct = t.cfg.TrailDistancePctRunner
-				lot.TrailActivateGateUSD = t.cfg.TrailActivateUSDRunner
-				lot.Take = activationPrice(lot, lot.TrailActivateGateUSD, feeRatePct)
-				if lot.TrailPeak == 0 {
-					lot.TrailPeak = lot.OpenPrice
-				}
+		// When Case 4 later arms, Take may be replaced with the
+		// maker-friendly protected-profit exit price.
+		refreshTakePreview := func(
+			lot *Position,
+		) {
+			if lot == nil {
 				return
 			}
-			// ScalpFixedTP: Take = fee-aware profit-gate price (preview);
-			// when gate passes you’ll arm FixedTPWorking and use this for post-only exits.
+
 			gateUSD := t.lotProfitGateUSD(lot)
+
 			lot.ExitMode = ExitModeScalpFixedTP
-			lot.TrailDistancePct = 0
-			lot.TrailActivateGateUSD = gateUSD
-			lot.Take = activationPrice(lot, gateUSD, feeRatePct)
+
+			lot.Take =
+				activationPrice(
+					lot,
+					gateUSD,
+					t.cfg.FeeRatePct,
+				)
 		}
 
 		var stopL2 []exitCandidate
@@ -564,7 +585,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		// Scan one side book and close at most one lot.
 		//
 		// Flow:
-		// 1. Refresh exit mode and Take
+		// 1. Refresh fee-aware Take preview
 		// 2. Compute fee-aware net PnL
 		// 3. Update nearest snapshot
 		// 4. Skip non-profitable lots
@@ -592,8 +613,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					continue
 				}
 
-				// classify per spec
-				setExitMode(book, i, lot)
+				// refresh fee-aware profit-gate preview
+				refreshTakePreview(lot)
 
 				// compute gate
 
@@ -604,39 +625,43 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				gateUSD := t.lotProfitGateUSD(lot)
 
-				// Case 4: once the lot reaches its profit gate, protect the gain.
+				// Case 4: once any lot reaches its profit gate, protect the gain.
+				//
+				// This protection is common to both normal lots and runners.
+				// A runner remains open until Case 4 produces a protected-profit exit.
 				case4Exit = false
 				protectedFloor = 0.0
 
-				if lot.ExitMode == ExitModeScalpFixedTP {
-					if net >= gateUSD {
-						if !lot.ProfitTrailActive {
-							lot.ProfitTrailActive = true
-							lot.ProfitPeakUSD = net
+				if net >= gateUSD {
+					if !lot.ProfitTrailActive {
+						lot.ProfitTrailActive = true
+						lot.ProfitPeakUSD = net
 
-							// log.Printf(
-							// "[TRACE] case4.armed side=%s idx=%d entry_id=%s net=%.6f gate=%.6f",
-							// lot.Side,
-							// i,
-							// lot.EntryOrderID,
-							// net,
-							// gateUSD,
-							// )
-						}
-
-						if net > lot.ProfitPeakUSD {
-							lot.ProfitPeakUSD = net
-						}
+						// log.Printf(
+						// 	"[TRACE] case4.armed side=%s idx=%d entry_id=%s net=%.6f gate=%.6f runner=%t",
+						// 	lot.Side,
+						// 	i,
+						// 	lot.EntryOrderID,
+						// 	net,
+						// 	gateUSD,
+						// 	isRunner(book, i),
+						// )
 					}
 
-					if lot.ProfitTrailActive {
-						protectedFloor = math.Max(
-							gateUSD,
-							lot.ProfitPeakUSD-profitGivebackUSD,
-						)
-
-						case4Exit = net > 0 && net < protectedFloor
+					if net > lot.ProfitPeakUSD {
+						lot.ProfitPeakUSD = net
 					}
+				}
+
+				if lot.ProfitTrailActive {
+					protectedFloor = math.Max(
+						gateUSD,
+						lot.ProfitPeakUSD-profitGivebackUSD,
+					)
+
+					case4Exit =
+						net > 0 &&
+							net < protectedFloor
 				}
 
 				if case4Exit {
@@ -656,10 +681,15 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					makerExitPx := price
 
 					if lot.Side == SideBuy && offBps > 0 {
-						makerExitPx = price * (1.0 + offBps/10000.0)
+						makerExitPx =
+							price *
+								(1.0 + offBps/10000.0)
 					}
+
 					if lot.Side == SideSell && offBps > 0 {
-						makerExitPx = price * (1.0 - offBps/10000.0)
+						makerExitPx =
+							price *
+								(1.0 - offBps/10000.0)
 					}
 
 					lot.Take = makerExitPx
@@ -674,59 +704,57 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						net:          net,
 					}
 
-					profitL2 = append(profitL2, cand)
+					profitL2 = append(
+						profitL2,
+						cand,
+					)
 
 					// log.Printf(
-					// "[TRACE] case4.protection_exit side=%s idx=%d entry_id=%s net=%.6f gate=%.6f peak=%.6f floor=%.6f take=%.8f",
-					// lot.Side,
-					// i,
-					// lot.EntryOrderID,
-					// net,
-					// gateUSD,
-					// lot.ProfitPeakUSD,
-					// protectedFloor,
-					// lot.Take,
+					// 	"[TRACE] case4.protection_exit side=%s idx=%d entry_id=%s net=%.6f gate=%.6f peak=%.6f floor=%.6f take=%.8f runner=%t",
+					// 	lot.Side,
+					// 	i,
+					// 	lot.EntryOrderID,
+					// 	net,
+					// 	gateUSD,
+					// 	lot.ProfitPeakUSD,
+					// 	protectedFloor,
+					// 	lot.Take,
+					// 	isRunner(book, i),
 					// )
-					lot.ProfitTrailActive = false
-					lot.ProfitPeakUSD = 0
+
+					// Do not clear ProfitTrailActive/ProfitPeakUSD here. The exit has
+					// only been queued; if submission fails, Case 4 must remain armed
+					// so the next tick can retry protection.
+
 					i++
 					continue
+				}
 
-				} else if lot.ProfitTrailActive && net <= 0 {
-					// Protection was armed, but price moved through the protected positive
-					// range before an exit could be scheduled. Do not classify this as profit.
-					// Continue into the ordinary stop-loss path below.
-					// log.Printf(
-					// "[TRACE] case4.protection_missed side=%s idx=%d entry_id=%s net=%.6f gate=%.6f peak=%.6f floor=%.6f",
-					// lot.Side,
-					// i,
-					// lot.EntryOrderID,
-					// net,
-					// gateUSD,
-					// lot.ProfitPeakUSD,
-					// protectedFloor,
-					// )
+				// Runner positions are managed exclusively by Case 4.
+				// If Case 4 did not request an exit this tick, keep the runner open.
+				// Runners do not enter ordinary take-profit or threshold-stop-loss paths.
+				if isRunner(book, i) {
+					lot.FixedTPWorking = false
+					i++
+					continue
+				}
+
+				if lot.ProfitTrailActive && net <= 0 {
+					// Case 4 was armed, but profit moved through the positive protected
+					// range before an exit could be scheduled. This is a normal lot, so
+					// ordinary loss-management remains available below.
+					// Keep Case 4 state intact so a later profitable recovery can still
+					// be evaluated against the previously established protected floor.
 				}
 
 				strongProfitExit := net >= gateUSD*strongProfitMult
 
-				if lot.ExitMode == ExitModeScalpFixedTP {
-					pass = net >= gateUSD
-					lot.TrailActivateGateUSD = gateUSD
-				}
+				pass = net >= gateUSD
 
 				// Must be profitable first
 				// Profit gate must pass before any exit action.
-				// If profit disappears, clear transient trailing/TP state.
+				// If the gate is not passed, normal-lot loss management may apply.
 				if !pass {
-					if lot.ExitMode == ExitModeRunnerTrailing {
-						lot.TrailActive = false
-						lot.TrailPeak = 0
-						lot.TrailStop = 0
-						lot.FixedTPWorking = false
-						i++
-						continue
-					}
 
 					exitD := ExitDecision{
 						Side:             lot.Side,
@@ -792,40 +820,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					continue
 				}
 
-				// Profit gate passed.
-				// Apply exit-mode-specific behavior.
+				// Profit gate passed for a normal lot.
+				// Apply ordinary fixed-TP behavior.
 				switch lot.ExitMode {
-				case ExitModeRunnerTrailing:
-					exitD := ExitDecision{
-						Side:          lot.Side,
-						MarketRegime:  t.MarketRegime,
-						RegimeMult:    t.RegimeMultiplier,
-						ExitReason:    "trailing_stop",
-						ExitClass:     "L1_TRAILING_STOP",
-						ExitNetPNLUSD: net,
-					}
-					// Runner path.
-					// Managed by trailing activation/stop behavior.
-					if trigger, _ := t.updateRunnerTrail(lot, price); trigger {
-						// --- MINIMAL CHANGE: skip trailing-stop close if notional < ORDER_MIN_USD and CONTINUE ---
-						closeSide := SideSell
-						if lot.Side == SideSell {
-							closeSide = SideBuy
-						}
-						notional := lot.SizeBase * price
-						if notional < minNotional {
-							log.Printf("[CLOSE-SKIP] lotSide=%s closeSide=%s base=%.8f price=%.2f notional=%.2f < ORDER_MIN_USD %.2f; deferring",
-								lot.Side, closeSide, lot.SizeBase, price, notional, minNotional)
-							i++
-							continue
-						}
-						msg, err := t.closeLot(ctx, livePrice, side, i, "trailing_stop", decisionExitReason(exitD))
-						if err != nil {
-							return "", true, err
-						}
-						return msg, true, nil
-					}
-
 				case ExitModeScalpFixedTP:
 					//-------flow reminder-----------------------------
 					// ProfitGate passed
@@ -939,24 +936,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				}
 
-				//--------------------information----------------------------
-				// Take = post-only exit price
-				// FixedTPWorking = maker exit armed
-				// trigger = send maker exit attempt now
-				//----------------------------------------------------------
-
-				// nearest summary (unchanged)
-				if lot.Side == SideBuy {
-					if lot.Take > 0 && (nearestTakeBuy == 0 || lot.Take < nearestTakeBuy) {
-						nearestTakeBuy = lot.Take
-						buyNearestIdx, buyModeLabel, buyNet = i, modeLabel(lot.ExitMode), net
-					}
-				} else {
-					if lot.Take > 0 && (nearestTakeSell == 0 || lot.Take > nearestTakeSell) {
-						nearestTakeSell = lot.Take
-						sellNearestIdx, sellModeLabel, sellNet = i, modeLabel(lot.ExitMode), net
-					}
-				}
 				i++
 			}
 			return "", false, nil
@@ -2536,13 +2515,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			intent.ProducerReason =
 				d.ProducerReason
 
-			intent.EquityBuy =
-				equityTriggerBuy &&
-					side == SideBuy
-
-			intent.EquitySell =
-				equityTriggerSell &&
-					side == SideSell
+			// Runner ownership is resolved by the producer decision. Execution
+			// carries that instruction forward without inferring it from Equity.
+			intent.AssignRunner =
+				d.AssignRunner
 
 			if intent.History == nil {
 				intent.History =
@@ -2623,7 +2599,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					"[TRACE] postonly.pending.set "+
 						"producer=%s side=%s order_id=%s "+
 						"limit=%.8f base=%.8f quote=%.2f "+
-						"dl=%s eqFlags[buy=%v sell=%v]",
+						"dl=%s assign_runner=%t",
 					entry.Producer,
 					entry.Side,
 					entry.OrderID,
@@ -2631,8 +2607,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					entry.Intent.BaseAtLimit,
 					entry.Intent.Quote,
 					entry.Intent.Deadline.Format(time.RFC3339),
-					entry.Intent.EquityBuy,
-					entry.Intent.EquitySell,
+					entry.Intent.AssignRunner,
 				)
 
 				return StepResult{
@@ -3108,42 +3083,35 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 	}
 
-	old := t.lastAddEquity
-	t.lastAddEquity = t.equityUSD
-	log.Printf(
-		"[TRACE] equity.baseline.set side=%s old=%.2f new=%.2f",
-		side,
-		old,
-		t.lastAddEquity,
-	)
-
-	// Assign/designate runner logic
-	// --- CHANGED: Do NOT auto-assign runner for first/non-equity lots; instead,
-	//               promote the equity-triggered lot to runner immediately.
-	if equityTriggerSell && side == SideSell {
-		newIdx := len(book.Lots) - 1 // promote the equity trade lot to runner
-		addRunner(book, newIdx)
-		r := book.Lots[newIdx]
-		// Initialize/Reset trailing fields for the new runner
-		r.TrailActive = false
-		r.TrailPeak = r.OpenPrice
-		r.TrailStop = 0
-		// Apply runner targets (stretched TP)
-		t.applyRunnerTargets(r)
-		// log.Printf("[TRACE] runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
+	// Equity owns its baseline lifecycle. A successful fill from any other
+	// producer must not restart or suppress the Equity trigger cycle.
+	if d.Producer == EntryProducerEquity {
+		oldEquityBaseline := t.lastAddEquity
+		t.lastAddEquity = t.equityUSD
+		log.Printf(
+			"[TRACE] equity.baseline.set side=%s producer=%s old=%.2f new=%.2f",
+			side,
+			d.Producer,
+			oldEquityBaseline,
+			t.lastAddEquity,
+		)
 	}
-	// --- NEW (minimal): promote equity-triggered BUY add to runner ---
-	if equityTriggerBuy && side == SideBuy {
+
+	// Runner assignment is producer-owned. The direct-market path executes
+	// the explicit decision instruction; it does not infer runner status
+	// from Equity or from a generic policy.
+	if d.AssignRunner {
 		newIdx := len(book.Lots) - 1
 		addRunner(book, newIdx)
-		r := book.Lots[newIdx]
-		r.TrailActive = false
-		r.TrailPeak = r.OpenPrice
-		r.TrailStop = 0
-		t.applyRunnerTargets(r)
-		// log.Printf("[TRACE] runner.assign idx=%d side=%s open=%.8f take=%.8f", newIdx, side, r.OpenPrice, r.Take)
+
+		log.Printf(
+			"[PRODUCER] runner_assigned producer=%s side=%s idx=%d order_id=%s",
+			d.Producer,
+			side,
+			newIdx,
+			newLot.EntryOrderID,
+		)
 	}
-	// (If not equityTriggerSell/equityTriggerBuy, leave RunnerIDs unchanged so first lot is NOT the runner.)
 
 	msg := ""
 	msg = fmt.Sprintf("[LIVE ORDER] %s notional=%.2f take=%.2f fee=%.4f reason=%s",

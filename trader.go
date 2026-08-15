@@ -42,9 +42,8 @@ import (
 type ExitMode string
 
 const (
-	ExitModeRunnerTrailing ExitMode = "RunnerTrailing"
-	ExitModeScalpFixedTP   ExitMode = "ScalpFixedTP"
-	ExitModeDustBasket     ExitMode = "DustBasket"
+	ExitModeScalpFixedTP ExitMode = "ScalpFixedTP"
+	ExitModeDustBasket   ExitMode = "DustBasket"
 )
 
 type Position struct {
@@ -56,26 +55,18 @@ type Position struct {
 	// --- NEW: record entry fee for later P/L adjustment ---
 	EntryFee        float64
 	OpenNotionalUSD float64
-	// --- NEW (runner-only trailing fields; used only when this lot is the runner) ---
-	TrailActive bool    // becomes true after TRAIL_ACTIVATE_PCT threshold (legacy flag; now also used by USD-activate)
-	TrailPeak   float64 // best favorable price since activation (peak for long; trough for short)
-	TrailStop   float64 // current trailing stop level derived from TrailPeak and TRAIL_DISTANCE_PCT
-
 	// --- NEW: human-readable gates/why string captured at entry time ---
 	ProducerReason string `json:"reason,omitempty"`
 
 	// --- NEW (profit-gate data model) ---
 	EstExitFeeUSD    float64  `json:"est_exit_fee_usd,omitempty"` // recomputed each tick from mark
 	UnrealizedPnLUSD float64  `json:"unrealized_pnl_usd"`         // NET = gross - entry - estExit
-	ExitMode         ExitMode `json:"exit_mode,omitempty"`        // RunnerTrailing | ScalpFixedTP
+	ExitMode         ExitMode `json:"exit_mode,omitempty"`        // ScalpFixedTP | DustBasket
 	Version          int      `json:"version"`
 	FixedTPWorking   bool     `json:"-"` // internal flag: emulate a posted TP (re-post each tick while gate holds)
 	ConfidenceMult   float64  `json:"confidence_mult,omitempty"`
 	ProfitGateUSD    float64  `json:"profit_gate_usd,omitempty"`
 	EntryMethod      string   `json:"entry_method,omitempty"`
-
-	TrailActivateGateUSD float64 `json:"activate_gate_usd"` // from TRAIL_ACTIVATE_USD (runner/scalp)
-	TrailDistancePct     float64 `json:"distance_pct"`      // from TRAIL_DISTANCE_PCT (runner/scalp)
 
 	// --- NEW: track maker-first TP exit order id (post-only limit attempt) ---
 	FixedTPOrderID   string  `json:"-"`
@@ -487,126 +478,6 @@ func (t *Trader) latestEntryBySide(side OrderSide) float64 {
 		return 0
 	}
 	return book.Lots[len(book.Lots)-1].OpenPrice
-}
-
-// applyRunnerTargets adjusts stop/take for the designated runner lot.
-func (t *Trader) applyRunnerTargets(p *Position) {
-	if p == nil {
-		return
-	}
-	actUSD := t.cfg.TrailActivateUSDRunner
-	if actUSD == 0 {
-		stage := t.equityStageBuy
-		if p.Side == SideSell {
-			stage = t.equityStageSell
-		}
-
-		runnerMult := 1.0 + float64(stage)
-		if runnerMult > 6.0 {
-			runnerMult = 6.0
-		}
-
-		actUSD = runnerMult * t.cfg.ProfitGateUSD
-	}
-	if actUSD <= 0 {
-		actUSD = t.cfg.ProfitGateUSD
-	}
-	p.TrailActivateGateUSD = actUSD
-	// NEW: runner Take = fee-aware USD trailing activation price
-	p.Take = activationPrice(p, p.TrailActivateGateUSD, t.cfg.FeeRatePct)
-}
-
-// --- NEW: USD-based trailing updater for runner/scalp trailing.
-// Uses lot.UnrealizedPnLUSD populated earlier this tick.
-// Returns (shouldExit, newTrailStopIfAny).
-func (t *Trader) updateRunnerTrail(lot *Position, price float64) (bool, float64) {
-	if lot == nil {
-		return false, 0
-	}
-	// Profit gate: do nothing until net ≥ gate
-	if lot.UnrealizedPnLUSD < t.cfg.ProfitGateUSD {
-		lot.TrailActive = false
-		lot.TrailPeak = 0
-		lot.TrailStop = 0
-		return false, 0
-	}
-
-	// Determine trailing parameters by ExitMode
-	actUSD := t.cfg.TrailActivateUSDRunner
-
-	if actUSD == 0 {
-		stage := t.equityStageBuy
-		if lot.Side == SideSell {
-			stage = t.equityStageSell
-		}
-
-		runnerMult := 1.0 + float64(stage)
-		if runnerMult > 6.0 {
-			runnerMult = 6.0
-		}
-
-		actUSD = runnerMult * t.cfg.ProfitGateUSD
-	}
-
-	distPct := t.cfg.TrailDistancePctRunner
-	switch lot.ExitMode {
-	case ExitModeRunnerTrailing:
-		// default as set
-	default:
-		// Non-trailing modes should not be routed here
-		return false, 0
-	}
-
-	// Activation when Net PnL ≥ TRAIL_ACTIVATE_USD
-	if !lot.TrailActive && lot.UnrealizedPnLUSD >= actUSD {
-		lot.TrailActive = true
-		lot.TrailDistancePct = distPct
-		lot.TrailActivateGateUSD = actUSD
-		if lot.Side == SideBuy {
-			lot.TrailPeak = price
-			lot.TrailStop = price * (1.0 - distPct/100.0)
-		} else {
-			lot.TrailPeak = price // trough for short
-			lot.TrailStop = price * (1.0 + distPct/100.0)
-		}
-		// --- breadcrumb ---
-		// log.Printf("[TRACE] trail.activate side=%s activate_usd=%.2f net=%.2f price=%.8f peak=%.8f stop=%.8f",
-		// lot.Side, actUSD, lot.UnrealizedPnLUSD, price, lot.TrailPeak, lot.TrailStop)
-	}
-
-	// Maintain peak/stop while activated
-	if lot.TrailActive {
-		if lot.Side == SideBuy {
-			if price > lot.TrailPeak {
-				lot.TrailPeak = price
-				ts := lot.TrailPeak * (1.0 - distPct/100.0)
-				if ts > lot.TrailStop {
-					lot.TrailStop = ts
-					// --- breadcrumb ---
-					// log.Printf("[TRACE] trail.raise lotSide=BUY peak=%.8f stop=%.8f", lot.TrailPeak, lot.TrailStop)
-				}
-			}
-			if price <= lot.TrailStop && lot.TrailStop > 0 {
-				// --- breadcrumb ---
-				// log.Printf("[TRACE] trail.trigger lotSide=BUY price=%.8f stop=%.8f", price, lot.TrailStop)
-				return true, lot.TrailStop
-			}
-		} else { // SELL
-			if price < lot.TrailPeak {
-				lot.TrailPeak = price
-				lot.TrailStop = lot.TrailPeak * (1.0 + distPct/100.0)
-				// --- breadcrumb ---
-				// log.Printf("[TRACE] trail.raise lotSide=SELL trough=%.8f stop=%.8f", lot.TrailPeak, lot.TrailStop)
-			}
-			if price >= lot.TrailStop && lot.TrailStop > 0 {
-				// --- breadcrumb ---
-				// log.Printf("[TRACE] trail.trigger lotSide=SELL price=%.8f stop=%.8f", price, lot.TrailStop)
-				return true, lot.TrailStop
-			}
-		}
-	}
-
-	return false, lot.TrailStop
 }
 
 // --- NEW: helper to get book by side (always non-nil) ---
@@ -1318,6 +1189,7 @@ func decisionEntryReason(d EntryDecision) string {
 		fmt.Sprintf("legacySignal=%s", d.LegacySignal),
 		fmt.Sprintf("logicOpinion=%s", d.LogicOpinion),
 		fmt.Sprintf("Producer=%s", d.Producer),
+		fmt.Sprintf("assignRunner=%t", d.AssignRunner),
 		// Backward-compatible aliases.
 		// Raw and Decision remain authoritative in the fixed log prefix.
 		fmt.Sprintf("aiRaw=%s", d.Raw),
@@ -1567,24 +1439,17 @@ func (t *Trader) loadState() error {
 		Lots:      st.BookSell.Lots,
 	}
 
+	// Runner identity is carried only by SideBook.RunnerIDs.
+	// ExitMode no longer determines runner behavior. Normalize all ordinary
+	// positions to the common scalp mode while preserving dust-basket lots.
 	for _, side := range []OrderSide{SideBuy, SideSell} {
 		book := t.book(side)
-		for i, lot := range book.Lots {
-			if containsIdx(book.RunnerIDs, i) {
-				// Runner → trailing (runner params)
-				if lot.TrailDistancePct == 0 {
-					lot.TrailDistancePct = t.cfg.TrailDistancePctRunner
-				}
-				if lot.TrailActivateGateUSD == 0 {
-					lot.TrailActivateGateUSD = t.cfg.TrailActivateUSDRunner
-				}
-				if lot.ExitMode == "" {
-					lot.ExitMode = ExitModeRunnerTrailing
-				}
-			} else {
-				if lot.ExitMode == "" {
-					lot.ExitMode = ExitModeScalpFixedTP
-				}
+		for _, lot := range book.Lots {
+			if lot == nil {
+				continue
+			}
+			if lot.ExitMode != ExitModeDustBasket {
+				lot.ExitMode = ExitModeScalpFixedTP
 			}
 		}
 	}
@@ -1625,19 +1490,6 @@ func (t *Trader) loadState() error {
 	t.refundSellUSD = st.RefundSellUSD
 	t.SpareBuyUSD = st.SpareBuyUSD
 	t.SpareSellUSD = st.SpareSellUSD
-
-	// Initialize trailing baseline for any current runners (no migration; just honor existing RunnerIDs)
-	for _, side := range []OrderSide{SideBuy, SideSell} {
-		book := t.book(side)
-		for _, rid := range book.RunnerIDs {
-			if rid >= 0 && rid < len(book.Lots) {
-				r := book.Lots[rid]
-				if r.TrailPeak == 0 {
-					r.TrailPeak = r.OpenPrice
-				}
-			}
-		}
-	}
 
 	// Restart warmup for pyramiding decay/adverse tracking
 	now := time.Now().UTC()
@@ -1927,14 +1779,12 @@ func (t *Trader) RehydratePending(
 			persisted.LastAdd = &t.lastAddBuy
 			persisted.WinExtreme = &t.winLowBuy
 			persisted.LatchedGate = &t.latchedGateBuy
-			persisted.EquityTriggered = intent.EquityBuy
 
 		case SideSell:
 			persisted.Book = t.book(SideSell)
 			persisted.LastAdd = &t.lastAddSell
 			persisted.WinExtreme = &t.winHighSell
 			persisted.LatchedGate = &t.latchedGateSell
-			persisted.EquityTriggered = intent.EquitySell
 
 		default:
 			// log.Printf(
@@ -3611,8 +3461,6 @@ type PendingEntry struct {
 	WinExtreme  *float64   `json:"-"`
 	LatchedGate *float64   `json:"-"`
 
-	EquityTriggered bool
-
 	Completed bool
 
 	clearOwner func() `json:"-"`
@@ -3639,8 +3487,7 @@ type PendingIntent struct {
 	CreatedAt  time.Time
 	Deadline   time.Time
 
-	EquityBuy  bool
-	EquitySell bool
+	AssignRunner bool `json:"assign_runner,omitempty"`
 
 	// Current live exchange order ID.
 	OrderID string
@@ -3920,8 +3767,7 @@ func (t *Trader) startCase3AReplacement(
 	intent.ProductID = t.cfg.ProductID
 	intent.SourceEntryOrderID = sourceEntryOrderID
 
-	intent.EquityBuy = false
-	intent.EquitySell = false
+	intent.AssignRunner = false
 	intent.RefundPortionUSD = 0
 
 	if intent.ConfidenceMult <= 0 {
@@ -4655,7 +4501,6 @@ func (t *Trader) buildPendingEntry(
 		entry.LastAdd = &t.lastAddBuy
 		entry.WinExtreme = &t.winLowBuy
 		entry.LatchedGate = &t.latchedGateBuy
-		entry.EquityTriggered = intent.EquityBuy
 
 	case SideSell:
 		entry.Book = t.book(SideSell)
@@ -4663,7 +4508,6 @@ func (t *Trader) buildPendingEntry(
 		entry.LastAdd = &t.lastAddSell
 		entry.WinExtreme = &t.winHighSell
 		entry.LatchedGate = &t.latchedGateSell
-		entry.EquityTriggered = intent.EquitySell
 
 	default:
 		return nil, &EntryProduceError{
@@ -7376,11 +7220,10 @@ func (t *Trader) commitEntryFill(
 		)
 	}
 
-	// Promote Equity-produced entries into runners. NormalLegacy entries
-	// remain scalp-only and therefore never receive runner assignment.
-	if policy.AllowRunner &&
-		entry.EquityTriggered {
-
+	// Runner assignment is producer-owned. The commit layer executes the
+	// instruction carried by PendingIntent; it does not infer runner status
+	// from Equity or from a generic producer policy.
+	if pending.AssignRunner {
 		newIndex :=
 			len(book.Lots) - 1
 
@@ -7389,25 +7232,14 @@ func (t *Trader) commitEntryFill(
 			newIndex,
 		)
 
-		runner := book.Lots[newIndex]
-
-		runner.TrailActive = false
-		runner.TrailPeak =
-			runner.OpenPrice
-		runner.TrailStop = 0
-
-		t.applyRunnerTargets(
-			runner,
+		log.Printf(
+			"[PRODUCER] runner_assigned "+
+				"producer=%s side=%s idx=%d order_id=%s",
+			entry.Producer,
+			side,
+			newIndex,
+			newLot.EntryOrderID,
 		)
-
-		// log.Printf(
-		// "[TRACE] runner.assign idx=%d side=%s producer=%s open=%.8f take=%.8f",
-		// newIndex,
-		// side,
-		// entry.Producer,
-		// runner.OpenPrice,
-		// runner.Take,
-		// )
 	}
 
 	if policy.ResetLastAdd &&
@@ -7428,7 +7260,10 @@ func (t *Trader) commitEntryFill(
 		*entry.LatchedGate = 0
 	}
 
-	if policy.UpdateEquityBaseline {
+	// Equity owns its baseline lifecycle. A fill from another producer,
+	// including another producer that requested runner treatment, must never
+	// restart or suppress the Equity trigger cycle.
+	if entry.Producer == EntryProducerEquity {
 		oldEquityBaseline :=
 			t.lastAddEquity
 

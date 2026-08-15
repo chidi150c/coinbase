@@ -202,61 +202,6 @@ func FormatDecisionID(
 	)
 }
 
-func newProducerDecisionLifecycle(
-	d *EntryDecision,
-) (*PendingIntent, *ProducerAttempt) {
-	if d == nil ||
-		d.Producer == EntryProducerNone {
-
-		return nil, nil
-	}
-
-	createdAt := time.Now().UTC()
-
-	var side OrderSide
-
-	if resolvedSide, ok := d.SignalToSide(); ok {
-		side = resolvedSide
-	}
-
-	intent := &PendingIntent{
-		CreatedAt: createdAt,
-		DecisionID: FormatDecisionID(
-			d.Producer,
-			createdAt,
-		),
-
-		Producer:            d.Producer,
-		PendingCancelPolicy: d.PendingCancelPolicy,
-		ProducerReason:      d.ProducerReason,
-
-		Side: side,
-	}
-
-	attemptSide := fmt.Sprint(d.Signal)
-
-	if side == SideBuy ||
-		side == SideSell {
-
-		attemptSide =
-			fmt.Sprint(side)
-	}
-
-	attempt := &ProducerAttempt{
-		DecisionID: intent.DecisionID,
-		CreatedAt:  intent.CreatedAt,
-
-		Producer: intent.Producer,
-		Side:     attemptSide,
-
-		Events: make(
-			map[ProducerStage]ProducerEvent,
-		),
-	}
-
-	return intent, attempt
-}
-
 func newProducerIntentLifecycle(
 	intent *PendingIntent,
 ) *ProducerAttempt {

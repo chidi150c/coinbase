@@ -108,6 +108,158 @@ const (
 	PendingSignalCancelDisabled PendingSignalCancelPolicy = "Disabled"
 )
 
+// EntryDecision contains the final entry-side decision and all evidence used
+// to produce it.
+//
+// Exit-specific information belongs exclusively to ExitDecision.
+type EntryDecision struct {
+	// Final decision.
+	Signal       Signal
+	Raw          Signal
+	LegacySignal Signal
+	LogicOpinion Signal
+	Producer     EntryProducer
+	Confidence   float64
+
+	// AI / model context.
+	PUp           float64
+	BuyThreshold  float64
+	SellThreshold float64
+
+	// Market / interpretation context.
+	MarketRegime   MarketRegime
+	RegimeMult     float64
+	LogicEPS       float64
+	LogicBaseEPS   float64
+	LogicRegimeEPS float64
+
+	// Complete Case 5 evaluator outputs.
+	Pyramid PyramidResult
+	Equity  EquityResult
+
+	// Selected-side summary.
+	PyramidPass   bool
+	PyramidReason string
+	EquityPass    bool
+	EquityReason  string
+
+	// MACD evidence.
+	LogicMACDLine           float64
+	LogicMACDLinePrev6      float64
+	LogicMACDTurn           float64
+	LogicMACDHist           float64
+	LogicMACDDHist          float64
+	LogicMACDDSmooth        float64
+	LogicMACDStrongPositive bool
+	LogicMACDStrongNegative bool
+	LogicMACDMomentumDown   bool
+	LogicMACDMomentumUp     bool
+
+	// EMA evidence.
+	LogicEMASpread float64
+	LogicEMA2050   float64
+
+	// Pattern evidence.
+	LogicPatternHighPeak    bool
+	LogicPatternLowBottom   bool
+	LogicPatternPriceDownUp bool
+	LogicPatternPriceUpDown bool
+	LogicPatternBuy         bool
+	LogicPatternSell        bool
+
+	// Peak-reversal (Case 11A).
+	MACDPrePeakZone  bool
+	PeakReversalSell bool
+	// Bottom-reversal (Case 11B).
+	MACDPreBottomZone bool
+	BottomReversalBuy bool
+
+	// Pyramid evaluation.
+	PyramidBuySpacingPass  bool
+	PyramidBuyAdversePass  bool
+	PyramidBuyGatePassed   bool
+	PyramidSellSpacingPass bool
+	PyramidSellAdversePass bool
+	PyramidSellGatePassed  bool
+
+	// Equity evaluation.
+	EquityBuyTrigger  bool
+	EquitySellTrigger bool
+	// Case 13 — Capitulation-Bottom BUY evidence.
+	NearRecentLowPct     float64
+	PriceNearRecentLow   bool
+	NearRecentHighPct    float64
+	PriceNearRecentHigh  bool
+	ProfitGateMultiplier float64
+	ProducerReason       string
+	PendingCancelPolicy  PendingSignalCancelPolicy
+	AssignRunner         bool
+}
+
+type EntryPolicy struct {
+	ResetLastAdd     bool
+	ResetWinExtreme  bool
+	ResetLatchedGate bool
+	ResetRegime      bool
+}
+
+func entryPolicyForSource(source EntryProducer) EntryPolicy {
+	switch source {
+
+	case EntryProducerNormalLegacy:
+		return EntryPolicy{
+			ResetLastAdd:     true,
+			ResetWinExtreme:  true,
+			ResetLatchedGate: true,
+			ResetRegime:      true,
+		}
+
+	case EntryProducerEquity:
+		return EntryPolicy{
+			ResetLastAdd:     true,
+			ResetWinExtreme:  true,
+			ResetLatchedGate: true,
+			ResetRegime:      true,
+		}
+
+	case EntryProducerCase3AReplacement:
+		return EntryPolicy{
+			ResetLastAdd:     true,
+			ResetWinExtreme:  true,
+			ResetLatchedGate: true,
+			ResetRegime:      false,
+		}
+	case EntryProducerCase11APeakReversal,
+		EntryProducerCase11BBottomReversal:
+		return EntryPolicy{
+			ResetLastAdd:     true,
+			ResetWinExtreme:  true,
+			ResetLatchedGate: true,
+			ResetRegime:      false,
+		}
+
+	case EntryProducerCase13APeakSell,
+		EntryProducerCase13BBottomBuy:
+		return EntryPolicy{
+			ResetLastAdd:     true,
+			ResetWinExtreme:  true,
+			ResetLatchedGate: true,
+			ResetRegime:      false,
+		}
+
+	case EntryProducerCase14BUptrendBuy:
+		return EntryPolicy{
+			ResetLastAdd:     true,
+			ResetWinExtreme:  true,
+			ResetLatchedGate: true,
+			ResetRegime:      false,
+		}
+
+	default:
+		panic(fmt.Sprintf("entryPolicyForSource: unsupported source %q", source))
+	}
+}
+
 // applyNormalLegacyProducer evaluates the standard AI + Logic + Pyramid
 // entry producer.
 //
@@ -255,6 +407,55 @@ func applyNormalLegacyProducer(
 
 		return false
 	}
+}
+
+// newProducerDecisionLifecycle creates the lifecycle state for a producer
+// decision that has been accepted by the entry decision engine.
+//
+// It converts the transient EntryDecision into:
+//   - PendingIntent, which carries the producer's execution intent and policy
+//     through the pending/order lifecycle; and
+//   - ProducerAttempt, which provides the observability record used to track
+//     that decision through subsequent producer stages.
+//
+// Producer-owned semantics established by the decision, including Producer,
+// PendingCancelPolicy, ProducerReason, and AssignRunner, are copied into the
+// PendingIntent here so they survive beyond EntryDecision processing.
+func newProducerDecisionLifecycle(d *EntryDecision) (*PendingIntent, *ProducerAttempt) {
+	if d == nil || d.Producer == EntryProducerNone {
+		return nil, nil
+	}
+	createdAt := time.Now().UTC()
+	var side OrderSide
+	if resolvedSide, ok := d.SignalToSide(); ok {
+		side = resolvedSide
+	}
+	intent := &PendingIntent{
+		CreatedAt: createdAt,
+		DecisionID: FormatDecisionID(
+			d.Producer,
+			createdAt,
+		),
+		Producer:            d.Producer,
+		PendingCancelPolicy: d.PendingCancelPolicy,
+		ProducerReason:      d.ProducerReason,
+		AssignRunner:        d.AssignRunner,
+		Side:                side,
+	}
+	attemptSide := fmt.Sprint(d.Signal)
+	if side == SideBuy || side == SideSell {
+		attemptSide = fmt.Sprint(side)
+	}
+	attempt := &ProducerAttempt{
+		DecisionID: intent.DecisionID,
+		CreatedAt:  intent.CreatedAt,
+		Producer:   intent.Producer,
+		Side:       attemptSide,
+		Events: make(
+			map[ProducerStage]ProducerEvent,
+		),
+	}
+	return intent, attempt
 }
 
 func (t *Trader) evaluateEquityProducerMaterial(
@@ -449,6 +650,7 @@ func applyEquityProducer(
 		d.EquityPass = equityPass
 		d.EquityReason = equity.Reason
 		d.Producer = EntryProducerEquity
+		d.AssignRunner = true
 		d.PendingCancelPolicy = PendingSignalCancelOnOpposite
 		d.ProducerReason = fmt.Sprintf(
 			"equity_buy|"+
@@ -515,6 +717,7 @@ func applyEquityProducer(
 		d.EquityReason = equity.Reason
 		d.PendingCancelPolicy = PendingSignalCancelOnOpposite
 		d.Producer = EntryProducerEquity
+		d.AssignRunner = true
 		d.ProducerReason = fmt.Sprintf(
 			"equity_sell|"+
 				"ai_raw=%s|logic=%s|"+
