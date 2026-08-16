@@ -570,7 +570,8 @@ func (t *Trader) markProducerExitedIfNotLiveLocked(
 				recordProducerRealizedPnLLocked() already accumulated
 				every partial/final realized contribution.
 			*/
-			PnL: matchedAttempt.RealizedPnLUSD,
+			PnL:   matchedAttempt.RealizedPnLUSD,
+			Price: rec.ClosePrice,
 		}
 
 	return true
