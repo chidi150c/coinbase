@@ -2286,8 +2286,13 @@ func (t *Trader) closeLot(
 	// =============================================================================
 
 	Case3ALossUSD := 0.0
-	// Prepare an empty PendingIntent in case Case 3A recovery becomes necessary.
+
+	// Case3A owns one producer lifecycle per qualifying losing SELL stop.
+	// The lifecycle is created at detection time (stage=decision) and then
+	// enriched through Mode A / Mode B evaluation and, when possible, the
+	// ordinary produced -> pending -> filled -> committed entry lifecycle.
 	var repl PendingIntent
+	var case3AAttempt *ProducerAttempt
 	// Estimate the exit fee
 	estExitFee := quote * (t.cfg.FeeRatePct / 100.0)
 	// Estimate the commission that would be paid if the position were closed at the current price.
@@ -2323,6 +2328,46 @@ func (t *Trader) closeLot(
 
 		if net < 0 {
 			Case3ALossUSD = -net
+
+			// A losing SELL threshold stop is the Case3A decision boundary.
+			// Create the producer lifecycle immediately so blocked recovery
+			// attempts remain observable instead of disappearing silently.
+			repl = PendingIntent{
+				Side:                SideSell,
+				SourceEntryOrderID:  lot.EntryOrderID,
+				Producer:            EntryProducerCase3AReplacement,
+				PendingCancelPolicy: PendingSignalCancelDisabled,
+				ProducerReason: fmt.Sprintf(
+					"case3A_decision|"+
+						"source_producer=%s|source_side=%s|"+
+						"source_exit=threshold_stop_loss|"+
+						"source_net_pnl=%.6f|loss_usd=%.6f|"+
+						"regime=%s|source_order_id=%s",
+					lot.Producer,
+					lot.Side,
+					net,
+					Case3ALossUSD,
+					t.MarketRegime,
+					lot.EntryOrderID,
+				),
+			}
+
+			case3AAttempt = newProducerIntentLifecycle(&repl)
+			if case3AAttempt == nil {
+				return "", errors.New(
+					"Case3A decision: failed to create producer lifecycle",
+				)
+			}
+
+			t.addDecisionProducerEvent(
+				&repl,
+				case3AAttempt,
+				ProducerStageDecision,
+				"",
+				nil,
+				false,
+				true,
+			)
 
 			// log.Printf(
 			// "[TRACE] Case3A.detect side=%s closeSide=%s regime=%s entry_price=%.8f stop_price=%.8f base=%.8f net_loss=%.6f",
@@ -2362,6 +2407,13 @@ func (t *Trader) closeLot(
 					recoveryPerBase := priceMove
 
 					if recoveryPerBase <= 0 {
+						repl.ProducerReason = fmt.Sprintf(
+							"case3A_decision_blocked|reason=non_positive_recovery_per_base|"+
+								"recovery_per_base=%.8f|price_move=%.8f|recovery_usd=%.6f|source_order_id=%s",
+							recoveryPerBase, priceMove, recoveryNetUSD, lot.EntryOrderID,
+						)
+						t.addDecisionProducerEvent(&repl, case3AAttempt, ProducerStageDecisionBlocked, "", nil, false, true)
+
 						// log.Printf(
 						// "[TRACE] Case3A.recovery_per_base.skip side=%s regime=%s recovery_net=%.6f price_move=%.8f recovery_per_base=%.8f reason=non_positive_recovery_move",
 						// lot.Side,
@@ -2391,71 +2443,69 @@ func (t *Trader) closeLot(
 
 						modeARequiredBase := normalBase + extraBase
 
-						switch {
-						case freshSpareBase >= modeARequiredBase:
+						if freshSpareBase >= modeARequiredBase {
 							// Mode A is permitted in every regime, including UP.
-							repl = PendingIntent{
-								Enabled:             true,
-								Side:                SideSell,
-								LimitPx:             replacementEntryPrice,
-								BaseAtLimit:         modeARequiredBase,
-								RecoveryNetUSD:      recoveryNetUSD,
-								RecoveryMethod:      RecoveryByPositionSize,
-								ProfitGateUSD:       t.cfg.ProfitGateUSD,
-								SourceEntryOrderID:  lot.EntryOrderID,
-								Producer:            EntryProducerCase3AReplacement,
-								PendingCancelPolicy: PendingSignalCancelDisabled,
-								ProducerReason: fmt.Sprintf(
-									"case3A_replacement|"+
-										"method=%s|"+
-										"recovery_usd=%.6f|"+
-										"regime=%s|"+
-										"source_order_id=%s",
-									RecoveryByPositionSize.String(),
-									recoveryNetUSD,
-									t.MarketRegime,
-									lot.EntryOrderID,
-								),
-							}
-						case t.MarketRegime == RegimeDown:
-							// Mode B remains the insufficient-spare fallback only in DOWN regime.
-							repl = PendingIntent{
-								Enabled:             true,
-								Side:                SideSell,
-								LimitPx:             replacementEntryPrice,
-								BaseAtLimit:         normalBase,
-								RecoveryNetUSD:      recoveryNetUSD,
-								RecoveryMethod:      RecoveryByProfitTarget,
-								ProfitGateUSD:       t.cfg.ProfitGateUSD + recoveryNetUSD,
-								SourceEntryOrderID:  lot.EntryOrderID,
-								Producer:            EntryProducerCase3AReplacement,
-								PendingCancelPolicy: PendingSignalCancelDisabled,
-								ProducerReason: fmt.Sprintf(
-									"case3A_replacement|"+
-										"method=%s|"+
-										"recovery_usd=%.6f|"+
-										"regime=%s|"+
-										"source_order_id=%s",
-									RecoveryByProfitTarget.String(),
-									recoveryNetUSD,
-									t.MarketRegime,
-									lot.EntryOrderID,
-								),
+							repl.Enabled = true
+							repl.LimitPx = replacementEntryPrice
+							repl.BaseAtLimit = modeARequiredBase
+							repl.RecoveryNetUSD = recoveryNetUSD
+							repl.RecoveryMethod = RecoveryByPositionSize
+							repl.ProfitGateUSD = t.cfg.ProfitGateUSD
+							repl.ProducerReason = fmt.Sprintf(
+								"case3A_replacement|method=%s|recovery_usd=%.6f|regime=%s|source_order_id=%s",
+								RecoveryByPositionSize.String(),
+								recoveryNetUSD,
+								t.MarketRegime,
+								lot.EntryOrderID,
+							)
+						} else {
+							modeAReason := fmt.Sprintf(
+								"case3A_mode_a_blocked|reason=insufficient_spare_base|"+
+									"spare_base=%.8f|required_base=%.8f|normal_base=%.8f|extra_base=%.8f|"+
+									"recovery_usd=%.6f|regime=%s|source_order_id=%s",
+								freshSpareBase, modeARequiredBase, normalBase, extraBase,
+								recoveryNetUSD, t.MarketRegime, lot.EntryOrderID,
+							)
+							if err != nil {
+								modeAReason = fmt.Sprintf(
+									"case3A_mode_a_blocked|reason=spare_base_lookup_failed|error=%q|"+
+										"required_base=%.8f|normal_base=%.8f|extra_base=%.8f|"+
+										"recovery_usd=%.6f|regime=%s|source_order_id=%s",
+									err.Error(), modeARequiredBase, normalBase, extraBase,
+									recoveryNetUSD, t.MarketRegime, lot.EntryOrderID,
+								)
 							}
 
-						default:
-							// UP/NORMAL with insufficient spare cannot safely run Mode A.
-							// Do not fabricate an oversized replacement request.
-							// log.Printf(
-							// "[TRACE] Case3A.modeA.blocked side=%s regime=%s spare_base=%.8f required_base=%.8f normal_base=%.8f extra_base=%.8f recovery=%.6f",
-							// lot.Side,
-							// t.MarketRegime,
-							// freshSpareBase,
-							// modeARequiredBase,
-							// normalBase,
-							// extraBase,
-							// recoveryNetUSD,
-							// )
+							repl.ProducerReason = modeAReason
+							t.addDecisionProducerEvent(&repl, case3AAttempt, ProducerStageCase3AModeABlocked, "", nil, false, true)
+
+							if t.MarketRegime == RegimeDown {
+								// Mode B is the insufficient-spare fallback only in DOWN regime.
+								repl.Enabled = true
+								repl.LimitPx = replacementEntryPrice
+								repl.BaseAtLimit = normalBase
+								repl.RecoveryNetUSD = recoveryNetUSD
+								repl.RecoveryMethod = RecoveryByProfitTarget
+								repl.ProfitGateUSD = t.cfg.ProfitGateUSD + recoveryNetUSD
+								repl.ProducerReason = fmt.Sprintf(
+									"case3A_replacement|method=%s|recovery_usd=%.6f|regime=%s|source_order_id=%s",
+									RecoveryByProfitTarget.String(), recoveryNetUSD, t.MarketRegime, lot.EntryOrderID,
+								)
+							} else {
+								repl.ProducerReason = fmt.Sprintf(
+									"case3A_mode_b_blocked|reason=regime_not_down|regime=%s|required_regime=%s|"+
+										"recovery_usd=%.6f|source_order_id=%s",
+									t.MarketRegime, RegimeDown, recoveryNetUSD, lot.EntryOrderID,
+								)
+								t.addDecisionProducerEvent(&repl, case3AAttempt, ProducerStageCase3AModeBBlocked, "", nil, false, true)
+
+								repl.ProducerReason = fmt.Sprintf(
+									"case3A_decision_blocked|reason=no_recovery_mode_available|regime=%s|"+
+										"recovery_usd=%.6f|source_order_id=%s",
+									t.MarketRegime, recoveryNetUSD, lot.EntryOrderID,
+								)
+								t.addDecisionProducerEvent(&repl, case3AAttempt, ProducerStageDecisionBlocked, "", nil, false, true)
+							}
 						}
 
 						if repl.Enabled {
@@ -2475,13 +2525,12 @@ func (t *Trader) closeLot(
 					}
 
 				} else {
-					// log.Printf(
-					// "[TRACE] Case3A.extra_base.skip side=%s recovery_net=%.6f stop_entry=%.8f recovery_exit=%.8f reason=no_positive_sell_recovery_move",
-					// lot.Side,
-					// recoveryNetUSD,
-					// replacementEntryPrice,
-					// recoveryExitPrice,
-					// )
+					repl.ProducerReason = fmt.Sprintf(
+						"case3A_decision_blocked|reason=no_positive_recovery_move|"+
+							"replacement_entry=%.8f|recovery_exit=%.8f|price_move=%.8f|recovery_usd=%.6f|source_order_id=%s",
+						replacementEntryPrice, recoveryExitPrice, priceMove, recoveryNetUSD, lot.EntryOrderID,
+					)
+					t.addDecisionProducerEvent(&repl, case3AAttempt, ProducerStageDecisionBlocked, "", nil, false, true)
 				}
 			}
 		}
@@ -2505,16 +2554,20 @@ func (t *Trader) closeLot(
 		repl.RecoveryMethod == RecoveryByPositionSize {
 
 		if lot.Case3AReplacementStarted {
-			// Replacement already exists for this source lot.
-			// Do not create another Case3A producer attempt.
+			// Replacement already exists for this source lot. The new stop-loss
+			// qualification remains observable, but it must not create another
+			// replacement order for the same source exposure.
+			repl.ProducerReason = fmt.Sprintf(
+				"case3A_decision_blocked|reason=replacement_already_started|replacement_order_id=%s|source_order_id=%s",
+				lot.Case3AReplacementOrderID, lot.EntryOrderID,
+			)
+			t.addDecisionProducerEvent(&repl, case3AAttempt, ProducerStageDecisionBlocked, "", nil, false, true)
 
 		} else {
-			attempt := newProducerIntentLifecycle(
-				&repl,
-			)
+			attempt := case3AAttempt
 			if attempt == nil {
 				return "", errors.New(
-					"Case3A modeA: failed to create producer lifecycle",
+					"Case3A modeA: missing decision lifecycle",
 				)
 			}
 
@@ -2697,48 +2750,50 @@ func (t *Trader) closeLot(
 			prepared while that exit is pending, but any deferred Mode B retry must wait
 			until the originating losing position has actually committed its exit.
 		*/
-		attempt := newProducerIntentLifecycle(
-			&repl,
-		)
-		if attempt == nil {
-			return "", errors.New(
-				"Case3A modeB pending-exit: failed to create producer lifecycle",
+		if repl.Enabled &&
+			repl.RecoveryMethod == RecoveryByProfitTarget {
+
+			attempt := case3AAttempt
+			if attempt == nil {
+				return "", errors.New(
+					"Case3A modeB pending-exit: missing decision lifecycle",
+				)
+			}
+
+			t.mu.Unlock()
+
+			_, replErr := t.startCase3AReplacement(
+				ctx,
+				&repl,
+				attempt,
 			)
-		}
 
-		t.mu.Unlock()
+			t.mu.Lock()
 
-		_, replErr := t.startCase3AReplacement(
-			ctx,
-			&repl,
-			attempt,
-		)
+			// t.mu is held again here; record the same enriched attempt mechanically.
+			t.recordProducerAttemptLocked(attempt)
+			if err := t.saveProducerHistoryNoLock(); err != nil {
+				log.Printf(
+					"[WARN] producer history save failed "+
+						"producer=%s decision_id=%s err=%v",
+					attempt.Producer,
+					attempt.DecisionID,
+					err,
+				)
+			}
 
-		t.mu.Lock()
-
-		// t.mu is held again here; record the same enriched attempt mechanically.
-		t.recordProducerAttemptLocked(attempt)
-		if err := t.saveProducerHistoryNoLock(); err != nil {
-			log.Printf(
-				"[WARN] producer history save failed "+
-					"producer=%s decision_id=%s err=%v",
-				attempt.Producer,
-				attempt.DecisionID,
-				err,
-			)
-		}
-
-		if replErr != nil {
-			/*
-				The wrapper has already performed immediate cleanup when required.
-				This higher-level handler decides retry / non-retry /
-				cleanup-uncertain policy for the returned EntryProduceError.
-			*/
-			t.handleCase3AReplacementError(
-				repl,
-				waitID,
-				replErr,
-			)
+			if replErr != nil {
+				/*
+					The wrapper has already performed immediate cleanup when required.
+					This higher-level handler decides retry / non-retry /
+					cleanup-uncertain policy for the returned EntryProduceError.
+				*/
+				t.handleCase3AReplacementError(
+					repl,
+					waitID,
+					replErr,
+				)
+			}
 		}
 
 		return fmt.Sprintf(
@@ -2841,12 +2896,10 @@ func (t *Trader) closeLot(
 			startCase3AReplacement() may acquire t.mu inside produceEntry(), so
 			release closeLot's lock while the replacement pipeline runs.
 		*/
-		attempt := newProducerIntentLifecycle(
-			&repl,
-		)
+		attempt := case3AAttempt
 		if attempt == nil {
 			return "", errors.New(
-				"Case3A modeB market-exit: failed to create producer lifecycle",
+				"Case3A modeB market-exit: missing decision lifecycle",
 			)
 		}
 

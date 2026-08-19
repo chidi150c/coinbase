@@ -39,6 +39,11 @@ const (
 	ProducerStageDecisionDeferred ProducerStage = "decision_deferred"
 	ProducerStageSizingReduced    ProducerStage = "sizing_reduced"
 
+	// Case3A recovery-mode evaluation stages preserve the sequential
+	// decision path under one Case3AReplacement DecisionID.
+	ProducerStageCase3AModeABlocked ProducerStage = "case3a_mode_a_blocked"
+	ProducerStageCase3AModeBBlocked ProducerStage = "case3a_mode_b_blocked"
+
 	ProducerStageCleanupCancelled    ProducerStage = "cleanup_cancelled"
 	ProducerStageCleanupCancelFailed ProducerStage = "cleanup_cancel_failed"
 
