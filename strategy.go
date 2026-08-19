@@ -1768,7 +1768,19 @@ func (t *Trader) combineEntryRawMaterials(
 	// -------------------------------------------------------------
 	// Case 13 — Independent persistent-trend reversal producers.
 	// -------------------------------------------------------------
-	if applyCase13Producer(&d, ai, macd, ema, pyramid, price, t.RecentLow, t.RecentHigh, t.MarketRegime, pendingCounts) {
+	if applyCase13Producer(
+		&d,
+		ai,
+		macd,
+		ema,
+		pyramid,
+		price,
+		t.RecentLow,
+		t.RecentHigh,
+		t.MarketRegime,
+		pendingCounts,
+		t.case13AReferencePrice,
+	) {
 		return d
 	}
 

@@ -1174,6 +1174,15 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			Signal: Flat,
 		}, nil
 	}
+	// Reset Case13A on the AI transition itself, before any later evaluator
+	// can cause this tick to return early. afterStepStateUpdate() writes this
+	// tick's Raw only after step() returns, so t.previousAIRaw is still the
+	// preceding tick here.
+	if t.previousAIRaw != Buy &&
+		aiResult.Raw == Buy {
+		t.case13AReferencePrice = 0
+	}
+
 	if macdSnapshot.Err != nil {
 		// log.Printf(
 		// "[TRACE] case5.macd.failed elapsed_ms=%d err=%v",
@@ -1263,6 +1272,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			Signal: Flat,
 		}, nil
 	}
+
 	// Only timer-extension maintenance from raw evaluation.
 	t.applyPyramidRawTransitions(
 		pyramidRaw.State,
@@ -3149,6 +3159,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			Raw:    d.Raw,
 			Signal: d.Signal,
 		}, err
+	}
+
+	// Only a successful Case13A fill/commit advances the reference, using
+	// the actual fill price selected above.
+	if d.Producer == EntryProducerCase13APeakSell {
+		t.case13AReferencePrice = priceToUse
 	}
 
 	// Exchange fill is now represented by a successfully persisted local Position.

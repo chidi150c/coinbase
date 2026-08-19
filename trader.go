@@ -178,6 +178,10 @@ type Trader struct {
 	equityUSD     float64
 	previousAIRaw Signal
 
+	// Case13A re-entry reference. Zero means the next Case13A SELL is the
+	// first entry of a fresh episode and must use global SELL spacing.
+	case13AReferencePrice float64
+
 	// NEW: path to persisted state file
 	stateFile string
 
@@ -7387,6 +7391,12 @@ func (t *Trader) commitEntryFill(
 
 			Err: err,
 		}
+	}
+
+	// Only a successful asynchronous Case13A fill/commit advances the
+	// reference, using the actual broker execution price.
+	if entry.Producer == EntryProducerCase13APeakSell {
+		t.case13AReferencePrice = priceToUse
 	}
 
 	log.Printf(

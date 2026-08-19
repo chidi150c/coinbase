@@ -923,6 +923,7 @@ func applyCase13Producer(
 	recentHigh float64,
 	regime MarketRegime,
 	pendingCounts PendingProducerCounts,
+	case13AReferencePrice float64,
 ) bool {
 	if applyCase13APeakProducer(
 		d,
@@ -934,6 +935,7 @@ func applyCase13Producer(
 		recentHigh,
 		regime,
 		pendingCounts,
+		case13AReferencePrice,
 	) {
 		return true
 	}
@@ -984,34 +986,44 @@ func applyCase13APeakProducer(
 	recentHigh float64,
 	regime MarketRegime,
 	pendingCounts PendingProducerCounts,
+	case13AReferencePrice float64,
 ) bool {
 	const (
 		minConfidence        = 0.65
 		maxNearPeakPct       = 0.10
 		profitGateMultiplier = 0.50
+		case13AReentryPct    = 0.10
 	)
 
-	// Case 12 extension for Case 13A:
-	//
-	// The first Case13A SELL may qualify without the adverse latch.
-	// While another Case13A SELL remains pending, a subsequent Case13A
-	// SELL must reach the advanced SELL latch.
 	case13APending :=
 		pendingCounts.Count(
 			EntryProducerCase13APeakSell,
 			SideSell,
 		)
 
-	case13AAdverseRequired :=
-		case13APending > 0
+	// Pending count is the simultaneous-duplicate guard.
+	case13AAvailable :=
+		case13APending == 0
 
-	sellAdverseReached :=
-		pyramid.Sell.Latched > 0 &&
-			price >= pyramid.Sell.Latched
+	firstCase13A :=
+		case13AReferencePrice <= 0
 
-	case13AAdversePass :=
-		!case13AAdverseRequired ||
-			sellAdverseReached
+	nextCase13AReentryPrice := 0.0
+	case13AReentryPass := false
+
+	if firstCase13A {
+		// First Case13A after reset retains the existing global SELL spacing.
+		case13AReentryPass =
+			pyramid.Sell.SpacingPass
+	} else {
+		nextCase13AReentryPrice =
+			case13AReferencePrice *
+				(1.0 + case13AReentryPct/100.0)
+
+		// Subsequent Case13A SELLs bypass global spacing and require +0.10%.
+		case13AReentryPass =
+			price >= nextCase13AReentryPrice
+	}
 
 	nearPeakPct := 0.0
 	priceNearRecentHigh := false
@@ -1030,17 +1042,15 @@ func applyCase13APeakProducer(
 	d.NearRecentHighPct = nearPeakPct
 	d.PriceNearRecentHigh = priceNearRecentHigh
 
-	// The arm identifies the complete peak environment.
-	//
-	// Case13A normally requires only Pyramid SELL spacing. However, when
-	// another Case13A SELL is already pending, it additionally requires
-	// price to reach the SELL latch advanced during pending registration.
+	// priceNearRecentHigh, confidence, regime, MACD and EMA HighPeak remain
+	// normal Case13A qualification conditions. The reference mechanism only
+	// replaces the duplicate/re-entry spacing behavior.
 	peakSellArm :=
-		ai.Raw == Sell &&
+		case13AAvailable &&
+			case13AReentryPass &&
+			ai.Raw == Sell &&
 			ai.Confidence >= minConfidence &&
 			regime == RegimeUp &&
-			pyramid.Sell.SpacingPass &&
-			case13AAdversePass &&
 			priceNearRecentHigh &&
 			macd.LinePrev6 > 0 &&
 			macd.Line > 0 &&
@@ -1054,14 +1064,10 @@ func applyCase13APeakProducer(
 	// log.Printf(
 	// 	"[TRACE] case13A.peak_sell.evaluate "+
 	// 		"ai_raw=%s confidence=%.2f min_confidence=%.2f regime=%s "+
-	// 		"price=%.8f recent_peak=%.8f near_peak_pct=%.6f "+
-	// 		"price_near_peak=%t "+
-	// 		"macd_idx6=%.6f macd_line=%.6f macd_hist=%.6f "+
-	// 		"ema_high_peak=%t "+
-	// 		"pyramid_spacing=%t "+
-	// 		"pending_count=%d adverse_required=%t "+
-	// 		"sell_latched=%.8f adverse_reached=%t adverse_pass=%t "+
-	// 		"arm=%t producer=%t|profit_gate_mult=%.2f",
+	// 		"price=%.8f recent_peak=%.8f near_peak_pct=%.6f price_near_peak=%t "+
+	// 		"macd_idx6=%.6f macd_line=%.6f macd_hist=%.6f ema_high_peak=%t "+
+	// 		"pending_count=%d first=%t spacing=%t reference=%.8f next_reentry=%.8f "+
+	// 		"reentry_pass=%t arm=%t producer=%t profit_gate_mult=%.2f",
 	// 	ai.Raw,
 	// 	ai.Confidence,
 	// 	minConfidence,
@@ -1074,12 +1080,12 @@ func applyCase13APeakProducer(
 	// 	macd.Line,
 	// 	macd.Hist,
 	// 	ema.HighPeak,
-	// 	pyramid.Sell.SpacingPass,
 	// 	case13APending,
-	// 	case13AAdverseRequired,
-	// 	pyramid.Sell.Latched,
-	// 	sellAdverseReached,
-	// 	case13AAdversePass,
+	// 	firstCase13A,
+	// 	pyramid.Sell.SpacingPass,
+	// 	case13AReferencePrice,
+	// 	nextCase13AReentryPrice,
+	// 	case13AReentryPass,
 	// 	peakSellArm,
 	// 	peakSell,
 	// 	profitGateMultiplier,
@@ -1090,30 +1096,26 @@ func applyCase13APeakProducer(
 	}
 
 	d.Signal = Sell
-
-	// Case13A requires SELL spacing. The complete ordinary Pyramid gate
-	// is not required for the first entry. Its advanced latch is required
-	// only when another Case13A SELL is already pending.
-	// d.PyramidPass =
-	// 	pyramid.Sell.SpacingPass &&
-	// 		case13AAdversePass
 	d.PyramidReason = pyramid.Sell.Reason
-
 	d.ProfitGateMultiplier = profitGateMultiplier
 	d.Producer = EntryProducerCase13APeakSell
 	d.PendingCancelPolicy = PendingSignalCancelDisabled
+
+	referenceMode := "reference"
+	if firstCase13A {
+		referenceMode = "first_spacing"
+	}
+
 	d.ProducerReason = fmt.Sprintf(
 		"peak_sell|"+
 			"confidence=%.2f|regime=%s|"+
 			"near_peak_pct=%.6f|"+
 			"macd_idx6=%.6f|macd_line=%.6f|macd_hist=%.6f|"+
 			"ema_high_peak=%t|"+
-			"spacing=%t|"+
 			"pending=%d|"+
-			"adverse_required=%t|"+
-			"sell_latched=%.8f|"+
-			"adverse_reached=%t|"+
-			"adverse_pass=%t|profit_gate_mult=%.2f",
+			"reference_mode=%s|reference_price=%.8f|"+
+			"next_reentry_price=%.8f|reentry_pct=%.2f|"+
+			"spacing=%t|reentry_pass=%t|profit_gate_mult=%.2f",
 		ai.Confidence,
 		regime,
 		nearPeakPct,
@@ -1121,12 +1123,13 @@ func applyCase13APeakProducer(
 		macd.Line,
 		macd.Hist,
 		ema.HighPeak,
-		pyramid.Sell.SpacingPass,
 		case13APending,
-		case13AAdverseRequired,
-		pyramid.Sell.Latched,
-		sellAdverseReached,
-		case13AAdversePass,
+		referenceMode,
+		case13AReferencePrice,
+		nextCase13AReentryPrice,
+		case13AReentryPct,
+		pyramid.Sell.SpacingPass,
+		case13AReentryPass,
 		profitGateMultiplier,
 	)
 

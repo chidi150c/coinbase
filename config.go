@@ -88,8 +88,8 @@ type Config struct {
 	ScalpTPMinPct      float64
 
 	// USD trailing / profit gates
-	ProfitGateUSD          float64
-	TPMakerOffsetBps       float64 // maker offset for fixed-TP exits
+	ProfitGateUSD    float64
+	TPMakerOffsetBps float64 // maker offset for fixed-TP exits
 
 	// Ramping
 	RampEnable   bool
@@ -208,8 +208,8 @@ func loadConfigFromEnv() Config {
 		ScalpTPMinPct:      getEnvFloat("SCALP_TP_MIN_PCT", 0.0),
 
 		// USD trailing / profit gates
-		ProfitGateUSD:          getEnvFloat("PROFIT_GATE_USD", 1.16),
-		TPMakerOffsetBps:       getEnvFloat("TP_MAKER_OFFSET_BPS", 0.0),
+		ProfitGateUSD:    getEnvFloat("PROFIT_GATE_USD", 1.16),
+		TPMakerOffsetBps: getEnvFloat("TP_MAKER_OFFSET_BPS", 0.0),
 
 		// Ramping
 		RampEnable:   getEnvBool("RAMP_ENABLE", false),
