@@ -467,12 +467,41 @@ func (t *Trader) evaluateEquityProducerMaterial(
 	reservedLongBase float64,
 ) (EquityResult, error) {
 	equityRaw := t.evaluateEquityRaw()
-	legacy :=
-		evaluateLegacyDirection(
-			ai,
-			macd,
-			ema,
+
+	/*
+		Equity owns its own direction.
+
+		BUY:
+			current Equity has crossed the configured BUY Equity threshold.
+
+		SELL:
+			current Equity has crossed the configured SELL Equity threshold.
+
+		AI, MACD, EMA, Legacy, and Pyramid do not determine Equity direction.
+	*/
+	equitySignal := Flat
+
+	switch {
+	case equityRaw.BuyThresholdPassed &&
+		equityRaw.SellThresholdPassed:
+
+		return EquityResult{}, fmt.Errorf(
+			"ambiguous equity thresholds: "+
+				"equity=%.8f baseline=%.8f "+
+				"buy_trigger=%.8f sell_trigger=%.8f",
+			equityRaw.EquityUSD,
+			equityRaw.BaselineUSD,
+			equityRaw.BuyTriggerUSD,
+			equityRaw.SellTriggerUSD,
 		)
+
+	case equityRaw.BuyThresholdPassed:
+		equitySignal = Buy
+
+	case equityRaw.SellThresholdPassed:
+		equitySignal = Sell
+	}
+
 	var (
 		symQ       string
 		availQuote float64
@@ -486,8 +515,14 @@ func (t *Trader) evaluateEquityProducerMaterial(
 		spareBase  float64
 	)
 
-	if legacy.Signal == Buy ||
-		legacy.Signal == Sell {
+	/*
+		Only obtain funding when Equity itself has produced a directional
+		candidate.
+
+		This lookup is intentionally independent of Legacy/AI direction.
+	*/
+	if equitySignal == Buy ||
+		equitySignal == Sell {
 
 		equityBalance, ok :=
 			t.getBalanceSpare(
@@ -508,14 +543,15 @@ func (t *Trader) evaluateEquityProducerMaterial(
 
 			return EquityResult{}, fmt.Errorf(
 				"equity balance cache unavailable: "+
-					"legacy=%s age_ms=%d",
-				legacy.Signal,
+					"equity_signal=%s age_ms=%d",
+				equitySignal,
 				ageMS,
 			)
 		}
 
 		availQuote = equityBalance.AvailQuote
 		quoteStep = equityBalance.QuoteStep
+
 		availBase = equityBalance.AvailBase
 		baseStep = equityBalance.BaseStep
 
@@ -527,17 +563,20 @@ func (t *Trader) evaluateEquityProducerMaterial(
 
 		log.Printf(
 			"[TRACE] equity.balance_cache.hit "+
-				"legacy=%s age_ms=%d "+
-				"quote=%.8f base=%.8f",
-			legacy.Signal,
+				"equity_signal=%s age_ms=%d "+
+				"quote=%.8f base=%.8f "+
+				"spare_quote=%.8f spare_base=%.8f",
+			equitySignal,
 			time.Since(
 				equityBalance.Snapshot.UpdatedAt,
 			).Milliseconds(),
 			availQuote,
 			availBase,
+			spareQuote,
+			spareBase,
 		)
 
-		switch legacy.Signal {
+		switch equitySignal {
 		case Buy:
 			if strings.TrimSpace(symQ) == "" ||
 				quoteStep <= 0 {
@@ -564,10 +603,18 @@ func (t *Trader) evaluateEquityProducerMaterial(
 		}
 	}
 
+	/*
+		interpretEquityRaw historically names this directional input
+		legacySignal.
+
+		For Equity it is now the Equity-owned direction. This preserves
+		the existing EquityResult structure without restoring a dependency
+		on Legacy.
+	*/
 	equityResult :=
 		interpretEquityRaw(
 			equityRaw,
-			legacy.Signal,
+			equitySignal,
 			spareQuote,
 			spareBase,
 			quoteStep,
@@ -585,17 +632,15 @@ func (t *Trader) evaluateEquityProducerMaterial(
 	return equityResult, nil
 }
 
-// applyEquityProducer evaluates the AI + Logic + Pyramid + Equity producer.
+// applyEquityProducer evaluates the independent Equity producer.
 //
-// Equity is independently attributed, but it still requires:
+// Equity owns its entry direction:
 //
-//   - a resolved legacy BUY or SELL direction;
-//   - the matching complete Pyramid gate; and
-//   - the matching Equity trigger.
-//   - the matching Equity trigger.
+//   - BUY when the BUY Equity threshold passes and BUY funding is available.
+//   - SELL when the SELL Equity threshold passes and SELL funding is available.
 //
-// The Pyramid result remains attached as diagnostics, but it does not gate
-// an Equity-triggered entry.
+// AI, Logic, Legacy, and Pyramid are retained as diagnostics only.
+// They do not gate an Equity-triggered entry.
 func applyEquityProducer(
 	d *EntryDecision,
 	ai AIResult,
@@ -608,6 +653,10 @@ func applyEquityProducer(
 		return false
 	}
 
+	/*
+		Legacy remains useful forensic context, but it has no authority
+		over whether Equity produces.
+	*/
 	legacy :=
 		evaluateLegacyDirection(
 			ai,
@@ -615,60 +664,49 @@ func applyEquityProducer(
 			ema,
 		)
 
-	switch ai.Raw {
-	case Buy:
+	switch {
+	case equity.BuyTrigger:
 		pyramidPass :=
 			pyramid.Buy.GatePassed
 
-		equityPass :=
-			equity.BuyTrigger
-
-		produced := equityPass
-
-		// log.Printf(
-		// 	"[TRACE] equity.buy.evaluate "+
-		// 		"ai_raw=%s logic=%s legacy=%s "+
-		// 		"pyramid_gate=%t equity_trigger=%t produced=%t "+
-		// 		"equity=%.2f baseline=%.2f",
-		// 	ai.Raw,
-		// 	legacy.LogicOpinion,
-		// 	legacy.Signal,
-		// 	pyramidPass,
-		// 	equityPass,
-		// 	produced,
-		// 	equity.Raw.EquityUSD,
-		// 	equity.Raw.BaselineUSD,
-		// )
-
-		if !produced {
-			return false
-		}
-
 		d.Signal = Buy
+
+		// Diagnostic only.
 		d.LogicOpinion = legacy.LogicOpinion
 		d.LegacySignal = legacy.Signal
 		d.PyramidPass = pyramidPass
 		d.PyramidReason = pyramid.Buy.Reason
-		d.EquityPass = equityPass
+
+		d.EquityPass = true
 		d.EquityReason = equity.Reason
+
 		d.Producer = EntryProducerEquity
 		d.AssignRunner = true
-		d.PendingCancelPolicy = PendingSignalCancelOnOpposite
+		d.PendingCancelPolicy =
+			PendingSignalCancelOnOpposite
+
 		d.ProducerReason = fmt.Sprintf(
 			"equity_buy|"+
-				"ai_raw=%s|logic=%s|"+
+				"ai_raw=%s|logic=%s|legacy=%s|"+
 				"equity=%.2f|baseline=%.2f|"+
 				"trigger_usd=%.2f|distance_usd=%.2f|"+
-				"equity_trigger=%t|"+
+				"threshold_pass=%t|funding_pass=%t|"+
+				"raw_spare_quote=%.8f|spare_quote=%.8f|"+
+				"proposed_buy_quote=%.8f|"+
 				"spacing=%t|adverse=%t|pyramid_gate=%t|"+
 				"latched=%.8f|gate_price=%.8f",
 			ai.Raw,
 			legacy.LogicOpinion,
+			legacy.Signal,
 			equity.Raw.EquityUSD,
 			equity.Raw.BaselineUSD,
 			equity.Raw.BuyTriggerUSD,
 			equity.Raw.BuyThresholdDistanceUSD,
-			equityPass,
+			equity.Raw.BuyThresholdPassed,
+			equity.BuyFundingAvailable,
+			equity.RawSpareQuote,
+			equity.SpareQuote,
+			equity.ProposedBuyQuote,
 			pyramid.Buy.SpacingPass,
 			pyramid.Buy.AdversePass,
 			pyramidPass,
@@ -678,61 +716,48 @@ func applyEquityProducer(
 
 		return true
 
-	case Sell:
+	case equity.SellTrigger:
 		pyramidPass :=
 			pyramid.Sell.GatePassed
 
-		equityPass :=
-			equity.SellTrigger
-
-		produced := equityPass
-
-		// log.Printf(
-		// 	"[TRACE] equity.sell.evaluate "+
-		// 		"ai_raw=%s logic=%s legacy=%s "+
-		// 		"pyramid_gate=%t equity_trigger=%t produced=%t "+
-		// 		"equity=%.2f baseline=%.2f",
-		// 	ai.Raw,
-		// 	legacy.LogicOpinion,
-		// 	legacy.Signal,
-		// 	pyramidPass,
-		// 	equityPass,
-		// 	produced,
-		// 	equity.Raw.EquityUSD,
-		// 	equity.Raw.BaselineUSD,
-		// )
-
-		if !produced {
-			return false
-		}
-
 		d.Signal = Sell
+
+		// Diagnostic only.
 		d.LogicOpinion = legacy.LogicOpinion
 		d.LegacySignal = legacy.Signal
-
 		d.PyramidPass = pyramidPass
 		d.PyramidReason = pyramid.Sell.Reason
 
-		d.EquityPass = equityPass
+		d.EquityPass = true
 		d.EquityReason = equity.Reason
-		d.PendingCancelPolicy = PendingSignalCancelOnOpposite
+
 		d.Producer = EntryProducerEquity
 		d.AssignRunner = true
+		d.PendingCancelPolicy =
+			PendingSignalCancelOnOpposite
+
 		d.ProducerReason = fmt.Sprintf(
 			"equity_sell|"+
-				"ai_raw=%s|logic=%s|"+
+				"ai_raw=%s|logic=%s|legacy=%s|"+
 				"equity=%.2f|baseline=%.2f|"+
 				"trigger_usd=%.2f|distance_usd=%.2f|"+
-				"equity_trigger=%t|"+
+				"threshold_pass=%t|funding_pass=%t|"+
+				"raw_spare_base=%.8f|spare_base=%.8f|"+
+				"proposed_sell_base=%.8f|"+
 				"spacing=%t|adverse=%t|pyramid_gate=%t|"+
 				"latched=%.8f|gate_price=%.8f",
 			ai.Raw,
 			legacy.LogicOpinion,
+			legacy.Signal,
 			equity.Raw.EquityUSD,
 			equity.Raw.BaselineUSD,
 			equity.Raw.SellTriggerUSD,
 			equity.Raw.SellThresholdDistanceUSD,
-			equityPass,
+			equity.Raw.SellThresholdPassed,
+			equity.SellFundingAvailable,
+			equity.RawSpareBase,
+			equity.SpareBase,
+			equity.ProposedSellBase,
 			pyramid.Sell.SpacingPass,
 			pyramid.Sell.AdversePass,
 			pyramidPass,
@@ -743,14 +768,6 @@ func applyEquityProducer(
 		return true
 
 	default:
-		// log.Printf(
-		// 	"[TRACE] equity.evaluate "+
-		// 		"ai_raw=%s logic=%s legacy=%s produced=false",
-		// 	ai.Raw,
-		// 	legacy.LogicOpinion,
-		// 	legacy.Signal,
-		// )
-
 		return false
 	}
 }
