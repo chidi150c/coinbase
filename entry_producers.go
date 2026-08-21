@@ -592,6 +592,10 @@ func (t *Trader) evaluateEquityProducerMaterial(
 //   - a resolved legacy BUY or SELL direction;
 //   - the matching complete Pyramid gate; and
 //   - the matching Equity trigger.
+//   - the matching Equity trigger.
+//
+// The Pyramid result remains attached as diagnostics, but it does not gate
+// an Equity-triggered entry.
 func applyEquityProducer(
 	d *EntryDecision,
 	ai AIResult,
@@ -611,7 +615,7 @@ func applyEquityProducer(
 			ema,
 		)
 
-	switch legacy.Signal {
+	switch ai.Raw {
 	case Buy:
 		pyramidPass :=
 			pyramid.Buy.GatePassed
@@ -619,9 +623,7 @@ func applyEquityProducer(
 		equityPass :=
 			equity.BuyTrigger
 
-		produced :=
-			pyramidPass &&
-				equityPass
+		produced := equityPass
 
 		// log.Printf(
 		// 	"[TRACE] equity.buy.evaluate "+
@@ -683,9 +685,7 @@ func applyEquityProducer(
 		equityPass :=
 			equity.SellTrigger
 
-		produced :=
-			pyramidPass &&
-				equityPass
+		produced := equityPass
 
 		// log.Printf(
 		// 	"[TRACE] equity.sell.evaluate "+
