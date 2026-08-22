@@ -79,7 +79,7 @@ import (
 	"time"
 )
 
-const Version = 176
+const Version = 177
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -774,7 +774,15 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					// Revert Case 7 by restoring:
 					// if enableStopLoss && net <= lossLimit {
 					// ============================================================================
-					if enableStopLoss && lot.Side == SideSell && net <= lossLimit {
+					regimeStopLoss :=
+						(lot.Side == SideBuy &&
+							t.MarketRegime == RegimeDown) ||
+							(lot.Side == SideSell &&
+								t.MarketRegime == RegimeUp)
+
+					if enableStopLoss &&
+						regimeStopLoss &&
+						net <= lossLimit {
 						exitD.ExitNetPNLUSD = net
 						exitD.StopLossLimitUSD = lossLimit
 						cand := exitCandidate{

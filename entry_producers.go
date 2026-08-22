@@ -216,10 +216,10 @@ func entryPolicyForSource(source EntryProducer) EntryPolicy {
 
 	case EntryProducerEquity:
 		return EntryPolicy{
-			ResetLastAdd:     true,
-			ResetWinExtreme:  true,
-			ResetLatchedGate: true,
-			ResetRegime:      true,
+			ResetLastAdd:     false,
+			ResetWinExtreme:  false,
+			ResetLatchedGate: false,
+			ResetRegime:      false,
 		}
 
 	case EntryProducerCase3AReplacement:
@@ -648,8 +648,34 @@ func applyEquityProducer(
 	ema EMAPatternResult,
 	pyramid PyramidResult,
 	equity EquityResult,
+	pendingCounts PendingProducerCounts,
 ) bool {
 	if d == nil {
+		return false
+	}
+
+	equityBuyPending :=
+		pendingCounts.Count(
+			EntryProducerEquity,
+			SideBuy,
+		)
+
+	equitySellPending :=
+		pendingCounts.Count(
+			EntryProducerEquity,
+			SideSell,
+		)
+
+	// Equity is single-flight across both directions.
+	//
+	// One active Equity BUY or SELL owns the current Equity threshold cycle.
+	// No additional Equity decision may be produced until that pending entry
+	// reaches a terminal state.
+	equityAvailable :=
+		equityBuyPending == 0 &&
+			equitySellPending == 0
+
+	if !equityAvailable {
 		return false
 	}
 
@@ -693,6 +719,7 @@ func applyEquityProducer(
 				"threshold_pass=%t|funding_pass=%t|"+
 				"raw_spare_quote=%.8f|spare_quote=%.8f|"+
 				"proposed_buy_quote=%.8f|"+
+				"equity_pending_buy=%d|equity_pending_sell=%d|"+
 				"spacing=%t|adverse=%t|pyramid_gate=%t|"+
 				"latched=%.8f|gate_price=%.8f",
 			ai.Raw,
@@ -707,6 +734,8 @@ func applyEquityProducer(
 			equity.RawSpareQuote,
 			equity.SpareQuote,
 			equity.ProposedBuyQuote,
+			equityBuyPending,
+			equitySellPending,
 			pyramid.Buy.SpacingPass,
 			pyramid.Buy.AdversePass,
 			pyramidPass,

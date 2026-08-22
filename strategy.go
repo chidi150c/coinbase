@@ -1799,7 +1799,7 @@ func (t *Trader) combineEntryRawMaterials(
 	// Equity — AI + Logic direction, matching complete Pyramid gate,
 	// and matching Equity trigger.
 	// -------------------------------------------------------------
-	if applyEquityProducer(&d, ai, macd, ema, pyramid, equity) {
+	if applyEquityProducer(&d, ai, macd, ema, pyramid, equity, pendingCounts) {
 		return d
 	}
 
@@ -2133,6 +2133,30 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(candles []Candle, wallNow 
 		)
 	}
 
+	shortenRegimeHalf := func(reason string) {
+		if t.RegimeUntil.IsZero() {
+			return
+		}
+
+		remaining := t.RegimeUntil.Sub(wallNow)
+		if remaining <= 0 {
+			return
+		}
+
+		newRemaining := remaining / 2
+		t.RegimeUntil = wallNow.Add(newRemaining)
+
+		log.Printf(
+			"[TRACE] regime.shorten_half "+
+				"regime=%s reason=%s remaining_before=%s remaining_after=%s until=%s",
+			t.MarketRegime,
+			reason,
+			remaining,
+			newRemaining,
+			t.RegimeUntil.Format(time.RFC3339),
+		)
+	}
+
 	if freshLow {
 		t.RecentLowBreakAt = wallNow
 	}
@@ -2153,22 +2177,47 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(candles []Candle, wallNow 
 		}
 
 	case RegimeDown:
-		if freshLow {
-			extendRegime(RegimeDown, "fresh_12h_low_extend_down")
+		if expiredByTime {
+			toNormal(
+				"regime_down_time_expired",
+			)
 			changed = true
-		} else if expiredByTime && freshHigh {
-			toNormal("expired_and_fresh_12h_high")
+
+		} else if freshLow {
+			extendRegime(
+				RegimeDown,
+				"fresh_12h_low_extend_down",
+			)
+			changed = true
+
+		} else if freshHigh {
+			shortenRegimeHalf(
+				"fresh_12h_high_against_down",
+			)
 			changed = true
 		}
 
 	case RegimeUp:
-		if freshHigh {
-			extendRegime(RegimeUp, "fresh_12h_high_extend_up")
+		if expiredByTime {
+			toNormal(
+				"regime_up_time_expired",
+			)
 			changed = true
-		} else if expiredByTime && freshLow {
-			toNormal("expired_and_fresh_12h_low")
+
+		} else if freshHigh {
+			extendRegime(
+				RegimeUp,
+				"fresh_12h_high_extend_up",
+			)
+			changed = true
+
+		} else if freshLow {
+			shortenRegimeHalf(
+				"fresh_12h_low_against_up",
+			)
 			changed = true
 		}
+
 	}
 
 	_ = changed
