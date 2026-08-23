@@ -130,8 +130,8 @@ type BotState struct {
 	PendingEntries          map[string]*PendingEntry
 	MarketRegime            MarketRegime `json:"market_regime,omitempty"`
 	RegimeUntil             time.Time    `json:"regime_until,omitempty"`
-	RecentLowBreakAt        time.Time    `json:"recent_low_break_at,omitempty"`
-	RecentHighBreakAt       time.Time    `json:"recent_high_break_at,omitempty"`
+	FreshLowAt              time.Time    `json:"recent_low_break_at,omitempty"`
+	FreshHighAt             time.Time    `json:"recent_high_break_at,omitempty"`
 	RegimeMultiplier        float64
 	RecoveryDebtUSD         float64
 	DustBuyLots             []*Position
@@ -195,14 +195,19 @@ type Trader struct {
 	// runnerIdx int
 
 	// --- NEW: side-aware pyramiding state (kept in-memory; copied to legacy fields for logs) ---
-	lastAddBuy         time.Time
-	lastAddSell        time.Time
-	winLowBuy          float64
-	winHighSell        float64
-	latchedGateBuy     float64
-	latchedGateSell    float64
-	RecentHigh         float64
-	RecentLow          float64
+	lastAddBuy      time.Time
+	lastAddSell     time.Time
+	winLowBuy       float64
+	winHighSell     float64
+	latchedGateBuy  float64
+	latchedGateSell float64
+	RecentHigh      float64
+	RecentLow       float64
+	// RecentHighAt/RecentLowAt are the timestamps of the candles currently
+	// supplying the rolling RecentHigh/RecentLow values. They are runtime
+	// derived state and are recalculated from candle history.
+	RecentHighAt       time.Time
+	RecentLowAt        time.Time
 	PreviousRecentHigh float64
 	PreviousRecentLow  float64
 	SellGateTouchedAt  time.Time
@@ -246,10 +251,15 @@ type Trader struct {
 	SpareBuyUSD   float64
 	SpareSellUSD  float64
 
-	MarketRegime            MarketRegime
-	RegimeUntil             time.Time
-	RecentLowBreakAt        time.Time
-	RecentHighBreakAt       time.Time
+	MarketRegime MarketRegime
+	RegimeUntil  time.Time
+
+	// FreshLowAt/FreshHighAt are regime-event timestamps: the last wall-clock
+	// times at which freshLow/freshHigh became true. They are intentionally
+	// separate from RecentLowAt/RecentHighAt.
+	FreshLowAt  time.Time
+	FreshHighAt time.Time
+
 	RegimeMultiplier        float64
 	RecoveryDebtUSD         float64
 	dustBuyLots             []*Position
@@ -1365,8 +1375,8 @@ func (t *Trader) snapshotStateLocked() BotState {
 		PendingEntries:          t.pendingEntries,
 		MarketRegime:            t.MarketRegime,
 		RegimeUntil:             t.RegimeUntil,
-		RecentLowBreakAt:        t.RecentLowBreakAt,
-		RecentHighBreakAt:       t.RecentHighBreakAt,
+		FreshLowAt:              t.FreshLowAt,
+		FreshHighAt:             t.FreshHighAt,
 		RegimeMultiplier:        t.RegimeMultiplier,
 		RecoveryDebtUSD:         t.RecoveryDebtUSD,
 		DustBuyLots:             append([]*Position(nil), t.dustBuyLots...),
@@ -1430,8 +1440,8 @@ func (t *Trader) loadState() error {
 		t.RecoveryDebtUSD = 0
 	}
 	t.RegimeUntil = st.RegimeUntil
-	t.RecentLowBreakAt = st.RecentLowBreakAt
-	t.RecentHighBreakAt = st.RecentHighBreakAt
+	t.FreshLowAt = st.FreshLowAt
+	t.FreshHighAt = st.FreshHighAt
 
 	// Restore per-side books (no migration; assume st.Book*.RunnerIDs reflects persisted state)
 	t.books[SideBuy] = &SideBook{

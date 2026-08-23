@@ -20,9 +20,9 @@ const (
 //
 // RecentHigh/RecentLow are the current strict rolling 12-hour extremes.
 //
-// RecentHighBreakAt/RecentLowBreakAt are the timestamps of the latest detected
-// fresh-extreme events. They are intentionally not the timestamps of the candle
-// currently supplying the rolling extreme.
+// RecentHighAt/RecentLowAt are the timestamps of the candles currently
+// supplying RecentHigh/RecentLow. These timestamps are paired with the
+// corresponding extreme prices and are suitable for chart positioning.
 //
 // PyramidBuyGatePrice/PyramidSellGatePrice are the authoritative final Pyramid
 // price gates at sample time. The caller must pass
@@ -34,10 +34,10 @@ type GateAnalysisPoint struct {
 	LogicEPS      float64 `json:"logic_eps"`
 	LogicMACDTurn float64 `json:"logic_macd_turn"`
 
-	RecentHigh        float64 `json:"recent_high"`
-	RecentLow         float64 `json:"recent_low"`
-	RecentHighBreakAt int64   `json:"recent_high_break_at"`
-	RecentLowBreakAt  int64   `json:"recent_low_break_at"`
+	RecentHigh   float64 `json:"recent_high"`
+	RecentLow    float64 `json:"recent_low"`
+	RecentHighAt int64   `json:"recent_high_break_at"`
+	RecentLowAt  int64   `json:"recent_low_break_at"`
 
 	PyramidBuyGatePrice  float64 `json:"pyramid_buy_gate_price"`
 	PyramidSellGatePrice float64 `json:"pyramid_sell_gate_price"`
@@ -121,10 +121,10 @@ func (t *Trader) recordGateAnalysisPointLocked(
 		LogicEPS:      logicEPS,
 		LogicMACDTurn: logicMACDTurn,
 
-		RecentHigh:        t.RecentHigh,
-		RecentLow:         t.RecentLow,
-		RecentHighBreakAt: unixOrZero(t.RecentHighBreakAt),
-		RecentLowBreakAt:  unixOrZero(t.RecentLowBreakAt),
+		RecentHigh:   t.RecentHigh,
+		RecentLow:    t.RecentLow,
+		RecentHighAt: unixOrZero(t.RecentHighAt),
+		RecentLowAt:  unixOrZero(t.RecentLowAt),
 
 		PyramidBuyGatePrice:  pyramidBuyGatePrice,
 		PyramidSellGatePrice: pyramidSellGatePrice,

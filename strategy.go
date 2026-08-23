@@ -1942,15 +1942,16 @@ func shouldExitByAILogic(lot *Position, d EntryDecision) bool {
 	return false
 }
 
-// lowestLow returns the lowest candle low within the rolling lookback window.
-// If no candle falls inside the window, returns 0.
+// lowestLow returns the lowest candle low within the rolling lookback window
+// together with the timestamp of the candle supplying that low.
+// If no candle falls inside the window, returns zero values.
 //
 // Example:
 //
-//	lowestLow(execHistory, 4*time.Hour)
-func lowestLow(candles []Candle, lookback time.Duration) float64 {
+//	low, lowAt := lowestLow(execHistory, 4*time.Hour)
+func lowestLow(candles []Candle, lookback time.Duration) (float64, time.Time) {
 	if len(candles) == 0 || lookback <= 0 {
-		return 0
+		return 0, time.Time{}
 	}
 
 	latest := candles[len(candles)-1].Time
@@ -1961,6 +1962,7 @@ func lowestLow(candles []Candle, lookback time.Duration) float64 {
 	cutoff := latest.Add(-lookback)
 
 	lowest := 0.0
+	lowestAt := time.Time{}
 	found := false
 
 	for i := len(candles) - 1; i >= 0; i-- {
@@ -1973,26 +1975,28 @@ func lowestLow(candles []Candle, lookback time.Duration) float64 {
 
 		if !found || c.Low < lowest {
 			lowest = c.Low
+			lowestAt = c.Time
 			found = true
 		}
 	}
 
 	if !found {
-		return 0
+		return 0, time.Time{}
 	}
 
-	return lowest
+	return lowest, lowestAt
 }
 
-// highestHigh returns the highest candle high within the rolling lookback window.
-// If no candle falls inside the window, returns 0.
+// highestHigh returns the highest candle high within the rolling lookback window
+// together with the timestamp of the candle supplying that high.
+// If no candle falls inside the window, returns zero values.
 //
 // Example:
 //
-//	highestHigh(execHistory, 4*time.Hour)
-func highestHigh(candles []Candle, lookback time.Duration) float64 {
+//	high, highAt := highestHigh(execHistory, 4*time.Hour)
+func highestHigh(candles []Candle, lookback time.Duration) (float64, time.Time) {
 	if len(candles) == 0 || lookback <= 0 {
-		return 0
+		return 0, time.Time{}
 	}
 
 	latest := candles[len(candles)-1].Time
@@ -2003,6 +2007,7 @@ func highestHigh(candles []Candle, lookback time.Duration) float64 {
 	cutoff := latest.Add(-lookback)
 
 	highest := 0.0
+	highestAt := time.Time{}
 	found := false
 
 	for i := len(candles) - 1; i >= 0; i-- {
@@ -2015,15 +2020,16 @@ func highestHigh(candles []Candle, lookback time.Duration) float64 {
 
 		if !found || c.High > highest {
 			highest = c.High
+			highestAt = c.Time
 			found = true
 		}
 	}
 
 	if !found {
-		return 0
+		return 0, time.Time{}
 	}
 
-	return highest
+	return highest, highestAt
 }
 
 func (t *Trader) updateMarketRegimeFromRecentExtremes(candles []Candle, wallNow time.Time) {
@@ -2035,8 +2041,10 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(candles []Candle, wallNow 
 		maxMult   = 3.0
 	)
 
-	t.RecentHigh = highestHigh(candles, 12*time.Hour)
-	t.RecentLow = lowestLow(candles, 12*time.Hour)
+	t.RecentHigh, t.RecentHighAt =
+		highestHigh(candles, 12*time.Hour)
+	t.RecentLow, t.RecentLowAt =
+		lowestLow(candles, 12*time.Hour)
 
 	freshLow :=
 		t.PreviousRecentLow > 0 &&
@@ -2158,10 +2166,10 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(candles []Candle, wallNow 
 	}
 
 	if freshLow {
-		t.RecentLowBreakAt = wallNow
+		t.FreshLowAt = wallNow
 	}
 	if freshHigh {
-		t.RecentHighBreakAt = wallNow
+		t.FreshHighAt = wallNow
 	}
 
 	changed := false
@@ -2242,11 +2250,11 @@ func (t *Trader) updateMarketRegimeFromRecentExtremes(candles []Candle, wallNow 
 
 	lowAgeHr := 0.0
 	highAgeHr := 0.0
-	if !t.RecentLowBreakAt.IsZero() {
-		lowAgeHr = wallNow.Sub(t.RecentLowBreakAt).Hours()
+	if !t.FreshLowAt.IsZero() {
+		lowAgeHr = wallNow.Sub(t.FreshLowAt).Hours()
 	}
-	if !t.RecentHighBreakAt.IsZero() {
-		highAgeHr = wallNow.Sub(t.RecentHighBreakAt).Hours()
+	if !t.FreshHighAt.IsZero() {
+		highAgeHr = wallNow.Sub(t.FreshHighAt).Hours()
 	}
 
 	log.Printf(
