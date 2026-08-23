@@ -79,7 +79,7 @@ import (
 	"time"
 )
 
-const Version = 177
+const Version = 178
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -1350,8 +1350,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		price,
 		d.LogicEPS,
 		d.LogicMACDTurn,
+		pyramidResult.Buy.EffectiveGatePrice,
+		pyramidResult.Sell.EffectiveGatePrice,
 	)
-
 	if d.Signal != Flat {
 		t.applyPyramidRebaseTransactions(
 			pyramidResult,

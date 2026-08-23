@@ -16,20 +16,64 @@ const (
 	gateAnalysisRetention      = 48 * time.Hour
 )
 
+// GateAnalysisPoint is the structured point consumed by Gate Analysis.
+//
+// RecentHigh/RecentLow are the current strict rolling 12-hour extremes.
+//
+// RecentHighBreakAt/RecentLowBreakAt are the timestamps of the latest detected
+// fresh-extreme events. They are intentionally not the timestamps of the candle
+// currently supplying the rolling extreme.
+//
+// PyramidBuyGatePrice/PyramidSellGatePrice are the authoritative final Pyramid
+// price gates at sample time. The caller must pass
+// pyramid.Buy.EffectiveGatePrice and pyramid.Sell.EffectiveGatePrice.
+// They must not be reconstructed from baseline, soft-gate, or latched state.
 type GateAnalysisPoint struct {
 	Time          int64   `json:"time"`
 	Price         float64 `json:"price"`
 	LogicEPS      float64 `json:"logic_eps"`
 	LogicMACDTurn float64 `json:"logic_macd_turn"`
+
+	RecentHigh        float64 `json:"recent_high"`
+	RecentLow         float64 `json:"recent_low"`
+	RecentHighBreakAt int64   `json:"recent_high_break_at"`
+	RecentLowBreakAt  int64   `json:"recent_low_break_at"`
+
+	PyramidBuyGatePrice  float64 `json:"pyramid_buy_gate_price"`
+	PyramidSellGatePrice float64 `json:"pyramid_sell_gate_price"`
 }
 
 // Gate Analysis history is intentionally disk-backed. The trading process
 // keeps no 48-hour slice/map of telemetry in memory.
 var gateAnalysisWriteMu sync.Mutex
 
+// unixOrZero converts a timestamp to UTC Unix seconds.
+// A zero time is preserved as 0 so the plot worker can omit that marker.
+func unixOrZero(v time.Time) int64 {
+	if v.IsZero() {
+		return 0
+	}
+
+	return v.UTC().Unix()
+}
+
+// validFinite reports whether v is safe to persist as JSON telemetry.
+func validFinite(v float64) bool {
+	return !math.IsNaN(v) &&
+		!math.IsInf(v, 0)
+}
+
 // recordGateAnalysisPointLocked records at most one point per 10-second bucket.
 //
 // The caller MUST already hold t.mu.
+//
+// The caller must pass the already-evaluated authoritative Pyramid gates:
+//
+//	pyramid.Buy.EffectiveGatePrice
+//	pyramid.Sell.EffectiveGatePrice
+//
+// Do not substitute latchedGateBuy/latchedGateSell, BaselineGatePrice,
+// SoftGatePrice, or any reconstructed gate value.
 //
 // Only the one last-sample timestamp is retained on Trader. Once a point is
 // accepted for sampling, file I/O is handed to a short-lived goroutine so the
@@ -39,15 +83,16 @@ func (t *Trader) recordGateAnalysisPointLocked(
 	price float64,
 	logicEPS float64,
 	logicMACDTurn float64,
+	pyramidBuyGatePrice float64,
+	pyramidSellGatePrice float64,
 ) {
 	if t == nil ||
 		price <= 0 ||
-		math.IsNaN(price) ||
-		math.IsInf(price, 0) ||
-		math.IsNaN(logicEPS) ||
-		math.IsInf(logicEPS, 0) ||
-		math.IsNaN(logicMACDTurn) ||
-		math.IsInf(logicMACDTurn, 0) {
+		!validFinite(price) ||
+		!validFinite(logicEPS) ||
+		!validFinite(logicMACDTurn) ||
+		!validFinite(pyramidBuyGatePrice) ||
+		!validFinite(pyramidSellGatePrice) {
 		return
 	}
 
@@ -75,6 +120,14 @@ func (t *Trader) recordGateAnalysisPointLocked(
 		Price:         price,
 		LogicEPS:      logicEPS,
 		LogicMACDTurn: logicMACDTurn,
+
+		RecentHigh:        t.RecentHigh,
+		RecentLow:         t.RecentLow,
+		RecentHighBreakAt: unixOrZero(t.RecentHighBreakAt),
+		RecentLowBreakAt:  unixOrZero(t.RecentLowBreakAt),
+
+		PyramidBuyGatePrice:  pyramidBuyGatePrice,
+		PyramidSellGatePrice: pyramidSellGatePrice,
 	}
 
 	go persistGateAnalysisPoint(
