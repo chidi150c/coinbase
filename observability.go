@@ -148,6 +148,7 @@ type ProducerOpsSummary struct {
 	LastActivityErrorCode EntryProduceErrorCode
 	LastActivityError     string
 }
+
 type ProducerEvent struct {
 	Time      time.Time
 	CreatedAt time.Time
@@ -167,6 +168,9 @@ type ProducerEvent struct {
 
 	PnL   float64
 	Price float64
+
+	BaseSize   float64
+	QuoteValue float64
 }
 
 type ProducerAttempt struct {

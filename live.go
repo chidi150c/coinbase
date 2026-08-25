@@ -615,23 +615,46 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 					}
 
 					cancel := false
+					cancelReason := ""
 
 					switch entry.Intent.PendingCancelPolicy {
 
 					case PendingSignalCancelOnFlatOrOpposite:
 						switch entry.Side {
 						case SideBuy:
-							cancel = res.Signal != Buy
+							switch res.Signal {
+							case Flat:
+								cancel = true
+								cancelReason = "signal_changed_to_flat"
+							case Sell:
+								cancel = true
+								cancelReason = "signal_changed_to_sell"
+							}
+
 						case SideSell:
-							cancel = res.Signal != Sell
+							switch res.Signal {
+							case Flat:
+								cancel = true
+								cancelReason = "signal_changed_to_flat"
+							case Buy:
+								cancel = true
+								cancelReason = "signal_changed_to_buy"
+							}
 						}
 
 					case PendingSignalCancelOnOpposite:
 						switch entry.Side {
 						case SideBuy:
-							cancel = res.Signal == Sell
+							if res.Signal == Sell {
+								cancel = true
+								cancelReason = "signal_changed_to_sell"
+							}
+
 						case SideSell:
-							cancel = res.Signal == Buy
+							if res.Signal == Buy {
+								cancel = true
+								cancelReason = "signal_changed_to_buy"
+							}
 						}
 
 					case PendingSignalCancelDisabled:
@@ -663,6 +686,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 
 					orderID := entry.Intent.OrderID
 					entry.Intent.CancelRequested = true
+					entry.Intent.CancelReason = cancelReason
 
 					_ = trader.saveStateNoLock()
 

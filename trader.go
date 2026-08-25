@@ -3574,7 +3574,8 @@ type PendingIntent struct {
 	RecoveryNetUSD float64        `json:"recovery_net_usd,omitempty"`
 	RecoveryMethod RecoveryMethod `json:"recovery_method,omitempty"`
 
-	CancelRequested bool `json:"cancel_requested,omitempty"`
+	CancelRequested bool   `json:"cancel_requested,omitempty"`
+	CancelReason    string `json:"cancel_reason,omitempty"`
 
 	// Empty for normal entries.
 	// Case3A uses this to identify the entry that caused the replacement.
@@ -3687,6 +3688,11 @@ func (t *Trader) startProducerBuyEntry(
 			DecisionID: intent.DecisionID,
 
 			Reason: intent.ProducerReason,
+
+			// Requested maker execution economics at production time.
+			Price:      intent.LimitPx,
+			BaseSize:   intent.BaseAtLimit,
+			QuoteValue: intent.Quote,
 		}
 
 	entry, err := t.produceEntry(
@@ -3766,6 +3772,11 @@ func (t *Trader) startProducerSellEntry(
 			DecisionID: intent.DecisionID,
 
 			Reason: intent.ProducerReason,
+
+			// Requested maker execution economics at production time.
+			Price:      intent.LimitPx,
+			BaseSize:   intent.BaseAtLimit,
+			QuoteValue: intent.Quote,
 		}
 
 	/*
@@ -3881,6 +3892,11 @@ func (t *Trader) startCase3AReplacement(
 			DecisionID: intent.DecisionID,
 
 			Reason: intent.ProducerReason,
+
+			// Requested maker execution economics at production time.
+			Price:      intent.LimitPx,
+			BaseSize:   intent.BaseAtLimit,
+			QuoteValue: intent.Quote,
 		}
 
 	entry, err := t.produceEntry(
@@ -4173,6 +4189,11 @@ func (t *Trader) produceEntry(
 			OrderID: entry.OrderID,
 
 			Reason: intent.ProducerReason,
+
+			// Requested exchange-order economics while the maker entry is pending.
+			Price:      intent.LimitPx,
+			BaseSize:   intent.BaseAtLimit,
+			QuoteValue: intent.Quote,
 		}
 
 	attempt.Events[ProducerStagePending] = pendingEvent
@@ -4999,7 +5020,19 @@ func (t *Trader) runPendingEntryPoller(
 			DecisionID: decisionID,
 			OrderID:    eventOrderID,
 
-			Reason: entry.ProducerReason,
+			Reason: func() string {
+				reason := entry.ProducerReason
+
+				if entry.Intent != nil &&
+					entry.Intent.CancelRequested &&
+					entry.Intent.CancelReason != "" {
+
+					reason += "|cancel_reason=" +
+						entry.Intent.CancelReason
+				}
+
+				return reason
+			}(),
 		}
 
 		/*
@@ -5154,6 +5187,8 @@ poll:
 					producerEvents[ProducerStageFilled]; exists {
 
 					event.Price = placed.Price
+					event.BaseSize = placed.BaseSize
+					event.QuoteValue = placed.QuoteSpent
 					producerEvents[ProducerStageFilled] = event
 				}
 
@@ -5460,6 +5495,8 @@ poll:
 						producerEvents[ProducerStageFilled]; exists {
 
 						event.Price = placed.Price
+						event.BaseSize = placed.BaseSize
+						event.QuoteValue = placed.QuoteSpent
 						producerEvents[ProducerStageFilled] = event
 					}
 
@@ -5656,6 +5693,8 @@ poll:
 			producerEvents[ProducerStageFilled]; exists {
 
 			event.Price = placed.Price
+			event.BaseSize = placed.BaseSize
+			event.QuoteValue = placed.QuoteSpent
 			producerEvents[ProducerStageFilled] = event
 		}
 
@@ -6807,6 +6846,17 @@ func (t *Trader) drainPendingEntry(
 						false,
 						false,
 					)
+
+				// committed records the actual exchange fill that became position state.
+				if event, exists :=
+					res.ProducerEvents[ProducerStageCommitted]; exists &&
+					res.Placed != nil {
+
+					event.Price = res.Placed.Price
+					event.BaseSize = res.Placed.BaseSize
+					event.QuoteValue = res.Placed.QuoteSpent
+					res.ProducerEvents[ProducerStageCommitted] = event
+				}
 
 				recordDrainProducerEvents(
 					res.ProducerEvents,

@@ -2792,6 +2792,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					DecisionID: intent.DecisionID,
 
 					Reason: intent.ProducerReason,
+
+					// Requested execution size for the direct-market submission.
+					// Filled/committed stages later replace this with actual execution economics.
+					Price:      price,
+					BaseSize:   base,
+					QuoteValue: quote,
 				}
 		}
 
@@ -2828,6 +2834,20 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 				quote = minNotional
 				base = quote / price
+
+				// The retry becomes the authoritative produced request if it is used.
+				// Keep observability aligned with the final size submitted to the broker.
+				if attempt != nil {
+					if event, exists :=
+						attempt.Events[ProducerStageProduced]; exists {
+
+						event.Price = price
+						event.BaseSize = base
+						event.QuoteValue = quote
+
+						attempt.Events[ProducerStageProduced] = event
+					}
+				}
 
 				// TODO: remove TRACE
 				log.Printf(
@@ -2944,8 +2964,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					DecisionID: intent.DecisionID,
 					OrderID:    placed.ID,
 
-					Reason: intent.ProducerReason,
-					Price:  placed.Price,
+					Reason:     intent.ProducerReason,
+					Price:      placed.Price,
+					BaseSize:   placed.BaseSize,
+					QuoteValue: placed.QuoteSpent,
 				}
 		}
 
@@ -3199,6 +3221,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				OrderID:    placedOrderID(placed),
 
 				Reason: intent.ProducerReason,
+
+				// Committed reflects the exposure that was actually persisted locally.
+				Price:      priceToUse,
+				BaseSize:   baseToUse,
+				QuoteValue: actualQuote,
 			}
 
 		t.recordProducerAttemptLocked(
