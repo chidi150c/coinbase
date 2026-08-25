@@ -435,11 +435,21 @@ func (t *Trader) evaluateEMAPatternSnapshot(
 func (t *Trader) evaluateEquityRaw() EquityRawResult {
 	started := time.Now()
 
+	sellTriggerMult :=
+		t.cfg.SellEquityTriggerMult
+
+	// After the first committed Equity SELL, continuation mode uses a reduced
+	// SELL adversity of +0.308% while the remembered SELL episode remains armed.
+	// The episode is cleared by any current AI BUY before entry-producer fan-in.
+	if t.equitySellContinuation {
+		sellTriggerMult = 1.00308
+	}
+
 	result := EquityRawResult{
 		EquityUSD:       t.equityUSD,
 		BaselineUSD:     t.lastAddEquity,
 		BuyTriggerMult:  t.cfg.BuyEquityTriggerMult,
-		SellTriggerMult: t.cfg.SellEquityTriggerMult,
+		SellTriggerMult: sellTriggerMult,
 	}
 
 	defer func() {
@@ -1688,6 +1698,16 @@ func (t *Trader) combineEntryRawMaterials(
 	price float64,
 	pendingCounts PendingProducerCounts,
 ) EntryDecision {
+	// SELL-episode memory is invalid whenever the current AI opinion is BUY.
+	// This is intentionally state-based rather than transition-based:
+	// BUY -> BUY keeps both SELL continuation memories forced clear, and a
+	// restart into an already-BUY AI state self-heals stale persisted memory.
+	if ai.Raw == Buy {
+		t.equitySellContinuation = false
+		t.case13AReferencePrice = 0
+		t.case11AReferencePrice = 0
+	}
+
 	regimeMult := t.RegimeMultiplier
 	if regimeMult <= 0 {
 		regimeMult = 1.0
@@ -1804,8 +1824,8 @@ func (t *Trader) combineEntryRawMaterials(
 	}
 
 	// -------------------------------------------------------------
-	// Equity — AI + Logic direction, matching complete Pyramid gate,
-	// and matching Equity trigger.
+	// Equity — independent Equity threshold + funding producer.
+	// AI / Logic / Pyramid are diagnostics only and do not gate Equity.
 	// -------------------------------------------------------------
 	if applyEquityProducer(&d, ai, macd, ema, pyramid, equity, pendingCounts) {
 		return d

@@ -113,6 +113,11 @@ type BotState struct {
 	// --- NEW: equity-at-last-add snapshots (SELL persisted; legacy fallback supported) ---
 	LastAddEquity float64
 
+	// Equity SELL continuation is armed only after a committed Equity SELL.
+	// It survives SELL/FLAT AI states and is cleared by any current AI BUY
+	// in the decision path.
+	EquitySellContinuation bool
+
 	// --- NEW: persist equity trigger staging indices per side ---
 	EquityStageBuy  int
 	EquityStageSell int
@@ -127,6 +132,7 @@ type BotState struct {
 	SpareSellUSD            float64
 	PreviousAIRaw           Signal
 	Case11AReferencePrice   float64
+	Case13AReferencePrice   float64
 	PendingExits            map[string]*PendingExit
 	PendingEntries          map[string]*PendingEntry
 	MarketRegime            MarketRegime `json:"market_regime,omitempty"`
@@ -223,6 +229,12 @@ type Trader struct {
 
 	// --- NEW: equity-at-last-add snapshots for equity strategy trading ---
 	lastAddEquity float64
+
+	// Equity SELL continuation is episode memory, not a Runner property.
+	// It is armed only by a successfully committed Equity SELL. SELL/FLAT
+	// preserves it; any current AI BUY clears it in the decision path.
+	equitySellContinuation bool
+
 	// --- NEW: equity trigger staging indices per side (0..3 for 25/50/75/100) ---
 	equityStageBuy  int
 	equityStageSell int
@@ -1365,9 +1377,11 @@ func (t *Trader) snapshotStateLocked() BotState {
 		LatchedGateBuy:        t.latchedGateBuy,
 		PreviousAIRaw:         t.previousAIRaw,
 		Case11AReferencePrice: t.case11AReferencePrice,
+		Case13AReferencePrice: t.case13AReferencePrice,
 		LatchedGateSell:       t.latchedGateSell,
 
-		LastAddEquity: t.lastAddEquity,
+		LastAddEquity:          t.lastAddEquity,
+		EquitySellContinuation: t.equitySellContinuation,
 
 		// Persist equity stages
 		EquityStageBuy:  t.equityStageBuy,
@@ -1485,8 +1499,10 @@ func (t *Trader) loadState() error {
 	t.latchedGateBuy = st.LatchedGateBuy
 	t.previousAIRaw = st.PreviousAIRaw
 	t.case11AReferencePrice = st.Case11AReferencePrice
+	t.case13AReferencePrice = st.Case13AReferencePrice
 	t.latchedGateSell = st.LatchedGateSell
 	t.lastAddEquity = st.LastAddEquity
+	t.equitySellContinuation = st.EquitySellContinuation
 	t.lastExits = st.Exits
 
 	t.dustBuyLots = append([]*Position(nil), st.DustBuyLots...)
@@ -7362,13 +7378,22 @@ func (t *Trader) commitEntryFill(
 		t.lastAddEquity =
 			t.equityUSD
 
+		// Arm SELL continuation only after a real Equity SELL reaches the
+		// committed position-state path. A produced, pending, rejected,
+		// cancelled, timed-out, or otherwise uncommitted SELL cannot arm it.
+		if side == SideSell {
+			t.equitySellContinuation = true
+		}
+
 		log.Printf(
 			"[TRACE] equity.baseline.set "+
-				"side=%s producer=%s old=%.2f new=%.2f",
+				"side=%s producer=%s old=%.2f new=%.2f "+
+				"sellContinuation=%t",
 			side,
 			entry.Producer,
 			oldEquityBaseline,
 			t.lastAddEquity,
+			t.equitySellContinuation,
 		)
 	}
 

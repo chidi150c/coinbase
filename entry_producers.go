@@ -469,6 +469,61 @@ func (t *Trader) evaluateEquityProducerMaterial(
 	equityRaw := t.evaluateEquityRaw()
 
 	/*
+		Equity SELL continuation
+		------------------------
+
+		The first committed Equity SELL arms t.equitySellContinuation in
+		trader.go. While that episode memory remains armed, SELL and FLAT AI
+		states preserve it. Any current AI BUY is the authoritative cancellation
+		condition and is cleared by the Trader-owned decision path.
+
+		This producer file must not mutate Trader episode state, so it only
+		consumes that state.
+
+		The ordinary first Equity SELL continues to use the configured SELL
+		Equity trigger produced by evaluateEquityRaw().
+
+		After the first committed Equity SELL, continuation mode uses a reduced
+		SELL adversity of +0.308% over the current Equity baseline:
+
+			baseline * 1.00308
+
+		This replaces only the SELL Equity threshold for continuation entries.
+		It does not change:
+		  - Equity staging / 25-50-75-100 sizing,
+		  - funding checks,
+		  - pending-entry single-flight protection,
+		  - Pyramid diagnostics,
+		  - BUY Equity behavior.
+
+		The ai.Raw != Buy guard is deliberately defensive. Even if persisted
+		continuation state has not yet been cleared by the caller on a BUY tick,
+		this evaluator will never apply SELL continuation against an opposite
+		AI BUY state.
+	*/
+	const equitySellContinuationMultiplier = 1.00308
+
+	equitySellContinuationActive :=
+		t.equitySellContinuation &&
+			ai.Raw != Buy
+
+	if equitySellContinuationActive &&
+		equityRaw.BaselineUSD > 0 {
+
+		equityRaw.SellTriggerUSD =
+			equityRaw.BaselineUSD *
+				equitySellContinuationMultiplier
+
+		equityRaw.SellThresholdDistanceUSD =
+			equityRaw.EquityUSD -
+				equityRaw.SellTriggerUSD
+
+		equityRaw.SellThresholdPassed =
+			equityRaw.EquityUSD >=
+				equityRaw.SellTriggerUSD
+	}
+
+	/*
 		Equity owns its own direction.
 
 		BUY:
@@ -629,6 +684,25 @@ func (t *Trader) evaluateEquityProducerMaterial(
 			)
 	}
 
+	// Preserve the existing Equity reason contract and extend it additively so
+	// BOT OPS / forensic logs can tell whether the reduced SELL threshold was
+	// authoritative for this evaluation.
+	equityResult.Reason = strings.TrimSpace(
+		equityResult.Reason,
+	)
+
+	continuationReason := fmt.Sprintf(
+		"sell_continuation=%t|sell_continuation_mult=%.6f",
+		equitySellContinuationActive,
+		equitySellContinuationMultiplier,
+	)
+
+	if equityResult.Reason == "" {
+		equityResult.Reason = continuationReason
+	} else {
+		equityResult.Reason += "|" + continuationReason
+	}
+
 	return equityResult, nil
 }
 
@@ -638,6 +712,11 @@ func (t *Trader) evaluateEquityProducerMaterial(
 //
 //   - BUY when the BUY Equity threshold passes and BUY funding is available.
 //   - SELL when the SELL Equity threshold passes and SELL funding is available.
+//
+// The first committed Equity SELL uses the ordinary configured SELL Equity
+// threshold. While t.equitySellContinuation remains armed, later SELLs in the
+// same SELL/FLAT AI episode use the reduced +0.308% continuation threshold.
+// Any current AI BUY cancels that episode in the Trader-owned decision path.
 //
 // AI, Logic, Legacy, and Pyramid are retained as diagnostics only.
 // They do not gate an Equity-triggered entry.

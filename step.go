@@ -79,7 +79,7 @@ import (
 	"time"
 )
 
-const Version = 180
+const Version = 181
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -1183,10 +1183,15 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}, nil
 	}
 
-	// Reset continuation references whenever the current AI raw signal is BUY.
-	// A BUY tick terminates the SELL-continuation sequence and forces the next
-	// qualifying SELL to establish a fresh reference price.
+	// Reset SELL-episode continuation state whenever the current AI raw
+	// signal is BUY.
+	//
+	// This is deliberately state-based rather than transition-based:
+	// SELL -> FLAT -> SELL preserves continuation/reference state, while any
+	// current BUY forces all SELL-episode memory off. Repeated BUY ticks are
+	// idempotent and also self-heal stale persisted state after restart.
 	if aiResult.Raw == Buy {
+		t.equitySellContinuation = false
 		t.case13AReferencePrice = 0
 		t.case11AReferencePrice = 0
 	}
