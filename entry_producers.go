@@ -810,12 +810,25 @@ func applyEquityProducer(
 // It populates all Case 11 diagnostics in d regardless of whether either
 // producer fires.
 //
+// Case11A remains directionally independent of AI. AI is passed only so
+// Case11A can reuse positive AI confidence for downstream sizing; confidence
+// <= 0 falls back to 1.0. Case11A's first SELL requires the complete Pyramid
+// SELL gate. After a committed Case11A fill establishes a durable reference,
+// subsequent SELLs replace Pyramid gating with a +0.308% reference-price gate.
+//
+// Resetting the durable Case11A reference when ai.Raw == Buy is Trader-owned
+// state mutation and must be performed by the caller before this pure producer
+// is evaluated.
+//
 // It returns true when Case 11 produces a directional decision.
 func applyCase11ReversalProducer(
 	d *EntryDecision,
+	ai AIResult,
 	macd MACDResult,
 	ema EMAPatternResult,
 	pyramid PyramidResult,
+	price float64,
+	case11AReferencePrice float64,
 ) bool {
 	const (
 		macdPeakBuffer   = 15.0
@@ -825,20 +838,58 @@ func applyCase11ReversalProducer(
 	// -------------------------------------------------------------
 	// Case 11A — Peak-Reversal SELL.
 	//
-	// MACD[idx-6] >= EPS - buffer
-	// AND EMA high-peak
-	// AND Pyramid SELL gate
+	// Core reversal interpretation remains unchanged:
+	//
+	//   MACD[idx-6] >= EPS - buffer
+	//   AND EMA high-peak
+	//
+	// Entry-location gate:
+	//
+	//   First SELL of an episode:
+	//     require the complete Pyramid SELL gate.
+	//
+	//   Subsequent SELLs after a committed Case11A fill:
+	//     bypass Pyramid and require price >= reference * 1.00308.
+	//
+	// The durable reference is advanced only by trader.go after a successful
+	// Case11A fill/commit. AI direction does not qualify Case11A. AI confidence
+	// is reused for sizing when positive; otherwise Case11A uses confidence 1.0.
 	// -------------------------------------------------------------
+	const case11AReentryMultiplier = 1.00308
+
 	macdPrePeakThreshold :=
 		macd.EPS - macdPeakBuffer
 
 	macdPrePeakZone :=
 		macd.LinePrev6 >= macdPrePeakThreshold
 
+	firstCase11A :=
+		case11AReferencePrice <= 0
+
+	nextCase11AReentryPrice := 0.0
+	case11AEntryGatePass := false
+
+	if firstCase11A {
+		case11AEntryGatePass =
+			pyramid.Sell.GatePassed
+	} else {
+		nextCase11AReentryPrice =
+			case11AReferencePrice *
+				case11AReentryMultiplier
+
+		case11AEntryGatePass =
+			price >= nextCase11AReentryPrice
+	}
+
+	case11AConfidence := ai.Confidence
+	if case11AConfidence <= 0 {
+		case11AConfidence = 1.0
+	}
+
 	peakReversalSell :=
 		macdPrePeakZone &&
 			ema.HighPeak &&
-			pyramid.Sell.GatePassed
+			case11AEntryGatePass
 
 	// -------------------------------------------------------------
 	// Case 11B — Bottom-Reversal BUY.
@@ -897,23 +948,44 @@ func applyCase11ReversalProducer(
 	// Case 11A has priority over Case 11B if both somehow evaluate true.
 	if peakReversalSell {
 		d.Signal = Sell
+		d.Confidence = case11AConfidence
+
+		// PyramidPass remains diagnostic. In continuation/reference mode the
+		// authoritative Case11A entry gate is the +0.308% reference-price gate.
 		d.PyramidPass = pyramid.Sell.GatePassed
 		d.PyramidReason = pyramid.Sell.Reason
 		d.Producer = EntryProducerCase11APeakReversal
 		d.PendingCancelPolicy = PendingSignalCancelDisabled
+
+		referenceMode := "reference"
+		if firstCase11A {
+			referenceMode = "first_pyramid"
+		}
+
 		d.ProducerReason = fmt.Sprintf(
 			"peak_reversal_sell|"+
+				"ai_raw=%s|ai_confidence=%.6f|case11a_confidence=%.6f|"+
 				"macd_idx6=%.6f|eps=%.6f|buffer=%.2f|"+
 				"threshold=%.6f|"+
 				"macd_zone=%t|"+
 				"ema_high_peak=%t|"+
-				"pyramid_sell=%t",
+				"reference_mode=%s|reference_price=%.8f|"+
+				"next_reentry_price=%.8f|reentry_multiplier=%.6f|"+
+				"entry_gate_pass=%t|pyramid_sell=%t",
+			ai.Raw,
+			ai.Confidence,
+			case11AConfidence,
 			macd.LinePrev6,
 			macd.EPS,
 			macdPeakBuffer,
 			macdPrePeakThreshold,
 			macdPrePeakZone,
 			ema.HighPeak,
+			referenceMode,
+			case11AReferencePrice,
+			nextCase11AReentryPrice,
+			case11AReentryMultiplier,
+			case11AEntryGatePass,
 			pyramid.Sell.GatePassed,
 		)
 

@@ -79,7 +79,7 @@ import (
 	"time"
 )
 
-const Version = 179
+const Version = 180
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -1182,13 +1182,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			Signal: Flat,
 		}, nil
 	}
-	// Reset Case13A on the AI transition itself, before any later evaluator
-	// can cause this tick to return early. afterStepStateUpdate() writes this
-	// tick's Raw only after step() returns, so t.previousAIRaw is still the
-	// preceding tick here.
-	if t.previousAIRaw != Buy &&
-		aiResult.Raw == Buy {
+
+	// Reset continuation references whenever the current AI raw signal is BUY.
+	// A BUY tick terminates the SELL-continuation sequence and forces the next
+	// qualifying SELL to establish a fresh reference price.
+	if aiResult.Raw == Buy {
 		t.case13AReferencePrice = 0
+		t.case11AReferencePrice = 0
 	}
 
 	if macdSnapshot.Err != nil {

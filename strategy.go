@@ -1761,7 +1761,15 @@ func (t *Trader) combineEntryRawMaterials(
 	// -------------------------------------------------------------
 	// Case 11 — Independent reversal producers.
 	// -------------------------------------------------------------
-	if applyCase11ReversalProducer(&d, macd, ema, pyramid) {
+	if applyCase11ReversalProducer(
+		&d,
+		ai,
+		macd,
+		ema,
+		pyramid,
+		price,
+		t.case11AReferencePrice,
+	) {
 		return d
 	}
 

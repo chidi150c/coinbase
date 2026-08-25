@@ -126,6 +126,7 @@ type BotState struct {
 	SpareBuyUSD             float64
 	SpareSellUSD            float64
 	PreviousAIRaw           Signal
+	Case11AReferencePrice   float64
 	PendingExits            map[string]*PendingExit
 	PendingEntries          map[string]*PendingEntry
 	MarketRegime            MarketRegime `json:"market_regime,omitempty"`
@@ -177,6 +178,13 @@ type Trader struct {
 	mu            sync.RWMutex
 	equityUSD     float64
 	previousAIRaw Signal
+
+	// Case11A continuation reference. Zero means the next Case11A SELL is
+	// the first entry of a fresh episode and must pass the normal Pyramid
+	// SELL gate. A successful Case11A fill/commit stores the actual broker
+	// execution price here. Subsequent Case11A entries may use their
+	// producer-specific continuation gate until any AI BUY clears this value.
+	case11AReferencePrice float64
 
 	// Case13A re-entry reference. Zero means the next Case13A SELL is the
 	// first entry of a fresh episode and must use global SELL spacing.
@@ -1350,13 +1358,14 @@ func (t *Trader) snapshotStateLocked() BotState {
 		BookBuy:  *t.book(SideBuy),
 		BookSell: *t.book(SideSell),
 
-		LastAddBuy:      t.lastAddBuy,
-		LastAddSell:     t.lastAddSell,
-		WinLowBuy:       t.winLowBuy,
-		WinHighSell:     t.winHighSell,
-		LatchedGateBuy:  t.latchedGateBuy,
-		PreviousAIRaw:   t.previousAIRaw,
-		LatchedGateSell: t.latchedGateSell,
+		LastAddBuy:            t.lastAddBuy,
+		LastAddSell:           t.lastAddSell,
+		WinLowBuy:             t.winLowBuy,
+		WinHighSell:           t.winHighSell,
+		LatchedGateBuy:        t.latchedGateBuy,
+		PreviousAIRaw:         t.previousAIRaw,
+		Case11AReferencePrice: t.case11AReferencePrice,
+		LatchedGateSell:       t.latchedGateSell,
 
 		LastAddEquity: t.lastAddEquity,
 
@@ -1475,6 +1484,7 @@ func (t *Trader) loadState() error {
 	t.winHighSell = st.WinHighSell
 	t.latchedGateBuy = st.LatchedGateBuy
 	t.previousAIRaw = st.PreviousAIRaw
+	t.case11AReferencePrice = st.Case11AReferencePrice
 	t.latchedGateSell = st.LatchedGateSell
 	t.lastAddEquity = st.LastAddEquity
 	t.lastExits = st.Exits
@@ -4073,56 +4083,21 @@ func (t *Trader) produceEntry(
 	/*
 		Registration succeeded.
 
-		Advance the same-side latch immediately so another same-side
-		pending entry must achieve additional adverse movement before
-		qualifying again.
+		Persist the newly registered pending entry without advancing the
+		global BUY/SELL latch. Pending registration is transport state,
+		not a filled-trade spacing event.
 
-		Save the latch together with the newly registered pending entry.
+		Case13A simultaneous duplicate prevention is owned by its
+		producer-specific pendingCounts guard, while post-fill Case13A
+		re-entry spacing is owned by case13AReferencePrice.
 	*/
-	oldBuyLatch :=
-		t.latchedGateBuy
-
-	oldSellLatch :=
-		t.latchedGateSell
-
-	nextLatch :=
-		pendingRegistrationLatchPrice(
-			intent.Side,
-			intent.LimitPx,
-			intent.BaseAtLimit,
-			t.cfg.FeeRatePct,
-		)
-
-	switch intent.Side {
-	case SideBuy:
-		if t.latchedGateBuy == 0 ||
-			nextLatch < t.latchedGateBuy {
-
-			t.latchedGateBuy =
-				nextLatch
-		}
-
-	case SideSell:
-		if t.latchedGateSell == 0 ||
-			nextLatch > t.latchedGateSell {
-
-			t.latchedGateSell =
-				nextLatch
-		}
-	}
-
 	if err :=
 		t.saveStateNoLock(); err != nil {
 
 		/*
-			Roll back only the local state mutated by produceEntry().
+			Registration persistence failed. Remove only the pending entry
+			that produceEntry() just registered.
 		*/
-		t.latchedGateBuy =
-			oldBuyLatch
-
-		t.latchedGateSell =
-			oldSellLatch
-
 		t.mu.Lock()
 
 		current, exists :=
@@ -7451,6 +7426,14 @@ func (t *Trader) commitEntryFill(
 
 			Err: err,
 		}
+	}
+
+	// Only a successful asynchronous Case11A fill/commit advances the
+	// Case11A continuation reference, using the actual broker execution price.
+	// The producer evaluator decides whether this reference replaces the normal
+	// Pyramid SELL gate for continuation entries.
+	if entry.Producer == EntryProducerCase11APeakReversal {
+		t.case11AReferencePrice = priceToUse
 	}
 
 	// Only a successful asynchronous Case13A fill/commit advances the
