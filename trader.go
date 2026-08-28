@@ -2534,7 +2534,7 @@ func (t *Trader) closeLot(
 								repl.BaseAtLimit = normalBase
 								repl.RecoveryNetUSD = recoveryNetUSD
 								repl.RecoveryMethod = RecoveryByProfitTarget
-								repl.ProfitGateUSD = t.cfg.ProfitGateUSD + recoveryNetUSD
+								repl.ProfitGateUSD = t.cfg.ProfitGateUSD
 								repl.ProducerReason = fmt.Sprintf(
 									"case3A_replacement|method=%s|recovery_usd=%.6f|regime=%s|source_order_id=%s",
 									RecoveryByProfitTarget.String(), recoveryNetUSD, t.MarketRegime, lot.EntryOrderID,
