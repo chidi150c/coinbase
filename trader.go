@@ -75,6 +75,9 @@ type Position struct {
 	// was created to recover. RecoveryMethod identifies Mode A vs Mode B.
 	RecoveryNetUSD float64        `json:"recovery_net_usd,omitempty"`
 	RecoveryMethod RecoveryMethod `json:"recovery_method,omitempty"`
+	// Case3AUpRecoveryUsed is per replacement lot. It is set only after the
+	// one-time UP-regime partial-recovery profit exit is confirmed filled.
+	Case3AUpRecoveryUsed bool `json:"case3a_up_recovery_used,omitempty"`
 
 	// --- NEW: track maker-first TP exit order id (post-only limit attempt) ---
 	FixedTPOrderID   string  `json:"-"`
@@ -2428,7 +2431,17 @@ func (t *Trader) closeLot(
 			// Case3ALossUSD,
 			// )
 
+			// Start with the newly realized stop-loss from this source lot.
 			recoveryNetUSD := Case3ALossUSD
+
+			// If the source lot is itself a Case3A replacement, carry its
+			// unrecovered trade-specific obligation forward into the next
+			// replacement. This preserves the recovery chain instead of
+			// resetting RecoveryNetUSD to only the newest stop-loss.
+			if lot.Producer == EntryProducerCase3AReplacement &&
+				lot.RecoveryNetUSD > 0 {
+				recoveryNetUSD += lot.RecoveryNetUSD
+			}
 
 			if recoveryNetUSD > 0 {
 				beforeDebt := t.RecoveryDebtUSD
@@ -3132,6 +3145,42 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 	pl -= entryPortion
 	pl -= exitFee
 
+	// Case3A one-time UP-regime partial recovery.
+	//
+	// This mutation happens only in the authoritative filled-exit path, after
+	// realized NET PnL is known. Stop-loss exits are deliberately excluded.
+	// The lot survives a full bookkeeping exit while RecoveryNetUSD remains
+	// positive; on later ticks the easy UP privilege is no longer available.
+	const case3AFillTol = 1e-9
+	case3AFullFill := baseFilled+case3AFillTol >= baseRequested
+	case3AUpPartialRecovery :=
+		case3AFullFill &&
+			lot.Producer == EntryProducerCase3AReplacement &&
+			lot.RecoveryNetUSD > 0 &&
+			!lot.Case3AUpRecoveryUsed &&
+			t.MarketRegime == RegimeUp &&
+			!strings.HasPrefix(exitReason, "threshold_stop_loss") &&
+			pl >= lot.ProfitGateUSD
+
+	case3ARecoveryBefore := lot.RecoveryNetUSD
+	if case3AUpPartialRecovery {
+		lot.RecoveryNetUSD -= pl
+		lot.Case3AUpRecoveryUsed = true
+
+		// Keep the canonical lot reason self-describing. Producer-history filled
+		// reason enrichment can consume these same persisted facts without
+		// independently recalculating recovery accounting.
+		lot.ProducerReason = strings.TrimSpace(
+			lot.ProducerReason + fmt.Sprintf(
+				"|case3a_up_partial_recovery=true|up_recovery_used=true"+
+					"|recovery_net_before=%.6f|recovered_net=%.6f|recovery_net_after=%.6f",
+				case3ARecoveryBefore,
+				pl,
+				lot.RecoveryNetUSD,
+			),
+		)
+	}
+
 	rawPL := func() float64 {
 		if lot.Side == SideBuy {
 			return (priceExec - lot.OpenPrice) * baseFilled
@@ -3231,6 +3280,30 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 
 	const tolExit = 1e-9
 	isPartial := baseFilled+tolExit < baseRequested
+
+	// A confirmed full Case3A UP recovery fill may intentionally leave an
+	// unrecovered bookkeeping obligation. Preserve that lot so the next tick
+	// can evaluate the remaining RecoveryNetUSD. The one-time easy UP gate has
+	// already been consumed by Case3AUpRecoveryUsed=true.
+	if !isPartial &&
+		case3AUpPartialRecovery &&
+		lot.RecoveryNetUSD > 0 {
+
+		msg := fmt.Sprintf(
+			"EXIT %s at %.2f reason=%s entry_reason=%s P/L=%.2f (fees=%.4f)",
+			exitTime.Format(time.RFC3339),
+			priceExec,
+			exitReason,
+			lot.ProducerReason,
+			pl,
+			entryPortion+exitFee,
+		)
+		if t.cfg.UseDirectSlack {
+			postSlack(msg)
+		}
+		_ = t.saveStateNoLock()
+		return msg, nil
+	}
 
 	if isPartial {
 		lot.SizeBase = baseRequested - baseFilled

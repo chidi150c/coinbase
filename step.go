@@ -604,14 +604,20 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				return true
 			}
 
-			if t.MarketRegime == RegimeUp {
-				return true
-			}
-
 			if lot.RecoveryNetUSD <= 0 {
 				return true
 			}
 
+			// First Case3A profit exit while the replacement is in UP:
+			// allow the ordinary ProfitGateUSD exit. The confirmed-fill
+			// path credits realized recovery and marks Case3AUpRecoveryUsed.
+			if t.MarketRegime == RegimeUp &&
+				!lot.Case3AUpRecoveryUsed {
+				return net >= lot.ProfitGateUSD
+			}
+
+			// After the one-time UP recovery exit has been used, or in
+			// NORMAL/DOWN, require ordinary profit plus remaining recovery.
 			requiredNet :=
 				lot.ProfitGateUSD +
 					lot.RecoveryNetUSD
