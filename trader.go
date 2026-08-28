@@ -68,6 +68,14 @@ type Position struct {
 	ProfitGateUSD    float64  `json:"profit_gate_usd,omitempty"`
 	EntryMethod      string   `json:"entry_method,omitempty"`
 
+	// Case3A replacement metadata persisted with the committed lot.
+	//
+	// ProfitGateUSD remains the ordinary per-lot profit gate.
+	// RecoveryNetUSD is the original loss this specific Case3A replacement
+	// was created to recover. RecoveryMethod identifies Mode A vs Mode B.
+	RecoveryNetUSD float64        `json:"recovery_net_usd,omitempty"`
+	RecoveryMethod RecoveryMethod `json:"recovery_method,omitempty"`
+
 	// --- NEW: track maker-first TP exit order id (post-only limit attempt) ---
 	FixedTPOrderID   string  `json:"-"`
 	RefundPortionUSD float64 `json:"refund_portion_usd"`
@@ -7247,6 +7255,8 @@ func (t *Trader) commitEntryFill(
 		ConfidenceMult:   pending.ConfidenceMult,
 		EntryMethod:      pending.EntryMethod,
 		ProfitGateUSD:    pending.ProfitGateUSD,
+		RecoveryNetUSD:   pending.RecoveryNetUSD,
+		RecoveryMethod:   pending.RecoveryMethod,
 
 		Producer: entry.Producer,
 	}

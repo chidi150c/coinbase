@@ -79,7 +79,7 @@ import (
 	"time"
 )
 
-const Version = 181
+const Version = 182
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -577,6 +577,45 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				)
 		}
 
+		// Case3A Mode A keeps all existing exit logic. This helper is only an
+		// additional final permission check at exit time:
+		//
+		//   UP:
+		//     existing exit behavior is unchanged.
+		//
+		//   DOWN / NORMAL:
+		//     a Case3A Mode A replacement may not take a profit exit until its
+		//     fee-aware net PnL has reached:
+		//
+		//         lot.ProfitGateUSD + lot.RecoveryNetUSD
+		//
+		// ProfitGateUSD itself is not rewritten. RecoveryNetUSD is the original,
+		// trade-specific recovery obligation persisted on the replacement lot.
+		case3AModeAProfitExitAllowed := func(
+			lot *Position,
+			net float64,
+		) bool {
+			if lot == nil ||
+				lot.Producer != EntryProducerCase3AReplacement ||
+				lot.RecoveryMethod != RecoveryByPositionSize {
+				return true
+			}
+
+			if t.MarketRegime == RegimeUp {
+				return true
+			}
+
+			if lot.RecoveryNetUSD <= 0 {
+				return true
+			}
+
+			requiredNet :=
+				t.lotProfitGateUSD(lot) +
+					lot.RecoveryNetUSD
+
+			return net >= requiredNet
+		}
+
 		var stopL2 []exitCandidate
 		var stopL1 []exitCandidate
 		var profitL2 []exitCandidate
@@ -665,6 +704,18 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				}
 
 				if case4Exit {
+					// Case3A Mode A uses the existing Case4 signal, but DOWN/NORMAL
+					// may not actually exit until normal profit + recovery obligation
+					// has been achieved. UP remains unchanged.
+					if !case3AModeAProfitExitAllowed(
+						lot,
+						net,
+					) {
+						lot.FixedTPWorking = false
+						i++
+						continue
+					}
+
 					// Exit as L2_PROFIT_PROTECTION.
 					// Guaranteed still profitable at decision time.
 					exitD := ExitDecision{
@@ -829,6 +880,19 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				}
 
 				// Profit gate passed for a normal lot.
+				//
+				// For Case3A Mode A this is the additional exit-time policy only:
+				// UP exits exactly as before; DOWN/NORMAL must also recover the
+				// trade-specific RecoveryNetUSD on top of the existing ProfitGateUSD.
+				if !case3AModeAProfitExitAllowed(
+					lot,
+					net,
+				) {
+					lot.FixedTPWorking = false
+					i++
+					continue
+				}
+
 				// Apply ordinary fixed-TP behavior.
 				switch lot.ExitMode {
 				case ExitModeScalpFixedTP:

@@ -2353,36 +2353,28 @@ func (t *Trader) recoveryTargetAddUSD() float64 {
 	return add
 }
 
+// applyRecoveryDebtFromExit maintains the bot-wide signed cumulative
+// realized PnL balance using the existing RecoveryDebtUSD sign convention:
+//
+//	RecoveryDebtUSD > 0  => cumulative realized net loss
+//	RecoveryDebtUSD == 0 => break-even
+//	RecoveryDebtUSD < 0  => cumulative realized net profit
+//
+// pnl is authoritative realized NET PnL:
+//
+//	pnl < 0 => loss, so RecoveryDebtUSD increases
+//	pnl > 0 => profit, so RecoveryDebtUSD decreases
+//
+// Do NOT clamp at zero. A negative RecoveryDebtUSD is meaningful and
+// represents realized profit exceeding realized losses.
 func (t *Trader) applyRecoveryDebtFromExit(pnl float64) {
-	if pnl < 0 {
-		old := t.RecoveryDebtUSD
-		t.RecoveryDebtUSD += math.Abs(pnl)
-
-		log.Printf(
-			"[TRACE] recovery.loss pnl=%.4f debt_before=%.4f debt_after=%.4f",
-			pnl,
-			old,
-			t.RecoveryDebtUSD,
-		)
+	if pnl == 0 ||
+		math.IsNaN(pnl) ||
+		math.IsInf(pnl, 0) {
 		return
 	}
 
-	if pnl > 0 && t.RecoveryDebtUSD > 0 {
-		old := t.RecoveryDebtUSD
-		recovered := math.Min(pnl, t.RecoveryDebtUSD)
-		t.RecoveryDebtUSD -= recovered
-		if t.RecoveryDebtUSD < 0 {
-			t.RecoveryDebtUSD = 0
-		}
-
-		log.Printf(
-			"[TRACE] recovery.profit pnl=%.4f recovered=%.4f debt_before=%.4f debt_after=%.4f",
-			pnl,
-			recovered,
-			old,
-			t.RecoveryDebtUSD,
-		)
-	}
+	t.RecoveryDebtUSD -= pnl
 }
 
 func (t *Trader) toNormal(reason string) {
