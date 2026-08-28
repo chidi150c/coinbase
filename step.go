@@ -1612,16 +1612,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	equitySpareBase :=
 		equityResult.ProposedSellBase
 
-	// Prevent duplicate opens while pending on this side (exits already ran) ---
-	// Extra belt-and-suspenders: if a pending exists and we haven't hit its Deadline, keep waiting.
-	// if side == SideBuy && entry.Intent != nil && time.Now().Before(entry.Intent.Deadline) {
-	// 	t.mu.Unlock()
-	// 	return StepResult{Msg: "OPEN-PENDING side=BUY", Raw: d.Raw, Signal: d.Signal}, nil
-	// }
-	// if side == SideSell && entry.Intent != nil && time.Now().Before(entry.Intent.Deadline) {
-	// 	t.mu.Unlock()
-	// 	return StepResult{Msg: "OPEN-PENDING side=SELL", Raw: d.Raw, Signal: d.Signal}, nil
-	// }
+		// Prevent duplicate opens while pending on this side (exits already ran) ---
+		// Extra belt-and-suspenders: if a pending exists and we haven't hit its Deadline, keep waiting.
+		// if side == SideBuy && entry.Intent != nil && time.Now().Before(entry.Intent.Deadline) {
+		// 	t.mu.Unlock()
+		// 	return StepResult{Msg: "OPEN-PENDING side=BUY", Raw: d.Raw, Signal: d.Signal}, nil
+		// }
+		// if side == SideSell && entry.Intent != nil && time.Now().Before(entry.Intent.Deadline) {
+		// 	t.mu.Unlock()
+		// 	return StepResult{Msg: "OPEN-PENDING side=SELL", Raw: d.Raw, Signal: d.Signal}, nil
+		// }
 
 	// -----------------------------------------------------------------------------
 	// Case 3B-Opposite - DOWN-Regime BUY Protection
@@ -1629,6 +1629,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// If the immediately previous exit was a BUY threshold-stop loss,
 	// block any new BUY entry above that loss-exit SELL price while the
 	// market regime remains DOWN.
+	//
+	// The protection is valid only for 24 hours after that loss exit.
+	// Older loss exits are ignored.
 	// -----------------------------------------------------------------------------
 	if side == SideBuy &&
 		t.MarketRegime == RegimeDown &&
@@ -1636,9 +1639,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 		last := t.lastExits[len(t.lastExits)-1]
 
+		case3BWithin24H :=
+			!last.Time.IsZero() &&
+				wallNow.Sub(last.Time) <= 24*time.Hour
+
 		if last.Side == SideBuy &&
 			strings.HasPrefix(last.Reason, "threshold_stop_loss") &&
 			last.PNLUSD < 0 &&
+			case3BWithin24H &&
 			price > last.ClosePrice {
 
 			t.addDecisionProducerEvent(
@@ -1655,15 +1663,24 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			)
 
 			t.mu.Unlock()
-			return StepResult{Msg: "HOLD Case3B block BUY above last loss-exit SELL price", Raw: d.Raw, Signal: d.Signal}, nil
+			return StepResult{
+				Msg:    "HOLD Case3B block BUY above last loss-exit SELL price",
+				Raw:    d.Raw,
+				Signal: d.Signal,
+			}, nil
 		}
 	}
+
 	// -----------------------------------------------------------------------------
 	// Case 3B - UP-Regime SELL Protection
 	//
 	// If the immediately previous exit was a SELL threshold-stop loss,
 	// block any new SELL entry below that loss-exit BUY price while the
 	// market regime remains UP.
+	//
+	// Case3A replacements bypass this protection.
+	// The protection is valid only for 24 hours after that loss exit.
+	// Older loss exits are ignored.
 	// -----------------------------------------------------------------------------
 	if side == SideSell &&
 		d.Producer != EntryProducerCase3AReplacement &&
@@ -1672,9 +1689,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 		last := t.lastExits[len(t.lastExits)-1]
 
+		case3BWithin24H :=
+			!last.Time.IsZero() &&
+				wallNow.Sub(last.Time) <= 24*time.Hour
+
 		if last.Side == SideSell &&
 			strings.HasPrefix(last.Reason, "threshold_stop_loss") &&
 			last.PNLUSD < 0 &&
+			case3BWithin24H &&
 			price < last.ClosePrice {
 
 			t.addDecisionProducerEvent(
@@ -1691,7 +1713,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			)
 
 			t.mu.Unlock()
-			return StepResult{Msg: "HOLD Case3B block SELL below last loss-exit BUY price", Raw: d.Raw, Signal: d.Signal}, nil
+			return StepResult{
+				Msg:    "HOLD Case3B block SELL below last loss-exit BUY price",
+				Raw:    d.Raw,
+				Signal: d.Signal,
+			}, nil
 		}
 	}
 
