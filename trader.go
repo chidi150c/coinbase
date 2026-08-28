@@ -143,6 +143,7 @@ type BotState struct {
 	SpareSellUSD            float64
 	PreviousAIRaw           Signal
 	Case11AReferencePrice   float64
+	Case11BReferencePrice   float64
 	Case13AReferencePrice   float64
 	PendingExits            map[string]*PendingExit
 	PendingEntries          map[string]*PendingEntry
@@ -202,6 +203,13 @@ type Trader struct {
 	// execution price here. Subsequent Case11A entries may use their
 	// producer-specific continuation gate until any AI BUY clears this value.
 	case11AReferencePrice float64
+
+	// Case11B continuation reference. Zero means the next Case11B BUY is
+	// the first entry of a fresh episode and must pass the normal Pyramid
+	// BUY gate. A successful Case11B fill/commit stores the actual broker
+	// execution price here. Subsequent Case11B entries may use their mirrored
+	// -0.308% continuation gate until any current AI SELL clears this value.
+	case11BReferencePrice float64
 
 	// Case13A re-entry reference. Zero means the next Case13A SELL is the
 	// first entry of a fresh episode and must use global SELL spacing.
@@ -1388,6 +1396,7 @@ func (t *Trader) snapshotStateLocked() BotState {
 		LatchedGateBuy:        t.latchedGateBuy,
 		PreviousAIRaw:         t.previousAIRaw,
 		Case11AReferencePrice: t.case11AReferencePrice,
+		Case11BReferencePrice: t.case11BReferencePrice,
 		Case13AReferencePrice: t.case13AReferencePrice,
 		LatchedGateSell:       t.latchedGateSell,
 
@@ -1510,6 +1519,7 @@ func (t *Trader) loadState() error {
 	t.latchedGateBuy = st.LatchedGateBuy
 	t.previousAIRaw = st.PreviousAIRaw
 	t.case11AReferencePrice = st.Case11AReferencePrice
+	t.case11BReferencePrice = st.Case11BReferencePrice
 	t.case13AReferencePrice = st.Case13AReferencePrice
 	t.latchedGateSell = st.LatchedGateSell
 	t.lastAddEquity = st.LastAddEquity
@@ -7526,6 +7536,13 @@ func (t *Trader) commitEntryFill(
 	// Pyramid SELL gate for continuation entries.
 	if entry.Producer == EntryProducerCase11APeakReversal {
 		t.case11AReferencePrice = priceToUse
+	}
+
+	// Mirror Case11A: only a successful asynchronous Case11B fill/commit
+	// advances the BUY-side continuation reference, using the actual broker
+	// execution price.
+	if entry.Producer == EntryProducerCase11BBottomReversal {
+		t.case11BReferencePrice = priceToUse
 	}
 
 	// Only a successful asynchronous Case13A fill/commit advances the

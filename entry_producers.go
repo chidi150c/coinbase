@@ -899,6 +899,12 @@ func applyEquityProducer(
 // state mutation and must be performed by the caller before this pure producer
 // is evaluated.
 //
+// Case11B mirrors Case11A on the BUY side. Its first BUY requires the complete
+// Pyramid BUY gate. After a committed Case11B fill establishes a durable
+// reference, subsequent BUYs replace Pyramid gating with a -0.308%
+// reference-price gate. Resetting that durable Case11B reference when
+// ai.Raw == Sell is likewise Trader-owned state mutation.
+//
 // It returns true when Case 11 produces a directional decision.
 func applyCase11ReversalProducer(
 	d *EntryDecision,
@@ -908,6 +914,7 @@ func applyCase11ReversalProducer(
 	pyramid PyramidResult,
 	price float64,
 	case11AReferencePrice float64,
+	case11BReferencePrice float64,
 ) bool {
 	const (
 		macdPeakBuffer   = 15.0
@@ -973,20 +980,52 @@ func applyCase11ReversalProducer(
 	// -------------------------------------------------------------
 	// Case 11B — Bottom-Reversal BUY.
 	//
-	// MACD[idx-6] <= -EPS + buffer
-	// AND EMA low-bottom
-	// AND Pyramid BUY gate
+	// Core reversal interpretation mirrors Case11A:
+	//
+	//   MACD[idx-6] <= -EPS + buffer
+	//   AND EMA low-bottom
+	//
+	// Entry-location gate:
+	//
+	//   First BUY of an episode:
+	//     require the complete Pyramid BUY gate.
+	//
+	//   Subsequent BUYs after a committed Case11B fill:
+	//     bypass Pyramid and require price <= reference * 0.99692.
+	//
+	// The durable reference is advanced only by trader.go after a successful
+	// Case11B fill/commit. AI direction does not qualify Case11B.
 	// -------------------------------------------------------------
+	const case11BReentryMultiplier = 0.99692
+
 	macdPreBottomThreshold :=
 		-macd.EPS + macdBottomBuffer
 
 	macdPreBottomZone :=
 		macd.LinePrev6 <= macdPreBottomThreshold
 
+	firstCase11B :=
+		case11BReferencePrice <= 0
+
+	nextCase11BReentryPrice := 0.0
+	case11BEntryGatePass := false
+
+	if firstCase11B {
+		case11BEntryGatePass =
+			pyramid.Buy.GatePassed
+	} else {
+		nextCase11BReentryPrice =
+			case11BReferencePrice *
+				case11BReentryMultiplier
+
+		case11BEntryGatePass =
+			price <= nextCase11BReentryPrice
+	}
+
 	bottomReversalBuy :=
 		macdPreBottomZone &&
 			ema.LowBottom &&
-			pyramid.Buy.GatePassed
+			case11BEntryGatePass
 
 	// Always expose Case 11 raw-material interpretation in the
 	// canonical EntryDecision, even when neither producer fires.
@@ -1073,23 +1112,39 @@ func applyCase11ReversalProducer(
 
 	if bottomReversalBuy {
 		d.Signal = Buy
+
+		// PyramidPass remains diagnostic. In continuation/reference mode the
+		// authoritative Case11B entry gate is the -0.308% reference-price gate.
 		d.PyramidPass = pyramid.Buy.GatePassed
 		d.PyramidReason = pyramid.Buy.Reason
 		d.Producer = EntryProducerCase11BBottomReversal
 		d.PendingCancelPolicy = PendingSignalCancelDisabled
+
+		referenceMode := "reference"
+		if firstCase11B {
+			referenceMode = "first_pyramid"
+		}
+
 		d.ProducerReason = fmt.Sprintf(
 			"bottom_reversal_buy|"+
 				"macd_idx6=%.6f|eps=%.6f|buffer=%.2f|"+
 				"threshold=%.6f|"+
 				"macd_zone=%t|"+
 				"ema_low_bottom=%t|"+
-				"pyramid_buy=%t",
+				"reference_mode=%s|reference_price=%.8f|"+
+				"next_reentry_price=%.8f|reentry_multiplier=%.6f|"+
+				"entry_gate_pass=%t|pyramid_buy=%t",
 			macd.LinePrev6,
 			macd.EPS,
 			macdBottomBuffer,
 			macdPreBottomThreshold,
 			macdPreBottomZone,
 			ema.LowBottom,
+			referenceMode,
+			case11BReferencePrice,
+			nextCase11BReentryPrice,
+			case11BReentryMultiplier,
+			case11BEntryGatePass,
 			pyramid.Buy.GatePassed,
 		)
 

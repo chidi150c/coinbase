@@ -1270,6 +1270,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		t.case11AReferencePrice = 0
 	}
 
+	// Mirror Case11A: any current AI SELL invalidates the BUY-side
+	// Case11B continuation/reference episode. This is state-based rather than
+	// transition-based, so repeated SELL ticks also self-heal stale state.
+	if aiResult.Raw == Sell {
+		t.case11BReferencePrice = 0
+	}
+
 	if macdSnapshot.Err != nil {
 		// log.Printf(
 		// "[TRACE] case5.macd.failed elapsed_ms=%d err=%v",
