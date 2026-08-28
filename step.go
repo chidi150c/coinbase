@@ -1666,6 +1666,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// market regime remains UP.
 	// -----------------------------------------------------------------------------
 	if side == SideSell &&
+		d.Producer != EntryProducerCase3AReplacement &&
 		t.MarketRegime == RegimeUp &&
 		len(t.lastExits) > 0 {
 
