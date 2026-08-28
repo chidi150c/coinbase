@@ -1708,6 +1708,12 @@ func (t *Trader) combineEntryRawMaterials(
 		t.case11AReferencePrice = 0
 	}
 
+	// Mirror Case11A: any current AI SELL invalidates the BUY-side
+	// Case11B continuation/reference episode.
+	if ai.Raw == Sell {
+		t.case11BReferencePrice = 0
+	}
+
 	regimeMult := t.RegimeMultiplier
 	if regimeMult <= 0 {
 		regimeMult = 1.0
@@ -1789,6 +1795,7 @@ func (t *Trader) combineEntryRawMaterials(
 		pyramid,
 		price,
 		t.case11AReferencePrice,
+		t.case11BReferencePrice,
 	) {
 		return d
 	}

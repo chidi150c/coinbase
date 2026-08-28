@@ -968,8 +968,10 @@ func applyCase11ReversalProducer(
 	}
 
 	case11AConfidence := ai.Confidence
+	case11AConfidenceFallback := false
 	if case11AConfidence <= 0 {
 		case11AConfidence = 1.0
+		case11AConfidenceFallback = true
 	}
 
 	peakReversalSell :=
@@ -1020,6 +1022,13 @@ func applyCase11ReversalProducer(
 
 		case11BEntryGatePass =
 			price <= nextCase11BReentryPrice
+	}
+
+	case11BConfidence := ai.Confidence
+	case11BConfidenceFallback := false
+	if case11BConfidence <= 0 {
+		case11BConfidence = 1.0
+		case11BConfidenceFallback = true
 	}
 
 	bottomReversalBuy :=
@@ -1082,7 +1091,7 @@ func applyCase11ReversalProducer(
 
 		d.ProducerReason = fmt.Sprintf(
 			"peak_reversal_sell|"+
-				"ai_raw=%s|ai_confidence=%.6f|case11a_confidence=%.6f|"+
+				"ai_raw=%s|ai_confidence=%.6f|case11a_confidence=%.6f|confidence_fallback=%t|"+
 				"macd_idx6=%.6f|eps=%.6f|buffer=%.2f|"+
 				"threshold=%.6f|"+
 				"macd_zone=%t|"+
@@ -1093,6 +1102,7 @@ func applyCase11ReversalProducer(
 			ai.Raw,
 			ai.Confidence,
 			case11AConfidence,
+			case11AConfidenceFallback,
 			macd.LinePrev6,
 			macd.EPS,
 			macdPeakBuffer,
@@ -1112,6 +1122,7 @@ func applyCase11ReversalProducer(
 
 	if bottomReversalBuy {
 		d.Signal = Buy
+		d.Confidence = case11BConfidence
 
 		// PyramidPass remains diagnostic. In continuation/reference mode the
 		// authoritative Case11B entry gate is the -0.308% reference-price gate.
@@ -1127,6 +1138,7 @@ func applyCase11ReversalProducer(
 
 		d.ProducerReason = fmt.Sprintf(
 			"bottom_reversal_buy|"+
+				"ai_raw=%s|ai_confidence=%.6f|case11b_confidence=%.6f|confidence_fallback=%t|"+
 				"macd_idx6=%.6f|eps=%.6f|buffer=%.2f|"+
 				"threshold=%.6f|"+
 				"macd_zone=%t|"+
@@ -1134,6 +1146,10 @@ func applyCase11ReversalProducer(
 				"reference_mode=%s|reference_price=%.8f|"+
 				"next_reentry_price=%.8f|reentry_multiplier=%.6f|"+
 				"entry_gate_pass=%t|pyramid_buy=%t",
+			ai.Raw,
+			ai.Confidence,
+			case11BConfidence,
+			case11BConfidenceFallback,
 			macd.LinePrev6,
 			macd.EPS,
 			macdBottomBuffer,
