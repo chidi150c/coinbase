@@ -2527,33 +2527,17 @@ func (t *Trader) closeLot(
 							repl.ProducerReason = modeAReason
 							t.addDecisionProducerEvent(&repl, case3AAttempt, ProducerStageCase3AModeABlocked, "", nil, false, true)
 
-							if t.MarketRegime == RegimeDown {
-								// Mode B is the insufficient-spare fallback only in DOWN regime.
-								repl.Enabled = true
-								repl.LimitPx = replacementEntryPrice
-								repl.BaseAtLimit = normalBase
-								repl.RecoveryNetUSD = recoveryNetUSD
-								repl.RecoveryMethod = RecoveryByProfitTarget
-								repl.ProfitGateUSD = t.cfg.ProfitGateUSD
-								repl.ProducerReason = fmt.Sprintf(
-									"case3A_replacement|method=%s|recovery_usd=%.6f|regime=%s|source_order_id=%s",
-									RecoveryByProfitTarget.String(), recoveryNetUSD, t.MarketRegime, lot.EntryOrderID,
-								)
-							} else {
-								repl.ProducerReason = fmt.Sprintf(
-									"case3A_mode_b_blocked|reason=regime_not_down|regime=%s|required_regime=%s|"+
-										"recovery_usd=%.6f|source_order_id=%s",
-									t.MarketRegime, RegimeDown, recoveryNetUSD, lot.EntryOrderID,
-								)
-								t.addDecisionProducerEvent(&repl, case3AAttempt, ProducerStageCase3AModeBBlocked, "", nil, false, true)
-
-								repl.ProducerReason = fmt.Sprintf(
-									"case3A_decision_blocked|reason=no_recovery_mode_available|regime=%s|"+
-										"recovery_usd=%.6f|source_order_id=%s",
-									t.MarketRegime, recoveryNetUSD, lot.EntryOrderID,
-								)
-								t.addDecisionProducerEvent(&repl, case3AAttempt, ProducerStageDecisionBlocked, "", nil, false, true)
-							}
+							// Mode B is the insufficient-spare fallback in every regime.
+							repl.Enabled = true
+							repl.LimitPx = replacementEntryPrice
+							repl.BaseAtLimit = normalBase
+							repl.RecoveryNetUSD = recoveryNetUSD
+							repl.RecoveryMethod = RecoveryByProfitTarget
+							repl.ProfitGateUSD = t.cfg.ProfitGateUSD
+							repl.ProducerReason = fmt.Sprintf(
+								"case3A_replacement|method=%s|recovery_usd=%.6f|regime=%s|source_order_id=%s",
+								RecoveryByProfitTarget.String(), recoveryNetUSD, t.MarketRegime, lot.EntryOrderID,
+							)
 						}
 
 						if repl.Enabled {

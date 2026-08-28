@@ -618,3 +618,64 @@ This keeps the Case 3A family well organized:
 Mode A → Preferred recovery using additional capital (RecoveryByPositionSize).
 Mode B → Immediate profit-target recovery in a DOWN regime.
 Mode C → Deferred profit-target recovery in an UP regime, waiting for a technically favorable SELL setup.
+
+=========================================================================
+
+// Case14BUptrendBuyProducer eases the normal BUY adverse-price gate during
+// strong UP-trend continuation.
+//
+// This producer owns only the buffered window immediately above the BUY
+// latch and never overlaps with NormalLegacy.
+//
+// Territory:
+//
+//	price <= BUY latch
+//	    -> NormalLegacy
+//
+//	BUY latch < price <= buffered BUY latch
+//	    -> Case14B (reduced profit target)
+//
+//	price > buffered BUY latch
+//	    -> No Case14B entry
+//
+//	pending Case14B > 0
+//	    -> Case14B disabled
+//
+// Requires AI BUY, Legacy BUY, Logic BUY, BUY pattern, UP regime, and
+// BUY spacing gate.
+
+========================================================================
+
+maybe case 15
+I have a trading-bot rule called Case 3B — SELL Loss Protection.
+
+Its purpose is to prevent repeated SELL entries after a SELL trade has already lost while the market is still in an UP regime.
+
+Example:
+
+A previous SELL position was closed by its loss-stop BUY at $80,000.
+Case 3B remembers $80,000 as the previous SELL loss-stop exit/reference price.
+While the market regime is UP, another SELL below $80,000 is blocked. This prevents repeatedly shorting/selling lower while the prevailing regime continues upward.
+A SELL above $80,000 is not blocked by this particular price protection.
+
+The unresolved design question is:
+
+If the market remains in the UP regime, under what condition should Case 3B eventually release the $80,000 protection and permit SELL entries below $80,000 again?
+
+Changing from UP → DOWN/NORMAL is an obvious release, but that does not solve the issue I am asking about. I specifically need a sensible release mechanism while the regime remains UP.
+
+We need to avoid two bad outcomes:
+
+Release too easily: the bot repeatedly SELLs below the previous loss-stop price and suffers the same type of loss.
+Never release: $80,000 becomes a permanent floor for SELL entries for as long as the regime remains UP, even if market structure changes substantially and SELL opportunities later become valid.
+
+Analyze what event should demonstrate that the old $80,000 loss reference is no longer relevant. Consider possibilities such as price reclaiming/crossing the reference, a new AI SELL cycle or opposite AI signal, a new local high followed by reversal, adverse-continuation distance, elapsed time, or another state-machine reset.
+
+Do not write code yet. First propose the cleanest state-machine policy. Explain exactly:
+
+what activates Case 3B;
+what remains blocked;
+what event arms/releases it while regime remains UP;
+whether $80,000 should be cleared or replaced with a new reference;
+how to prevent immediate re-entry loops;
+and walk through price examples around $80,000 showing when SELL is blocked versus allowed.
