@@ -164,6 +164,25 @@ func producerTierFor(producer EntryProducer) (ProducerTier, float64) {
 	}
 }
 
+func continuationEntryMultiplier(
+	side OrderSide,
+) float64 {
+	spacing :=
+		ContinuationEntrySpacingPct /
+			100.0
+
+	switch side {
+	case SideSell:
+		return 1.0 + spacing
+
+	case SideBuy:
+		return 1.0 - spacing
+
+	default:
+		return 0
+	}
+}
+
 func continuationReferenceGate(
 	side OrderSide,
 	current float64,
@@ -173,15 +192,24 @@ func continuationReferenceGate(
 		return 0, false
 	}
 
-	spacing := ContinuationEntrySpacingPct / 100.0
+	multiplier :=
+		continuationEntryMultiplier(
+			side,
+		)
+
+	if multiplier <= 0 {
+		return 0, false
+	}
+
+	threshold =
+		reference *
+			multiplier
 
 	switch side {
 	case SideSell:
-		threshold = reference * (1.0 + spacing)
 		return threshold, current >= threshold
 
 	case SideBuy:
-		threshold = reference * (1.0 - spacing)
 		return threshold, current <= threshold
 
 	default:
@@ -197,6 +225,10 @@ func applyStandardProducerEconomics(
 	threshold float64,
 	entryPass bool,
 ) {
+	if d == nil {
+		panic("applyStandardProducerEconomics: nil EntryDecision")
+	}
+
 	tier, tierMultiplier := producerTierFor(producer)
 	resolvedMultiplier := tierMultiplier
 	if continuation {
@@ -660,6 +692,13 @@ func (t *Trader) evaluateEquityProducerMaterial(
 				equityBuyReference,
 			)
 
+		// In continuation mode this is the effective trigger multiplier
+		// relative to the committed Equity reference, not the configured
+		// first-entry Equity multiplier.
+		equityRaw.BuyTriggerMult =
+			continuationEntryMultiplier(
+				SideBuy,
+			)
 		equityRaw.BuyTriggerUSD = nextBuyEquity
 		equityRaw.BuyThresholdDistanceUSD =
 			nextBuyEquity -
@@ -675,6 +714,12 @@ func (t *Trader) evaluateEquityProducerMaterial(
 				equitySellReference,
 			)
 
+		// Mirror BUY: continuation exposes +0.20% as the effective
+		// reference-relative Equity trigger multiplier.
+		equityRaw.SellTriggerMult =
+			continuationEntryMultiplier(
+				SideSell,
+			)
 		equityRaw.SellTriggerUSD = nextSellEquity
 		equityRaw.SellThresholdDistanceUSD =
 			equityRaw.EquityUSD -

@@ -158,8 +158,9 @@ type EquityRawResult struct {
 	Elapsed time.Duration
 }
 
-// EquityResult preserves the raw Equity snapshot, applies the legacy signal,
-// applies available spare funding, and proposes the Equity BUY/SELL trigger.
+// EquityResult preserves the raw Equity snapshot, applies the directional
+// input supplied by the Equity material evaluator, applies available spare
+// funding, and proposes the Equity BUY/SELL trigger.
 //
 // It does not access balances, enforce LongOnly, check lot caps, or place an
 // order.
@@ -491,8 +492,8 @@ func (t *Trader) evaluateEquityRaw() EquityRawResult {
 	return result
 }
 
-// interpretEquityRaw applies the legacy direction and available spare funding
-// to the direction-independent Equity snapshot.
+// interpretEquityRaw applies the supplied Equity-owned direction and available
+// spare funding to the direction-independent Equity snapshot.
 //
 // It proposes an Equity trigger and a step-snapped amount. LongOnly and final
 // order validation remain in step().
@@ -1683,8 +1684,8 @@ func interpretPyramidSideRaw(
 // Ordinary producers receive the same immutable continuation snapshot. Their
 // signal intelligence remains producer-owned; after a committed same-producer/
 // same-side entry, the standardized continuation admission gate replaces the
-// producer's native Pyramid/price repeat-entry admission and applies the
-// producer-tier continuation ProfitGateMultiplier.
+// producer's native Pyramid/price admission for that continuation attempt and
+// applies the producer-tier continuation ProfitGateMultiplier.
 //
 // Sizing, LongOnly, lot caps, pending-entry registration, funding approval,
 // committed-reference mutation, and order placement remain outside this function.
@@ -1845,8 +1846,12 @@ func (t *Trader) combineEntryRawMaterials(
 	}
 
 	// -------------------------------------------------------------
-	// NormalLegacy — AI + Logic direction and matching complete
-	// Pyramid gate.
+	// NormalLegacy — AI + Logic direction.
+	//
+	// First entry uses the native matching complete Pyramid gate.
+	// After a committed same-producer/same-side fill, continuation keeps
+	// the same signal qualification but replaces Pyramid admission with
+	// the standardized committed-reference +/-0.20% gate.
 	// -------------------------------------------------------------
 	if applyNormalLegacyProducer(
 		&d,

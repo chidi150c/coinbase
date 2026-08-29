@@ -124,9 +124,10 @@ type BotState struct {
 	// --- NEW: equity-at-last-add snapshots (SELL persisted; legacy fallback supported) ---
 	LastAddEquity float64
 
-	// Equity SELL continuation is armed only after a committed Equity SELL.
-	// It survives SELL/FLAT AI states and is cleared by any current AI BUY
-	// in the decision path.
+	// Legacy pre-standardization Equity SELL continuation marker.
+	// Retained only so old state files can migrate LastAddEquity into the
+	// generic producer+side continuation map. New behavior is driven solely by
+	// ProducerContinuationReferences.
 	EquitySellContinuation bool
 
 	// --- NEW: persist equity trigger staging indices per side ---
@@ -247,11 +248,6 @@ type Trader struct {
 
 	// --- NEW: equity-at-last-add snapshots for equity strategy trading ---
 	lastAddEquity float64
-
-	// Legacy Equity SELL continuation flag retained only during migration.
-	// Standardized continuation state is authoritative in
-	// producerContinuationReferences[EntryProducerEquity][side].
-	equitySellContinuation bool
 
 	// --- NEW: equity trigger staging indices per side (0..3 for 25/50/75/100) ---
 	equityStageBuy  int
@@ -643,11 +639,6 @@ func (t *Trader) clearProducerContinuationReference(
 			producer,
 		)
 	}
-
-	if producer == EntryProducerEquity &&
-		side == SideSell {
-		t.equitySellContinuation = false
-	}
 }
 
 // clearProducerContinuationSide clears one side across all ordinary
@@ -671,10 +662,6 @@ func (t *Trader) clearProducerContinuationSide(
 				producer,
 			)
 		}
-	}
-
-	if side == SideSell {
-		t.equitySellContinuation = false
 	}
 }
 
@@ -1377,6 +1364,13 @@ func decisionEntryReason(d EntryDecision) string {
 		fmt.Sprintf("legacySignal=%s", d.LegacySignal),
 		fmt.Sprintf("logicOpinion=%s", d.LogicOpinion),
 		fmt.Sprintf("Producer=%s", d.Producer),
+		fmt.Sprintf("producerTier=%s", d.ProducerTier),
+		fmt.Sprintf("producerTierMult=%.6f", d.ProducerTierMultiplier),
+		fmt.Sprintf("continuation=%t", d.IsContinuation),
+		fmt.Sprintf("continuationReference=%.8f", d.ContinuationReference),
+		fmt.Sprintf("continuationEntryThreshold=%.8f", d.ContinuationEntryThreshold),
+		fmt.Sprintf("continuationEntryPass=%t", d.ContinuationEntryPass),
+		fmt.Sprintf("profitGateMultiplier=%.6f", d.ProfitGateMultiplier),
 		fmt.Sprintf("assignRunner=%t", d.AssignRunner),
 		// Backward-compatible aliases.
 		// Raw and Decision remain authoritative in the fixed log prefix.
@@ -1719,11 +1713,6 @@ func (t *Trader) loadState() error {
 
 	t.latchedGateSell = st.LatchedGateSell
 	t.lastAddEquity = st.LastAddEquity
-	t.equitySellContinuation =
-		t.producerContinuationReferences.Reference(
-			EntryProducerEquity,
-			SideSell,
-		) > 0
 	t.lastExits = st.Exits
 
 	t.dustBuyLots = append([]*Position(nil), st.DustBuyLots...)
@@ -7664,14 +7653,6 @@ func (t *Trader) commitEntryFill(
 			t.lastAddEquity,
 		)
 
-		// Keep the legacy flag synchronized for backward-compatible state and
-		// diagnostics while generic continuation state remains authoritative.
-		t.equitySellContinuation =
-			t.producerContinuationReferences.Reference(
-				EntryProducerEquity,
-				SideSell,
-			) > 0
-
 		log.Printf(
 			"[TRACE] equity.baseline.set "+
 				"side=%s producer=%s old=%.2f new=%.2f "+
@@ -7758,16 +7739,24 @@ func (t *Trader) commitEntryFill(
 		}
 	}
 
+	committedContinuationReference :=
+		t.producerContinuationReferences.Reference(
+			entry.Producer,
+			side,
+		)
+
 	log.Printf(
 		"[PRODUCER] stage=committed "+
 			"producer=%s side=%s order_id=%s "+
-			"price=%.8f base=%.8f fee_usd=%.8f reason=%q",
+			"price=%.8f base=%.8f fee_usd=%.8f "+
+			"continuation_reference=%.8f reason=%q",
 		entry.Producer,
 		side,
 		res.OrderID,
 		newLot.OpenPrice,
 		newLot.SizeBase,
 		newLot.EntryFee,
+		committedContinuationReference,
 		newLot.ProducerReason,
 	)
 

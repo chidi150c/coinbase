@@ -79,7 +79,7 @@ import (
 	"time"
 )
 
-const Version = 183
+const Version = 184
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -1944,8 +1944,40 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	profitGateMultiplier :=
 		d.ProfitGateMultiplier
 
-	if profitGateMultiplier <= 0 {
-		profitGateMultiplier = 1.0
+	if d.Producer == EntryProducerCase3AReplacement {
+		// Case3A is the explicit standardization exemption. Its replacement
+		// economics are resolved by the dedicated recovery path.
+		if profitGateMultiplier <= 0 {
+			profitGateMultiplier = 1.0
+		}
+	} else if d.Producer != EntryProducerNone &&
+		profitGateMultiplier <= 0 {
+
+		// Every ordinary producer must resolve its tier and continuation
+		// multiplier before execution. Never silently promote a wiring error
+		// to HIGH tier.
+		t.addDecisionProducerEvent(
+			intent,
+			attempt,
+			ProducerStageDecisionFailed,
+			EntryProduceErrInvalidProfitGate,
+			fmt.Errorf(
+				"ordinary producer missing standardized ProfitGateMultiplier: producer=%s tier=%s continuation=%t",
+				d.Producer,
+				d.ProducerTier,
+				d.IsContinuation,
+			),
+			false,
+			true,
+		)
+
+		t.mu.Unlock()
+
+		return StepResult{
+			Msg:    "HOLD invalid producer economics",
+			Raw:    d.Raw,
+			Signal: d.Signal,
+		}, nil
 	}
 
 	producerProfitGateUSD :=
@@ -3287,12 +3319,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			continuationReference,
 		)
 
-		// Legacy compatibility only; the generic reference map is authoritative.
-		if d.Producer == EntryProducerEquity &&
-			side == SideSell {
-			t.equitySellContinuation =
-				continuationReference > 0
-		}
 	}
 
 	// Runner assignment is producer-owned. The direct-market path executes
@@ -3359,6 +3385,31 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				make(map[ProducerStage]ProducerEvent)
 		}
 
+		committedReason :=
+			strings.TrimSpace(
+				intent.ProducerReason,
+			)
+
+		standardizedFacts := fmt.Sprintf(
+			"producer_tier=%s|tier_mult=%.6f|continuation=%t|"+
+				"continuation_reference=%.8f|continuation_threshold=%.8f|"+
+				"continuation_entry_pass=%t|profit_gate_mult=%.6f|profit_gate_usd=%.8f",
+			d.ProducerTier,
+			d.ProducerTierMultiplier,
+			d.IsContinuation,
+			d.ContinuationReference,
+			d.ContinuationEntryThreshold,
+			d.ContinuationEntryPass,
+			profitGateMultiplier,
+			newLot.ProfitGateUSD,
+		)
+
+		if committedReason == "" {
+			committedReason = standardizedFacts
+		} else {
+			committedReason += "|" + standardizedFacts
+		}
+
 		attempt.Events[ProducerStageCommitted] =
 			ProducerEvent{
 				Time:      time.Now().UTC(),
@@ -3371,7 +3422,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				DecisionID: intent.DecisionID,
 				OrderID:    placedOrderID(placed),
 
-				Reason: intent.ProducerReason,
+				Reason: committedReason,
 
 				// Committed reflects the exposure that was actually persisted locally.
 				Price:      priceToUse,
