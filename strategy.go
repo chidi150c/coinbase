@@ -435,21 +435,14 @@ func (t *Trader) evaluateEMAPatternSnapshot(
 func (t *Trader) evaluateEquityRaw() EquityRawResult {
 	started := time.Now()
 
-	sellTriggerMult :=
-		t.cfg.SellEquityTriggerMult
-
-	// After the first committed Equity SELL, continuation mode uses a reduced
-	// SELL adversity of +0.308% while the remembered SELL episode remains armed.
-	// The episode is cleared by any current AI BUY before entry-producer fan-in.
-	if t.equitySellContinuation {
-		sellTriggerMult = 1.00308
-	}
-
+	// Raw Equity remains producer-neutral. Continuation admission is applied
+	// later by evaluateEquityProducerMaterial() from the standardized
+	// producer+side committed-reference snapshot.
 	result := EquityRawResult{
 		EquityUSD:       t.equityUSD,
 		BaselineUSD:     t.lastAddEquity,
 		BuyTriggerMult:  t.cfg.BuyEquityTriggerMult,
-		SellTriggerMult: sellTriggerMult,
+		SellTriggerMult: t.cfg.SellEquityTriggerMult,
 	}
 
 	defer func() {
@@ -1687,8 +1680,14 @@ func interpretPyramidSideRaw(
 //
 // The first producer that emits BUY or SELL becomes the final decision.
 //
+// Ordinary producers receive the same immutable continuation snapshot. Their
+// signal intelligence remains producer-owned; after a committed same-producer/
+// same-side entry, the standardized continuation admission gate replaces the
+// producer's native Pyramid/price repeat-entry admission and applies the
+// producer-tier continuation ProfitGateMultiplier.
+//
 // Sizing, LongOnly, lot caps, pending-entry registration, funding approval,
-// and order placement remain outside this function.
+// committed-reference mutation, and order placement remain outside this function.
 func (t *Trader) combineEntryRawMaterials(
 	ai AIResult,
 	macd MACDResult,
@@ -1697,22 +1696,11 @@ func (t *Trader) combineEntryRawMaterials(
 	equity EquityResult,
 	price float64,
 	pendingCounts PendingProducerCounts,
+	continuationRefs ProducerContinuationReferences,
 ) EntryDecision {
-	// SELL-episode memory is invalid whenever the current AI opinion is BUY.
-	// This is intentionally state-based rather than transition-based:
-	// BUY -> BUY keeps both SELL continuation memories forced clear, and a
-	// restart into an already-BUY AI state self-heals stale persisted memory.
-	if ai.Raw == Buy {
-		t.equitySellContinuation = false
-		t.case13AReferencePrice = 0
-		t.case11AReferencePrice = 0
-	}
-
-	// Mirror Case11A: any current AI SELL invalidates the BUY-side
-	// Case11B continuation/reference episode.
-	if ai.Raw == Sell {
-		t.case11BReferencePrice = 0
-	}
+	// Continuation episode mutation is intentionally not performed here.
+	// step.go owns the mirrored AI-direction reset and passes this function an
+	// immutable producer+side reference snapshot for deterministic evaluation.
 
 	regimeMult := t.RegimeMultiplier
 	if regimeMult <= 0 {
@@ -1727,7 +1715,7 @@ func (t *Trader) combineEntryRawMaterials(
 		Confidence:           ai.Confidence,
 		Producer:             EntryProducerNone,
 		PendingCancelPolicy:  PendingSignalCancelUnspecified,
-		ProfitGateMultiplier: 1.0,
+		ProfitGateMultiplier: 0,
 
 		PUp:           ai.PUp,
 		BuyThreshold:  ai.BuyThreshold,
@@ -1794,8 +1782,7 @@ func (t *Trader) combineEntryRawMaterials(
 		ema,
 		pyramid,
 		price,
-		t.case11AReferencePrice,
-		t.case11BReferencePrice,
+		continuationRefs,
 	) {
 		return d
 	}
@@ -1814,7 +1801,7 @@ func (t *Trader) combineEntryRawMaterials(
 		t.RecentHigh,
 		t.MarketRegime,
 		pendingCounts,
-		t.case13AReferencePrice,
+		continuationRefs,
 	) {
 		return d
 	}
@@ -1826,7 +1813,17 @@ func (t *Trader) combineEntryRawMaterials(
 	// price > buffered latch: no Case14B entry
 	// pending Case14B > 0: Case14B disabled
 	// -------------------------------------------------------------
-	if applyCase14BUptrendBuyProducer(&d, ai, macd, ema, pyramid, price, t.MarketRegime, pendingCounts) {
+	if applyCase14BUptrendBuyProducer(
+		&d,
+		ai,
+		macd,
+		ema,
+		pyramid,
+		price,
+		t.MarketRegime,
+		pendingCounts,
+		continuationRefs,
+	) {
 		return d
 	}
 
@@ -1834,7 +1831,16 @@ func (t *Trader) combineEntryRawMaterials(
 	// Equity — independent Equity threshold + funding producer.
 	// AI / Logic / Pyramid are diagnostics only and do not gate Equity.
 	// -------------------------------------------------------------
-	if applyEquityProducer(&d, ai, macd, ema, pyramid, equity, pendingCounts) {
+	if applyEquityProducer(
+		&d,
+		ai,
+		macd,
+		ema,
+		pyramid,
+		equity,
+		pendingCounts,
+		continuationRefs,
+	) {
 		return d
 	}
 
@@ -1842,7 +1848,15 @@ func (t *Trader) combineEntryRawMaterials(
 	// NormalLegacy — AI + Logic direction and matching complete
 	// Pyramid gate.
 	// -------------------------------------------------------------
-	if applyNormalLegacyProducer(&d, ai, macd, ema, pyramid) {
+	if applyNormalLegacyProducer(
+		&d,
+		ai,
+		macd,
+		ema,
+		pyramid,
+		price,
+		continuationRefs,
+	) {
 		return d
 	}
 

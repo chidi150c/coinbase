@@ -135,16 +135,24 @@ type BotState struct {
 	Exits           []ExitRecord
 
 	// --- NEW (persist pending maker-first opens & recheck flags) ---
-	PendingRecheckBuy       bool
-	PendingRecheckSell      bool
-	RefundBuyUSD            float64
-	RefundSellUSD           float64
-	SpareBuyUSD             float64
-	SpareSellUSD            float64
-	PreviousAIRaw           Signal
-	Case11AReferencePrice   float64
-	Case11BReferencePrice   float64
-	Case13AReferencePrice   float64
+	PendingRecheckBuy  bool
+	PendingRecheckSell bool
+	RefundBuyUSD       float64
+	RefundSellUSD      float64
+	SpareBuyUSD        float64
+	SpareSellUSD       float64
+	PreviousAIRaw      Signal
+	// Standardized durable continuation references keyed by producer + side.
+	// Market-price producers store committed execution price; Equity stores
+	// committed account equity in the same map.
+	ProducerContinuationReferences ProducerContinuationReferences `json:"producer_continuation_references,omitempty"`
+
+	// Legacy continuation fields are retained only for state-file migration.
+	// New code reads/writes ProducerContinuationReferences.
+	Case11AReferencePrice float64 `json:"case11a_reference_price,omitempty"`
+	Case11BReferencePrice float64 `json:"case11b_reference_price,omitempty"`
+	Case13AReferencePrice float64 `json:"case13a_reference_price,omitempty"`
+
 	PendingExits            map[string]*PendingExit
 	PendingEntries          map[string]*PendingEntry
 	MarketRegime            MarketRegime `json:"market_regime,omitempty"`
@@ -197,23 +205,14 @@ type Trader struct {
 	equityUSD     float64
 	previousAIRaw Signal
 
-	// Case11A continuation reference. Zero means the next Case11A SELL is
-	// the first entry of a fresh episode and must pass the normal Pyramid
-	// SELL gate. A successful Case11A fill/commit stores the actual broker
-	// execution price here. Subsequent Case11A entries may use their
-	// producer-specific continuation gate until any AI BUY clears this value.
-	case11AReferencePrice float64
-
-	// Case11B continuation reference. Zero means the next Case11B BUY is
-	// the first entry of a fresh episode and must pass the normal Pyramid
-	// BUY gate. A successful Case11B fill/commit stores the actual broker
-	// execution price here. Subsequent Case11B entries may use their mirrored
-	// -0.308% continuation gate until any current AI SELL clears this value.
-	case11BReferencePrice float64
-
-	// Case13A re-entry reference. Zero means the next Case13A SELL is the
-	// first entry of a fresh episode and must use global SELL spacing.
-	case13AReferencePrice float64
+	// Standardized continuation memory for every ordinary producer.
+	//
+	// Keys are producer + side. A zero/missing value means "first entry".
+	// Values advance only after a successful committed fill. Market-price
+	// producers store the actual broker execution price; Equity stores the
+	// committed account-equity snapshot so its continuation remains
+	// equity-referenced.
+	producerContinuationReferences ProducerContinuationReferences
 
 	// NEW: path to persisted state file
 	stateFile string
@@ -249,9 +248,9 @@ type Trader struct {
 	// --- NEW: equity-at-last-add snapshots for equity strategy trading ---
 	lastAddEquity float64
 
-	// Equity SELL continuation is episode memory, not a Runner property.
-	// It is armed only by a successfully committed Equity SELL. SELL/FLAT
-	// preserves it; any current AI BUY clears it in the decision path.
+	// Legacy Equity SELL continuation flag retained only during migration.
+	// Standardized continuation state is authoritative in
+	// producerContinuationReferences[EntryProducerEquity][side].
 	equitySellContinuation bool
 
 	// --- NEW: equity trigger staging indices per side (0..3 for 25/50/75/100) ---
@@ -354,6 +353,9 @@ func NewTrader(cfg Config, broker Broker) *Trader {
 		),
 		producerEconomics: make(
 			map[EntryProducer]*ProducerEconomics,
+		),
+		producerContinuationReferences: make(
+			ProducerContinuationReferences,
 		),
 	}
 
@@ -541,6 +543,139 @@ func (t *Trader) book(side OrderSide) *SideBook {
 		t.books[side] = b
 	}
 	return b
+}
+
+func cloneProducerContinuationReferences(
+	src ProducerContinuationReferences,
+) ProducerContinuationReferences {
+	if src == nil {
+		return make(ProducerContinuationReferences)
+	}
+
+	dst := make(
+		ProducerContinuationReferences,
+		len(src),
+	)
+	for producer, bySide := range src {
+		if bySide == nil {
+			continue
+		}
+		copyBySide := make(
+			map[OrderSide]float64,
+			len(bySide),
+		)
+		for side, reference := range bySide {
+			if reference > 0 {
+				copyBySide[side] = reference
+			}
+		}
+		if len(copyBySide) > 0 {
+			dst[producer] = copyBySide
+		}
+	}
+	return dst
+}
+
+// producerContinuationReferencesSnapshot returns an immutable copy suitable
+// for pure producer evaluation.
+func (t *Trader) producerContinuationReferencesSnapshot() ProducerContinuationReferences {
+	return cloneProducerContinuationReferences(
+		t.producerContinuationReferences,
+	)
+}
+
+// setProducerContinuationReference advances one producer+side reference.
+// Caller must hold t.mu when concurrent mutation is possible.
+func (t *Trader) setProducerContinuationReference(
+	producer EntryProducer,
+	side OrderSide,
+	reference float64,
+) {
+	if producer == EntryProducerNone ||
+		producer == EntryProducerCase3AReplacement ||
+		(side != SideBuy && side != SideSell) {
+		return
+	}
+
+	if t.producerContinuationReferences == nil {
+		t.producerContinuationReferences =
+			make(ProducerContinuationReferences)
+	}
+
+	if reference <= 0 {
+		t.clearProducerContinuationReference(
+			producer,
+			side,
+		)
+		return
+	}
+
+	bySide :=
+		t.producerContinuationReferences[producer]
+	if bySide == nil {
+		bySide = make(map[OrderSide]float64)
+		t.producerContinuationReferences[producer] =
+			bySide
+	}
+	bySide[side] = reference
+}
+
+// clearProducerContinuationReference clears one producer+side continuation
+// episode without affecting any other producer or the opposite side.
+func (t *Trader) clearProducerContinuationReference(
+	producer EntryProducer,
+	side OrderSide,
+) {
+	if t.producerContinuationReferences == nil {
+		return
+	}
+
+	bySide :=
+		t.producerContinuationReferences[producer]
+	if bySide == nil {
+		return
+	}
+
+	delete(bySide, side)
+	if len(bySide) == 0 {
+		delete(
+			t.producerContinuationReferences,
+			producer,
+		)
+	}
+
+	if producer == EntryProducerEquity &&
+		side == SideSell {
+		t.equitySellContinuation = false
+	}
+}
+
+// clearProducerContinuationSide clears one side across all ordinary
+// producers. This helper is intentionally separate from decision logic so
+// callers can apply the agreed mirrored reset policy explicitly.
+func (t *Trader) clearProducerContinuationSide(
+	side OrderSide,
+) {
+	if t.producerContinuationReferences == nil {
+		return
+	}
+
+	for producer, bySide := range t.producerContinuationReferences {
+		if bySide == nil {
+			continue
+		}
+		delete(bySide, side)
+		if len(bySide) == 0 {
+			delete(
+				t.producerContinuationReferences,
+				producer,
+			)
+		}
+	}
+
+	if side == SideSell {
+		t.equitySellContinuation = false
+	}
 }
 
 // mergeLots merges lot at fromIdx into lot at toIdx inside the given book.
@@ -1389,19 +1524,24 @@ func (t *Trader) snapshotStateLocked() BotState {
 		BookBuy:  *t.book(SideBuy),
 		BookSell: *t.book(SideSell),
 
-		LastAddBuy:            t.lastAddBuy,
-		LastAddSell:           t.lastAddSell,
-		WinLowBuy:             t.winLowBuy,
-		WinHighSell:           t.winHighSell,
-		LatchedGateBuy:        t.latchedGateBuy,
-		PreviousAIRaw:         t.previousAIRaw,
-		Case11AReferencePrice: t.case11AReferencePrice,
-		Case11BReferencePrice: t.case11BReferencePrice,
-		Case13AReferencePrice: t.case13AReferencePrice,
-		LatchedGateSell:       t.latchedGateSell,
+		LastAddBuy:     t.lastAddBuy,
+		LastAddSell:    t.lastAddSell,
+		WinLowBuy:      t.winLowBuy,
+		WinHighSell:    t.winHighSell,
+		LatchedGateBuy: t.latchedGateBuy,
+		PreviousAIRaw:  t.previousAIRaw,
+		ProducerContinuationReferences: cloneProducerContinuationReferences(
+			t.producerContinuationReferences,
+		),
+		LatchedGateSell: t.latchedGateSell,
 
-		LastAddEquity:          t.lastAddEquity,
-		EquitySellContinuation: t.equitySellContinuation,
+		LastAddEquity: t.lastAddEquity,
+		// Legacy compatibility only. The generic Equity SELL reference is
+		// authoritative for new state.
+		EquitySellContinuation: t.producerContinuationReferences.Reference(
+			EntryProducerEquity,
+			SideSell,
+		) > 0,
 
 		// Persist equity stages
 		EquityStageBuy:  t.equityStageBuy,
@@ -1518,12 +1658,72 @@ func (t *Trader) loadState() error {
 	t.winHighSell = st.WinHighSell
 	t.latchedGateBuy = st.LatchedGateBuy
 	t.previousAIRaw = st.PreviousAIRaw
-	t.case11AReferencePrice = st.Case11AReferencePrice
-	t.case11BReferencePrice = st.Case11BReferencePrice
-	t.case13AReferencePrice = st.Case13AReferencePrice
+	t.producerContinuationReferences =
+		cloneProducerContinuationReferences(
+			st.ProducerContinuationReferences,
+		)
+	if t.producerContinuationReferences == nil {
+		t.producerContinuationReferences =
+			make(ProducerContinuationReferences)
+	}
+
+	// One-time migration from the pre-standardization producer-specific
+	// continuation fields. Generic persisted references take precedence.
+	migrateContinuationReference := func(
+		producer EntryProducer,
+		side OrderSide,
+		legacy float64,
+	) {
+		if t.producerContinuationReferences.Reference(
+			producer,
+			side,
+		) > 0 || legacy <= 0 {
+			return
+		}
+		t.setProducerContinuationReference(
+			producer,
+			side,
+			legacy,
+		)
+	}
+	migrateContinuationReference(
+		EntryProducerCase11APeakReversal,
+		SideSell,
+		st.Case11AReferencePrice,
+	)
+	migrateContinuationReference(
+		EntryProducerCase11BBottomReversal,
+		SideBuy,
+		st.Case11BReferencePrice,
+	)
+	migrateContinuationReference(
+		EntryProducerCase13APeakSell,
+		SideSell,
+		st.Case13AReferencePrice,
+	)
+
+	// Legacy Equity SELL continuation did not persist a separate reference;
+	// LastAddEquity was its reference quantity.
+	if st.EquitySellContinuation &&
+		t.producerContinuationReferences.Reference(
+			EntryProducerEquity,
+			SideSell,
+		) <= 0 &&
+		st.LastAddEquity > 0 {
+		t.setProducerContinuationReference(
+			EntryProducerEquity,
+			SideSell,
+			st.LastAddEquity,
+		)
+	}
+
 	t.latchedGateSell = st.LatchedGateSell
 	t.lastAddEquity = st.LastAddEquity
-	t.equitySellContinuation = st.EquitySellContinuation
+	t.equitySellContinuation =
+		t.producerContinuationReferences.Reference(
+			EntryProducerEquity,
+			SideSell,
+		) > 0
 	t.lastExits = st.Exits
 
 	t.dustBuyLots = append([]*Position(nil), st.DustBuyLots...)
@@ -7455,22 +7655,35 @@ func (t *Trader) commitEntryFill(
 		t.lastAddEquity =
 			t.equityUSD
 
-		// Arm SELL continuation only after a real Equity SELL reaches the
-		// committed position-state path. A produced, pending, rejected,
-		// cancelled, timed-out, or otherwise uncommitted SELL cannot arm it.
-		if side == SideSell {
-			t.equitySellContinuation = true
-		}
+		// Equity continuation is mirrored for BUY and SELL. Its reference
+		// quantity is account equity, not market execution price. Advance it
+		// only in this successful committed-position path.
+		t.setProducerContinuationReference(
+			EntryProducerEquity,
+			side,
+			t.lastAddEquity,
+		)
+
+		// Keep the legacy flag synchronized for backward-compatible state and
+		// diagnostics while generic continuation state remains authoritative.
+		t.equitySellContinuation =
+			t.producerContinuationReferences.Reference(
+				EntryProducerEquity,
+				SideSell,
+			) > 0
 
 		log.Printf(
 			"[TRACE] equity.baseline.set "+
 				"side=%s producer=%s old=%.2f new=%.2f "+
-				"sellContinuation=%t",
+				"continuation_reference=%.2f",
 			side,
 			entry.Producer,
 			oldEquityBaseline,
 			t.lastAddEquity,
-			t.equitySellContinuation,
+			t.producerContinuationReferences.Reference(
+				EntryProducerEquity,
+				side,
+			),
 		)
 	}
 
@@ -7515,6 +7728,21 @@ func (t *Trader) commitEntryFill(
 		postSlack(message)
 	}
 
+	// Standardized continuation reference advancement belongs to the
+	// successful commit path and must occur before persistence.
+	//
+	// Equity was advanced above using account equity. Every other ordinary
+	// producer uses the actual broker execution price. Case3A is explicitly
+	// exempt from ordinary producer standardization.
+	if entry.Producer != EntryProducerCase3AReplacement &&
+		entry.Producer != EntryProducerEquity {
+		t.setProducerContinuationReference(
+			entry.Producer,
+			side,
+			priceToUse,
+		)
+	}
+
 	if err := t.saveStateNoLock(); err != nil {
 
 		return &EntryProduceError{
@@ -7528,27 +7756,6 @@ func (t *Trader) commitEntryFill(
 
 			Err: err,
 		}
-	}
-
-	// Only a successful asynchronous Case11A fill/commit advances the
-	// Case11A continuation reference, using the actual broker execution price.
-	// The producer evaluator decides whether this reference replaces the normal
-	// Pyramid SELL gate for continuation entries.
-	if entry.Producer == EntryProducerCase11APeakReversal {
-		t.case11AReferencePrice = priceToUse
-	}
-
-	// Mirror Case11A: only a successful asynchronous Case11B fill/commit
-	// advances the BUY-side continuation reference, using the actual broker
-	// execution price.
-	if entry.Producer == EntryProducerCase11BBottomReversal {
-		t.case11BReferencePrice = priceToUse
-	}
-
-	// Only a successful asynchronous Case13A fill/commit advances the
-	// reference, using the actual broker execution price.
-	if entry.Producer == EntryProducerCase13APeakSell {
-		t.case13AReferencePrice = priceToUse
 	}
 
 	log.Printf(

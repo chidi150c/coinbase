@@ -1257,25 +1257,32 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}, nil
 	}
 
-	// Reset SELL-episode continuation state whenever the current AI raw
-	// signal is BUY.
+	// Standardized continuation episode reset.
 	//
-	// This is deliberately state-based rather than transition-based:
-	// SELL -> FLAT -> SELL preserves continuation/reference state, while any
-	// current BUY forces all SELL-episode memory off. Repeated BUY ticks are
-	// idempotent and also self-heal stale persisted state after restart.
+	// Continuation state is producer + side specific, but the episode reset is
+	// mirrored by AI direction:
+	//
+	//   current AI BUY  -> clear every ordinary SELL continuation reference
+	//   current AI SELL -> clear every ordinary BUY continuation reference
+	//
+	// FLAT preserves both sides. Repeated BUY/SELL ticks are intentionally
+	// idempotent so stale persisted continuation state self-heals after restart.
 	if aiResult.Raw == Buy {
-		t.equitySellContinuation = false
-		t.case13AReferencePrice = 0
-		t.case11AReferencePrice = 0
+		t.clearProducerContinuationSide(
+			SideSell,
+		)
+	}
+	if aiResult.Raw == Sell {
+		t.clearProducerContinuationSide(
+			SideBuy,
+		)
 	}
 
-	// Mirror Case11A: any current AI SELL invalidates the BUY-side
-	// Case11B continuation/reference episode. This is state-based rather than
-	// transition-based, so repeated SELL ticks also self-heal stale state.
-	if aiResult.Raw == Sell {
-		t.case11BReferencePrice = 0
-	}
+	// Producers consume an immutable snapshot for this decision pass. Any
+	// committed entry later in the tick advances Trader-owned continuation state
+	// only after the fill has become local position state.
+	continuationRefs :=
+		t.producerContinuationReferencesSnapshot()
 
 	if macdSnapshot.Err != nil {
 		// log.Printf(
@@ -1385,6 +1392,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		balanceSnapshotMaxAge,
 		reservedShortQuoteWithFee,
 		reservedLongBase,
+		continuationRefs,
 	)
 
 	// log.Printf(
@@ -1416,6 +1424,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		equityResult,
 		price,
 		pendingCounts,
+		continuationRefs,
 	)
 
 	log.Printf(
@@ -1923,8 +1932,15 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		baseEntryProfitGateUSD = 0.30
 	}
 
-	// Producers may reduce or increase the ordinary target.
-	// A zero/unset multiplier preserves existing behavior.
+	// Producer economics are resolved by the producer before execution:
+	//
+	//   HIGH = 1.00, MID = 0.75, LOW = 0.50
+	//   continuation = tier multiplier * 0.80
+	//
+	// step.go remains the single place where that resolved multiplier becomes a
+	// persisted USD exit target. The fallback is defensive compatibility only;
+	// every standardized ordinary producer is expected to provide a positive
+	// ProfitGateMultiplier explicitly. Case3A remains a special-case exemption.
 	profitGateMultiplier :=
 		d.ProfitGateMultiplier
 
@@ -3251,6 +3267,34 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		)
 	}
 
+	// Standardized continuation reference advancement belongs to the
+	// successful direct-market commit path and must occur before persistence.
+	//
+	// Equity is account-equity referenced. Every other ordinary producer is
+	// execution-price referenced. Case3A is explicitly exempt.
+	if d.Producer != EntryProducerCase3AReplacement {
+		continuationReference :=
+			priceToUse
+
+		if d.Producer == EntryProducerEquity {
+			continuationReference =
+				t.lastAddEquity
+		}
+
+		t.setProducerContinuationReference(
+			d.Producer,
+			side,
+			continuationReference,
+		)
+
+		// Legacy compatibility only; the generic reference map is authoritative.
+		if d.Producer == EntryProducerEquity &&
+			side == SideSell {
+			t.equitySellContinuation =
+				continuationReference > 0
+		}
+	}
+
 	// Runner assignment is producer-owned. The direct-market path executes
 	// the explicit decision instruction; it does not infer runner status
 	// from Equity or from a generic policy.
@@ -3303,12 +3347,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			Raw:    d.Raw,
 			Signal: d.Signal,
 		}, err
-	}
-
-	// Only a successful Case13A fill/commit advances the reference, using
-	// the actual fill price selected above.
-	if d.Producer == EntryProducerCase13APeakSell {
-		t.case13AReferencePrice = priceToUse
 	}
 
 	// Exchange fill is now represented by a successfully persisted local Position.
