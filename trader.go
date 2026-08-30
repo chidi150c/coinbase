@@ -5310,6 +5310,37 @@ func (t *Trader) runPendingEntryPoller(
 		producerEvents[stage] = event
 	}
 
+	// addCancelRequestedEvent guarantees that every cancel_requested event
+	// explains why cancellation was requested. A strategy-owned CancelReason
+	// already copied by addProducerEvent remains authoritative.
+	addCancelRequestedEvent := func(
+		eventOrderID string,
+		fallbackReason string,
+		replace bool,
+	) {
+		addProducerEvent(
+			ProducerStageCancelRequested,
+			eventOrderID,
+			nil,
+			replace,
+		)
+
+		event, exists := producerEvents[ProducerStageCancelRequested]
+		if !exists {
+			return
+		}
+		if strings.Contains(event.Reason, "|cancel_reason=") {
+			return
+		}
+
+		fallbackReason = strings.TrimSpace(fallbackReason)
+		if fallbackReason == "" {
+			fallbackReason = "unspecified"
+		}
+		event.Reason += "|cancel_reason=" + fallbackReason
+		producerEvents[ProducerStageCancelRequested] = event
+	}
+
 poll:
 	for time.Now().Before(deadline) {
 		select {
@@ -5499,10 +5530,9 @@ poll:
 						Record only the lifecycle fact. Do not issue another
 						cancel or alter existing cancellation behavior.
 					*/
-					addProducerEvent(
-						ProducerStageCancelRequested,
+					addCancelRequestedEvent(
 						orderID,
-						nil,
+						"strategy_requested",
 						false,
 					)
 
@@ -5655,10 +5685,9 @@ poll:
 					if t.pendingEntryCancelRequested(
 						entry,
 					) {
-						addProducerEvent(
-							ProducerStageCancelRequested,
+						addCancelRequestedEvent(
 							orderID,
-							nil,
+							"strategy_requested",
 							false,
 						)
 
@@ -5850,10 +5879,9 @@ poll:
 
 		This is observability only; it does not change cancellation behavior.
 	*/
-	addProducerEvent(
-		ProducerStageCancelRequested,
+	addCancelRequestedEvent(
 		orderID,
-		nil,
+		"poller_final_cancel",
 		false,
 	)
 
