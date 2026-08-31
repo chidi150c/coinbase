@@ -1642,28 +1642,25 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// -----------------------------------------------------------------------------
 	// Case 3B-Opposite - DOWN-Regime BUY Protection
 	//
-	// If the immediately previous exit was a BUY threshold-stop loss,
-	// block any new BUY entry above that loss-exit SELL price while the
+	// Find the latest BUY threshold-stop loss within the last 24 hours.
+	//
+	// Block any new BUY entry above that loss-exit SELL price while the
 	// market regime remains DOWN.
 	//
-	// The protection is valid only for 24 hours after that loss exit.
-	// Older loss exits are ignored.
+	// Unrelated exits occurring afterward do not invalidate the protection.
 	// -----------------------------------------------------------------------------
 	if side == SideBuy &&
-		t.MarketRegime == RegimeDown &&
-		len(t.lastExits) > 0 {
+		t.MarketRegime == RegimeDown {
 
-		last := t.lastExits[len(t.lastExits)-1]
+		lastLossExit, ok :=
+			latestThresholdStopLossExitWithin(
+				t.lastExits,
+				SideBuy,
+				wallNow,
+				24*time.Hour,
+			)
 
-		case3BWithin24H :=
-			!last.Time.IsZero() &&
-				wallNow.Sub(last.Time) <= 24*time.Hour
-
-		if last.Side == SideBuy &&
-			strings.HasPrefix(last.Reason, "threshold_stop_loss") &&
-			last.PNLUSD < 0 &&
-			case3BWithin24H &&
-			price > last.ClosePrice {
+		if ok && price > lastLossExit.ClosePrice {
 
 			t.addDecisionProducerEvent(
 				intent,
@@ -1671,16 +1668,17 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				ProducerStageDecisionBlocked,
 				EntryProduceErrDecisionCase3BBlocked,
 				fmt.Errorf(
-					"Case3B BUY blocked above previous threshold-stop loss exit price %.8f",
-					last.ClosePrice,
+					"Case3B BUY blocked above latest threshold-stop loss exit price %.8f",
+					lastLossExit.ClosePrice,
 				),
 				false,
 				true,
 			)
 
 			t.mu.Unlock()
+
 			return StepResult{
-				Msg:    "HOLD Case3B block BUY above last loss-exit SELL price",
+				Msg:    "HOLD Case3B block BUY above latest loss-exit SELL price",
 				Raw:    d.Raw,
 				Signal: d.Signal,
 			}, nil
@@ -1690,30 +1688,27 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// -----------------------------------------------------------------------------
 	// Case 3B - UP-Regime SELL Protection
 	//
-	// If the immediately previous exit was a SELL threshold-stop loss,
-	// block any new SELL entry below that loss-exit BUY price while the
+	// Find the latest SELL threshold-stop loss within the last 24 hours.
+	//
+	// Block any new SELL entry below that loss-exit BUY price while the
 	// market regime remains UP.
 	//
 	// Case3A replacements bypass this protection.
-	// The protection is valid only for 24 hours after that loss exit.
-	// Older loss exits are ignored.
+	// Unrelated exits occurring afterward do not invalidate the protection.
 	// -----------------------------------------------------------------------------
 	if side == SideSell &&
 		d.Producer != EntryProducerCase3AReplacement &&
-		t.MarketRegime == RegimeUp &&
-		len(t.lastExits) > 0 {
+		t.MarketRegime == RegimeUp {
 
-		last := t.lastExits[len(t.lastExits)-1]
+		lastLossExit, ok :=
+			latestThresholdStopLossExitWithin(
+				t.lastExits,
+				SideSell,
+				wallNow,
+				24*time.Hour,
+			)
 
-		case3BWithin24H :=
-			!last.Time.IsZero() &&
-				wallNow.Sub(last.Time) <= 24*time.Hour
-
-		if last.Side == SideSell &&
-			strings.HasPrefix(last.Reason, "threshold_stop_loss") &&
-			last.PNLUSD < 0 &&
-			case3BWithin24H &&
-			price < last.ClosePrice {
+		if ok && price < lastLossExit.ClosePrice {
 
 			t.addDecisionProducerEvent(
 				intent,
@@ -1721,16 +1716,17 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				ProducerStageDecisionBlocked,
 				EntryProduceErrDecisionCase3BBlocked,
 				fmt.Errorf(
-					"Case3B SELL blocked below previous threshold-stop loss exit price %.8f",
-					last.ClosePrice,
+					"Case3B SELL blocked below latest threshold-stop loss exit price %.8f",
+					lastLossExit.ClosePrice,
 				),
 				false,
 				true,
 			)
 
 			t.mu.Unlock()
+
 			return StepResult{
-				Msg:    "HOLD Case3B block SELL below last loss-exit BUY price",
+				Msg:    "HOLD Case3B block SELL below latest loss-exit BUY price",
 				Raw:    d.Raw,
 				Signal: d.Signal,
 			}, nil
@@ -3450,6 +3446,60 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// t.equityUSD, t.dailyPnL, len(t.book(SideBuy).Lots), len(t.book(SideSell).Lots), t.cfg.ProductID)
 	t.mu.Unlock()
 	return StepResult{Msg: msg, Raw: d.Raw, Signal: d.Signal}, nil
+}
+
+// -----------------------------------------------------------------------------
+// Case 3B - Latest Threshold-Stop-Loss Exit Lookup
+//
+// Returns the most recent losing threshold-stop-loss exit for the requested
+// side within the supplied time window.
+//
+// Other exits that occurred afterward do not invalidate the protection.
+// -----------------------------------------------------------------------------
+func latestThresholdStopLossExitWithin(
+	exits []ExitRecord,
+	side OrderSide,
+	now time.Time,
+	window time.Duration,
+) (*ExitRecord, bool) {
+	for i := len(exits) - 1; i >= 0; i-- {
+		exit := &exits[i]
+
+		if exit.Time.IsZero() {
+			continue
+		}
+
+		age := now.Sub(exit.Time)
+
+		// Ignore invalid/future timestamps.
+		if age < 0 {
+			continue
+		}
+
+		// lastExits is chronological, so anything earlier is also expired.
+		if age > window {
+			break
+		}
+
+		if exit.Side != side {
+			continue
+		}
+
+		if !strings.HasPrefix(
+			exit.Reason,
+			"threshold_stop_loss",
+		) {
+			continue
+		}
+
+		if exit.PNLUSD >= 0 {
+			continue
+		}
+
+		return exit, true
+	}
+
+	return nil, false
 }
 
 type exitCandidate struct {

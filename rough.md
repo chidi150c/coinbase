@@ -1,34 +1,10 @@
 
 chidi@localhost:~$
+chidi@localhost:~$
+chidi@localhost:~$
 chidi@localhost:~$ what-state --all --n 8
 === BUY last 8 ===
 === SELL last 8 ===
-{
-  "OpenPrice": 79321.98999999999,
-  "Side": "SELL",
-  "SizeBase": 0.00221,
-  "Take": 78937.48617992867,
-  "OpenTime": "2026-08-30T16:59:00Z",
-  "EntryFee": 0.1753015979,
-  "OpenNotionalUSD": 175.3015979,
-  "reason": "case3A_replacement|method=RecoveryByProfitTarget|recovery_usd=2.130281|regime=UP|source_order_id=66030272789|case3a_up_partial_recovery=true|up_recovery_used=true|recovery_net_before=2.130281|recovered_net=0.680154|recovery_net_after=1.450127",
-  "est_exit_fee_usd": 0.17372810000000002,
-  "unrealized_pnl_usd": 1.2244682020999798,
-  "exit_mode": "ScalpFixedTP",
-  "version": 184,
-  "confidence_mult": 1,
-  "profit_gate_usd": 0.5,
-  "entry_method": "UNKNOWN",
-  "recovery_net_usd": 1.4501274125000938,
-  "case3a_up_recovery_used": true,
-  "refund_portion_usd": 0,
-  "entry_order_id": "66032720929",
-  "profit_trail_active": true,
-  "profit_peak_usd": 1.5916950620999797,
-  "case3_b_replacement_started": false,
-  "case3_b_replacement_order_id": "",
-  "entry_producer": "Case3AReplacement"
-}
 {
   "OpenPrice": 79199.99,
   "Side": "SELL",
@@ -38,8 +14,8 @@ chidi@localhost:~$ what-state --all --n 8
   "EntryFee": 0.1908719759,
   "OpenNotionalUSD": 190.8719759,
   "reason": "case3A_replacement|method=RecoveryByProfitTarget|recovery_usd=2.012680|regime=UP|source_order_id=66027645290|case3a_up_partial_recovery=true|up_recovery_used=true|recovery_net_before=2.012680|recovered_net=0.534682|recovery_net_after=1.477998",
-  "est_exit_fee_usd": 0.18945009999999998,
-  "unrealized_pnl_usd": 1.0415538241000126,
+  "est_exit_fee_usd": 0.18966699999999997,
+  "unrealized_pnl_usd": 0.8244369241000125,
   "exit_mode": "ScalpFixedTP",
   "version": 184,
   "confidence_mult": 1,
@@ -50,32 +26,10 @@ chidi@localhost:~$ what-state --all --n 8
   "refund_portion_usd": 0,
   "entry_order_id": "66030969574",
   "profit_trail_active": true,
-  "profit_peak_usd": 1.4420138841000125,
+  "profit_peak_usd": 1.9326498299000239,
   "case3_b_replacement_started": false,
   "case3_b_replacement_order_id": "",
   "entry_producer": "Case3AReplacement"
-}
-{
-  "OpenPrice": 78934.41,
-  "Side": "SELL",
-  "SizeBase": 0.00147,
-  "Take": 78287.752714464,
-  "OpenTime": "2026-08-30T13:51:00Z",
-  "EntryFee": 0.1160335827,
-  "OpenNotionalUSD": 116.0335827,
-  "reason": "peak_sell|confidence=0.73|regime=UP|near_peak_pct=0.041068|macd_idx6=25.901299|macd_line=65.807146|macd_hist=21.996201|ema_high_peak=true|pending=0|reference_mode=continuation_reference|reference_price=78674.02000000|next_entry_price=78831.36804000|continuation_spacing_pct=0.2000|spacing=true|entry_gate_pass=true|tier=MID|tier_mult=0.750000|continuation=true|continuation_profit_factor=0.800000|profit_gate_mult=0.600000",
-  "est_exit_fee_usd": 0.1155567,
-  "unrealized_pnl_usd": 0.24529241730000512,
-  "exit_mode": "ScalpFixedTP",
-  "version": 184,
-  "confidence_mult": 0.7315654351588468,
-  "profit_gate_usd": 0.719469630547654,
-  "entry_method": "Case13APeakSell",
-  "refund_portion_usd": 0,
-  "entry_order_id": "66027745355",
-  "case3_b_replacement_started": false,
-  "case3_b_replacement_order_id": "",
-  "entry_producer": "Case13APeakSell"
 }
 {
   "OpenPrice": 77519.36,
@@ -86,8 +40,8 @@ chidi@localhost:~$ what-state --all --n 8
   "EntryFee": 0.028682163200000003,
   "OpenNotionalUSD": 28.6821632,
   "reason": "equity_sell|ai_raw=SELL|logic=FLAT|legacy=FLAT|equity=740.65|baseline=653.19|trigger_usd=666.26|distance_usd=74.39|threshold_pass=true|funding_pass=true|raw_spare_base=0.00776430|spare_base=0.00776430|proposed_sell_base=0.00776000|spacing=true|adverse=false|pyramid_gate=false|latched=79716.66666667|gate_price=79716.66666667",
-  "est_exit_fee_usd": 0.0290857,
-  "unrealized_pnl_usd": -0.46130466319999974,
+  "est_exit_fee_usd": 0.029119,
+  "unrealized_pnl_usd": -0.4946379631999998,
   "exit_mode": "ScalpFixedTP",
   "version": 176,
   "confidence_mult": 0.20011284293790052,
@@ -108,8 +62,8 @@ chidi@localhost:~$ what-state --all --n 8
   "EntryFee": 0.0224767632,
   "OpenNotionalUSD": 22.4767632,
   "reason": "equity_sell|ai_raw=SELL|logic=FLAT|legacy=FLAT|equity=740.68|baseline=653.19|trigger_usd=666.26|distance_usd=74.42|threshold_pass=true|funding_pass=true|raw_spare_base=0.00153430|spare_base=0.00153430|proposed_sell_base=0.00153000|spacing=true|adverse=false|pyramid_gate=false|latched=79716.66666667|gate_price=79716.66666667",
-  "est_exit_fee_usd": 0.022796900000000002,
-  "unrealized_pnl_usd": -0.3654104631999995,
+  "est_exit_fee_usd": 0.022823,
+  "unrealized_pnl_usd": -0.39153656319999947,
   "exit_mode": "ScalpFixedTP",
   "version": 176,
   "confidence_mult": 0.20011284293790052,
@@ -130,8 +84,8 @@ chidi@localhost:~$ what-state --all --n 8
   "EntryFee": 0.02867722,
   "OpenNotionalUSD": 28.67722,
   "reason": "equity_sell|ai_raw=SELL|logic=FLAT|legacy=FLAT|equity=740.68|baseline=653.19|trigger_usd=666.26|distance_usd=74.42|threshold_pass=true|funding_pass=true|raw_spare_base=0.00190430|spare_base=0.00190430|proposed_sell_base=0.00190000|spacing=true|adverse=false|pyramid_gate=false|latched=79716.66666667|gate_price=79716.66666667",
-  "est_exit_fee_usd": 0.0290857,
-  "unrealized_pnl_usd": -0.46624292,
+  "est_exit_fee_usd": 0.029119,
+  "unrealized_pnl_usd": -0.49957622,
   "exit_mode": "ScalpFixedTP",
   "version": 176,
   "confidence_mult": 0.20011284293790052,
@@ -152,8 +106,8 @@ chidi@localhost:~$ what-state --all --n 8
   "EntryFee": 0.0286772496,
   "OpenNotionalUSD": 28.6772496,
   "reason": "equity_sell|ai_raw=SELL|logic=FLAT|legacy=FLAT|equity=740.68|baseline=653.19|trigger_usd=666.26|distance_usd=74.42|threshold_pass=true|funding_pass=true|raw_spare_base=0.00193430|spare_base=0.00193430|proposed_sell_base=0.00193000|spacing=true|adverse=false|pyramid_gate=false|latched=79716.66666667|gate_price=79716.66666667",
-  "est_exit_fee_usd": 0.0290857,
-  "unrealized_pnl_usd": -0.4662133495999993,
+  "est_exit_fee_usd": 0.029119,
+  "unrealized_pnl_usd": -0.49954664959999934,
   "exit_mode": "ScalpFixedTP",
   "version": 176,
   "confidence_mult": 0.20011284293790052,
@@ -166,6 +120,42 @@ chidi@localhost:~$ what-state --all --n 8
   "entry_producer": "Equity"
 }
 === EXIT last 8 ===
+{
+  "time": "2026-08-30T21:02:22.849520657Z",
+  "side": "SELL",
+  "open_price": 79321.98999999999,
+  "close_price": 78269.94999999998,
+  "size_base": 0.00221,
+  "open_notional_usd": 175.3015979,
+  "entry_fee_usd": 0.1753015979,
+  "exit_fee_usd": 0.17297658949999997,
+  "pnl_usd": 1.9767302126000181,
+  "reason": "take_profit | exitReason{side=SELL|regime=NORMAL|regimeMult=1.00|exitReason=take_profit|exitClass=L2_STRONG_PROFIT|exitNetPNL=1.95941}  ||  openReason{case3A_replacement|method=RecoveryByProfitTarget|recovery_usd=2.130281|regime=UP|source_order_id=66030272789|case3a_up_partial_recovery=true|up_recovery_used=true|recovery_net_before=2.130281|recovered_net=0.680154|recovery_net_after=1.450127}",
+  "exit_mode": "ScalpFixedTP",
+  "was_runner": false,
+  "refund_portion_usd": 0,
+  "entry_order_id": "66032720929",
+  "exit_order_id": "66038489743",
+  "version": 184
+}
+{
+  "time": "2026-08-30T21:02:22.817251758Z",
+  "side": "SELL",
+  "open_price": 78934.41,
+  "close_price": 78269.95,
+  "size_base": 0.00147,
+  "open_notional_usd": 116.0335827,
+  "entry_fee_usd": 0.11603358269999998,
+  "exit_fee_usd": 0.11505682649999999,
+  "pnl_usd": 0.7456657908000095,
+  "reason": "take_profit | exitReason{side=SELL|regime=NORMAL|regimeMult=1.00|exitReason=take_profit|exitClass=L1_PROFIT_GATE|exitNetPNL=0.73414}  ||  openReason{peak_sell|confidence=0.73|regime=UP|near_peak_pct=0.041068|macd_idx6=25.901299|macd_line=65.807146|macd_hist=21.996201|ema_high_peak=true|pending=0|reference_mode=continuation_reference|reference_price=78674.02000000|next_entry_price=78831.36804000|continuation_spacing_pct=0.2000|spacing=true|entry_gate_pass=true|tier=MID|tier_mult=0.750000|continuation=true|continuation_profit_factor=0.800000|profit_gate_mult=0.600000}",
+  "exit_mode": "ScalpFixedTP",
+  "was_runner": false,
+  "refund_portion_usd": 0,
+  "entry_order_id": "66027745355",
+  "exit_order_id": "66038489728",
+  "version": 184
+}
 {
   "time": "2026-08-30T18:10:33.363540894Z",
   "side": "SELL",
@@ -272,42 +262,6 @@ chidi@localhost:~$ what-state --all --n 8
   "refund_portion_usd": 0,
   "entry_order_id": "66013486698",
   "exit_order_id": "66027645356",
-  "version": 184
-}
-{
-  "time": "2026-08-30T12:33:17.233240526Z",
-  "side": "SELL",
-  "open_price": 77971.98999999999,
-  "close_price": 78819.62999999999,
-  "size_base": 0.00101,
-  "open_notional_usd": 78.7517099,
-  "entry_fee_usd": 0.0787517099,
-  "exit_fee_usd": 0.0796078263,
-  "pnl_usd": -1.0144759361999995,
-  "reason": "threshold_stop_loss | exitReason{side=SELL|regime=UP|regimeMult=3.00|exitReason=threshold_stop_loss|exitClass=L1_THRESHOLD_WARNING|exitNetPNL=-1.02245|stopLossPNL=1.00000|stopLossLimit=-1.00000}  ||  openReason{peak_sell|confidence=1.00|regime=UP|near_peak_pct=0.079978|macd_idx6=4.835588|macd_line=51.448265|macd_hist=23.946271|ema_high_peak=true|pending=0|reference_mode=first_spacing|reference_price=0.00000000|next_reentry_price=0.00000000|reentry_pct=0.10|spacing=true|reentry_pass=true|profit_gate_mult=0.50}",
-  "exit_mode": "ScalpFixedTP",
-  "was_runner": false,
-  "refund_portion_usd": 0,
-  "entry_order_id": "66009532762",
-  "exit_order_id": "66025876611",
-  "version": 184
-}
-{
-  "time": "2026-08-30T12:33:15.086847485Z",
-  "side": "SELL",
-  "open_price": 78469.47,
-  "close_price": 78832.09999999999,
-  "size_base": 0.00202,
-  "open_notional_usd": 158.5083294,
-  "entry_fee_usd": 0.1585083294,
-  "exit_fee_usd": 0.159240842,
-  "pnl_usd": -1.0502617713999802,
-  "reason": "threshold_stop_loss | exitReason{side=SELL|regime=UP|regimeMult=3.00|exitReason=threshold_stop_loss|exitClass=L1_THRESHOLD_WARNING|exitNetPNL=-1.06622|stopLossPNL=1.00000|stopLossLimit=-1.00000}  ||  openReason{peak_sell|confidence=1.00|regime=UP|near_peak_pct=0.056729|macd_idx6=3.534422|macd_line=66.391196|macd_hist=34.633635|ema_high_peak=true|pending=0|reference_mode=first_spacing|reference_price=0.00000000|next_entry_price=0.00000000|continuation_spacing_pct=0.2000|spacing=true|entry_gate_pass=true|tier=MID|tier_mult=0.750000|continuation=false|continuation_profit_factor=0.800000|profit_gate_mult=0.750000}",
-  "exit_mode": "ScalpFixedTP",
-  "was_runner": false,
-  "refund_portion_usd": 0,
-  "entry_order_id": "66025012038",
-  "exit_order_id": "66025860014",
   "version": 184
 }
 chidi@localhost:~$

@@ -3315,6 +3315,80 @@ func (t *Trader) currentSpareBaseLocked(ctx context.Context) (float64, float64, 
 	return spareBase, baseStep, nil
 }
 
+// recordCase3ARecoveryLifecycleEventLocked records an authoritative Case3A
+// recovery exit on the SAME producer attempt that owns entryOrderID.
+//
+// The caller MUST already hold t.mu.
+//
+// These are non-generic recovery lifecycle events:
+//   - case3a_partial_recovery: an exchange exit filled, recovery debt was
+//     reduced, and the producer lot remains live.
+//   - case3a_final_recovery: an exchange exit filled and the lot-specific
+//     recovery obligation reached zero.
+//
+// Canonical ProducerStageFilled and ProducerStageExited remain unchanged.
+func (t *Trader) recordCase3ARecoveryLifecycleEventLocked(
+	lot *Position,
+	rec ExitRecord,
+	stage ProducerStage,
+	reason string,
+) bool {
+	if t == nil ||
+		lot == nil ||
+		lot.Producer != EntryProducerCase3AReplacement {
+		return false
+	}
+
+	entryOrderID := strings.TrimSpace(rec.EntryOrderID)
+	if entryOrderID == "" {
+		entryOrderID = strings.TrimSpace(lot.EntryOrderID)
+	}
+	if entryOrderID == "" {
+		return false
+	}
+
+	attempt := t.findProducerAttemptByEntryOrderIDLocked(
+		lot.Producer,
+		entryOrderID,
+	)
+	if attempt == nil {
+		return false
+	}
+
+	if attempt.Events == nil {
+		attempt.Events = make(map[ProducerStage]ProducerEvent)
+	}
+
+	// One Case3A replacement currently permits at most one partial-recovery
+	// privilege. Preserve the first authoritative event if it already exists.
+	if _, exists := attempt.Events[stage]; exists {
+		return false
+	}
+
+	eventTime := rec.Time
+	if eventTime.IsZero() {
+		eventTime = time.Now().UTC()
+	}
+
+	attempt.Events[stage] = ProducerEvent{
+		Time:      eventTime,
+		CreatedAt: attempt.CreatedAt,
+
+		Producer: attempt.Producer,
+		Side:     attempt.Side,
+		Stage:    stage,
+
+		DecisionID: attempt.DecisionID,
+		OrderID:    strings.TrimSpace(rec.ExitOrderID),
+
+		Reason: reason,
+		PnL:    rec.PNLUSD,
+		Price:  rec.ClosePrice,
+	}
+
+	return true
+}
+
 func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, baseRequested float64, baseFilled float64, side OrderSide, localIdx int, exitReason string, exitDecision string, exitTime time.Time, exitOrderID string, commissionUSD float64, minNotional float64, wasNewest bool) (string, error) {
 	_ = livePrice
 
@@ -3344,38 +3418,88 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 	pl -= entryPortion
 	pl -= exitFee
 
-	// Case3A one-time UP-regime partial recovery.
+	// Case3A recovery lifecycle classification.
 	//
-	// This mutation happens only in the authoritative filled-exit path, after
-	// realized NET PnL is known. Stop-loss exits are deliberately excluded.
-	// The lot survives a full bookkeeping exit while RecoveryNetUSD remains
-	// positive; on later ticks the easy UP privilege is no longer available.
+	// Classification occurs only after an authoritative exchange exit fill has
+	// produced realized NET PnL. Stop-loss exits are never recovery events.
+	//
+	// The first qualifying UP-regime recovery fill may leave recovery debt
+	// outstanding. That is a non-terminal case3a_partial_recovery event and the
+	// lot remains live. Any qualifying Case3A profit exit that clears the
+	// remaining lot-specific obligation is case3a_final_recovery.
 	const case3AFillTol = 1e-9
 	case3AFullFill := baseFilled+case3AFillTol >= baseRequested
-	case3AUpPartialRecovery :=
+	case3ARecoveryBefore := lot.RecoveryNetUSD
+
+	case3AUpRecoveryCandidate :=
 		case3AFullFill &&
 			lot.Producer == EntryProducerCase3AReplacement &&
-			lot.RecoveryNetUSD > 0 &&
+			case3ARecoveryBefore > 0 &&
 			!lot.Case3AUpRecoveryUsed &&
 			t.MarketRegime == RegimeUp &&
 			!strings.HasPrefix(exitReason, "threshold_stop_loss") &&
 			pl >= lot.ProfitGateUSD
 
-	case3ARecoveryBefore := lot.RecoveryNetUSD
-	if case3AUpPartialRecovery {
-		lot.RecoveryNetUSD -= pl
-		lot.Case3AUpRecoveryUsed = true
+	case3AUpPartialRecovery := false
+	case3AFinalRecovery := false
+	case3ARecoveredNet := 0.0
+	case3ARecoveryAfter := case3ARecoveryBefore
+	case3ARecoveryExcessPnL := 0.0
 
-		// Keep the canonical lot reason self-describing. Producer-history filled
-		// reason enrichment can consume these same persisted facts without
-		// independently recalculating recovery accounting.
-		lot.ProducerReason = strings.TrimSpace(
-			lot.ProducerReason + fmt.Sprintf(
-				"|case3a_up_partial_recovery=true|up_recovery_used=true"+
-					"|recovery_net_before=%.6f|recovered_net=%.6f|recovery_net_after=%.6f",
+	if case3AUpRecoveryCandidate {
+		case3ARecoveredNet = math.Min(pl, case3ARecoveryBefore)
+		case3ARecoveryAfter =
+			math.Max(0, case3ARecoveryBefore-case3ARecoveredNet)
+
+		if case3ARecoveryAfter > case3AFillTol {
+			case3AUpPartialRecovery = true
+			lot.Case3AUpRecoveryUsed = true
+			lot.RecoveryNetUSD = case3ARecoveryAfter
+
+			// Carry the partial state on the live lot so subsequent exit
+			// decisions continue from the exact remaining obligation.
+			lot.ProducerReason = strings.TrimSpace(
+				lot.ProducerReason + fmt.Sprintf(
+					"|case3a_up_partial_recovery=true|up_recovery_used=true"+
+						"|recovery_net_before=%.6f|recovered_net=%.6f|recovery_net_after=%.6f",
+					case3ARecoveryBefore,
+					case3ARecoveredNet,
+					case3ARecoveryAfter,
+				),
+			)
+		} else {
+			// The first qualifying UP recovery fill itself completed the
+			// obligation; classify it as final rather than partial.
+			case3AFinalRecovery = true
+			lot.RecoveryNetUSD = 0
+			case3ARecoveryExcessPnL =
+				math.Max(0, pl-case3ARecoveredNet)
+		}
+	} else if case3AFullFill &&
+		lot.Producer == EntryProducerCase3AReplacement &&
+		case3ARecoveryBefore > 0 &&
+		!strings.HasPrefix(exitReason, "threshold_stop_loss") &&
+		pl+case3AFillTol >= case3ARecoveryBefore {
+
+		case3AFinalRecovery = true
+		case3ARecoveredNet = case3ARecoveryBefore
+		case3ARecoveryAfter = 0
+		case3ARecoveryExcessPnL =
+			math.Max(0, pl-case3ARecoveredNet)
+		lot.RecoveryNetUSD = 0
+	}
+
+	if case3AFinalRecovery {
+		// Final recovery state belongs to the exit reason/current event, not
+		// merely to the carried open reason from an earlier partial recovery.
+		exitDecision = strings.TrimSpace(
+			exitDecision + fmt.Sprintf(
+				"|recovery_net_before=%.6f|recovered_net=%.6f"+
+					"|recovery_net_after=0.000000|recovery_complete=true"+
+					"|recovery_excess_pnl=%.6f",
 				case3ARecoveryBefore,
-				pl,
-				lot.RecoveryNetUSD,
+				case3ARecoveredNet,
+				case3ARecoveryExcessPnL,
 			),
 		)
 	}
@@ -3457,6 +3581,38 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 		lot,
 		rec,
 	) {
+		if case3AUpPartialRecovery {
+			t.recordCase3ARecoveryLifecycleEventLocked(
+				lot,
+				rec,
+				ProducerStageCase3APartialRecovery,
+				fmt.Sprintf(
+					"case3a_partial_recovery|recovery_net_before=%.6f"+
+						"|recovered_net=%.6f|recovery_net_after=%.6f"+
+						"|lot_remains_open=true",
+					case3ARecoveryBefore,
+					case3ARecoveredNet,
+					case3ARecoveryAfter,
+				),
+			)
+		}
+
+		if case3AFinalRecovery {
+			t.recordCase3ARecoveryLifecycleEventLocked(
+				lot,
+				rec,
+				ProducerStageCase3AFinalRecovery,
+				fmt.Sprintf(
+					"case3a_final_recovery|recovery_net_before=%.6f"+
+						"|recovered_net=%.6f|recovery_net_after=0.000000"+
+						"|recovery_complete=true|recovery_excess_pnl=%.6f",
+					case3ARecoveryBefore,
+					case3ARecoveredNet,
+					case3ARecoveryExcessPnL,
+				),
+			)
+		}
+
 		if err := t.saveProducerHistoryNoLock(); err != nil {
 			log.Printf(
 				"[ERROR] producer.history.save_failed "+

@@ -44,6 +44,17 @@ const (
 	ProducerStageCase3AModeABlocked ProducerStage = "case3a_mode_a_blocked"
 	ProducerStageCase3AModeBBlocked ProducerStage = "case3a_mode_b_blocked"
 
+	// Case3A realized-recovery lifecycle stages.
+	//
+	// Partial recovery is a first-class NON-TERMINAL exit event:
+	// an exchange exit filled, realized PnL was booked, recovery debt was
+	// reduced, and the original producer entry remains live in SideBook.Lots.
+	//
+	// Final recovery is the Case3A recovery-completion event. Canonical
+	// ProducerStageExited remains the terminal producer-exposure stage.
+	ProducerStageCase3APartialRecovery ProducerStage = "case3a_partial_recovery"
+	ProducerStageCase3AFinalRecovery   ProducerStage = "case3a_final_recovery"
+
 	ProducerStageCleanupCancelled    ProducerStage = "cleanup_cancelled"
 	ProducerStageCleanupCancelFailed ProducerStage = "cleanup_cancel_failed"
 
@@ -185,7 +196,9 @@ type ProducerAttempt struct {
 	// Accumulated realized NET PnL attributable to this producer attempt.
 	//
 	// Every authoritative ExitRecord.PNLUSD for this entry contributes
-	// exactly once here, including partial exits.
+	// exactly once here, including Case3A partial/final recovery exits.
+	// Those exits are also retained as first-class ProducerEvent stages:
+	// ProducerStageCase3APartialRecovery / ProducerStageCase3AFinalRecovery.
 	//
 	// This is not itself a terminal lifecycle state. The producer exposure
 	// may remain live after RealizedPnLUSD has become non-zero.
