@@ -1647,9 +1647,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// Block any new BUY entry above that loss-exit SELL price while the
 	// market regime remains DOWN.
 	//
+	// LOW-tier producers bypass this protection.
 	// Unrelated exits occurring afterward do not invalidate the protection.
 	// -----------------------------------------------------------------------------
 	if side == SideBuy &&
+		d.ProducerTier != ProducerTierLow &&
 		t.MarketRegime == RegimeDown {
 
 		lastLossExit, ok :=
@@ -1697,6 +1699,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// Unrelated exits occurring afterward do not invalidate the protection.
 	// -----------------------------------------------------------------------------
 	if side == SideSell &&
+		d.ProducerTier != ProducerTierLow &&
 		d.Producer != EntryProducerCase3AReplacement &&
 		t.MarketRegime == RegimeUp {
 
