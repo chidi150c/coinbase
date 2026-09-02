@@ -168,9 +168,10 @@ type ProducerResourceAllocation struct {
 	PriorityGroupAvailable float64
 	PriorityGroupMembers   int
 
-	// FundingShortfallUSD preserves the historical true-funding-failure
-	// refund semantics. It remains zero for successful allocations and
-	// non-funding rejection reasons.
+	// FundingShortfallUSD is the USD value of this request that was not
+	// funded by the final authoritative allocation plan. It is computed from
+	// the producer's core request (before historical refund augmentation) and
+	// is accumulated with the other same-tick producer shortfalls.
 	FundingShortfallUSD float64
 }
 
@@ -365,28 +366,22 @@ func (c ProducerResourceCoordinator) Allocate(
 						allocation.Reason = AllocationReasonBelowMinNotional
 					}
 
-					// Historical refund shortfall is based on the core funding gate,
-					// which ran before refund augmentation in the old path. Priority
-					// contention must not manufacture refund debt.
-					initialAvailable := 0.0
+					// Refund creation follows the final allocation plan, not the frozen
+					// snapshot in isolation. A request starved by higher-priority producers
+					// contributes its unfunded core amount to this tick's shortfall exactly
+					// like any other funding shortage. Historical refund augmentation is
+					// excluded so an old refund cannot recursively create a new refund.
+					shortResource := coreRequested - allocatedResource
+					if shortResource < 0 {
+						shortResource = 0
+					}
 					switch resourceKind {
 					case ResourceKindQuote:
-						initialAvailable = snapDownResource(snapshot.SpareQuote, req.ResourceStep)
+						allocation.FundingShortfallUSD = shortResource
 					case ResourceKindBase:
-						initialAvailable = snapDownResource(snapshot.SpareBase, req.ResourceStep)
+						allocation.FundingShortfallUSD = shortResource * snapshot.Price
 					}
-					if initialAvailable+1e-12 < req.MinimumResource {
-						shortResource := coreRequested - initialAvailable
-						if shortResource < 0 {
-							shortResource = 0
-						}
-						switch resourceKind {
-						case ResourceKindQuote:
-							allocation.FundingShortfallUSD = shortResource
-						case ResourceKindBase:
-							allocation.FundingShortfallUSD = shortResource * snapshot.Price
-						}
-					}
+
 					plan.Allocations = append(plan.Allocations, allocation)
 					continue
 				}
@@ -407,8 +402,32 @@ func (c ProducerResourceCoordinator) Allocate(
 					allocation.AllocatedQuote = 0
 					allocation.AllocatedBase = 0
 					allocation.Reason = AllocationReasonBelowMinNotional
+
+					// Nothing exchange-valid survived allocation, so the producer's
+					// entire core request remains unfunded for this coordination tick.
+					switch resourceKind {
+					case ResourceKindQuote:
+						allocation.FundingShortfallUSD = coreRequested
+					case ResourceKindBase:
+						allocation.FundingShortfallUSD = coreRequested * snapshot.Price
+					}
+
 					plan.Allocations = append(plan.Allocations, allocation)
 					continue
+				}
+
+				// A partial but exchange-valid allocation also contributes the
+				// unfunded portion of the producer's CORE request. Refund augmentation
+				// is intentionally excluded from refund creation.
+				allocatedCore := math.Min(coreRequested, allocatedResource)
+				shortResource := coreRequested - allocatedCore
+				if shortResource > 0 {
+					switch resourceKind {
+					case ResourceKindQuote:
+						allocation.FundingShortfallUSD = shortResource
+					case ResourceKindBase:
+						allocation.FundingShortfallUSD = shortResource * snapshot.Price
+					}
 				}
 
 				allocation.AllocationFraction = 1

@@ -288,6 +288,13 @@ type Trader struct {
 	nearestNetSell  float64
 	nearestIdxSell  int
 
+	// Refund buckets retain the historical cross-side service semantics:
+	//   refundBuyUSD  = BUY shortfall to be serviced by a later SELL.
+	//   refundSellUSD = SELL shortfall to be serviced by a later BUY.
+	//
+	// Parallel allocation may aggregate multiple same-side shortfalls inside one
+	// coordinator tick, but publication remains replacement assignment, never +=
+	// across ticks.
 	refundBuyUSD  float64
 	refundSellUSD float64
 	SpareBuyUSD   float64
@@ -4063,6 +4070,51 @@ func (t *Trader) producerResourceReservationsLocked() (
 		}
 	}
 	return quoteUSD, base
+}
+
+// reserveProducerAllocationLocked converts one authoritative coordinator grant
+// into a transient Trader-owned reservation before any broker submission.
+//
+// The reservation exists only to bridge the gap between:
+//  1. AllocationPlan finalization from the frozen ResourceSnapshot, and
+//  2. exchange-backed PendingEntry registration or synchronous market commit.
+//
+// The coordinator grant remains authoritative; this helper never resizes it.
+// Caller must hold t.mu.
+func (t *Trader) reserveProducerAllocationLocked(
+	allocation ProducerResourceAllocation,
+) error {
+	req := allocation.Request
+	if req.Intent == nil {
+		return errors.New("reserveProducerAllocationLocked: nil PendingIntent")
+	}
+
+	reservation := ProducerResourceReservation{
+		DecisionID: strings.TrimSpace(req.Intent.DecisionID),
+		Producer:   req.Producer,
+		Side:       req.Side,
+		CreatedAt:  time.Now().UTC(),
+	}
+
+	switch req.Side {
+	case SideBuy:
+		reservation.QuoteUSD = allocation.AllocatedQuote
+
+	case SideSell:
+		if t.cfg.RequireBaseForShort {
+			reservation.Base = allocation.AllocatedBase
+		} else {
+			return nil
+		}
+
+	default:
+		return fmt.Errorf(
+			"reserveProducerAllocationLocked: unsupported side=%s",
+			req.Side,
+		)
+	}
+
+	return t.reserveProducerResourcesLocked(reservation)
 }
 
 type PendingEntry struct {

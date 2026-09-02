@@ -1,3 +1,4 @@
+// producer_parallel_entry.go — parallel producer admission, allocation, refund servicing, and execution.
 package main
 
 import (
@@ -263,6 +264,17 @@ func (t *Trader) executeProducerAllocation(
 	if intent == nil || attempt == nil {
 		return "", fmt.Errorf("allocation missing producer lifecycle")
 	}
+
+	// The batch installed a transient resource reservation before any broker
+	// submission. Keep it authoritative during execution, then always release it:
+	// on pending registration the PendingEntry registry becomes authoritative;
+	// on market success the committed position becomes authoritative; and on any
+	// failure no exchange-backed reservation remains.
+	defer func() {
+		t.mu.Lock()
+		t.releaseProducerResourcesLocked(intent.DecisionID)
+		t.mu.Unlock()
+	}()
 
 	quote := allocation.AllocatedQuote
 	base := allocation.AllocatedBase
@@ -583,9 +595,10 @@ func (t *Trader) executeProducerAllocation(
 	return fmt.Sprintf("OPEN producer=%s side=%s order_id=%s", req.Producer, req.Side, placed.ID), nil
 }
 
-// preserveFundingFailureSideEffectsLocked carries forward the old inline
-// insufficient-funding side effects. Caller holds t.mu.
-func (t *Trader) preserveFundingFailureSideEffectsLocked(
+// preserveFundingFailureDebugLocked carries forward the old inline
+// insufficient-funding DEBUG behavior. Refund state is mutated once per side
+// after same-tick shortfalls have been aggregated. Caller holds t.mu.
+func (t *Trader) preserveFundingFailureDebugLocked(
 	allocation ProducerResourceAllocation,
 	snapshot ResourceSnapshot,
 	price float64,
@@ -597,9 +610,6 @@ func (t *Trader) preserveFundingFailureSideEffectsLocked(
 	req := allocation.Request
 	switch req.Side {
 	case SideBuy:
-		// Historical semantics: replacement assignment, never accumulation.
-		t.refundBuyUSD = allocation.FundingShortfallUSD
-
 		usable := snapDownResource(snapshot.SpareQuote, snapshot.QuoteStep)
 		if usable < snapshot.MinNotional {
 			if snapshot.SpareQuote+1e-9 < req.RequestedQuote {
@@ -617,7 +627,6 @@ func (t *Trader) preserveFundingFailureSideEffectsLocked(
 		}
 
 	case SideSell:
-		t.refundSellUSD = allocation.FundingShortfallUSD
 		log.Printf(
 			"[DEBUG] GATE SELL: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
 			req.MinimumResource,
@@ -826,6 +835,30 @@ func (t *Trader) processParallelProducerEntriesLocked(
 	plan := coordinator.Allocate(snapshot, requests, balanceAvailable)
 
 	approved := make([]ProducerResourceAllocation, 0, len(plan.Allocations))
+
+	// Refund creation keeps historical replacement semantics. Parallel allocation
+	// can produce multiple same-side funding shortfalls in one coordinator tick,
+	// so aggregate those shortfalls first and replace each persisted side bucket
+	// exactly once. Never += into persisted refund state and never let allocation
+	// iteration order decide which same-tick shortfall survives.
+	var shortBuyUSD, shortSellUSD float64
+	for _, allocation := range plan.Allocations {
+		if allocation.FundingShortfallUSD <= 0 {
+			continue
+		}
+		switch allocation.Request.Side {
+		case SideBuy:
+			shortBuyUSD += allocation.FundingShortfallUSD
+		case SideSell:
+			shortSellUSD += allocation.FundingShortfallUSD
+		}
+	}
+	// Do not publish this tick's newly-created refund debt yet. Approved
+	// opposite-side producers were sized against the refund state that existed
+	// at the start of the coordinator tick. Preserve the old ordering: existing
+	// refund is serviced first; this tick's shortfall replaces the persisted
+	// bucket only after execution (never +=).
+
 	for _, allocation := range plan.Allocations {
 		t.recordAllocationEventLocked(allocation, allocationFinalStage(allocation.Status))
 
@@ -833,8 +866,11 @@ func (t *Trader) processParallelProducerEntriesLocked(
 			if allocation.Reason == AllocationReasonLotCapacity {
 				log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", t.cfg.MaxConcurrentLots)
 			}
-			t.preserveFundingFailureSideEffectsLocked(allocation, snapshot, price)
 		}
+
+		// Funding shortfall is meaningful for both rejected and partial grants.
+		// Preserve historical DEBUG behavior independently from refund mutation.
+		t.preserveFundingFailureDebugLocked(allocation, snapshot, price)
 
 		t.persistProducerAttemptLocked(allocation.Request.Attempt)
 
@@ -863,14 +899,64 @@ func (t *Trader) processParallelProducerEntriesLocked(
 		}
 	}
 
-	// The full plan has been established atomically while t.mu is held. Network
-	// I/O now proceeds without t.mu. producerAllocationMu (owned by step) keeps a
-	// second entry-allocation cycle from using this batch's frozen resources.
-	t.mu.Unlock()
+	// Atomically reserve every approved coordinator grant BEFORE broker
+	// submissions begin. Existing pending reservations remain paramount and were
+	// already reflected in the frozen snapshot. These transient reservations
+	// protect the gap between plan finalization and PendingEntry/commit ownership.
+	reservedDecisionIDs := make([]string, 0, len(approved))
+	for _, allocation := range approved {
+		if err := t.reserveProducerAllocationLocked(allocation); err != nil {
+			for _, decisionID := range reservedDecisionIDs {
+				t.releaseProducerResourcesLocked(decisionID)
+			}
+			t.mu.Unlock()
+			return StepResult{
+					Msg:    "HOLD resource reservation failed",
+					Raw:    aiRaw,
+					Signal: Flat,
+				}, fmt.Errorf(
+					"producer resource reservation failed producer=%s decision_id=%s: %w",
+					allocation.Request.Producer,
+					allocation.Request.Intent.DecisionID,
+					err,
+				)
+		}
 
+		if allocation.Request.Intent != nil &&
+			strings.TrimSpace(allocation.Request.Intent.DecisionID) != "" &&
+			(allocation.Request.Side == SideBuy ||
+				(allocation.Request.Side == SideSell && t.cfg.RequireBaseForShort)) {
+			reservedDecisionIDs = append(
+				reservedDecisionIDs,
+				allocation.Request.Intent.DecisionID,
+			)
+		}
+	}
+
+	publishTickRefundShortfallsLocked := func() {
+		if shortBuyUSD > 0 {
+			t.refundBuyUSD = shortBuyUSD
+		}
+		if shortSellUSD > 0 {
+			t.refundSellUSD = shortSellUSD
+		}
+	}
+
+	// If every allocation was rejected there is no execution phase, but funding
+	// shortfalls are still real outcomes of this coordinator tick and must not be
+	// lost behind an early return.
 	if len(approved) == 0 {
+		publishTickRefundShortfallsLocked()
+		_ = t.saveStateNoLock()
+		t.mu.Unlock()
 		return StepResult{Msg: "HOLD allocation rejected", Raw: aiRaw, Signal: Flat}, nil
 	}
+
+	// The full plan and all transient reservations have been established while
+	// t.mu is held. Network I/O now proceeds without t.mu. producerAllocationMu
+	// (owned by step) prevents another complete allocation cycle from racing this
+	// batch's frozen plan.
+	t.mu.Unlock()
 
 	messages := make([]string, 0, len(approved))
 	errs := make([]error, 0)
@@ -892,6 +978,16 @@ func (t *Trader) processParallelProducerEntriesLocked(
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", allocation.Request.Producer, err))
 		}
+	}
+
+	// Publish funding shortfalls created by THIS coordinator tick only after all
+	// approved allocations had their historical opportunity to consume the
+	// pre-tick refund state.
+	if shortBuyUSD > 0 || shortSellUSD > 0 {
+		t.mu.Lock()
+		publishTickRefundShortfallsLocked()
+		_ = t.saveStateNoLock()
+		t.mu.Unlock()
 	}
 
 	result := StepResult{

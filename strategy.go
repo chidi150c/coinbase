@@ -14,6 +14,11 @@
 // Execution, funding, exchange validity, pending orders, lot capacity, and
 // risk controls remain deterministic downstream policy. step.go orchestrates
 // producer admission, request building, resource coordination, and execution.
+//
+// Refund shortfall creation/consumption is deliberately NOT model/strategy
+// state. It is execution-resource accounting owned downstream by the producer
+// resource coordinator / parallel entry lifecycle so AI/indicator decisions
+// remain immutable when resource contention occurs.
 
 package main
 
