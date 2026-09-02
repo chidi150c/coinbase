@@ -1090,7 +1090,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			var (
 				msgs      []string
 				succeeded int
-				noAction  int
 				failed    int
 			)
 
@@ -1107,12 +1106,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					// )
 
 					continue
-				}
-
-				if res.Acted {
-					succeeded++
-				} else {
-					noAction++
 				}
 
 				// log.Printf(
@@ -1136,10 +1129,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			if succeeded > 0 || failed > 0 {
 				return StepResult{
 					Msg: fmt.Sprintf(
-						"EXIT-FANOUT total=%d succeeded=%d no_action=%d failed=%d\n%s",
+						"EXIT-FANOUT total=%d succeeded=%d failed=%d\n%s",
 						len(results),
 						succeeded,
-						noAction,
 						failed,
 						strings.Join(msgs, "\n"),
 					),

@@ -2303,7 +2303,6 @@ type exitFanoutResult struct {
 	Reason       string
 	Msg          string
 	Err          error
-	Acted        bool
 }
 
 func (t *Trader) fanOutExits(
@@ -2335,33 +2334,6 @@ func (t *Trader) fanOutExits(
 			// cand.net,
 			// )
 
-			// Snapshot only the candidate's existing exit-relevant state. This lets
-			// fanout distinguish a successful no-op from a real exit-side action
-			// without changing closeLot's established return contract.
-			var (
-				beforeExists             bool
-				beforeSize               float64
-				beforeFixedTPOrderID     string
-				beforeReplacementStarted bool
-				beforeReplacementOrderID string
-				beforeUpRecoveryUsed     bool
-			)
-
-			t.mu.Lock()
-			if idx := t.findLotIndexByEntryIDLocked(cand.side, cand.entryOrderID); idx >= 0 {
-				book := t.book(cand.side)
-				if idx < len(book.Lots) && book.Lots[idx] != nil {
-					lot := book.Lots[idx]
-					beforeExists = true
-					beforeSize = lot.SizeBase
-					beforeFixedTPOrderID = strings.TrimSpace(lot.FixedTPOrderID)
-					beforeReplacementStarted = lot.Case3AReplacementStarted
-					beforeReplacementOrderID = strings.TrimSpace(lot.Case3AReplacementOrderID)
-					beforeUpRecoveryUsed = lot.Case3AUpRecoveryUsed
-				}
-			}
-			t.mu.Unlock()
-
 			msg, err := t.closeLotByEntryID(
 				ctx,
 				livePrice,
@@ -2371,38 +2343,12 @@ func (t *Trader) fanOutExits(
 				cand.decision,
 			)
 
-			acted := false
-			if err == nil && beforeExists {
-				t.mu.Lock()
-				idx := t.findLotIndexByEntryIDLocked(cand.side, cand.entryOrderID)
-				if idx < 0 {
-					// The source lot was actually removed by a completed exit.
-					acted = true
-				} else {
-					book := t.book(cand.side)
-					if idx < len(book.Lots) && book.Lots[idx] != nil {
-						lot := book.Lots[idx]
-						afterFixedTPOrderID := strings.TrimSpace(lot.FixedTPOrderID)
-						afterReplacementOrderID := strings.TrimSpace(lot.Case3AReplacementOrderID)
-
-						acted =
-							lot.SizeBase != beforeSize ||
-								(beforeFixedTPOrderID == "" && afterFixedTPOrderID != "") ||
-								(!beforeReplacementStarted && lot.Case3AReplacementStarted) ||
-								(beforeReplacementOrderID == "" && afterReplacementOrderID != "") ||
-								(!beforeUpRecoveryUsed && lot.Case3AUpRecoveryUsed)
-					}
-				}
-				t.mu.Unlock()
-			}
-
 			resultsCh <- exitFanoutResult{
 				Side:         cand.side,
 				EntryOrderID: cand.entryOrderID,
 				Reason:       cand.reason,
 				Msg:          msg,
 				Err:          err,
-				Acted:        acted,
 			}
 		}()
 	}
@@ -3499,14 +3445,16 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 	case3ARecoveryExcessPnL := 0.0
 
 	if case3AUpRecoveryCandidate {
-		case3ARecoveredNet = math.Min(pl, case3ARecoveryBefore)
-		case3ARecoveryAfter =
-			math.Max(0, case3ARecoveryBefore-case3ARecoveredNet)
+		// Apply the authoritative realized NET PnL exactly once to the
+		// lot-specific recovery obligation. Do NOT clamp at zero: a negative
+		// value is valid and records recovery overshoot.
+		case3ARecoveredNet = pl
+		case3ARecoveryAfter = case3ARecoveryBefore - pl
+		lot.RecoveryNetUSD = case3ARecoveryAfter
 
 		if case3ARecoveryAfter > case3AFillTol {
 			case3AUpPartialRecovery = true
 			lot.Case3AUpRecoveryUsed = true
-			lot.RecoveryNetUSD = case3ARecoveryAfter
 
 			// Carry the partial state on the live lot so subsequent exit
 			// decisions continue from the exact remaining obligation.
@@ -3521,11 +3469,9 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 			)
 		} else {
 			// The first qualifying UP recovery fill itself completed the
-			// obligation; classify it as final rather than partial.
+			// obligation. Keep the exact <= 0 balance; do not normalize it.
 			case3AFinalRecovery = true
-			lot.RecoveryNetUSD = 0
-			case3ARecoveryExcessPnL =
-				math.Max(0, pl-case3ARecoveredNet)
+			case3ARecoveryExcessPnL = math.Max(0, -case3ARecoveryAfter)
 		}
 	} else if case3AFullFill &&
 		lot.Producer == EntryProducerCase3AReplacement &&
@@ -3533,12 +3479,13 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 		!strings.HasPrefix(exitReason, "threshold_stop_loss") &&
 		pl+case3AFillTol >= case3ARecoveryBefore {
 
-		case3AFinalRecovery = true
-		case3ARecoveredNet = case3ARecoveryBefore
-		case3ARecoveryAfter = 0
-		case3ARecoveryExcessPnL =
-			math.Max(0, pl-case3ARecoveredNet)
-		lot.RecoveryNetUSD = 0
+		// Later recovery exit: apply actual realized NET once and preserve any
+		// negative overshoot. RecoveryNetUSD <= 0 is the completion condition.
+		case3ARecoveredNet = pl
+		case3ARecoveryAfter = case3ARecoveryBefore - pl
+		lot.RecoveryNetUSD = case3ARecoveryAfter
+		case3AFinalRecovery = case3ARecoveryAfter <= case3AFillTol
+		case3ARecoveryExcessPnL = math.Max(0, -case3ARecoveryAfter)
 	}
 
 	if case3AFinalRecovery {
@@ -3547,10 +3494,11 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 		exitDecision = strings.TrimSpace(
 			exitDecision + fmt.Sprintf(
 				"|recovery_net_before=%.6f|recovered_net=%.6f"+
-					"|recovery_net_after=0.000000|recovery_complete=true"+
+					"|recovery_net_after=%.6f|recovery_complete=true"+
 					"|recovery_excess_pnl=%.6f",
 				case3ARecoveryBefore,
 				case3ARecoveredNet,
+				case3ARecoveryAfter,
 				case3ARecoveryExcessPnL,
 			),
 		)
@@ -3647,10 +3595,11 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 				ProducerStageCase3AFinalRecovery,
 				fmt.Sprintf(
 					"case3a_final_recovery|recovery_net_before=%.6f"+
-						"|recovered_net=%.6f|recovery_net_after=0.000000"+
+						"|recovered_net=%.6f|recovery_net_after=%.6f"+
 						"|recovery_complete=true|recovery_excess_pnl=%.6f",
 					case3ARecoveryBefore,
 					case3ARecoveredNet,
+					case3ARecoveryAfter,
 					case3ARecoveryExcessPnL,
 				),
 			)
