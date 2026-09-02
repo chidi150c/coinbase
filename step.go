@@ -1092,41 +1092,43 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				if res.Err != nil {
 					failed++
 
-					// log.Printf(
-					// "[TRACE] exit.fanout.failed side=%s entry_id=%s reason=%s err=%v",
-					// res.Side,
-					// res.EntryOrderID,
-					// res.Reason,
-					// res.Err,
-					// )
+					// Genuine exit failures still own the tick. They must not be
+					// treated as permission to continue into new-entry processing.
+					continue
+				}
 
+				if !res.Acted {
+					// A selected exit candidate that completed with nil error but
+					// made no exit-side state transition does not own the tick.
 					continue
 				}
 
 				succeeded++
-
-				// log.Printf(
-				// "[TRACE] exit.fanout.done side=%s entry_id=%s reason=%s msg=%q",
-				// res.Side,
-				// res.EntryOrderID,
-				// res.Reason,
-				// res.Msg,
-				// )
 
 				if strings.TrimSpace(res.Msg) != "" {
 					msgs = append(msgs, res.Msg)
 				}
 			}
 
-			return StepResult{
-				Msg: fmt.Sprintf(
-					"EXIT-FANOUT total=%d succeeded=%d failed=%d\n%s",
-					len(results),
-					succeeded,
-					failed,
-					strings.Join(msgs, "\n"),
-				),
-			}, nil
+			if succeeded > 0 || failed > 0 {
+				// A real exit action, or a genuine exit failure, preserves the
+				// existing exit-first ownership of this tick.
+				return StepResult{
+					Msg: fmt.Sprintf(
+						"EXIT-FANOUT total=%d succeeded=%d failed=%d\n%s",
+						len(results),
+						succeeded,
+						failed,
+						strings.Join(msgs, "\n"),
+					),
+				}, nil
+			}
+
+			// Every selected exit candidate was a nil-error no-op. fanOutExits
+			// ran with t.mu released because its workers acquire t.mu themselves.
+			// Reacquire it exactly once before continuing through the remainder
+			// of step(), whose entry/gate path expects the trader lock to be held.
+			t.mu.Lock()
 		}
 
 		// single-pass enriched summary (collected in-loop; no extra scans)

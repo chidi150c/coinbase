@@ -2305,6 +2305,7 @@ type exitFanoutResult struct {
 	Reason       string
 	Msg          string
 	Err          error
+	Acted        bool
 }
 
 func (t *Trader) fanOutExits(
@@ -2336,6 +2337,33 @@ func (t *Trader) fanOutExits(
 			// cand.net,
 			// )
 
+			// Snapshot only the candidate's existing exit-relevant state. This lets
+			// fanout distinguish a successful no-op from a real exit-side action
+			// without changing closeLot's established return contract.
+			var (
+				beforeExists             bool
+				beforeSize               float64
+				beforeFixedTPOrderID     string
+				beforeReplacementStarted bool
+				beforeReplacementOrderID string
+				beforeUpRecoveryUsed     bool
+			)
+
+			t.mu.Lock()
+			if idx := t.findLotIndexByEntryIDLocked(cand.side, cand.entryOrderID); idx >= 0 {
+				book := t.book(cand.side)
+				if idx < len(book.Lots) && book.Lots[idx] != nil {
+					lot := book.Lots[idx]
+					beforeExists = true
+					beforeSize = lot.SizeBase
+					beforeFixedTPOrderID = strings.TrimSpace(lot.FixedTPOrderID)
+					beforeReplacementStarted = lot.Case3AReplacementStarted
+					beforeReplacementOrderID = strings.TrimSpace(lot.Case3AReplacementOrderID)
+					beforeUpRecoveryUsed = lot.Case3AUpRecoveryUsed
+				}
+			}
+			t.mu.Unlock()
+
 			msg, err := t.closeLotByEntryID(
 				ctx,
 				livePrice,
@@ -2345,12 +2373,38 @@ func (t *Trader) fanOutExits(
 				cand.decision,
 			)
 
+			acted := false
+			if err == nil && beforeExists {
+				t.mu.Lock()
+				idx := t.findLotIndexByEntryIDLocked(cand.side, cand.entryOrderID)
+				if idx < 0 {
+					// The source lot was actually removed by a completed exit.
+					acted = true
+				} else {
+					book := t.book(cand.side)
+					if idx < len(book.Lots) && book.Lots[idx] != nil {
+						lot := book.Lots[idx]
+						afterFixedTPOrderID := strings.TrimSpace(lot.FixedTPOrderID)
+						afterReplacementOrderID := strings.TrimSpace(lot.Case3AReplacementOrderID)
+
+						acted =
+							lot.SizeBase != beforeSize ||
+								(beforeFixedTPOrderID == "" && afterFixedTPOrderID != "") ||
+								(!beforeReplacementStarted && lot.Case3AReplacementStarted) ||
+								(beforeReplacementOrderID == "" && afterReplacementOrderID != "") ||
+								(!beforeUpRecoveryUsed && lot.Case3AUpRecoveryUsed)
+					}
+				}
+				t.mu.Unlock()
+			}
+
 			resultsCh <- exitFanoutResult{
 				Side:         cand.side,
 				EntryOrderID: cand.entryOrderID,
 				Reason:       cand.reason,
 				Msg:          msg,
 				Err:          err,
+				Acted:        acted,
 			}
 		}()
 	}
