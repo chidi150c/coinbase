@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"strings"
@@ -198,6 +199,31 @@ func snapDownResource(value, step float64) float64 {
 	return math.Floor(value/step) * step
 }
 
+func producerRequestCoreResource(req ProducerResourceRequest) float64 {
+	switch req.ResourceKind {
+	case ResourceKindQuote:
+		return math.Max(0, req.CoreQuote)
+	case ResourceKindBase:
+		return math.Max(0, req.CoreBase)
+	default:
+		return math.Max(0, req.RequestedResource)
+	}
+}
+
+func producerRequestRefundResource(req ProducerResourceRequest) float64 {
+	if req.RefundRequestedUSD <= 0 {
+		return 0
+	}
+	switch req.ResourceKind {
+	case ResourceKindQuote:
+		return math.Max(0, req.RequestedResource-producerRequestCoreResource(req))
+	case ResourceKindBase:
+		return math.Max(0, req.RequestedResource-producerRequestCoreResource(req))
+	default:
+		return 0
+	}
+}
+
 func (c ProducerResourceCoordinator) Allocate(
 	snapshot ResourceSnapshot,
 	requests []ProducerResourceRequest,
@@ -208,13 +234,10 @@ func (c ProducerResourceCoordinator) Allocate(
 		Snapshot:    snapshot,
 		Allocations: make([]ProducerResourceAllocation, 0, len(requests)),
 	}
-
 	if len(requests) == 0 {
 		return plan
 	}
 
-	// Highest priority first. Stable producer/DecisionID ordering is used only
-	// for deterministic diagnostics; equal-priority funding is proportional.
 	sorted := append([]ProducerResourceRequest(nil), requests...)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		if sorted[i].Priority != sorted[j].Priority {
@@ -248,12 +271,16 @@ func (c ProducerResourceCoordinator) Allocate(
 		for _, resourceKind := range []ResourceKind{ResourceKindQuote, ResourceKindBase, ResourceKindNone} {
 			members := make([]ProducerResourceRequest, 0, len(group))
 			groupRequested := 0.0
+			groupCoreRequested := 0.0
+			groupRefundRequested := 0.0
 			for _, req := range group {
 				if req.ResourceKind != resourceKind {
 					continue
 				}
 				members = append(members, req)
 				groupRequested += math.Max(0, req.RequestedResource)
+				groupCoreRequested += producerRequestCoreResource(req)
+				groupRefundRequested += producerRequestRefundResource(req)
 			}
 			if len(members) == 0 {
 				continue
@@ -267,20 +294,43 @@ func (c ProducerResourceCoordinator) Allocate(
 				groupAvailable = spareBase
 			}
 
-			ratio := 1.0
-			if groupRequested > 0 && groupAvailable < groupRequested {
-				ratio = groupAvailable / groupRequested
-				if ratio < 0 {
-					ratio = 0
+			// Preserve old producer sizing order: core sizing/funding is resolved
+			// before opposite-side refund augmentation. Refund demand must never
+			// proportionally shrink an otherwise fundable core order.
+			coreRatio := 1.0
+			if resourceKind != ResourceKindNone && groupCoreRequested > groupAvailable && groupCoreRequested > 0 {
+				coreRatio = groupAvailable / groupCoreRequested
+				if coreRatio < 0 {
+					coreRatio = 0
 				}
 			}
 
-			for _, req := range members {
+			coreAllocated := make([]float64, len(members))
+			usedCore := 0.0
+			for i, req := range members {
+				core := producerRequestCoreResource(req)
+				if resourceKind == ResourceKindNone {
+					coreAllocated[i] = core
+				} else {
+					coreAllocated[i] = snapDownResource(core*coreRatio, req.ResourceStep)
+				}
+				usedCore += coreAllocated[i]
+			}
+
+			refundAvailable := math.Max(0, groupAvailable-usedCore)
+			refundRatio := 0.0
+			if coreRatio >= 1-1e-12 && groupRefundRequested > 0 {
+				refundRatio = 1.0
+				if refundAvailable < groupRefundRequested {
+					refundRatio = refundAvailable / groupRefundRequested
+				}
+			}
+
+			for i, req := range members {
 				allocation := ProducerResourceAllocation{
 					Request:                req,
 					Status:                 AllocationRejected,
 					Reason:                 AllocationReasonInvalidRequest,
-					AllocationFraction:     0,
 					AllocationMethod:       "priority",
 					PriorityGroupRequested: groupRequested,
 					PriorityGroupAvailable: groupAvailable,
@@ -292,34 +342,41 @@ func (c ProducerResourceCoordinator) Allocate(
 					plan.Allocations = append(plan.Allocations, allocation)
 					continue
 				}
-
 				if req.ConsumesLotSlot && lotSlots == 0 {
 					allocation.Reason = AllocationReasonLotCapacity
 					plan.Allocations = append(plan.Allocations, allocation)
 					continue
 				}
 
-				if req.RequestedQuote <= 0 || req.RequestedBase <= 0 ||
-					req.RequestedQuote < snapshot.MinNotional {
-					allocation.Reason = AllocationReasonBelowMinNotional
-					plan.Allocations = append(plan.Allocations, allocation)
-					continue
+				coreRequested := producerRequestCoreResource(req)
+				allocatedResource := coreAllocated[i]
+				if resourceKind != ResourceKindNone && coreRatio >= 1-1e-12 {
+					refundPart := snapDownResource(producerRequestRefundResource(req)*refundRatio, req.ResourceStep)
+					allocatedResource += refundPart
+					if allocatedResource > req.RequestedResource {
+						allocatedResource = req.RequestedResource
+					}
 				}
 
-				allocatedResource := req.RequestedResource
-				if resourceKind != ResourceKindNone {
-					rawAllocatedResource := req.RequestedResource * ratio
-					allocatedResource = snapDownResource(rawAllocatedResource, req.ResourceStep)
-					if allocatedResource+1e-12 < req.MinimumResource {
-						if groupAvailable <= 0 {
-							allocation.Reason = AllocationReasonInsufficientFunding
-						} else {
-							allocation.Reason = AllocationReasonBelowMinNotional
-						}
+				if allocatedResource+1e-12 < req.MinimumResource {
+					if groupAvailable <= 0 {
+						allocation.Reason = AllocationReasonInsufficientFunding
+					} else {
+						allocation.Reason = AllocationReasonBelowMinNotional
+					}
 
-						// Preserve the historical refund definition: only the
-						// producer's missing resource becomes a refund obligation.
-						shortResource := req.RequestedResource - rawAllocatedResource
+					// Historical refund shortfall is based on the core funding gate,
+					// which ran before refund augmentation in the old path. Priority
+					// contention must not manufacture refund debt.
+					initialAvailable := 0.0
+					switch resourceKind {
+					case ResourceKindQuote:
+						initialAvailable = snapDownResource(snapshot.SpareQuote, req.ResourceStep)
+					case ResourceKindBase:
+						initialAvailable = snapDownResource(snapshot.SpareBase, req.ResourceStep)
+					}
+					if initialAvailable+1e-12 < req.MinimumResource {
+						shortResource := coreRequested - initialAvailable
 						if shortResource < 0 {
 							shortResource = 0
 						}
@@ -329,10 +386,9 @@ func (c ProducerResourceCoordinator) Allocate(
 						case ResourceKindBase:
 							allocation.FundingShortfallUSD = shortResource * snapshot.Price
 						}
-
-						plan.Allocations = append(plan.Allocations, allocation)
-						continue
 					}
+					plan.Allocations = append(plan.Allocations, allocation)
+					continue
 				}
 
 				switch resourceKind {
@@ -359,7 +415,6 @@ func (c ProducerResourceCoordinator) Allocate(
 				if req.RequestedResource > 0 && resourceKind != ResourceKindNone {
 					allocation.AllocationFraction = allocatedResource / req.RequestedResource
 				}
-
 				if allocation.AllocationFraction+1e-9 < 1 {
 					allocation.Status = AllocationPartial
 					allocation.Reason = AllocationReasonPartial
@@ -367,38 +422,34 @@ func (c ProducerResourceCoordinator) Allocate(
 				} else {
 					allocation.Status = AllocationApproved
 					allocation.Reason = AllocationReasonApproved
-					if len(members) > 1 && ratio < 1 {
+					if len(members) > 1 && (coreRatio < 1 || refundRatio < 1) {
 						allocation.AllocationMethod = "proportional"
 					}
 				}
 
-				if resourceKind == ResourceKindQuote {
+				switch resourceKind {
+				case ResourceKindQuote:
 					spareQuote -= allocation.AllocatedQuote
 					if spareQuote < 0 {
 						spareQuote = 0
 					}
 					plan.ReservedQuote += allocation.AllocatedQuote
-				}
-				if resourceKind == ResourceKindBase {
+				case ResourceKindBase:
 					spareBase -= allocation.AllocatedBase
 					if spareBase < 0 {
 						spareBase = 0
 					}
 					plan.ReservedBase += allocation.AllocatedBase
 				}
-
 				if req.ConsumesLotSlot && lotSlots > 0 {
 					lotSlots--
 					plan.ReservedLots++
 				}
-
 				plan.Allocations = append(plan.Allocations, allocation)
 			}
 		}
-
 		start = end
 	}
-
 	return plan
 }
 
@@ -664,6 +715,11 @@ func (t *Trader) buildProducerResourceRequestLocked(
 		} else {
 			take = price * (1 - tpPct/100)
 		}
+
+		log.Printf(
+			"[DEBUG] scalp tp decay: k=%d mode=%s baseTP=%.3f%% tpPct=%.3f%% minTP=%.3f%% take=%.2f",
+			k, t.cfg.ScalpTPDecMode, t.cfg.TakeProfitPct, tpPct, t.cfg.ScalpTPMinPct, take,
+		)
 	}
 
 	req := ProducerResourceRequest{

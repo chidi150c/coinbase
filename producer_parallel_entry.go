@@ -174,28 +174,6 @@ func (t *Trader) capAllocationToCurrentRefundLocked(
 	return refundUSD
 }
 
-// rememberInsufficientFundingLocked restores the historical refund-service
-// side effect: when an entry cannot be funded, remember the unexecuted USD so
-// the opposite-side trade can service it later.
-//
-// A failed BUY is serviced by a later SELL through refundBuyUSD.
-// A failed SELL is serviced by a later BUY through refundSellUSD.
-// The caller must hold t.mu.
-func (t *Trader) rememberInsufficientFundingLocked(side OrderSide, failedUSD float64) {
-	if failedUSD <= 0 {
-		return
-	}
-
-	switch side {
-	case SideBuy:
-		t.refundBuyUSD += failedUSD
-	case SideSell:
-		t.refundSellUSD += failedUSD
-	}
-
-	_ = t.saveStateNoLock()
-}
-
 func (t *Trader) consumeRefundReservationLocked(side OrderSide, refundUSD float64) {
 	if refundUSD <= 0 {
 		return
@@ -299,6 +277,34 @@ func (t *Trader) executeProducerAllocation(
 	refundUSD := t.capAllocationToCurrentRefundLocked(&allocation, price)
 	quote = allocation.AllocatedQuote
 	base = allocation.AllocatedBase
+
+	// Preserve the old refund timing: once this producer has actually taken a
+	// refund-service slice into its order sizing, consume that stored refund
+	// before submission. A later broker failure does not recreate it.
+	if refundUSD > 0 {
+		t.consumeRefundReservationLocked(req.Side, refundUSD)
+		remaining := 0.0
+		switch req.Side {
+		case SideSell:
+			remaining = t.refundBuyUSD
+			if remaining == 0 {
+				req.Decision.ProducerReason = strings.TrimSpace(req.Decision.ProducerReason + "|refund=buy-full")
+			} else {
+				req.Decision.ProducerReason = strings.TrimSpace(req.Decision.ProducerReason + "|refund=buy-partial")
+			}
+		case SideBuy:
+			remaining = t.refundSellUSD
+			if remaining == 0 {
+				req.Decision.ProducerReason = strings.TrimSpace(req.Decision.ProducerReason + "|refund=sell-full")
+			} else {
+				req.Decision.ProducerReason = strings.TrimSpace(req.Decision.ProducerReason + "|refund=sell-partial")
+			}
+		}
+		allocation.Request.Decision.ProducerReason = req.Decision.ProducerReason
+		if intent != nil {
+			intent.ProducerReason = req.Decision.ProducerReason
+		}
+	}
 	t.mu.Unlock()
 
 	if quote < minNotional || base <= 0 {
@@ -345,6 +351,14 @@ func (t *Trader) executeProducerAllocation(
 			baseAtLimit = math.Floor(baseAtLimit/t.cfg.BaseStep) * t.cfg.BaseStep
 		}
 
+		if limitPx <= 0 {
+			log.Printf(
+				"[DEBUG] postonly.invalid_limit "+
+					"side=%s limit=%.8f live=%.8f",
+				req.Side, limitPx, price,
+			)
+		}
+
 		if limitPx > 0 && baseAtLimit > 0 && baseAtLimit*limitPx >= minNotional {
 			t.prepareIntentFromAllocation(allocation, refundUSD, limitPx, baseAtLimit)
 
@@ -363,13 +377,16 @@ func (t *Trader) executeProducerAllocation(
 
 			t.mu.Lock()
 			if err == nil && entry != nil {
-				t.consumeRefundReservationLocked(req.Side, refundUSD)
-				_ = t.saveStateNoLock()
 			}
 			t.persistProducerAttemptLocked(attempt)
 			t.mu.Unlock()
 
 			if err != nil {
+				log.Printf(
+					"[DEBUG] postonly.error "+
+						"hold_for_recheck side=%s err=%v",
+					req.Side, err,
+				)
 				return fmt.Sprintf("HOLD producer=%s", req.Producer), err
 			}
 			if entry != nil {
@@ -377,6 +394,13 @@ func (t *Trader) executeProducerAllocation(
 			}
 			// Maker size became non-viable inside the wrapper only if an invariant
 			// changed. Fall through to direct market rather than increasing size.
+		} else if limitPx > 0 {
+			log.Printf(
+				"[DEBUG] postonly.skip "+
+					"reason=snapped_size_below_min "+
+					"side=%s base=%.8f limit=%.8f notional=%.8f min_notional=%.8f",
+				req.Side, baseAtLimit, limitPx, baseAtLimit*limitPx, minNotional,
+			)
 		}
 	}
 
@@ -414,7 +438,6 @@ func (t *Trader) executeProducerAllocation(
 		QuoteValue: marketQuote,
 	}
 
-	originalMarketQuote := marketQuote
 	placed, err := t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, req.Side, marketQuote)
 	if err != nil && marketQuote > minNotional && isBinanceInsufficientBalance(err) {
 		marketQuote = minNotional
@@ -428,13 +451,6 @@ func (t *Trader) executeProducerAllocation(
 	}
 	if err != nil {
 		t.mu.Lock()
-		if isBinanceInsufficientBalance(err) {
-			failedUSD := originalMarketQuote
-			if failedUSD <= 0 {
-				failedUSD = marketQuote
-			}
-			t.rememberInsufficientFundingLocked(req.Side, failedUSD)
-		}
 		t.addDecisionProducerEvent(
 			intent,
 			attempt,
@@ -472,6 +488,17 @@ func (t *Trader) executeProducerAllocation(
 	// Reuse the authoritative generic commit logic used by asynchronous maker
 	// fills instead of maintaining a second position-commit implementation.
 	t.mu.Lock()
+
+	// Preserve the historical direct-market actual-fill fee delta. The old
+	// market path adjusted equity only for the difference between requested
+	// quote and broker-reported actual quote; maker commits did not do this.
+	actualQuoteForDelta := marketQuote
+	if placed.QuoteSpent > 0 {
+		actualQuoteForDelta = placed.QuoteSpent
+	}
+	delta := (actualQuoteForDelta - marketQuote) * (t.cfg.FeeRatePct / 100.0)
+	t.equityUSD -= delta
+
 	entry, buildErr := t.buildPendingEntry(intent, placed.ID)
 	if buildErr != nil {
 		t.addDecisionProducerEvent(intent, attempt, ProducerStageEntryFailed, buildErr.Code, buildErr.Err, buildErr.CleanupRequired, true)
@@ -518,6 +545,17 @@ func (t *Trader) executeProducerAllocation(
 		return fmt.Sprintf("HOLD producer=%s", req.Producer), commitErr
 	}
 
+	// Preserve the one-shot recheck lifecycle: consume the side flag only
+	// after a real market order has successfully reached the commit path.
+	if recheckNow {
+		switch req.Side {
+		case SideBuy:
+			t.pendingRecheckBuy = false
+		case SideSell:
+			t.pendingRecheckSell = false
+		}
+	}
+
 	if _, refundConsumed := attempt.Events[ProducerStageRefundConsumed]; !refundConsumed {
 		attempt.Events[ProducerStageCommitted] = ProducerEvent{
 			Time:       time.Now().UTC(),
@@ -534,16 +572,6 @@ func (t *Trader) executeProducerAllocation(
 		}
 	}
 
-	t.consumeRefundReservationLocked(req.Side, refundUSD)
-	if recheckNow {
-		switch req.Side {
-		case SideBuy:
-			t.pendingRecheckBuy = false
-		case SideSell:
-			t.pendingRecheckSell = false
-		}
-	}
-	_ = t.saveStateNoLock()
 	t.persistProducerAttemptLocked(attempt)
 	t.mu.Unlock()
 
@@ -553,6 +581,52 @@ func (t *Trader) executeProducerAllocation(
 	t.invalidateBalanceSnapshot()
 
 	return fmt.Sprintf("OPEN producer=%s side=%s order_id=%s", req.Producer, req.Side, placed.ID), nil
+}
+
+// preserveFundingFailureSideEffectsLocked carries forward the old inline
+// insufficient-funding side effects. Caller holds t.mu.
+func (t *Trader) preserveFundingFailureSideEffectsLocked(
+	allocation ProducerResourceAllocation,
+	snapshot ResourceSnapshot,
+	price float64,
+) {
+	if allocation.FundingShortfallUSD <= 0 {
+		return
+	}
+
+	req := allocation.Request
+	switch req.Side {
+	case SideBuy:
+		// Historical semantics: replacement assignment, never accumulation.
+		t.refundBuyUSD = allocation.FundingShortfallUSD
+
+		usable := snapDownResource(snapshot.SpareQuote, snapshot.QuoteStep)
+		if usable < snapshot.MinNotional {
+			if snapshot.SpareQuote+1e-9 < req.RequestedQuote {
+				log.Printf("[DEBUG] GATE BUY: degrade failed; HOLD")
+			} else {
+				log.Printf(
+					"[DEBUG] GATE BUY: need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
+					req.RequestedQuote,
+					snapshot.SpareQuote,
+					snapshot.AvailQuote,
+					snapshot.ReservedQuote,
+					snapshot.QuoteStep,
+				)
+			}
+		}
+
+	case SideSell:
+		t.refundSellUSD = allocation.FundingShortfallUSD
+		log.Printf(
+			"[DEBUG] GATE SELL: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
+			req.MinimumResource,
+			snapshot.SpareBase,
+			snapshot.AvailBase,
+			snapshot.ReservedBase,
+			snapshot.BaseStep,
+		)
+	}
 }
 
 // processParallelProducerEntriesLocked owns the complete ordinary producer
@@ -603,21 +677,14 @@ func (t *Trader) processParallelProducerEntriesLocked(
 	}
 
 	requests := make([]ProducerResourceRequest, 0, len(decisions))
-	totalLots :=
-		len(t.book(SideBuy).Lots) +
-			len(t.book(SideSell).Lots)
+
 	for i := range decisions {
 		d := decisions[i]
 
+		totalLots := len(t.book(SideBuy).Lots) + len(t.book(SideSell).Lots)
 		log.Printf(
 			"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver=%d",
-			totalLots,
-			d.Raw,
-			d.Signal,
-			price,
-			decisionEntryReason(d),
-			t.cfg.LongOnly,
-			Version,
+			totalLots, d.Raw, d.Signal, price, decisionEntryReason(d), t.cfg.LongOnly, Version,
 		)
 		intent, attempt := newProducerDecisionLifecycle(&d)
 		if intent == nil || attempt == nil {
@@ -676,6 +743,43 @@ func (t *Trader) processParallelProducerEntriesLocked(
 			continue
 		}
 
+		if d.Confidence <= 0 {
+			log.Printf(
+				"[TRADE_GATE] confidence=%.2f lastAddBuy=%s lastAddSell=%s "+
+					"winLowBuy=%.2f winHighSell=%.2f "+
+					"latchedBuy=%.2f latchedSell=%.2f "+
+					"nearestBuy{take=%.2f net=%.2f idx=%d} "+
+					"nearestSell{take=%.2f net=%.2f idx=%d} ",
+				d.Confidence,
+				t.lastAddBuy.Format(time.RFC3339),
+				t.lastAddSell.Format(time.RFC3339),
+				t.winLowBuy, t.winHighSell,
+				t.latchedGateBuy, t.latchedGateSell,
+				t.nearestTakeBuy, t.nearestNetBuy, t.nearestIdxBuy,
+				t.nearestTakeSell, t.nearestNetSell, t.nearestIdxSell,
+			)
+			t.addDecisionProducerEvent(
+				intent, attempt, ProducerStageDecisionFailed,
+				EntryProduceErrDecisionInvalidConfidence,
+				fmt.Errorf("decision confidence must be > 0: %.8f", d.Confidence),
+				false, true,
+			)
+			continue
+		}
+
+		if d.Producer != EntryProducerCase3AReplacement && d.ProfitGateMultiplier <= 0 {
+			t.addDecisionProducerEvent(
+				intent, attempt, ProducerStageDecisionFailed,
+				EntryProduceErrInvalidProfitGate,
+				fmt.Errorf(
+					"ordinary producer missing standardized ProfitGateMultiplier: producer=%s tier=%s continuation=%t",
+					d.Producer, d.ProducerTier, d.IsContinuation,
+				),
+				false, true,
+			)
+			continue
+		}
+
 		req, err := t.buildProducerResourceRequestLocked(
 			d, intent, attempt, snapshot, equity, execHistory, price, minNotional,
 		)
@@ -724,20 +828,40 @@ func (t *Trader) processParallelProducerEntriesLocked(
 	approved := make([]ProducerResourceAllocation, 0, len(plan.Allocations))
 	for _, allocation := range plan.Allocations {
 		t.recordAllocationEventLocked(allocation, allocationFinalStage(allocation.Status))
+
+		if allocation.Status == AllocationRejected {
+			if allocation.Reason == AllocationReasonLotCapacity {
+				log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", t.cfg.MaxConcurrentLots)
+			}
+			t.preserveFundingFailureSideEffectsLocked(allocation, snapshot, price)
+		}
+
 		t.persistProducerAttemptLocked(allocation.Request.Attempt)
 
 		if allocation.Status == AllocationApproved || allocation.Status == AllocationPartial {
-			// Allocation is only a resource reservation. Equity stage advancement
-			// already occurred at the historical sizing/request-preparation point.
+			if allocation.Status == AllocationPartial {
+				t.addDecisionProducerEvent(
+					allocation.Request.Intent,
+					allocation.Request.Attempt,
+					ProducerStageSizingReduced,
+					"", nil, false, false,
+				)
+			}
 			approved = append(approved, allocation)
 		}
 	}
 
-	// AllocationPlan is now authoritative. These values are diagnostics/spare
-	// pointers used by the existing commit path; existing pending reservations
-	// were already removed exactly once when snapshot was created.
-	t.SpareBuyUSD = math.Max(0, snapshot.SpareQuote)
-	t.SpareSellUSD = math.Max(0, snapshot.SpareBase*price)
+	// Preserve the historical side-local spare synchronization. The old path
+	// refreshed only the side actually being attempted; do not rewrite the
+	// opposite side merely because a common snapshot now exists.
+	for _, allocation := range approved {
+		switch allocation.Request.Side {
+		case SideBuy:
+			t.SpareBuyUSD = math.Max(0, snapshot.SpareQuote)
+		case SideSell:
+			t.SpareSellUSD = math.Max(0, snapshot.SpareBase*price)
+		}
+	}
 
 	// The full plan has been established atomically while t.mu is held. Network
 	// I/O now proceeds without t.mu. producerAllocationMu (owned by step) keeps a
