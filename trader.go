@@ -1351,36 +1351,6 @@ func decisionEntryReason(d EntryDecision) string {
 	)
 
 	// -----------------------------------------------------------------
-	// Selected-side summaries.
-	//
-	// These explain the final selected side when a directional producer
-	// exists. For FLAT decisions, the pass values remain false and the
-	// reasons may be empty because no side was selected.
-	// -----------------------------------------------------------------
-
-	parts = append(
-		parts,
-		fmt.Sprintf(
-			"selected_pyramid_pass=%t",
-			d.PyramidPass,
-		),
-		fmt.Sprintf(
-			"selected_equity_pass=%t",
-			d.EquityPass,
-		),
-	)
-
-	appendPrefixedFields(
-		"selected_pyramid",
-		d.PyramidReason,
-	)
-
-	appendPrefixedFields(
-		"selected_equity",
-		d.EquityReason,
-	)
-
-	// -----------------------------------------------------------------
 	// Decision flow.
 	//
 	// Raw and final are already printed in the canonical log prefix as
