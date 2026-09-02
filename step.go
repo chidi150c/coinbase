@@ -29,11 +29,12 @@
 //     • Runner: bypass ordinary TP/threshold-stop-loss; exit only through Case 4
 //     • Normal lot: retain ordinary fixed-TP and threshold-stop-loss behavior
 //  3. OPEN evaluation (if no exit fired):
-//     - Pull balances/steps with lock released
-//     - Enforce MinNotional/OrderMinUSD and step/tick snapping symmetrically
-//     - Equity triggers may use staged sizing; runner assignment is producer-owned
-//     - If ORDER_TYPE=limit with offset+timeout → maker-first (async pending)
-//     else place market immediately
+//     - Build one frozen ResourceSnapshot after existing reservations
+//     - Evaluate all ordinary producers independently
+//     - Apply per-producer admission (Case3B/LongOnly) without terminating the batch
+//     - Build all producer sizing/resource requests from the same snapshot
+//     - Allocate by ProducerPriority with proportional equal-priority sharing
+//     - Execute every approved/partial allocation independently
 //
 // Maker-First Async Opens (Post-Only)
 //   - Per-side PendingOpen is persisted and polled until filled/timeout; channels deliver the result.
@@ -70,7 +71,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -79,7 +79,7 @@ import (
 	"time"
 )
 
-const Version = 184
+const Version = 187
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -202,6 +202,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	if len(execHistory) == 0 {
 		return StepResult{Msg: "NO_DATA"}, nil
 	}
+
+	// One complete EXIT -> ENTRY cycle is serialized. Parallel producer trading
+	// means multiple independent producer trades within this cycle; it does not
+	// mean concurrent step() goroutines mutating Trader state or racing frozen
+	// resource snapshots.
+	t.producerAllocationMu.Lock()
+	defer t.producerAllocationMu.Unlock()
 
 	// Use wall clock as authoritative "now" for pyramiding timings; fall back for zero candle time.
 	wallNow := time.Now().UTC()
@@ -385,12 +392,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// --- NEW: walk-forward (re)fit guard hook (no-op other than the guard) ---
 	_ = t.shouldRefit(len(execHistory)) // intentionally unused here (guard only)
 
-	log.Printf("[TRACE] hotpath.after_drain elapsed_ms=%d",
-		time.Since(hotStart).Milliseconds())
+	// [TRACE] hotpath.after_drain intentionally disabled.
 
 	// TODO: remove TRACE
-	lsb := len(t.book(SideBuy).Lots)
-	lss := len(t.book(SideSell).Lots)
 	// log.Printf("[TRACE] step.start ts=%s livePrice=%.8f candleClose=%.8f lotsBuy=%d lotsSell=%d lastAddBuy=%s lastAddSell=%s winLowBuy=%.8f winHighSell=%.8f latchedGateBuy=%.8f latchedGateSell=%.8f recentLow=%.8f recentHigh=%.8f elapsed_Hours_Buy=%.1f elapsed_Hours_Sell=%.1f",
 	// now.Format(time.RFC3339), livePrice, execHistory[len(execHistory)-1].Close, lsb, lss,
 	// t.lastAddBuy.Format(time.RFC3339), t.lastAddSell.Format(time.RFC3339), t.winLowBuy, t.winHighSell, t.latchedGateBuy, t.latchedGateSell, t.RecentLow, t.RecentHigh, time.Since(t.lastAddBuy).Hours(), time.Since(t.lastAddSell).Hours())
@@ -427,8 +431,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		return StepResult{Msg: msg}, err
 	}
 
-	log.Printf("[TRACE] hotpath.after_dust elapsed_ms=%d",
-		time.Since(hotStart).Milliseconds())
+	// [TRACE] hotpath.after_dust intentionally disabled.
 
 	// --------------------------------------------------------------------------------------------------------
 	// EXIT path: fee-aware per-lot exit management.
@@ -443,6 +446,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// - Runners bypass ordinary TP and threshold-stop-loss and exit only through Case 4.
 	// - nearestTakeBuy/Sell are diagnostic/Gate2 snapshots, not separate exit orders.
 	// --------------------------------------------------------------------------------------------------------
+	lsb := len(t.book(SideBuy).Lots)
+	lss := len(t.book(SideSell).Lots)
 	if (lsb > 0) || (lss > 0) {
 
 		nearestTakeBuy := 0.0
@@ -1085,6 +1090,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			var (
 				msgs      []string
 				succeeded int
+				noAction  int
 				failed    int
 			)
 
@@ -1092,42 +1098,54 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				if res.Err != nil {
 					failed++
 
-					// Genuine exit failures still own the tick. They must not be
-					// treated as permission to continue into new-entry processing.
+					// log.Printf(
+					// "[TRACE] exit.fanout.failed side=%s entry_id=%s reason=%s err=%v",
+					// res.Side,
+					// res.EntryOrderID,
+					// res.Reason,
+					// res.Err,
+					// )
+
 					continue
 				}
 
-				if !res.Acted {
-					// A selected exit candidate that completed with nil error but
-					// made no exit-side state transition does not own the tick.
-					continue
+				if res.Acted {
+					succeeded++
+				} else {
+					noAction++
 				}
 
-				succeeded++
+				// log.Printf(
+				// "[TRACE] exit.fanout.done side=%s entry_id=%s reason=%s acted=%t msg=%q",
+				// res.Side,
+				// res.EntryOrderID,
+				// res.Reason,
+				// res.Acted,
+				// res.Msg,
+				// )
 
 				if strings.TrimSpace(res.Msg) != "" {
 					msgs = append(msgs, res.Msg)
 				}
 			}
 
+			// Preserve exit-first semantics. A real exit/recovery action owns the
+			// tick, and a genuine exit failure remains terminal for this tick.
+			// If every selected candidate was a nil-error no-op, reacquire t.mu and
+			// continue into Gate Analysis and ordinary producer coordination.
 			if succeeded > 0 || failed > 0 {
-				// A real exit action, or a genuine exit failure, preserves the
-				// existing exit-first ownership of this tick.
 				return StepResult{
 					Msg: fmt.Sprintf(
-						"EXIT-FANOUT total=%d succeeded=%d failed=%d\n%s",
+						"EXIT-FANOUT total=%d succeeded=%d no_action=%d failed=%d\n%s",
 						len(results),
 						succeeded,
+						noAction,
 						failed,
 						strings.Join(msgs, "\n"),
 					),
 				}, nil
 			}
 
-			// Every selected exit candidate was a nil-error no-op. fanOutExits
-			// ran with t.mu released because its workers acquire t.mu themselves.
-			// Reacquire it exactly once before continuing through the remainder
-			// of step(), whose entry/gate path expects the trader lock to be held.
 			t.mu.Lock()
 		}
 
@@ -1204,6 +1222,25 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			reservedShortQuoteWithFee += intent.Quote * feeMult
 		}
 	}
+
+	// Build the ONE immutable resource snapshot for this entry-allocation
+	// cycle. Existing pending reservations above are already included exactly
+	// once in the spare calculation. Equity and every ordinary producer reuse
+	// this same snapshot; no later getBalanceSpare() lookup is permitted.
+	//
+	// ResourceSnapshot remains the authoritative funding view. The historical
+	// SpareBuyUSD/SpareSellUSD compatibility mirrors are refreshed downstream
+	// by processParallelProducerEntriesLocked() after the complete AllocationPlan
+	// has been established, so step() does not create a second funding authority
+	// or duplicate pending reservations here.
+	resourceSnapshot, resourceSnapshotOK :=
+		t.buildResourceSnapshotLocked(
+			balanceSnapshotMaxAge,
+			reservedShortQuoteWithFee,
+			reservedLongBase,
+			price,
+			minNotional,
+		)
 	//-------------------------------------------------------------
 	//2. Fan out only AI, MACD and EMA
 	//-----------------------------------------------------------
@@ -1391,9 +1428,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		aiResult,
 		macdResult,
 		emaResult,
-		balanceSnapshotMaxAge,
-		reservedShortQuoteWithFee,
-		reservedLongBase,
+		resourceSnapshot,
 		continuationRefs,
 	)
 
@@ -1416,9 +1451,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	pendingCounts :=
 		t.pendingProducerCountsNoLock()
 
-	// Case 5 may retain or override the legacy AI + Logic decision using
-	// the complete AI, MACD, EMA and Pyramid materials.
-	entryDecision := t.combineEntryRawMaterials(
+	// Evaluate every ordinary producer independently. Resource priority is not
+	// applied during signal evaluation; it is applied only by the downstream
+	// ProducerResourceCoordinator after per-producer admission and sizing.
+	decisions := t.collectEntryProducerDecisions(
 		aiResult,
 		macdResult,
 		emaResult,
@@ -1430,2027 +1466,63 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	)
 
 	log.Printf(
-		"[TRACE] hotpath.after_decision elapsed_ms=%d",
+		"[TRACE] hotpath.after_decision elapsed_ms=%d producer_candidates=%d",
 		time.Since(hotStart).Milliseconds(),
+		len(decisions),
 	)
 
-	d := entryDecision
-
 	/*
-		Gate Analysis telemetry reuses values already computed for this tick.
-
-		The helper only decides whether this tick belongs to the next 10-second
-		sample bucket. Disk persistence is asynchronous and does not hold t.mu.
+		Gate Analysis telemetry is shared market telemetry, not a selected-
+		producer artifact. MACD/EPS are common materials for every producer.
 	*/
 	t.recordGateAnalysisPointLocked(
 		wallNow,
 		price,
-		d.LogicEPS,
-		d.LogicMACDTurn,
+		macdResult.EPS,
+		macdResult.Turn,
 		pyramidResult.Buy.EffectiveGatePrice,
 		pyramidResult.Sell.EffectiveGatePrice,
 	)
-	if d.Signal != Flat {
-		t.applyPyramidRebaseTransactions(
-			pyramidResult,
-			d.Signal,
-		)
-	}
 
-	intent, attempt := newProducerDecisionLifecycle(
-		&d,
-	)
-
-	if attempt != nil &&
-		intent != nil &&
-		(d.Signal == Buy || d.Signal == Sell) {
-
-		t.addDecisionProducerEvent(
-			intent,
-			attempt,
-			ProducerStageDecision,
-			"",
-			nil,
-			false,
-			false,
-		)
-
-		if event, exists :=
-			attempt.Events[ProducerStageDecision]; exists {
-
-			event.Price = price
-			attempt.Events[ProducerStageDecision] = event
+	// Preserve Pyramid rebase transactions once per directional side represented
+	// in this producer batch. Multiple same-side producers must not cause the
+	// same shared Pyramid transition to be applied/logged repeatedly.
+	hasBuyDecision := false
+	hasSellDecision := false
+	for _, decision := range decisions {
+		switch decision.Signal {
+		case Buy:
+			hasBuyDecision = true
+		case Sell:
+			hasSellDecision = true
 		}
-
-		log.Printf(
-			"[PRODUCER] stage=decision "+
-				"producer=%s side=%s reason=%q",
-			d.Producer,
-			d.Signal,
-			d.ProducerReason,
-		)
+	}
+	if hasBuyDecision {
+		t.applyPyramidRebaseTransactions(pyramidResult, Buy)
+	}
+	if hasSellDecision {
+		t.applyPyramidRebaseTransactions(pyramidResult, Sell)
 	}
 
-	totalLots := lsb + lss
-
-	log.Printf(
-		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver=%d",
-		totalLots,
-		d.Raw,
-		d.Signal,
+	// The parallel-entry processor owns admission, request construction,
+	// allocation lifecycle, historical refund-shortfall restoration, legacy
+	// Equity-stage timing during request preparation, spare compatibility mirrors,
+	// and execution of every approved/partial allocation. step() supplies the
+	// single frozen ResourceSnapshot and does not re-run legacy inline sizing.
+	return t.processParallelProducerEntriesLocked(
+		ctx,
+		decisions,
+		resourceSnapshot,
+		resourceSnapshotOK,
+		equityResult,
+		execHistory,
 		price,
-		decisionEntryReason(d),
-		t.cfg.LongOnly,
-		Version,
+		minNotional,
+		now,
+		wallNow,
+		hotStart,
+		aiResult.Raw,
 	)
-
-	side, ok := d.SignalToSide()
-	if !ok {
-		t.addDecisionProducerEvent(
-			intent,
-			attempt,
-			ProducerStageDecisionFailed,
-			EntryProduceErrInvalidSide,
-			fmt.Errorf(
-				"decision signal cannot map to order side: %v",
-				d.Signal,
-			),
-			false,
-			true,
-		)
-
-		t.mu.Unlock()
-
-		return StepResult{
-			Msg:    "FLAT",
-			Raw:    d.Raw,
-			Signal: d.Signal,
-		}, nil
-	}
-
-	executionBalance, executionCacheOK :=
-		t.getBalanceSpare(
-			balanceSnapshotMaxAge,
-			reservedShortQuoteWithFee,
-			reservedLongBase,
-		)
-
-	if !executionCacheOK {
-		ageMS := int64(-1)
-
-		if !executionBalance.Snapshot.UpdatedAt.IsZero() {
-			ageMS =
-				time.Since(
-					executionBalance.Snapshot.UpdatedAt,
-				).Milliseconds()
-		}
-
-		log.Printf(
-			"[WARN] balance.execution_cache.unavailable "+
-				"side=%s source=%s final=%s age_ms=%d",
-			side,
-			d.Producer,
-			d.Signal,
-			ageMS,
-		)
-
-		t.addDecisionProducerEvent(
-			intent,
-			attempt,
-			ProducerStageDecisionFailed,
-			EntryProduceErrDecisionBalanceUnavailable,
-			fmt.Errorf(
-				"execution balance unavailable age_ms=%d",
-				ageMS,
-			),
-			false,
-			true,
-		)
-
-		t.mu.Unlock()
-
-		return StepResult{
-			Msg:    "HOLD",
-			Raw:    d.Raw,
-			Signal: d.Signal,
-		}, nil
-	}
-
-	availQuote := executionBalance.AvailQuote
-	quoteStep := executionBalance.QuoteStep
-	availBase := executionBalance.AvailBase
-	baseStep := executionBalance.BaseStep
-
-	spare := 0.0
-
-	switch side {
-	case SideBuy:
-		spare = executionBalance.SpareQuote
-
-	case SideSell:
-		spare = executionBalance.SpareBase
-	}
-
-	// log.Printf(
-	// "[TRACE] balance.execution_cache.hit "+
-	// "side=%s producer=%s final=%s age_ms=%d "+
-	// "quote=%.8f quoteStep=%.8f base=%.8f baseStep=%.8f",
-	// side,
-	// d.Producer,
-	// d.Signal,
-	// time.Since(executionBalance.Snapshot.UpdatedAt).Milliseconds(),
-	// availQuote,
-	// quoteStep,
-	// availBase,
-	// baseStep,
-	// )
-
-	log.Printf(
-		"[TRACE] hotpath.after_execution_balance elapsed_ms=%d final=%s",
-		time.Since(hotStart).Milliseconds(),
-		d.Signal,
-	)
-	// --------------------------------------------------------------------------------------------------------
-	//---ADD path continues-----
-	// --------------------------------------------------------------------------------------------------------
-
-	book := t.book(side)
-
-	// Case 5 already evaluated Equity thresholds, direction, spare funding,
-	// exchange-step snapping, and proposed triggers.
-	equityTriggerBuy :=
-		equityResult.BuyTrigger
-
-	equityTriggerSell :=
-		equityResult.SellTrigger
-
-	equitySpareQuote :=
-		equityResult.ProposedBuyQuote
-
-	equitySpareBase :=
-		equityResult.ProposedSellBase
-
-		// Prevent duplicate opens while pending on this side (exits already ran) ---
-		// Extra belt-and-suspenders: if a pending exists and we haven't hit its Deadline, keep waiting.
-		// if side == SideBuy && entry.Intent != nil && time.Now().Before(entry.Intent.Deadline) {
-		// 	t.mu.Unlock()
-		// 	return StepResult{Msg: "OPEN-PENDING side=BUY", Raw: d.Raw, Signal: d.Signal}, nil
-		// }
-		// if side == SideSell && entry.Intent != nil && time.Now().Before(entry.Intent.Deadline) {
-		// 	t.mu.Unlock()
-		// 	return StepResult{Msg: "OPEN-PENDING side=SELL", Raw: d.Raw, Signal: d.Signal}, nil
-		// }
-
-	// -----------------------------------------------------------------------------
-	// Case 3B-Opposite - DOWN-Regime BUY Protection
-	//
-	// Find the latest BUY threshold-stop loss within the last 24 hours.
-	//
-	// Block any new BUY entry above that loss-exit SELL price while the
-	// market regime remains DOWN.
-	//
-	// LOW-tier producers bypass this protection.
-	// Unrelated exits occurring afterward do not invalidate the protection.
-	// -----------------------------------------------------------------------------
-	if side == SideBuy &&
-		d.ProducerTier != ProducerTierLow &&
-		t.MarketRegime == RegimeDown {
-
-		lastLossExit, ok :=
-			latestThresholdStopLossExitWithin(
-				t.lastExits,
-				SideBuy,
-				wallNow,
-				24*time.Hour,
-			)
-
-		if ok && price > lastLossExit.ClosePrice {
-
-			t.addDecisionProducerEvent(
-				intent,
-				attempt,
-				ProducerStageDecisionBlocked,
-				EntryProduceErrDecisionCase3BBlocked,
-				fmt.Errorf(
-					"Case3B BUY blocked above latest threshold-stop loss exit price %.8f",
-					lastLossExit.ClosePrice,
-				),
-				false,
-				true,
-			)
-
-			t.mu.Unlock()
-
-			return StepResult{
-				Msg:    "HOLD Case3B block BUY above latest loss-exit SELL price",
-				Raw:    d.Raw,
-				Signal: d.Signal,
-			}, nil
-		}
-	}
-
-	// -----------------------------------------------------------------------------
-	// Case 3B - UP-Regime SELL Protection
-	//
-	// Find the latest SELL threshold-stop loss within the last 24 hours.
-	//
-	// Block any new SELL entry below that loss-exit BUY price while the
-	// market regime remains UP.
-	//
-	// Case3A replacements bypass this protection.
-	// Unrelated exits occurring afterward do not invalidate the protection.
-	// -----------------------------------------------------------------------------
-	if side == SideSell &&
-		d.ProducerTier != ProducerTierLow &&
-		d.Producer != EntryProducerCase3AReplacement &&
-		t.MarketRegime == RegimeUp {
-
-		lastLossExit, ok :=
-			latestThresholdStopLossExitWithin(
-				t.lastExits,
-				SideSell,
-				wallNow,
-				24*time.Hour,
-			)
-
-		if ok && price < lastLossExit.ClosePrice {
-
-			t.addDecisionProducerEvent(
-				intent,
-				attempt,
-				ProducerStageDecisionBlocked,
-				EntryProduceErrDecisionCase3BBlocked,
-				fmt.Errorf(
-					"Case3B SELL blocked below latest threshold-stop loss exit price %.8f",
-					lastLossExit.ClosePrice,
-				),
-				false,
-				true,
-			)
-
-			t.mu.Unlock()
-
-			return StepResult{
-				Msg:    "HOLD Case3B block SELL below latest loss-exit BUY price",
-				Raw:    d.Raw,
-				Signal: d.Signal,
-			}, nil
-		}
-	}
-
-	// Long-only veto for SELL when flat; unchanged behavior.
-	if d.Signal == Sell && t.cfg.LongOnly {
-		t.addDecisionProducerEvent(
-			intent,
-			attempt,
-			ProducerStageDecisionBlocked,
-			EntryProduceErrDecisionLongOnlyBlocked,
-			fmt.Errorf(
-				"SELL blocked because LongOnly is enabled",
-			),
-			false,
-			true,
-		)
-		t.mu.Unlock()
-		return StepResult{Msg: fmt.Sprintf("FLAT (long-only) [%s]", decisionEntryReason(d)), Raw: d.Raw, Signal: d.Signal}, nil
-	}
-
-	// GATE1 Respect lot cap (both sides)
-	if (lsb+lss) >= t.cfg.MaxConcurrentLots && !((equityTriggerBuy && d.Signal == Buy) || (equityTriggerSell && d.Signal == Sell)) {
-		if !t.didConsolidateStartup {
-			// run runner-specific consolidation first (both sides)
-			t.consolidateRunners(t.book(SideBuy), price)
-			t.consolidateRunners(t.book(SideSell), price)
-
-			// then the generic dust consolidation (unchanged)
-			t.consolidateDust(t.book(SideBuy), price, minNotional)
-			t.consolidateDust(t.book(SideSell), price, minNotional)
-			t.archiveOrphanDust(t.book(SideBuy), price, minNotional)
-			t.archiveOrphanDust(t.book(SideSell), price, minNotional)
-
-			if err := t.saveStateNoLock(); err != nil {
-				log.Printf("[WARN] saveState (startup consolidate): %v", err)
-			}
-			t.didConsolidateStartup = true
-			// log.Printf("[TRACE] consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
-		}
-		t.addDecisionProducerEvent(
-			intent,
-			attempt,
-			ProducerStageDecisionBlocked,
-			EntryProduceErrDecisionLotCapReached,
-			fmt.Errorf(
-				"entry blocked by max concurrent lot cap current=%d max=%d",
-				lsb+lss,
-				t.cfg.MaxConcurrentLots,
-			),
-			false,
-			true,
-		)
-		t.mu.Unlock()
-		log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", t.cfg.MaxConcurrentLots)
-		return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
-	}
-
-	log.Printf("[TRACE] hotpath.before_sizing elapsed_ms=%d",
-		time.Since(hotStart).Milliseconds())
-
-	// --- Fixed-USD risk sizing & ramping (no equity dependency) ---
-	// Base dollar size for the first lot
-	baseUSD := t.cfg.RiskPerTradeUSD
-	if baseUSD <= 0 {
-		// safety fallback: at least minNotional
-		baseUSD = minNotional
-	}
-
-	// Start with baseUSD as our target notional
-	quote := baseUSD
-
-	// Optional: volatility adjust as a multiplier on USD (not on equity)
-	if t.cfg.VolRiskAdjust {
-		f := volRiskFactor(execHistory)
-		if f <= 0 {
-			f = 1.0
-		}
-		quote = quote * f
-	}
-
-	// --- Fixed-USD ramping: scale around baseUSD, independent of equityUSD ---
-	if t.cfg.RampEnable && !(equityTriggerSell || equityTriggerBuy) {
-		// number of existing non-dust lots on THIS SIDE
-		k := rampCount(book, price, minNotional)
-		// exclude all runner(s) on this side from k
-		if rc := runnerCount(book); rc > 0 && k >= rc {
-			k = k - rc
-		}
-
-		switch strings.ToLower(strings.TrimSpace(t.cfg.RampMode)) {
-		case "exp":
-			// Interpret RampStartPct / RampMaxPct as percent multipliers of baseUSD.
-			// Example:
-			//   RAMP_START_PCT = 100  => 1.0x baseUSD
-			//   RAMP_GROWTH    = 1.25 => grow by 25% per add
-			//   RAMP_MAX_PCT   = 200  => cap at 2.0x baseUSD
-			start := t.cfg.RampStartPct
-			g := t.cfg.RampGrowth
-			if start <= 0 {
-				start = 100.0 // 1.0x
-			}
-			if g <= 0 {
-				g = 1.0
-			}
-			f := start
-			for i := 0; i < k; i++ {
-				f *= g
-			}
-			if max := t.cfg.RampMaxPct; max > 0 && f > max {
-				f = max
-			}
-			if f <= 0 {
-				f = 100.0
-			}
-			quote = baseUSD * (f / 100.0)
-
-		default: // linear
-			// Interpret RampStartPct / RampStepPct / RampMaxPct as percent multipliers of baseUSD.
-			// Example:
-			//   RAMP_START_PCT = 100  => 1.0x baseUSD (first lot)
-			//   RAMP_STEP_PCT  = 25   => +0.25x per existing lot
-			//   RAMP_MAX_PCT   = 200  => cap at 2.0x baseUSD
-			start := t.cfg.RampStartPct
-			step := t.cfg.RampStepPct
-			if start <= 0 {
-				start = 100.0 // 1.0x
-			}
-			f := start + float64(k)*step
-			if max := t.cfg.RampMaxPct; max > 0 && f > max {
-				f = max
-			}
-			if f <= 0 {
-				f = 100.0
-			}
-			quote = baseUSD * (f / 100.0)
-		}
-	}
-
-	confMult := d.Confidence
-	if confMult <= 0 {
-		log.Printf(
-			"[TRADE_GATE] confidence=%.2f lastAddBuy=%s lastAddSell=%s "+
-				"winLowBuy=%.2f winHighSell=%.2f "+
-				"latchedBuy=%.2f latchedSell=%.2f "+
-				"nearestBuy{take=%.2f net=%.2f idx=%d} "+
-				"nearestSell{take=%.2f net=%.2f idx=%d} ",
-			confMult,
-			t.lastAddBuy.Format(time.RFC3339),
-			t.lastAddSell.Format(time.RFC3339),
-			t.winLowBuy,
-			t.winHighSell,
-			t.latchedGateBuy,
-			t.latchedGateSell,
-			t.nearestTakeBuy,
-			t.nearestNetBuy,
-			t.nearestIdxBuy,
-			t.nearestTakeSell,
-			t.nearestNetSell,
-			t.nearestIdxSell,
-		)
-
-		t.addDecisionProducerEvent(
-			intent,
-			attempt,
-			ProducerStageDecisionFailed,
-			EntryProduceErrDecisionInvalidConfidence,
-			fmt.Errorf(
-				"decision confidence must be > 0: %.8f",
-				confMult,
-			),
-			false,
-			true,
-		)
-
-		t.mu.Unlock()
-
-		return StepResult{
-			Msg:    "HOLD",
-			Raw:    d.Raw,
-			Signal: d.Signal,
-		}, nil
-	}
-
-	entryAIMode :=
-		string(d.Producer)
-
-	if entryAIMode == "" {
-		entryAIMode = "UNKNOWN"
-	}
-
-	// Calculate the ordinary confidence-adjusted target first.
-	baseEntryProfitGateUSD :=
-		t.cfg.ProfitGateUSD * confMult
-
-	if baseEntryProfitGateUSD < 0.30 {
-		baseEntryProfitGateUSD = 0.30
-	}
-
-	// Producer economics are resolved by the producer before execution:
-	//
-	//   HIGH = 1.00, MID = 0.75, LOW = 0.50
-	//   continuation = tier multiplier * 0.80
-	//
-	// step.go remains the single place where that resolved multiplier becomes a
-	// persisted USD exit target. The fallback is defensive compatibility only;
-	// every standardized ordinary producer is expected to provide a positive
-	// ProfitGateMultiplier explicitly. Case3A remains a special-case exemption.
-	profitGateMultiplier :=
-		d.ProfitGateMultiplier
-
-	if d.Producer == EntryProducerCase3AReplacement {
-		// Case3A is the explicit standardization exemption. Its replacement
-		// economics are resolved by the dedicated recovery path.
-		if profitGateMultiplier <= 0 {
-			profitGateMultiplier = 1.0
-		}
-	} else if d.Producer != EntryProducerNone &&
-		profitGateMultiplier <= 0 {
-
-		// Every ordinary producer must resolve its tier and continuation
-		// multiplier before execution. Never silently promote a wiring error
-		// to HIGH tier.
-		t.addDecisionProducerEvent(
-			intent,
-			attempt,
-			ProducerStageDecisionFailed,
-			EntryProduceErrInvalidProfitGate,
-			fmt.Errorf(
-				"ordinary producer missing standardized ProfitGateMultiplier: producer=%s tier=%s continuation=%t",
-				d.Producer,
-				d.ProducerTier,
-				d.IsContinuation,
-			),
-			false,
-			true,
-		)
-
-		t.mu.Unlock()
-
-		return StepResult{
-			Msg:    "HOLD invalid producer economics",
-			Raw:    d.Raw,
-			Signal: d.Signal,
-		}, nil
-	}
-
-	producerProfitGateUSD :=
-		baseEntryProfitGateUSD *
-			profitGateMultiplier
-
-	// Recovery debt is independent of producer target policy and must not
-	// be reduced by the producer multiplier.
-	recoveryAddUSD :=
-		t.recoveryTargetAddUSD()
-
-	entryProfitGateUSD :=
-		producerProfitGateUSD +
-			recoveryAddUSD
-
-	// log.Printf(
-	// "[TRACE] entry.profit_gate "+
-	// "producer=%s confidence=%.2f "+
-	// "base_usd=%.4f multiplier=%.4f "+
-	// "producer_usd=%.4f recovery_add_usd=%.4f "+
-	// "resolved_usd=%.4f",
-	// d.Producer,
-	// confMult,
-	// baseEntryProfitGateUSD,
-	// profitGateMultiplier,
-	// producerProfitGateUSD,
-	// recoveryAddUSD,
-	// entryProfitGateUSD,
-	// )
-
-	//Applying confidence multiplier to scalp, that of equity comes later
-	if !(equityTriggerSell || equityTriggerBuy) {
-		oldQuote := quote
-		quote *= confMult
-		log.Printf(
-			"[TRACE] sizing.confidence side=%s pUp=%.5f mult=%.2f quote_before=%.2f quote_after=%.2f",
-			side, d.PUp, confMult, oldQuote, quote,
-		)
-	}
-
-	// Ensure we respect the exchange minimum notional
-	if quote < minNotional {
-		quote = minNotional
-	}
-	base := quote / price
-
-	// Staged sizing for EQUITY triggers (SELL in BASE, BUY in QUOTE) ---
-	// Override sizing for normal Sell using stage function of spare base as the order size (SELL only) ---
-	if equityTriggerSell && side == SideSell && equitySpareBase > 0 {
-		stagesSell := equityStagesSell()
-		startStage := clampStage(t.equityStageSell, len(stagesSell))
-		chosen := -1
-		var targetBase float64
-		for s := startStage; s < len(stagesSell); s++ {
-			tb := equitySpareBase * stagesSell[s]
-			oldBase := tb
-			tb *= confMult
-			log.Printf(
-				"[TRACE] sizing.equity.confidence side=%s pUp=%.5f mult=%.2f size_before=%.2f size_after=%.2f",
-				side, d.PUp, confMult, oldBase, tb,
-			)
-			tb = snapToStep(tb, baseStep)
-			if tb <= 0 || tb > equitySpareBase {
-				continue
-			}
-			if tb*price >= minNotional {
-				targetBase = tb
-				chosen = s
-				break
-			}
-		}
-		if chosen >= 0 {
-			base = targetBase
-			quote = base * price
-			t.equityStageSell = clampStage(chosen+1, len(stagesSell))
-		} else {
-			equityTriggerSell = false
-		}
-	}
-	// --- NEW: override sizing for BUY equity dip to use entire spare quote ---
-	if equityTriggerBuy && side == SideBuy && equitySpareQuote > 0 {
-		stagesBuy := equityStagesBuy()
-		startStage := clampStage(t.equityStageBuy, len(stagesBuy))
-		chosen := -1
-		var targetQuote float64
-		for s := startStage; s < len(stagesBuy); s++ {
-			tq := equitySpareQuote * stagesBuy[s]
-			oldQuote := tq
-			tq *= confMult
-			log.Printf(
-				"[TRACE] sizing.equity.confidence side=%s pUp=%.5f mult=%.2f quote_before=%.2f quote_after=%.2f",
-				side, d.PUp, confMult, oldQuote, tq,
-			)
-			tq = snapToStep(tq, quoteStep)
-			if tq <= 0 || tq > equitySpareQuote {
-				continue
-			}
-			if tq >= minNotional {
-				targetQuote = tq
-				chosen = s
-				break
-			}
-		}
-		if chosen >= 0 {
-			quote = targetQuote
-			base = quote / price
-			t.equityStageBuy = clampStage(chosen+1, len(stagesBuy))
-		} else {
-			equityTriggerBuy = false
-		}
-	}
-
-	// TODO: remove TRACE
-	// log.Printf("[TRACE] sizing.pre side=%s eq=%.2f quote=%.2f price=%.8f base=%.8f", side, t.equityUSD, quote, price, base)
-
-	// Unified epsilon for spare checks
-	const spareEps = 1e-9
-
-	// -----------------------------------------------------------------------------------------------
-	// --- Spare and Reservation Inventory ---
-	// -----------------------------------------------------------------------------------------------
-	// --- BUY gating (require spare quote after reserving open shorts) ---
-	if side == SideBuy {
-		// TODO: remove TRACE
-		// log.Printf("[TRACE] buy.gate.pre availQuote=%.2f reservedShort=%.2f needQuoteRaw=%.2f quoteStep=%.8f",
-		// availQuote, reservedShortQuoteWithFee, quote, quoteStep)
-
-		// Floor the needed quote to step.
-		neededQuote := quote
-		if quoteStep > 0 {
-			n := math.Floor(neededQuote/quoteStep) * quoteStep
-			if n > 0 {
-				neededQuote = n
-			}
-		}
-
-		if spare < 0 {
-			spare = 0
-		}
-
-		// Fast path: we have enough spare to fund the snapped neededQuote
-		if spare+spareEps >= neededQuote {
-			// Enforce exchange minimum notional after snapping, then snap UP to step to keep >= min; re-check spare.
-			if neededQuote < minNotional {
-				neededQuote = minNotional
-				if quoteStep > 0 {
-					steps := math.Ceil(neededQuote / quoteStep)
-					neededQuote = steps * quoteStep
-				}
-				// after bump to minNotional we must still have spare
-				if spare+spareEps < neededQuote {
-					log.Printf("[WARN] FUNDS_EXHAUSTED BUY need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
-						neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
-					log.Printf("[DEBUG] GATE BUY: need=%.2f quote (min-notional), spare=%.2f (avail=%.2f, reserved_shorts=%.6f, step=%.2f)",
-						neededQuote, spare, availQuote, reservedShortQuoteWithFee, quoteStep)
-					// log.Printf("[TRACE] buy.gate.block minNotional need=%.2f spare=%.2f", neededQuote, spare)
-
-					short := neededQuote - spare
-					if short > 0 {
-						// remember that a BUY was blocked by this amount
-						t.refundBuyUSD = short
-					}
-					t.addDecisionProducerEvent(
-						intent,
-						attempt,
-						ProducerStageDecisionFailed,
-						EntryProduceErrDecisionInsufficientFunds,
-						fmt.Errorf(
-							"BUY insufficient funds after min-notional adjustment: needed_quote=%.8f spare_quote=%.8f min_notional=%.8f",
-							neededQuote,
-							spare,
-							minNotional,
-						),
-						false,
-						true,
-					)
-					t.mu.Unlock()
-					return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
-				}
-			}
-
-			// Use the final neededQuote; recompute base.
-			quote = neededQuote
-			base = quote / price
-
-			// log.Printf("[TRACE] buy.gate.post needQuote=%.2f spare=%.2f base=%.8f", quote, spare, base)
-		} else {
-			// Slow path: we don't have enough to fund neededQuote → try to degrade to available spare
-			log.Printf("[WARN] FUNDS_SHORT BUY need=%.2f quote, spare=%.2f → attempting degrade-to-spare",
-				neededQuote, spare)
-
-			useQuote := spare
-
-			// snap spare DOWN to quote step
-			if quoteStep > 0 {
-				u := math.Floor(useQuote/quoteStep) * quoteStep
-				if u > 0 {
-					useQuote = u
-				}
-			}
-
-			// must still satisfy minNotional after snapping
-			if useQuote < minNotional {
-				log.Printf("[WARN] FUNDS_EXHAUSTED BUY even after degrade: useQuote=%.2f < minNotional=%.2f (avail=%.2f, reserved_shorts=%.6f)",
-					useQuote, minNotional, availQuote, reservedShortQuoteWithFee)
-				log.Printf("[DEBUG] GATE BUY: degrade failed; HOLD")
-
-				short := neededQuote - spare
-				if short > 0 {
-					// only now (true failure) remember that a BUY was blocked
-					t.refundBuyUSD = short
-				}
-				t.addDecisionProducerEvent(
-					intent,
-					attempt,
-					ProducerStageDecisionFailed,
-					EntryProduceErrDecisionInsufficientFunds,
-					fmt.Errorf(
-						"BUY insufficient funds after degrade-to-spare: requested_quote=%.8f usable_quote=%.8f spare_quote=%.8f min_notional=%.8f",
-						neededQuote,
-						useQuote,
-						spare,
-						minNotional,
-					),
-					false,
-					true,
-				)
-				t.mu.Unlock()
-				return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
-			}
-
-			// SUCCESSFUL DEGRADE-TO-SPARE PATH
-			quote = useQuote
-			base = quote / price
-
-			// add sizing_reduced event HERE
-
-			t.addDecisionProducerEvent(
-				intent,
-				attempt,
-				ProducerStageSizingReduced,
-				"",
-				nil,
-				false,
-				false,
-			)
-
-			// log.Printf("[TRACE] buy.gate.post.degraded useQuote=%.2f spare=%.2f base=%.8f", quote, spare, base)
-		}
-	}
-
-	// If SELL, require spare base inventory (spot safe)
-	if side == SideSell && t.cfg.RequireBaseForShort {
-		// TODO: remove TRACE
-		// log.Printf("[TRACE] sell.gate.pre availBase=%.8f reservedLong=%.8f needBaseRaw=%.8f baseStep=%.8f",
-		// availBase, reservedLongBase, base, baseStep)
-
-		// Floor the *needed* base to baseStep (if known)
-		neededBase := base
-		if baseStep > 0 {
-			n := math.Floor(neededBase/baseStep) * baseStep
-			if n > 0 {
-				neededBase = n
-			}
-		}
-
-		if spare < 0 {
-			spare = 0
-		}
-
-		// Fast path: we have enough spare base to fund neededBase
-		if spare+spareEps >= neededBase {
-			// Use the floored base for the order by updating quote
-			quote = neededBase * price
-			base = neededBase
-
-			// Ensure SELL meets exchange min funds and step rules (and re-check spare symmetry)
-			if quote < minNotional {
-				quote = minNotional
-				base = quote / price
-				if baseStep > 0 {
-					b := math.Floor(base/baseStep) * baseStep
-					if b > 0 {
-						base = b
-						quote = base * price
-					}
-				}
-				// >>> Symmetry: re-check spare after min-notional snap <<<
-				if spare+spareEps < base {
-					// --- breadcrumb ---
-					log.Printf("[WARN] FUNDS_EXHAUSTED SELL need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
-						base, spare, availBase, reservedLongBase, baseStep)
-					log.Printf("[DEBUG] GATE SELL: need=%.8f base (min-notional), spare=%.8f (avail=%.8f, reserved_longs=%.8f, baseStep=%.8f)",
-						base, spare, availBase, reservedLongBase, baseStep)
-					// log.Printf("[TRACE] sell.gate.block minNotional need=%.8f spare=%.8f", base, spare)
-
-					// convert the short to USD at current price so we can reuse later on BUY
-					shortBase := base - spare
-					shortUSD := shortBase * price
-					if shortUSD > 0 {
-						t.refundSellUSD = shortUSD
-					}
-
-					t.addDecisionProducerEvent(
-						intent,
-						attempt,
-						ProducerStageDecisionFailed,
-						EntryProduceErrDecisionInsufficientFunds,
-						fmt.Errorf(
-							"SELL insufficient funds after min-notional adjustment: needed_base=%.8f spare_base=%.8f min_notional=%.8f",
-							base,
-							spare,
-							minNotional,
-						),
-						false,
-						true,
-					)
-
-					t.mu.Unlock()
-					return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
-				}
-			}
-
-			// log.Printf("[TRACE] sell.gate.post needBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
-		} else {
-			// Slow path: not enough spare for neededBase → try degrade-to-spare
-			log.Printf("[WARN] FUNDS_SHORT SELL need=%.8f base, spare=%.8f → attempting degrade-to-spare",
-				neededBase, spare)
-
-			useBase := spare
-
-			// snap spare DOWN to baseStep
-			if baseStep > 0 {
-				b := math.Floor(useBase/baseStep) * baseStep
-				if b > 0 {
-					useBase = b
-				} else {
-					useBase = 0
-				}
-			}
-
-			// must still satisfy minNotional after snapping
-			if useBase <= 0 || useBase*price < minNotional {
-				log.Printf("[WARN] FUNDS_EXHAUSTED SELL even after degrade: useBase=%.8f (quote=%.2f) < minNotional=%.2f (avail=%.8f, reserved_longs=%.8f)",
-					useBase, useBase*price, minNotional, availBase, reservedLongBase)
-
-				// convert the shortfall to USD only on true failure
-				shortBase := neededBase - spare
-				shortUSD := shortBase * price
-				if shortUSD > 0 {
-					t.refundSellUSD = shortUSD
-				}
-
-				t.addDecisionProducerEvent(
-					intent,
-					attempt,
-					ProducerStageDecisionFailed,
-					EntryProduceErrDecisionInsufficientFunds,
-					fmt.Errorf(
-						"SELL insufficient funds after degrade-to-spare: requested_base=%.8f usable_base=%.8f spare_base=%.8f min_notional=%.8f",
-						neededBase,
-						useBase,
-						spare,
-						minNotional,
-					),
-					false,
-					true,
-				)
-
-				t.mu.Unlock()
-				return StepResult{Msg: "HOLD", Raw: d.Raw, Signal: d.Signal}, nil
-			}
-
-			// SUCCESSFUL DEGRADE-TO-SPARE PATH
-			base = useBase
-			quote = base * price
-
-			t.addDecisionProducerEvent(
-				intent,
-				attempt,
-				ProducerStageSizingReduced,
-				"",
-				nil,
-				false,
-				false,
-			)
-
-			// log.Printf("[TRACE] sell.gate.post.degraded useBase=%.8f spare=%.8f quote=%.2f", base, spare, quote)
-
-		}
-	}
-
-	var take float64
-	if t.cfg.ScalpTPDecayEnable && !((equityTriggerBuy && side == SideBuy) || (equityTriggerSell && side == SideSell)) {
-		// number of existing non-dust lots on THIS SIDE
-		k := rampCount(book, price, minNotional)
-
-		if rc := runnerCount(book); rc > 0 && k >= rc {
-			k = len(book.Lots) - rc
-		}
-		baseTP := t.cfg.TakeProfitPct
-		tpPct := baseTP
-
-		switch strings.ToLower(strings.TrimSpace(t.cfg.ScalpTPDecMode)) {
-		case "exp", "exponential":
-			// geometric decay: baseTP * factor^k, floored
-			f := t.cfg.ScalpTPDecayFactor
-			if f <= 0 {
-				f = 1.0
-			}
-			factorPow := 1.0
-			for i := 0; i < k; i++ {
-				factorPow *= f
-			}
-			tpPct = baseTP * factorPow
-		default:
-			// linear: baseTP - k * decPct, floored
-			dec := t.cfg.ScalpTPDecPct
-			tpPct = baseTP - float64(k)*dec
-		}
-
-		minTP := t.cfg.ScalpTPMinPct
-		if tpPct < minTP {
-			tpPct = minTP
-		}
-		// apply the (possibly reduced) TP for the scalp only
-		if side == SideBuy {
-			take = price * (1.0 + tpPct/100.0)
-		} else {
-			take = price * (1.0 - tpPct/100.0)
-		}
-
-		// >>> DEBUG LOG <<<
-		log.Printf("[DEBUG] scalp tp decay: k=%d mode=%s baseTP=%.3f%% tpPct=%.3f%% minTP=%.3f%% take=%.2f",
-			k, t.cfg.ScalpTPDecMode, t.cfg.TakeProfitPct, tpPct, minTP, take)
-	}
-
-	// --- apply entry fee (preliminary; may be replaced by broker-provided commission below) ---
-	feeRate := t.cfg.FeeRatePct
-	entryFee := quote * (feeRate / 100.0)
-
-	refundFromOpposite := 0.0
-	refundMinConf := 0.60
-	if t.refundBuyUSD > 0 && side == SideSell && confMult >= refundMinConf {
-		// turn refund USD into extra base at current price
-		extraBase := t.refundBuyUSD / price
-
-		// how much room do we actually have (in base)?
-		room := spare - base
-		if room < 0 {
-			room = 0
-		}
-		if extraBase > room {
-			extraBase = room
-		}
-
-		// snap to step if we know it
-		if baseStep > 0 {
-			extraBase = math.Floor(extraBase/baseStep) * baseStep
-		}
-
-		if extraBase > 0 {
-			base += extraBase
-			quote = base * price
-
-			consumedUSD := extraBase * price
-			refundFromOpposite = consumedUSD
-
-			// reduce stored refund
-			t.refundBuyUSD -= consumedUSD
-			if t.refundBuyUSD < 0 {
-				t.refundBuyUSD = 0
-			}
-
-			gatesReason := d.ProducerReason
-			if t.refundBuyUSD == 0 {
-				d.ProducerReason = strings.TrimSpace(gatesReason + "|refund=buy-full")
-
-			} else {
-				d.ProducerReason = strings.TrimSpace(gatesReason + "|refund=buy-partial")
-			}
-			intent.ProducerReason =
-				d.ProducerReason
-		}
-	} else if t.refundBuyUSD > 0 && side == SideSell && confMult < refundMinConf {
-		// log.Printf("[TRACE] refund.block side=%s conf=%.2f need>=%.2f refundBuyUSD=%.2f",
-		// side, confMult, refundMinConf, t.refundBuyUSD)
-	}
-
-	if t.refundSellUSD > 0 && side == SideBuy && confMult >= refundMinConf {
-		extraQuote := t.refundSellUSD
-
-		// how much room do we actually have (in quote)?
-		room := spare - quote
-		if room < 0 {
-			room = 0
-		}
-		if extraQuote > room {
-			extraQuote = room
-		}
-
-		// snap to quoteStep
-		if quoteStep > 0 {
-			extraQuote = math.Floor(extraQuote/quoteStep) * quoteStep
-		}
-		if extraQuote > 0 {
-			quote += extraQuote
-			base = quote / price
-
-			consumedUSD := extraQuote
-			refundFromOpposite = consumedUSD
-
-			// reduce stored refund
-			t.refundSellUSD -= consumedUSD
-			if t.refundSellUSD < 0 {
-				t.refundSellUSD = 0
-			}
-
-			gatesReason := d.ProducerReason
-			if t.refundSellUSD == 0 {
-				d.ProducerReason = strings.TrimSpace(gatesReason + "|refund=sell-full")
-			} else {
-				d.ProducerReason = strings.TrimSpace(gatesReason + "|refund=sell-partial")
-			}
-			intent.ProducerReason =
-				d.ProducerReason
-		}
-	} else if t.refundSellUSD > 0 && side == SideBuy && confMult < refundMinConf {
-		// log.Printf("[TRACE] refund.block side=%s conf=%.2f need>=%.2f refundSellUSD=%.2f",
-		// side, confMult, refundMinConf, t.refundSellUSD)
-	}
-
-	if side == SideBuy {
-		buySpareUSD := spare
-		if buySpareUSD < 0 {
-			buySpareUSD = 0
-		}
-		t.SpareBuyUSD = buySpareUSD
-	}
-	if side == SideSell {
-		sellSpareUSD := spare * price
-		if sellSpareUSD < 0 {
-			sellSpareUSD = 0
-		}
-		t.SpareSellUSD = sellSpareUSD
-	}
-
-	//-----------------------------------------------------------------------------------------------------------
-	//------------------ Place live order without holding the lock.=====================
-	//-------------------------------------------------------------------------------------------------------------------
-	t.mu.Unlock()
-	var placed *PlacedOrder
-
-	offsetBps := t.cfg.LimitPriceOffsetBps
-	limitWait := t.cfg.LimitTimeoutSec
-	wantLimit := strings.ToLower(strings.TrimSpace(t.cfg.OrderType)) == "limit" && offsetBps > 0 && limitWait > 0
-
-	// ---- ONE-SHOT MARKET PREFERENCE (after a maker timeout) ----
-	// A timed-out maker attempt sets a side-level one-shot preference.
-	// The next valid entry attempt on that side skips maker once.
-	recheckNow := false
-
-	t.mu.Lock()
-
-	switch side {
-	case SideBuy:
-		recheckNow = t.pendingRecheckBuy
-		if recheckNow {
-			t.pendingRecheckBuy = false
-		}
-
-	case SideSell:
-		recheckNow = t.pendingRecheckSell
-		if recheckNow {
-			t.pendingRecheckSell = false
-		}
-	}
-
-	t.mu.Unlock()
-
-	if wantLimit && recheckNow {
-		wantLimit = false
-
-		log.Printf(
-			"[TRACE] postonly.skip reason=recheck_market_next_tick side=%s",
-			side,
-		)
-	}
-
-	// Maker-first entry production now routes through the unified producer:
-	//
-	//	step()
-	//	  → startProducerBuyEntry()/startProducerSellEntry()
-	//	  → PendingIntent
-	//	  → produceEntry()
-	//	  → submitPendingIntent()
-	//	  → buildPendingEntry()
-	//	  → registerPendingEntry()
-	//	  → startEntryPoller()
-	if wantLimit {
-		var limitPx float64
-
-		if side == SideBuy {
-			limitPx = price * (1.0 - offsetBps/10000.0)
-		} else {
-			limitPx = price * (1.0 + offsetBps/10000.0)
-		}
-
-		// Preserve existing side-aware tick snapping.
-		tick := t.cfg.PriceTick
-		if tick > 0 {
-			if side == SideBuy {
-				limitPx =
-					math.Floor(limitPx/tick) *
-						tick
-			} else {
-				limitPx =
-					math.Ceil(limitPx/tick) *
-						tick
-			}
-		}
-
-		if limitPx <= 0 {
-			log.Printf(
-				"[DEBUG] postonly.invalid_limit "+
-					"side=%s limit=%.8f live=%.8f",
-				side,
-				limitPx,
-				price,
-			)
-
-			t.mu.Lock()
-
-			t.addDecisionProducerEvent(
-				intent,
-				attempt,
-				ProducerStageDecisionFailed,
-				EntryProduceErrInvalidPrice,
-				fmt.Errorf(
-					"invalid maker limit price: side=%s limit_price=%.8f live_price=%.8f",
-					side,
-					limitPx,
-					price,
-				),
-				false,
-				true,
-			)
-
-			t.mu.Unlock()
-
-			return StepResult{
-				Msg:    "HOLD",
-				Raw:    d.Raw,
-				Signal: d.Signal,
-			}, nil
-		}
-
-		baseAtLimit := quote / limitPx
-
-		// Preserve existing base-step snapping.
-		if t.cfg.BaseStep > 0 {
-			baseAtLimit =
-				math.Floor(baseAtLimit/t.cfg.BaseStep) *
-					t.cfg.BaseStep
-		}
-
-		log.Printf(
-			"[TRACE] hotpath.before_submit "+
-				"elapsed_ms=%d side=%s limit=%.2f live=%.2f",
-			time.Since(hotStart).Milliseconds(),
-			side,
-			limitPx,
-			price,
-		)
-
-		if baseAtLimit > 0 &&
-			baseAtLimit*limitPx >= minNotional {
-
-			log.Printf(
-				"[TRACE] postonly.place "+
-					"side=%s limit=%.8f baseReq=%.8f timeout_sec=%d",
-				side,
-				limitPx,
-				baseAtLimit,
-				limitWait,
-			)
-
-			/*
-				Complete the execution-specific fields on the SAME PendingIntent
-				created at Decision stage.
-
-				Do not create a new intent or ProducerAttempt here.
-			*/
-			intent.Side = side
-			intent.LimitPx = limitPx
-			intent.BaseAtLimit = baseAtLimit
-			intent.Quote = baseAtLimit * limitPx
-			intent.Take = take
-
-			intent.ProductID = t.cfg.ProductID
-			intent.EntryMethod = entryAIMode
-
-			intent.RefundPortionUSD =
-				refundFromOpposite
-
-			intent.ConfidenceMult =
-				confMult
-
-			intent.ProfitGateUSD =
-				entryProfitGateUSD
-
-			intent.PendingCancelPolicy =
-				d.PendingCancelPolicy
-
-			intent.ProducerReason =
-				d.ProducerReason
-
-			// Runner ownership is resolved by the producer decision. Execution
-			// carries that instruction forward without inferring it from Equity.
-			intent.AssignRunner =
-				d.AssignRunner
-
-			if intent.History == nil {
-				intent.History =
-					make([]string, 0, 5)
-			}
-
-			var (
-				entry *PendingEntry
-				err   error
-			)
-
-			switch side {
-			case SideBuy:
-				entry, err =
-					t.startProducerBuyEntry(
-						ctx,
-						intent,
-						attempt,
-					)
-
-			case SideSell:
-				entry, err =
-					t.startProducerSellEntry(
-						ctx,
-						intent,
-						attempt,
-					)
-
-			default:
-				err = fmt.Errorf(
-					"unsupported entry side: %s",
-					side,
-				)
-			}
-
-			/*
-				The BUY/SELL source wrapper has now completed the portion of the
-				producer lifecycle that it owns.
-
-				On success, attempt contains:
-				  - produced
-				  - pending
-
-				On entry-production failure, attempt contains:
-				  - produced
-				  - entry_failed
-				  - cleanup_cancelled or cleanup_cancel_failed, when applicable
-
-				This Step-level caller is above the source wrapper, so it owns
-				recording that completed/current ProducerAttempt into producerHistory.
-
-				recordProducerAttemptLocked() requires t.mu.
-			*/
-			if attempt != nil {
-				t.mu.Lock()
-				t.recordProducerAttemptLocked(attempt)
-				if err := t.saveProducerHistoryNoLock(); err != nil {
-					log.Printf(
-						"[WARN] producer history save failed "+
-							"producer=%s decision_id=%s err=%v",
-						attempt.Producer,
-						attempt.DecisionID,
-						err,
-					)
-				}
-				t.mu.Unlock()
-			}
-
-			if err == nil && entry != nil {
-				log.Printf(
-					"[TRACE] hotpath.order.done "+
-						"elapsed_ms=%d orderID=%s",
-					time.Since(hotStart).Milliseconds(),
-					entry.OrderID,
-				)
-
-				log.Printf(
-					"[TRACE] postonly.pending.set "+
-						"producer=%s side=%s order_id=%s "+
-						"limit=%.8f base=%.8f quote=%.2f "+
-						"dl=%s assign_runner=%t",
-					entry.Producer,
-					entry.Side,
-					entry.OrderID,
-					entry.Intent.LimitPx,
-					entry.Intent.BaseAtLimit,
-					entry.Intent.Quote,
-					entry.Intent.Deadline.Format(time.RFC3339),
-					entry.Intent.AssignRunner,
-				)
-
-				return StepResult{
-					Msg: fmt.Sprintf(
-						"OPEN-PENDING side=%s",
-						side,
-					),
-					Raw:    d.Raw,
-					Signal: d.Signal,
-				}, nil
-			}
-
-			if err != nil {
-				log.Printf(
-					"[DEBUG] postonly.error "+
-						"hold_for_recheck side=%s err=%v",
-					side,
-					err,
-				)
-
-				/*
-					The wrapper has already completed this producer lifecycle:
-
-						decision
-						→ produced
-						→ entry_failed
-						→ optional cleanup stage
-
-					and the attempt was recorded above.
-
-					Do not continue this same failed lifecycle into market fallback
-					or append another terminal/deferred outcome.
-				*/
-				return StepResult{
-					Msg:    "HOLD",
-					Raw:    d.Raw,
-					Signal: d.Signal,
-				}, nil
-			}
-
-			if entry == nil {
-				/*
-					Nil entry with nil error is an internal invariant violation.
-					The normal wrappers should never return this combination.
-				*/
-				t.mu.Lock()
-
-				t.addDecisionProducerEvent(
-					intent,
-					attempt,
-					ProducerStageEntryFailed,
-					EntryProduceErrBuildOrder,
-					fmt.Errorf(
-						"producer wrapper returned nil PendingEntry with nil error",
-					),
-					false,
-					true,
-				)
-
-				t.mu.Unlock()
-
-				return StepResult{
-					Msg:    "HOLD",
-					Raw:    d.Raw,
-					Signal: d.Signal,
-				}, nil
-			}
-
-		} else {
-			/*
-				The maker order became ineligible after base-step snapping.
-
-				No maker submission occurred, so there is nothing to wait for
-				or recheck. Allow this SAME Decision lifecycle to continue
-				directly to the market fallback path.
-			*/
-			log.Printf(
-				"[DEBUG] postonly.skip "+
-					"reason=snapped_size_below_min "+
-					"side=%s base=%.8f limit=%.8f notional=%.8f min_notional=%.8f",
-				side,
-				baseAtLimit,
-				limitPx,
-				baseAtLimit*limitPx,
-				minNotional,
-			)
-
-			wantLimit = false
-		}
-	}
-
-	// --- NEW (Phase 2): gate market fallback by recheck flag after async timeout/error ---
-	allowMarket := true
-	if wantLimit {
-		if side == SideBuy {
-			allowMarket = t.pendingRecheckBuy
-		} else if side == SideSell {
-			allowMarket = t.pendingRecheckSell
-		}
-	}
-
-	// If maker path did not result in a fill (or was skipped), fall back to market path.
-	if placed == nil {
-		if !allowMarket {
-			log.Printf(
-				"[DEBUG] postonly.market_fallback.blocked "+
-					"side=%s reason=recheck_flag_not_set",
-				side,
-			)
-
-			t.mu.Lock()
-
-			t.addDecisionProducerEvent(
-				intent,
-				attempt,
-				ProducerStageDecisionDeferred,
-				"",
-				nil,
-				false,
-				true,
-			)
-
-			t.mu.Unlock()
-
-			return StepResult{
-				Msg:    "HOLD",
-				Raw:    d.Raw,
-				Signal: d.Signal,
-			}, nil
-		}
-
-		// before order submit
-		log.Printf(
-			"[TRACE] hotpath.before_submit.market_quote elapsed_ms=%d side=%s live=%.2f",
-			time.Since(hotStart).Milliseconds(),
-			side,
-			price,
-		)
-
-		/*
-		   The direct market fallback is also a producer production attempt.
-
-		   It therefore uses the SAME Decision-created ProducerAttempt and
-		   adds stage=produced before submitting to the broker.
-		*/
-		if attempt != nil &&
-			intent != nil {
-
-			if attempt.Events == nil {
-				attempt.Events =
-					make(map[ProducerStage]ProducerEvent)
-			}
-
-			attempt.Events[ProducerStageProduced] =
-				ProducerEvent{
-					Time:      time.Now().UTC(),
-					CreatedAt: intent.CreatedAt,
-
-					Producer: intent.Producer,
-					Side:     attempt.Side,
-					Stage:    ProducerStageProduced,
-
-					DecisionID: intent.DecisionID,
-
-					Reason: intent.ProducerReason,
-
-					// Requested execution size for the direct-market submission.
-					// Filled/committed stages later replace this with actual execution economics.
-					Price:      price,
-					BaseSize:   base,
-					QuoteValue: quote,
-				}
-		}
-
-		var err error
-
-		placed, err =
-			t.broker.PlaceMarketQuote(
-				ctx,
-				t.cfg.ProductID,
-				side,
-				quote,
-			)
-
-		// TODO: remove TRACE
-		log.Printf("[TRACE] order.open request side=%s quote=%.2f baseEst=%.8f priceSnap=%.8f take=%.8f",
-			side, quote, base, price, take)
-		log.Printf("[TRACE] postonly.market_fallback.go side=%s quote=%.2f", side, quote)
-		// log.Printf("[KPI] taker.open side=%s quote=%.2f reason=market_fallback", side, quote)
-		log.Printf("[TRACE] hotpath.order.done elapsed_ms=%d",
-			time.Since(hotStart).Milliseconds())
-
-		if err != nil {
-			// Retry once with ORDER_MIN_USD on insufficient-funds style failures.
-
-			if quote > minNotional &&
-				isBinanceInsufficientBalance(err) {
-
-				log.Printf(
-					"[WARN] open order %.2f USD failed with Binance insufficient balance (%v); retrying with ORDER_MIN_USD=%.2f",
-					quote,
-					err,
-					minNotional,
-				)
-
-				quote = minNotional
-				base = quote / price
-
-				// The retry becomes the authoritative produced request if it is used.
-				// Keep observability aligned with the final size submitted to the broker.
-				if attempt != nil {
-					if event, exists :=
-						attempt.Events[ProducerStageProduced]; exists {
-
-						event.Price = price
-						event.BaseSize = base
-						event.QuoteValue = quote
-
-						attempt.Events[ProducerStageProduced] = event
-					}
-				}
-
-				// TODO: remove TRACE
-				log.Printf(
-					"[TRACE] order.open retry side=%s quote=%.2f baseEst=%.8f",
-					side,
-					quote,
-					base,
-				)
-
-				placed, err =
-					t.broker.PlaceMarketQuote(
-						ctx,
-						t.cfg.ProductID,
-						side,
-						quote,
-					)
-			}
-
-			if err != nil {
-				if t.cfg.UseDirectSlack {
-					postSlack(
-						fmt.Sprintf(
-							"ERR step: %v",
-							err,
-						),
-					)
-				}
-
-				code :=
-					EntryProduceErrSubmitNetworkFailed
-
-				var binanceErr *BinanceBridgeError
-
-				if errors.As(
-					err,
-					&binanceErr,
-				) {
-					msg :=
-						strings.TrimSpace(
-							binanceErr.BinanceMsg,
-						)
-
-					switch {
-					case (binanceErr.BinanceCode == -2010 ||
-						binanceErr.BinanceCode == -1010) &&
-						msg ==
-							"Account has insufficient balance for requested action.":
-
-						code =
-							EntryProduceErrInsufficientBalance
-
-					case binanceErr.BinanceCode == -1007:
-
-						code =
-							EntryProduceErrSubmitTimeout
-
-					case binanceErr.BinanceCode == -1003:
-
-						code =
-							EntryProduceErrRateLimited
-
-					default:
-						code =
-							EntryProduceErrExchangeRejected
-					}
-				}
-
-				t.mu.Lock()
-
-				t.addDecisionProducerEvent(
-					intent,
-					attempt,
-					ProducerStageEntryFailed,
-					code,
-					fmt.Errorf(
-						"direct market entry submission failed: side=%s quote=%.8f: %w",
-						side,
-						quote,
-						err,
-					),
-					false,
-					true,
-				)
-
-				t.mu.Unlock()
-
-				return StepResult{
-					Msg:    "",
-					Raw:    d.Raw,
-					Signal: d.Signal,
-				}, err
-			}
-
-		}
-
-		if attempt != nil &&
-			intent != nil &&
-			placed != nil {
-
-			if attempt.Events == nil {
-				attempt.Events =
-					make(map[ProducerStage]ProducerEvent)
-			}
-
-			attempt.Events[ProducerStageFilled] =
-				ProducerEvent{
-					Time:      time.Now().UTC(),
-					CreatedAt: intent.CreatedAt,
-
-					Producer: intent.Producer,
-					Side:     attempt.Side,
-					Stage:    ProducerStageFilled,
-
-					DecisionID: intent.DecisionID,
-					OrderID:    placed.ID,
-
-					Reason:     intent.ProducerReason,
-					Price:      placed.Price,
-					BaseSize:   placed.BaseSize,
-					QuoteValue: placed.QuoteSpent,
-				}
-		}
-
-		// TODO: remove TRACE
-		if placed != nil {
-			log.Printf("[TRACE] order.open placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f",
-				placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
-		}
-
-	}
-
-	// Re-lock to mutate state (append new lot to THIS SIDE).
-	t.mu.Lock()
-
-	// --- NEW (Phase 2): reset recheck flag after successful market fallback open ---
-
-	// We only reset when a real order is being appended (placed != nil).
-	if placed != nil {
-		offsetBps := t.cfg.LimitPriceOffsetBps
-		limitWait := t.cfg.LimitTimeoutSec
-		wantLimit := strings.ToLower(strings.TrimSpace(t.cfg.OrderType)) == "limit" && offsetBps > 0 && limitWait > 0
-		if wantLimit {
-			if side == SideBuy {
-				t.pendingRecheckBuy = false
-			} else if side == SideSell {
-				t.pendingRecheckSell = false
-			}
-		}
-	}
-
-	// --- MINIMAL CHANGE: use actual filled size/price when available ---
-	priceToUse := price
-	baseRequested := base
-	baseToUse := baseRequested
-	actualQuote := quote
-
-	if placed != nil {
-		if placed.Price > 0 {
-			priceToUse = placed.Price
-		}
-		if placed.BaseSize > 0 {
-			baseToUse = placed.BaseSize
-		}
-		if placed.QuoteSpent > 0 {
-			actualQuote = placed.QuoteSpent
-		}
-		// Log WARN on partial fill (filled < requested) with a small tolerance.
-		const tol = 1e-9
-		if baseToUse+tol < baseRequested {
-			log.Printf("[WARN] partial fill: requested_base=%.8f filled_base=%.8f (%.2f%%)",
-				baseRequested, baseToUse, 100.0*(baseToUse/baseRequested))
-			// TODO: remove TRACE
-			// log.Printf("[TRACE] fill.open partial requested=%.8f filled=%.8f", baseRequested, baseToUse)
-		}
-	}
-
-	// Prefer broker-provided commission for entry if present; otherwise fallback to FEE_RATE_PCT.
-	if placed != nil {
-		if placed.CommissionUSD > 0 {
-			entryFee = placed.CommissionUSD
-		} else {
-			log.Printf("[WARN] commission missing (entry); falling back to FEE_RATE_PCT=%.4f%%", feeRate)
-			entryFee = actualQuote * (feeRate / 100.0)
-		}
-	} else {
-		// DryRun path keeps previously computed entryFee and adjusts by delta as before.
-	}
-
-	// already deducted above for DryRun using quote; adjust to the actualQuote delta
-	delta := (actualQuote - quote) * (feeRate / 100.0)
-	t.equityUSD -= delta
-
-	if refundFromOpposite > 0 {
-		origBase := baseToUse
-		origQuote := actualQuote
-		origFee := entryFee
-
-		refundBase := refundFromOpposite / priceToUse
-		if refundBase > baseToUse {
-			refundBase = baseToUse
-		}
-
-		keptBase := baseToUse - refundBase
-		if keptBase < 0 {
-			keptBase = 0
-		}
-
-		keptQuote := actualQuote
-		keptFee := entryFee
-		refundQuote := refundFromOpposite
-		refundFee := refundQuote * (t.cfg.FeeRatePct / 100.0)
-
-		if origBase > 0 {
-			keptQuote = origQuote * (keptBase / origBase)
-			keptFee = origFee * (keptBase / origBase)
-			refundQuote = origQuote * (refundBase / origBase)
-			refundFee = origFee * (refundBase / origBase)
-		}
-
-		t.creditRefundService(side, refundQuote, refundFee)
-
-		baseToUse = keptBase
-		actualQuote = keptQuote
-		entryFee = keptFee
-	}
-
-	newLot := &Position{
-		OpenPrice:        priceToUse,
-		Side:             side,
-		SizeBase:         baseToUse,
-		OpenTime:         now,
-		EntryFee:         entryFee,
-		OpenNotionalUSD:  actualQuote,      // <<< USD PERSISTENCE: notional in USD at open
-		ProducerReason:   d.ProducerReason, // side-biased; no winLow
-		Take:             take,
-		Version:          Version,
-		EntryOrderID:     placedOrderID(placed),
-		RefundPortionUSD: refundFromOpposite,
-		ConfidenceMult:   confMult,
-		EntryMethod:      entryAIMode,
-		ProfitGateUSD:    entryProfitGateUSD,
-		Producer:         d.Producer,
-	}
-
-	// log.Printf(
-	// "[KPI] lot.created producer=%s side=%s mode=%s conf=%.2f gate=%.2f",
-	// newLot.Producer,
-	// newLot.Side,
-	// newLot.EntryMethod,
-	// newLot.ConfidenceMult,
-	// newLot.ProfitGateUSD,
-	// )
-
-	book.Lots = append(book.Lots, newLot)
-	t.consolidateDust(book, priceToUse, minNotional)
-	t.archiveOrphanDust(book, priceToUse, minNotional)
-	t.didConsolidateStartup = false
-	// Use wall clock for lastAdd to drive spacing/decay even if candle time is zero.
-	if side == SideBuy {
-		t.lastAddBuy = wallNow
-		t.winLowBuy = priceToUse
-		t.latchedGateBuy = 0
-		t.SpareBuyUSD -= actualQuote
-		if t.SpareBuyUSD < 0 {
-			t.SpareBuyUSD = 0
-		}
-	} else {
-		t.lastAddSell = wallNow
-		t.winHighSell = priceToUse
-		t.latchedGateSell = 0
-		t.SpareSellUSD -= actualQuote
-		if t.SpareSellUSD < 0 {
-			t.SpareSellUSD = 0
-		}
-	}
-
-	// Equity owns its baseline lifecycle. A successful fill from any other
-	// producer must not restart or suppress the Equity trigger cycle.
-	if d.Producer == EntryProducerEquity {
-		oldEquityBaseline := t.lastAddEquity
-		t.lastAddEquity = t.equityUSD
-		log.Printf(
-			"[TRACE] equity.baseline.set side=%s producer=%s old=%.2f new=%.2f",
-			side,
-			d.Producer,
-			oldEquityBaseline,
-			t.lastAddEquity,
-		)
-	}
-
-	// Standardized continuation reference advancement belongs to the
-	// successful direct-market commit path and must occur before persistence.
-	//
-	// Equity is account-equity referenced. Every other ordinary producer is
-	// execution-price referenced. Case3A is explicitly exempt.
-	if d.Producer != EntryProducerCase3AReplacement {
-		continuationReference :=
-			priceToUse
-
-		if d.Producer == EntryProducerEquity {
-			continuationReference =
-				t.lastAddEquity
-		}
-
-		t.setProducerContinuationReference(
-			d.Producer,
-			side,
-			continuationReference,
-		)
-
-	}
-
-	// Runner assignment is producer-owned. The direct-market path executes
-	// the explicit decision instruction; it does not infer runner status
-	// from Equity or from a generic policy.
-	if d.AssignRunner {
-		newIdx := len(book.Lots) - 1
-		addRunner(book, newIdx)
-
-		log.Printf(
-			"[PRODUCER] runner_assigned producer=%s side=%s idx=%d order_id=%s",
-			d.Producer,
-			side,
-			newIdx,
-			newLot.EntryOrderID,
-		)
-	}
-
-	msg := ""
-	msg = fmt.Sprintf("[LIVE ORDER] %s notional=%.2f take=%.2f fee=%.4f reason=%s",
-		side, newLot.OpenNotionalUSD, newLot.Take, entryFee, newLot.ProducerReason)
-
-	if t.cfg.UseDirectSlack {
-		postSlack(msg)
-	}
-
-	// Persist the newly committed local position state.
-	if err := t.saveStateNoLock(); err != nil {
-		log.Printf(
-			"[WARN] saveState: %v",
-			err,
-		)
-
-		t.addDecisionProducerEvent(
-			intent,
-			attempt,
-			ProducerStageEntryFailed,
-			EntryProduceErrPersistState,
-			fmt.Errorf(
-				"direct market entry filled but local state persistence failed: order_id=%s: %w",
-				placedOrderID(placed),
-				err,
-			),
-			true,
-			true,
-		)
-
-		t.mu.Unlock()
-
-		return StepResult{
-			Msg:    "",
-			Raw:    d.Raw,
-			Signal: d.Signal,
-		}, err
-	}
-
-	// Exchange fill is now represented by a successfully persisted local Position.
-	// The producer lifecycle can therefore advance to committed.
-	if attempt != nil &&
-		intent != nil {
-
-		if attempt.Events == nil {
-			attempt.Events =
-				make(map[ProducerStage]ProducerEvent)
-		}
-
-		committedReason :=
-			strings.TrimSpace(
-				intent.ProducerReason,
-			)
-
-		standardizedFacts := fmt.Sprintf(
-			"producer_tier=%s|tier_mult=%.6f|continuation=%t|"+
-				"continuation_reference=%.8f|continuation_threshold=%.8f|"+
-				"continuation_entry_pass=%t|profit_gate_mult=%.6f|profit_gate_usd=%.8f",
-			d.ProducerTier,
-			d.ProducerTierMultiplier,
-			d.IsContinuation,
-			d.ContinuationReference,
-			d.ContinuationEntryThreshold,
-			d.ContinuationEntryPass,
-			profitGateMultiplier,
-			newLot.ProfitGateUSD,
-		)
-
-		if committedReason == "" {
-			committedReason = standardizedFacts
-		} else {
-			committedReason += "|" + standardizedFacts
-		}
-
-		attempt.Events[ProducerStageCommitted] =
-			ProducerEvent{
-				Time:      time.Now().UTC(),
-				CreatedAt: intent.CreatedAt,
-
-				Producer: intent.Producer,
-				Side:     attempt.Side,
-				Stage:    ProducerStageCommitted,
-
-				DecisionID: intent.DecisionID,
-				OrderID:    placedOrderID(placed),
-
-				Reason: committedReason,
-
-				// Committed reflects the exposure that was actually persisted locally.
-				Price:      priceToUse,
-				BaseSize:   baseToUse,
-				QuoteValue: actualQuote,
-			}
-
-		t.recordProducerAttemptLocked(
-			attempt,
-		)
-
-		if err := t.saveProducerHistoryNoLock(); err != nil {
-			log.Printf(
-				"[ERROR] producer.history.save_failed "+
-					"stage=%s producer=%s decision_id=%s err=%v",
-				ProducerStageCommitted,
-				attempt.Producer,
-				attempt.DecisionID,
-				err,
-			)
-		}
-	}
-
-	// log.Printf("[KPI] summary equity=%.2f daily_pnl=%.2f lots_buy=%d lots_sell=%d product=%s",
-	// t.equityUSD, t.dailyPnL, len(t.book(SideBuy).Lots), len(t.book(SideSell).Lots), t.cfg.ProductID)
-	t.mu.Unlock()
-	return StepResult{Msg: msg, Raw: d.Raw, Signal: d.Signal}, nil
 }
 
 // -----------------------------------------------------------------------------

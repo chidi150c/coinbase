@@ -202,7 +202,15 @@ type Trader struct {
 	didConsolidateStartup bool
 	pos                   *Position // kept for backward compatibility with earlier logic (represents last lot in aggregate)
 	// lots      []*Position // legacy aggregate view (derived from books; do not mutate directly)
-	mu            sync.RWMutex
+	mu sync.RWMutex
+
+	// producerAllocationMu serializes one complete EXIT -> ENTRY allocation
+	// cycle. Ordinary producers are evaluated independently and allocated as one
+	// deterministic priority batch; t.mu may still be released around broker I/O.
+	// This lock prevents a second step from building a competing frozen resource
+	// snapshot while the current AllocationPlan is being realized.
+	producerAllocationMu sync.Mutex
+
 	equityUSD     float64
 	previousAIRaw Signal
 
@@ -306,8 +314,25 @@ type Trader struct {
 	balanceRefreshOnce sync.Once
 	balanceRefreshStop chan struct{}
 	// Unified asynchronous entry registry; key = exchange OrderID.
+	//
+	// This registry is intentionally NOT side-singleton state. Parallel
+	// ordinary producers may own multiple simultaneous pending BUY and/or SELL
+	// entries. Existing exchange-backed pending entries remain paramount
+	// reservations and are accounted for before a new ResourceSnapshot is built.
 	pendingEntries map[string]*PendingEntry
 	pendingExits   map[string]*PendingExit
+
+	// Step-local producer resource reservations.
+	//
+	// The parallel producer coordinator reserves approved allocations here
+	// before releasing t.mu for broker I/O. This prevents two independently
+	// admitted producers from consuming the same frozen-snapshot capacity.
+	//
+	// These reservations are transient: once an exchange-backed PendingEntry is
+	// registered, that PendingEntry becomes the authoritative reservation. On
+	// pre-registration failure the coordinator releases the transient record.
+	// Key = DecisionID.
+	entryResourceReservations map[string]ProducerResourceReservation
 
 	producerHistory map[EntryProducer]*ProducerHistory
 
@@ -340,6 +365,9 @@ func NewTrader(cfg Config, broker Broker) *Trader {
 
 		pendingEntries: make(map[string]*PendingEntry),
 		pendingExits:   make(map[string]*PendingExit),
+		entryResourceReservations: make(
+			map[string]ProducerResourceReservation,
+		),
 
 		stateApplyCh:        make(chan func(*Trader), 128),
 		MarketRegime:        RegimeNormal,
@@ -3558,24 +3586,15 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 		)
 	}
 
-	rawPL := func() float64 {
-		if lot.Side == SideBuy {
-			return (priceExec - lot.OpenPrice) * baseFilled
-		}
-		return (lot.OpenPrice - priceExec) * baseFilled
-	}()
-
 	removedWasRunner := false
-	kind := "scalp"
 	for _, rid := range book.RunnerIDs {
 		if rid == localIdx {
 			removedWasRunner = true
-			kind = "runner"
 			break
 		}
 	}
 
-	log.Printf("[TRACE] exit.classify side=%s kind=%s reason=%s open=%.8f exec=%.8f baseFilled=%.8f rawPL=%.6f entryFee=%.6f exitFee=%.6f finalPL=%.6f", lot.Side, kind, exitReason, lot.OpenPrice, priceExec, baseFilled, rawPL, entryPortion, exitFee, pl)
+	// [TRACE] exit.classify intentionally disabled.
 
 	t.dailyPnL += pl
 	t.equityUSD += pl
@@ -4009,6 +4028,122 @@ func (t *Trader) maybeCloseDustBasket(ctx context.Context, side OrderSide, liveP
 
 	_ = t.saveStateNoLock()
 	return msg, true, nil
+}
+
+// ProducerResourceReservation is the coordinator's transient ownership record
+// for an allocation approved from one frozen ResourceSnapshot.
+//
+// QuoteUSD is the BUY-side quote commitment (including whatever fee treatment
+// the coordinator used when allocating). Base is the SELL-side base commitment.
+// Only the field appropriate to Side is expected to be non-zero.
+//
+// t.mu protects this map and its records.
+type ProducerResourceReservation struct {
+	DecisionID string
+	Producer   EntryProducer
+	Side       OrderSide
+	QuoteUSD   float64
+	Base       float64
+	CreatedAt  time.Time
+}
+
+// reserveProducerResourcesLocked atomically installs one step-local resource
+// reservation. Caller must hold t.mu.
+//
+// A DecisionID may reserve only once. This makes coordinator retries/fan-out
+// mistakes fail closed instead of silently double-reserving the same decision.
+func (t *Trader) reserveProducerResourcesLocked(
+	reservation ProducerResourceReservation,
+) error {
+	if t == nil {
+		return errors.New("reserveProducerResourcesLocked: nil trader")
+	}
+
+	reservation.DecisionID = strings.TrimSpace(reservation.DecisionID)
+	if reservation.DecisionID == "" {
+		return errors.New("reserveProducerResourcesLocked: missing DecisionID")
+	}
+	if reservation.Producer == EntryProducerNone {
+		return errors.New("reserveProducerResourcesLocked: missing producer")
+	}
+	if reservation.Side != SideBuy && reservation.Side != SideSell {
+		return fmt.Errorf(
+			"reserveProducerResourcesLocked: invalid side=%s",
+			reservation.Side,
+		)
+	}
+	if reservation.QuoteUSD < 0 || reservation.Base < 0 {
+		return errors.New(
+			"reserveProducerResourcesLocked: negative resource reservation",
+		)
+	}
+	if reservation.Side == SideBuy && reservation.QuoteUSD <= 0 {
+		return errors.New(
+			"reserveProducerResourcesLocked: BUY requires positive quote reservation",
+		)
+	}
+	if reservation.Side == SideSell && reservation.Base <= 0 {
+		return errors.New(
+			"reserveProducerResourcesLocked: SELL requires positive base reservation",
+		)
+	}
+
+	if t.entryResourceReservations == nil {
+		t.entryResourceReservations =
+			make(map[string]ProducerResourceReservation)
+	}
+	if _, exists := t.entryResourceReservations[reservation.DecisionID]; exists {
+		return fmt.Errorf(
+			"reserveProducerResourcesLocked: duplicate DecisionID=%s",
+			reservation.DecisionID,
+		)
+	}
+
+	if reservation.CreatedAt.IsZero() {
+		reservation.CreatedAt = time.Now().UTC()
+	}
+	t.entryResourceReservations[reservation.DecisionID] = reservation
+	return nil
+}
+
+// releaseProducerResourcesLocked releases only the transient coordinator
+// reservation. Caller must hold t.mu.
+//
+// Once produceEntry/registerPendingEntry succeeds, the PendingEntry registry is
+// the authoritative reservation and this transient record must be removed so
+// resources are never subtracted twice.
+func (t *Trader) releaseProducerResourcesLocked(
+	decisionID string,
+) {
+	if t == nil || t.entryResourceReservations == nil {
+		return
+	}
+	decisionID = strings.TrimSpace(decisionID)
+	if decisionID == "" {
+		return
+	}
+	delete(t.entryResourceReservations, decisionID)
+}
+
+// producerResourceReservationsLocked returns current transient commitments.
+// Caller must hold t.mu.
+func (t *Trader) producerResourceReservationsLocked() (
+	quoteUSD float64,
+	base float64,
+) {
+	if t == nil {
+		return 0, 0
+	}
+
+	for _, reservation := range t.entryResourceReservations {
+		switch reservation.Side {
+		case SideBuy:
+			quoteUSD += reservation.QuoteUSD
+		case SideSell:
+			base += reservation.Base
+		}
+	}
+	return quoteUSD, base
 }
 
 type PendingEntry struct {
@@ -8501,7 +8636,7 @@ func (t *Trader) completePendingExit(ctx context.Context, candles []Candle, live
 
 	wasNewest := localIdx == len(book.Lots)-1
 
-	msg, err := t.applyFilledExitLocked(livePrice, priceExec, baseRequested, baseFilled, p.Side, localIdx, p.ExitReason, p.ExitDecision, exitTime, orderID, commissionUSD, minNotional, wasNewest)
+	_, err := t.applyFilledExitLocked(livePrice, priceExec, baseRequested, baseFilled, p.Side, localIdx, p.ExitReason, p.ExitDecision, exitTime, orderID, commissionUSD, minNotional, wasNewest)
 	if err != nil {
 		// log.Printf("[TRACE] pending_exit.apply_error order_id=%s err=%v", orderID, err)
 		_ = t.saveStateNoLock()
@@ -8511,7 +8646,7 @@ func (t *Trader) completePendingExit(ctx context.Context, candles []Candle, live
 	delete(t.pendingExits, orderID)
 	_ = t.saveStateNoLock()
 
-	log.Printf("[TRACE] pending_exit.applied order_id=%s entry_id=%s msg=%s", orderID, p.EntryOrderID, msg)
+	// [TRACE] pending_exit.applied intentionally disabled.
 }
 
 // Exit Drain Wrapper

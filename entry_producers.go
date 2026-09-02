@@ -8,8 +8,9 @@
 //	independent directional decision without relying on the legacy AI/Logic decision path.
 //
 //	A producer represents one well-defined market phenomenon (for example, Peak Reversal,
-//	Bottom Reversal, Capitulation Bottom, Momentum Exhaustion, etc.) and is evaluated in a
-//	deterministic priority order by combineEntryRawMaterials().
+//	Bottom Reversal, Capitulation Bottom, Momentum Exhaustion, etc.). Ordinary producers are
+//	evaluated independently; every qualifying directional decision is retained for downstream
+//	resource coordination rather than being suppressed by first-match return behavior.
 //
 // Responsibilities
 //
@@ -43,12 +44,20 @@
 //     when that structure naturally represents the phenomenon.
 //   - Every producer should be independently testable.
 //
-// Priority
+// Resource Priority
 //
-//	Producers are evaluated in deterministic priority order by the entry
-//	decision engine. The first producer that emits a directional signal
-//	becomes the final entry decision. If no independent producer fires,
-//	control falls back to the legacy Case 5 producer.
+//	ProducerPriority is intentionally separate from ProducerTier. ProducerTier controls
+//	producer economics / profit-target behavior. ProducerPriority controls only downstream
+//	resource-allocation precedence when multiple qualifying producer requests compete for
+//	constrained resources.
+//
+//	All ordinary producers remain independently evaluable. No producer is skipped merely
+//	because a higher-priority producer also fired. Equal-priority producers are expected to
+//	share constrained resources proportionally in the Producer Resource Coordinator.
+//
+//	Case3AReplacement has the highest priority but retains its special exit-owned lifecycle;
+//	this priority does not change EXIT -> OPEN sequencing in step(). Existing pending-order
+//	reservations remain paramount and are never revoked by a newly evaluated priority.
 //
 // Evolution
 //
@@ -66,12 +75,27 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"strings"
 	"time"
 )
 
 type EntryProducer string
+
+// ProducerPriority controls resource-allocation precedence only.
+// Higher numeric values are allocated before lower values when resources
+// are constrained. It is deliberately independent of ProducerTier.
+type ProducerPriority int
+
+const (
+	ProducerPriorityCase3AReplacement ProducerPriority = 800
+	ProducerPriorityCase11A           ProducerPriority = 700
+	ProducerPriorityCase11B           ProducerPriority = 600
+	ProducerPriorityCase13A           ProducerPriority = 500
+	ProducerPriorityCase13B           ProducerPriority = 400
+	ProducerPriorityCase14B           ProducerPriority = 300
+	ProducerPriorityEquity            ProducerPriority = 200
+	ProducerPriorityNormalLegacy      ProducerPriority = 100
+)
 
 const (
 	EntryProducerNone EntryProducer = ""
@@ -92,6 +116,39 @@ const (
 
 	EntryProducerCase14BUptrendBuy EntryProducer = "Case14BUptrendBuy"
 )
+
+// producerPriorityFor is the single authoritative mapping used by resource
+// coordination. Do not derive allocation priority from ProducerTier.
+func producerPriorityFor(producer EntryProducer) ProducerPriority {
+	switch producer {
+	case EntryProducerCase3AReplacement:
+		return ProducerPriorityCase3AReplacement
+
+	case EntryProducerCase11APeakReversal:
+		return ProducerPriorityCase11A
+
+	case EntryProducerCase11BBottomReversal:
+		return ProducerPriorityCase11B
+
+	case EntryProducerCase13APeakSell:
+		return ProducerPriorityCase13A
+
+	case EntryProducerCase13BBottomBuy:
+		return ProducerPriorityCase13B
+
+	case EntryProducerCase14BUptrendBuy:
+		return ProducerPriorityCase14B
+
+	case EntryProducerEquity:
+		return ProducerPriorityEquity
+
+	case EntryProducerNormalLegacy:
+		return ProducerPriorityNormalLegacy
+
+	default:
+		return 0
+	}
+}
 
 // ProducerTier standardizes ordinary producer profit-target power levels.
 // Case3AReplacement is intentionally exempt because it owns special recovery
@@ -146,17 +203,15 @@ func (r ProducerContinuationReferences) Reference(
 func producerTierFor(producer EntryProducer) (ProducerTier, float64) {
 	switch producer {
 	case EntryProducerNormalLegacy,
-		EntryProducerEquity:
+		EntryProducerEquity,
+		EntryProducerCase11APeakReversal,
+		EntryProducerCase11BBottomReversal:
 		return ProducerTierHigh, HighTierProducerMultiplier
 
-	case EntryProducerCase11APeakReversal,
-		EntryProducerCase11BBottomReversal,
+	case EntryProducerCase13APeakSell,
+		EntryProducerCase13BBottomBuy,
 		EntryProducerCase14BUptrendBuy:
 		return ProducerTierMid, MidTierProducerMultiplier
-
-	case EntryProducerCase13APeakSell,
-		EntryProducerCase13BBottomBuy:
-		return ProducerTierLow, LowTierProducerMultiplier
 
 	case EntryProducerCase3AReplacement:
 		panic("producerTierFor: Case3AReplacement is a special-case exemption")
@@ -237,6 +292,7 @@ func applyStandardProducerEconomics(
 		resolvedMultiplier *= ContinuationProfitGateFactor
 	}
 
+	d.ProducerPriority = producerPriorityFor(producer)
 	d.ProducerTier = tier
 	d.ProducerTierMultiplier = tierMultiplier
 	d.IsContinuation = continuation
@@ -267,12 +323,13 @@ const (
 // Exit-specific information belongs exclusively to ExitDecision.
 type EntryDecision struct {
 	// Final decision.
-	Signal       Signal
-	Raw          Signal
-	LegacySignal Signal
-	LogicOpinion Signal
-	Producer     EntryProducer
-	Confidence   float64
+	Signal           Signal
+	Raw              Signal
+	LegacySignal     Signal
+	LogicOpinion     Signal
+	Producer         EntryProducer
+	ProducerPriority ProducerPriority
+	Confidence       float64
 
 	// AI / model context.
 	PUp           float64
@@ -604,8 +661,10 @@ func applyNormalLegacyProducer(
 	}
 }
 
-// newProducerDecisionLifecycle creates the lifecycle state for a producer
-// decision that has been accepted by the entry decision engine.
+// newProducerDecisionLifecycle creates the lifecycle state for a qualifying
+// producer decision. The resulting DecisionID exists before resource allocation
+// so allocation_requested / approved / partial / rejected can remain on the same
+// producer attempt even when no exchange OrderID is ever created.
 //
 // It converts the transient EntryDecision into:
 //   - PendingIntent, which carries the producer's execution intent and policy
@@ -657,9 +716,7 @@ func (t *Trader) evaluateEquityProducerMaterial(
 	ai AIResult,
 	macd MACDResult,
 	ema EMAPatternResult,
-	balanceSnapshotMaxAge time.Duration,
-	reservedShortQuoteWithFee float64,
-	reservedLongBase float64,
+	resourceSnapshot ResourceSnapshot,
 	continuationRefs ProducerContinuationReferences,
 ) (EquityResult, error) {
 	equityRaw := t.evaluateEquityRaw()
@@ -763,105 +820,22 @@ func (t *Trader) evaluateEquityProducerMaterial(
 		equitySignal = Sell
 	}
 
-	var (
-		symQ       string
-		availQuote float64
-		quoteStep  float64
+	// Funding material comes from the ONE immutable ResourceSnapshot built for
+	// this entry-allocation cycle. Equity no longer performs a private balance
+	// lookup, so every producer sees the same balance timestamp and the same
+	// already-netted pending reservations.
+	quoteStep := resourceSnapshot.QuoteStep
+	baseStep := resourceSnapshot.BaseStep
+	spareQuote := resourceSnapshot.SpareQuote
+	spareBase := resourceSnapshot.SpareBase
 
-		symB      string
-		availBase float64
-		baseStep  float64
-
-		spareQuote float64
-		spareBase  float64
-	)
-
-	/*
-		Only obtain funding when Equity itself has produced a directional
-		candidate.
-
-		This lookup is intentionally independent of Legacy/AI direction.
-	*/
-	if equitySignal == Buy ||
-		equitySignal == Sell {
-
-		equityBalance, ok :=
-			t.getBalanceSpare(
-				balanceSnapshotMaxAge,
-				reservedShortQuoteWithFee,
-				reservedLongBase,
-			)
-
-		if !ok {
-			ageMS := int64(-1)
-
-			if !equityBalance.Snapshot.UpdatedAt.IsZero() {
-				ageMS =
-					time.Since(
-						equityBalance.Snapshot.UpdatedAt,
-					).Milliseconds()
-			}
-
-			return EquityResult{}, fmt.Errorf(
-				"equity balance cache unavailable: "+
-					"equity_signal=%s age_ms=%d",
-				equitySignal,
-				ageMS,
-			)
-		}
-
-		availQuote = equityBalance.AvailQuote
-		quoteStep = equityBalance.QuoteStep
-
-		availBase = equityBalance.AvailBase
-		baseStep = equityBalance.BaseStep
-
-		spareQuote = equityBalance.SpareQuote
-		spareBase = equityBalance.SpareBase
-
-		symQ = equityBalance.Snapshot.SymQuote
-		symB = equityBalance.Snapshot.SymBase
-
-		log.Printf(
-			"[TRACE] equity.balance_cache.hit "+
-				"equity_signal=%s age_ms=%d "+
-				"quote=%.8f base=%.8f "+
-				"spare_quote=%.8f spare_base=%.8f",
-			equitySignal,
-			time.Since(
-				equityBalance.Snapshot.UpdatedAt,
-			).Milliseconds(),
-			availQuote,
-			availBase,
-			spareQuote,
-			spareBase,
-		)
-
-		switch equitySignal {
-		case Buy:
-			if strings.TrimSpace(symQ) == "" ||
-				quoteStep <= 0 {
-
-				return EquityResult{}, fmt.Errorf(
-					"invalid cached quote metadata: "+
-						"symbol=%q step=%.8f",
-					symQ,
-					quoteStep,
-				)
-			}
-
-		case Sell:
-			if strings.TrimSpace(symB) == "" ||
-				baseStep <= 0 {
-
-				return EquityResult{}, fmt.Errorf(
-					"invalid cached base metadata: "+
-						"symbol=%q step=%.8f",
-					symB,
-					baseStep,
-				)
-			}
-		}
+	// Resource availability is diagnostic here. It must not suppress the Equity
+	// signal; the Producer Resource Coordinator owns final funding admission.
+	if equitySignal == Buy && quoteStep <= 0 {
+		quoteStep = 0
+	}
+	if equitySignal == Sell && baseStep <= 0 {
+		baseStep = 0
 	}
 
 	/*
@@ -921,8 +895,11 @@ func (t *Trader) evaluateEquityProducerMaterial(
 //
 // Equity owns its entry direction:
 //
-//   - BUY when the BUY Equity threshold passes and BUY funding is available.
-//   - SELL when the SELL Equity threshold passes and SELL funding is available.
+//   - BUY when the BUY Equity threshold passes.
+//   - SELL when the SELL Equity threshold passes.
+//
+// Funding fields remain diagnostics derived from the common ResourceSnapshot.
+// Final funding admission belongs exclusively to ProducerResourceCoordinator.
 //
 // First Equity BUY/SELL entries use the ordinary configured Equity thresholds.
 // After a committed same-side Equity entry establishes a continuation reference,
@@ -1164,27 +1141,13 @@ func applyEquityProducer(
 	}
 }
 
-// applyCase11ReversalProducer evaluates the independent Case 11
-// reversal producers:
+// applyCase11APeakReversalProducer evaluates Case 11A independently.
 //
-//   - Case 11A: Peak-Reversal SELL
-//   - Case 11B: Bottom-Reversal BUY
-//
-// It populates all Case 11 diagnostics in d regardless of whether either
-// producer fires.
-//
-// Case11A remains directionally independent of AI. AI is passed only so
-// Case11A can reuse positive AI confidence for downstream sizing; confidence
-// <= 0 falls back to 1.0. Its first SELL requires the complete Pyramid SELL
-// gate; continuation keeps the MACD/EMA signal qualification but replaces
-// Pyramid admission with the standardized +0.20% committed-reference gate.
-//
-// Case11B is the BUY mirror: first BUY uses the complete Pyramid BUY gate;
-// continuation keeps the MACD/EMA signal qualification and replaces Pyramid
-// admission with the standardized -0.20% committed-reference gate.
-//
-// It returns true when Case 11 produces a directional decision.
-func applyCase11ReversalProducer(
+// Case11A is a Peak-Reversal SELL producer. First entry requires the complete
+// Pyramid SELL gate; continuation keeps the MACD/EMA signal qualification but
+// replaces native Pyramid admission with the standardized +0.20% committed-
+// reference gate.
+func applyCase11APeakReversalProducer(
 	d *EntryDecision,
 	ai AIResult,
 	macd MACDResult,
@@ -1193,20 +1156,16 @@ func applyCase11ReversalProducer(
 	price float64,
 	continuationRefs ProducerContinuationReferences,
 ) bool {
-	const (
-		macdPeakBuffer   = 15.0
-		macdBottomBuffer = 15.0
-	)
+	if d == nil {
+		return false
+	}
 
-	case11AReferencePrice :=
+	const macdPeakBuffer = 15.0
+
+	reference :=
 		continuationRefs.Reference(
 			EntryProducerCase11APeakReversal,
 			SideSell,
-		)
-	case11BReferencePrice :=
-		continuationRefs.Reference(
-			EntryProducerCase11BBottomReversal,
-			SideBuy,
 		)
 
 	macdPrePeakThreshold :=
@@ -1214,231 +1173,202 @@ func applyCase11ReversalProducer(
 	macdPrePeakZone :=
 		macd.LinePrev6 >= macdPrePeakThreshold
 
-	case11AContinuation :=
-		case11AReferencePrice > 0
-	nextCase11AEntryPrice := 0.0
-	case11AEntryGatePass :=
-		pyramid.Sell.GatePassed
+	continuation := reference > 0
+	nextEntryPrice := 0.0
+	entryGatePass := pyramid.Sell.GatePassed
 
-	if case11AContinuation {
-		nextCase11AEntryPrice, case11AEntryGatePass =
+	if continuation {
+		nextEntryPrice, entryGatePass =
 			continuationReferenceGate(
 				SideSell,
 				price,
-				case11AReferencePrice,
+				reference,
 			)
 	}
 
-	case11AConfidence := ai.Confidence
-	case11AConfidenceFallback := false
-	if case11AConfidence <= 0 {
-		case11AConfidence = 1.0
-		case11AConfidenceFallback = true
+	confidence := ai.Confidence
+	confidenceFallback := false
+	if confidence <= 0 {
+		confidence = 1.0
+		confidenceFallback = true
 	}
 
 	peakReversalSell :=
 		macdPrePeakZone &&
 			ema.HighPeak &&
-			case11AEntryGatePass
-
-	macdPreBottomThreshold :=
-		-macd.EPS + macdBottomBuffer
-	macdPreBottomZone :=
-		macd.LinePrev6 <= macdPreBottomThreshold
-
-	case11BContinuation :=
-		case11BReferencePrice > 0
-	nextCase11BEntryPrice := 0.0
-	case11BEntryGatePass :=
-		pyramid.Buy.GatePassed
-
-	if case11BContinuation {
-		nextCase11BEntryPrice, case11BEntryGatePass =
-			continuationReferenceGate(
-				SideBuy,
-				price,
-				case11BReferencePrice,
-			)
-	}
-
-	case11BConfidence := ai.Confidence
-	case11BConfidenceFallback := false
-	if case11BConfidence <= 0 {
-		case11BConfidence = 1.0
-		case11BConfidenceFallback = true
-	}
-
-	bottomReversalBuy :=
-		macdPreBottomZone &&
-			ema.LowBottom &&
-			case11BEntryGatePass
+			entryGatePass
 
 	d.MACDPrePeakZone = macdPrePeakZone
 	d.PeakReversalSell = peakReversalSell
-	d.MACDPreBottomZone = macdPreBottomZone
-	d.BottomReversalBuy = bottomReversalBuy
 
-	if peakReversalSell {
-		d.Signal = Sell
-		d.Confidence = case11AConfidence
-		d.PyramidPass = pyramid.Sell.GatePassed
-		d.PyramidReason = pyramid.Sell.Reason
-		d.Producer = EntryProducerCase11APeakReversal
-		d.PendingCancelPolicy = PendingSignalCancelDisabled
-
-		applyStandardProducerEconomics(
-			d,
-			EntryProducerCase11APeakReversal,
-			case11AContinuation,
-			case11AReferencePrice,
-			nextCase11AEntryPrice,
-			case11AEntryGatePass,
-		)
-
-		d.ProducerReason = fmt.Sprintf(
-			"peak_reversal_sell|"+
-				"ai_raw=%s|ai_confidence=%.6f|case11a_confidence=%.6f|confidence_fallback=%t|"+
-				"macd_idx6=%.6f|eps=%.6f|buffer=%.2f|threshold=%.6f|"+
-				"macd_zone=%t|ema_high_peak=%t|"+
-				"reference_mode=%s|reference_price=%.8f|next_entry_price=%.8f|"+
-				"continuation_spacing_pct=%.4f|entry_gate_pass=%t|pyramid_sell=%t|"+
-				"tier=%s|tier_mult=%.6f|continuation=%t|"+
-				"continuation_profit_factor=%.6f|profit_gate_mult=%.6f",
-			ai.Raw,
-			ai.Confidence,
-			case11AConfidence,
-			case11AConfidenceFallback,
-			macd.LinePrev6,
-			macd.EPS,
-			macdPeakBuffer,
-			macdPrePeakThreshold,
-			macdPrePeakZone,
-			ema.HighPeak,
-			map[bool]string{true: "continuation_reference", false: "first_pyramid"}[case11AContinuation],
-			case11AReferencePrice,
-			nextCase11AEntryPrice,
-			ContinuationEntrySpacingPct,
-			case11AEntryGatePass,
-			pyramid.Sell.GatePassed,
-			d.ProducerTier,
-			d.ProducerTierMultiplier,
-			d.IsContinuation,
-			ContinuationProfitGateFactor,
-			d.ProfitGateMultiplier,
-		)
-
-		return true
+	if !peakReversalSell {
+		return false
 	}
 
-	if bottomReversalBuy {
-		d.Signal = Buy
-		d.Confidence = case11BConfidence
-		d.PyramidPass = pyramid.Buy.GatePassed
-		d.PyramidReason = pyramid.Buy.Reason
-		d.Producer = EntryProducerCase11BBottomReversal
-		d.PendingCancelPolicy = PendingSignalCancelDisabled
+	d.Signal = Sell
+	d.Confidence = confidence
+	d.PyramidPass = pyramid.Sell.GatePassed
+	d.PyramidReason = pyramid.Sell.Reason
+	d.Producer = EntryProducerCase11APeakReversal
+	d.PendingCancelPolicy = PendingSignalCancelDisabled
 
-		applyStandardProducerEconomics(
-			d,
-			EntryProducerCase11BBottomReversal,
-			case11BContinuation,
-			case11BReferencePrice,
-			nextCase11BEntryPrice,
-			case11BEntryGatePass,
-		)
+	applyStandardProducerEconomics(
+		d,
+		EntryProducerCase11APeakReversal,
+		continuation,
+		reference,
+		nextEntryPrice,
+		entryGatePass,
+	)
 
-		d.ProducerReason = fmt.Sprintf(
-			"bottom_reversal_buy|"+
-				"ai_raw=%s|ai_confidence=%.6f|case11b_confidence=%.6f|confidence_fallback=%t|"+
-				"macd_idx6=%.6f|eps=%.6f|buffer=%.2f|threshold=%.6f|"+
-				"macd_zone=%t|ema_low_bottom=%t|"+
-				"reference_mode=%s|reference_price=%.8f|next_entry_price=%.8f|"+
-				"continuation_spacing_pct=%.4f|entry_gate_pass=%t|pyramid_buy=%t|"+
-				"tier=%s|tier_mult=%.6f|continuation=%t|"+
-				"continuation_profit_factor=%.6f|profit_gate_mult=%.6f",
-			ai.Raw,
-			ai.Confidence,
-			case11BConfidence,
-			case11BConfidenceFallback,
-			macd.LinePrev6,
-			macd.EPS,
-			macdBottomBuffer,
-			macdPreBottomThreshold,
-			macdPreBottomZone,
-			ema.LowBottom,
-			map[bool]string{true: "continuation_reference", false: "first_pyramid"}[case11BContinuation],
-			case11BReferencePrice,
-			nextCase11BEntryPrice,
-			ContinuationEntrySpacingPct,
-			case11BEntryGatePass,
-			pyramid.Buy.GatePassed,
-			d.ProducerTier,
-			d.ProducerTierMultiplier,
-			d.IsContinuation,
-			ContinuationProfitGateFactor,
-			d.ProfitGateMultiplier,
-		)
+	d.ProducerReason = fmt.Sprintf(
+		"peak_reversal_sell|"+
+			"ai_raw=%s|ai_confidence=%.6f|case11a_confidence=%.6f|confidence_fallback=%t|"+
+			"macd_idx6=%.6f|eps=%.6f|buffer=%.2f|threshold=%.6f|"+
+			"macd_zone=%t|ema_high_peak=%t|"+
+			"reference_mode=%s|reference_price=%.8f|next_entry_price=%.8f|"+
+			"continuation_spacing_pct=%.4f|entry_gate_pass=%t|pyramid_sell=%t|"+
+			"tier=%s|tier_mult=%.6f|continuation=%t|"+
+			"continuation_profit_factor=%.6f|profit_gate_mult=%.6f",
+		ai.Raw,
+		ai.Confidence,
+		confidence,
+		confidenceFallback,
+		macd.LinePrev6,
+		macd.EPS,
+		macdPeakBuffer,
+		macdPrePeakThreshold,
+		macdPrePeakZone,
+		ema.HighPeak,
+		map[bool]string{true: "continuation_reference", false: "first_pyramid"}[continuation],
+		reference,
+		nextEntryPrice,
+		ContinuationEntrySpacingPct,
+		entryGatePass,
+		pyramid.Sell.GatePassed,
+		d.ProducerTier,
+		d.ProducerTierMultiplier,
+		d.IsContinuation,
+		ContinuationProfitGateFactor,
+		d.ProfitGateMultiplier,
+	)
 
-		return true
-	}
-
-	return false
+	return true
 }
 
-// applyCase13Producer evaluates the independent Case 13 producers.
+// applyCase11BBottomReversalProducer evaluates Case 11B independently.
 //
-// Case 13 consists of:
-//
-//   - Case 13A — Peak SELL producer.
-//   - Case 13B — Bottom BUY producer.
-//
-// Both producers target early reversals from persistent trends by
-// combining AI conviction, market regime, price location, MACD
-// persistence, and EMA structural confirmation.
-func applyCase13Producer(
+// Case11B is the BUY mirror. First entry requires the complete Pyramid BUY
+// gate; continuation keeps the MACD/EMA signal qualification and replaces
+// native Pyramid admission with the standardized -0.20% committed-reference
+// gate.
+func applyCase11BBottomReversalProducer(
 	d *EntryDecision,
 	ai AIResult,
 	macd MACDResult,
 	ema EMAPatternResult,
 	pyramid PyramidResult,
 	price float64,
-	recentLow float64,
-	recentHigh float64,
-	regime MarketRegime,
-	pendingCounts PendingProducerCounts,
 	continuationRefs ProducerContinuationReferences,
 ) bool {
-	if applyCase13APeakProducer(
-		d,
-		ai,
-		macd,
-		ema,
-		pyramid,
-		price,
-		recentHigh,
-		regime,
-		pendingCounts,
-		continuationRefs,
-	) {
-		return true
+	if d == nil {
+		return false
 	}
 
-	if applyCase13BBottomProducer(
-		d,
-		ai,
-		macd,
-		ema,
-		pyramid,
-		price,
-		recentLow,
-		regime,
-		pendingCounts,
-		continuationRefs,
-	) {
-		return true
+	const macdBottomBuffer = 15.0
+
+	reference :=
+		continuationRefs.Reference(
+			EntryProducerCase11BBottomReversal,
+			SideBuy,
+		)
+
+	macdPreBottomThreshold :=
+		-macd.EPS + macdBottomBuffer
+	macdPreBottomZone :=
+		macd.LinePrev6 <= macdPreBottomThreshold
+
+	continuation := reference > 0
+	nextEntryPrice := 0.0
+	entryGatePass := pyramid.Buy.GatePassed
+
+	if continuation {
+		nextEntryPrice, entryGatePass =
+			continuationReferenceGate(
+				SideBuy,
+				price,
+				reference,
+			)
 	}
 
-	return false
+	confidence := ai.Confidence
+	confidenceFallback := false
+	if confidence <= 0 {
+		confidence = 1.0
+		confidenceFallback = true
+	}
+
+	bottomReversalBuy :=
+		macdPreBottomZone &&
+			ema.LowBottom &&
+			entryGatePass
+
+	d.MACDPreBottomZone = macdPreBottomZone
+	d.BottomReversalBuy = bottomReversalBuy
+
+	if !bottomReversalBuy {
+		return false
+	}
+
+	d.Signal = Buy
+	d.Confidence = confidence
+	d.PyramidPass = pyramid.Buy.GatePassed
+	d.PyramidReason = pyramid.Buy.Reason
+	d.Producer = EntryProducerCase11BBottomReversal
+	d.PendingCancelPolicy = PendingSignalCancelDisabled
+
+	applyStandardProducerEconomics(
+		d,
+		EntryProducerCase11BBottomReversal,
+		continuation,
+		reference,
+		nextEntryPrice,
+		entryGatePass,
+	)
+
+	d.ProducerReason = fmt.Sprintf(
+		"bottom_reversal_buy|"+
+			"ai_raw=%s|ai_confidence=%.6f|case11b_confidence=%.6f|confidence_fallback=%t|"+
+			"macd_idx6=%.6f|eps=%.6f|buffer=%.2f|threshold=%.6f|"+
+			"macd_zone=%t|ema_low_bottom=%t|"+
+			"reference_mode=%s|reference_price=%.8f|next_entry_price=%.8f|"+
+			"continuation_spacing_pct=%.4f|entry_gate_pass=%t|pyramid_buy=%t|"+
+			"tier=%s|tier_mult=%.6f|continuation=%t|"+
+			"continuation_profit_factor=%.6f|profit_gate_mult=%.6f",
+		ai.Raw,
+		ai.Confidence,
+		confidence,
+		confidenceFallback,
+		macd.LinePrev6,
+		macd.EPS,
+		macdBottomBuffer,
+		macdPreBottomThreshold,
+		macdPreBottomZone,
+		ema.LowBottom,
+		map[bool]string{true: "continuation_reference", false: "first_pyramid"}[continuation],
+		reference,
+		nextEntryPrice,
+		ContinuationEntrySpacingPct,
+		entryGatePass,
+		pyramid.Buy.GatePassed,
+		d.ProducerTier,
+		d.ProducerTierMultiplier,
+		d.IsContinuation,
+		ContinuationProfitGateFactor,
+		d.ProfitGateMultiplier,
+	)
+
+	return true
 }
 
 // applyCase13APeakProducer evaluates Case 13A, an independent Peak SELL

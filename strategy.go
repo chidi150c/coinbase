@@ -11,8 +11,9 @@
 //   • Convert pUp into BUY / SELL / FLAT using configured thresholds
 //   • Preserve execution/gate logic outside the model decision path
 //
-// Execution, funding, exchange validity, pending orders, lot caps, and risk
-// controls remain deterministic hard gates in step.go.
+// Execution, funding, exchange validity, pending orders, lot capacity, and
+// risk controls remain deterministic downstream policy. step.go orchestrates
+// producer admission, request building, resource coordination, and execution.
 
 package main
 
@@ -492,11 +493,12 @@ func (t *Trader) evaluateEquityRaw() EquityRawResult {
 	return result
 }
 
-// interpretEquityRaw applies the supplied Equity-owned direction and available
-// spare funding to the direction-independent Equity snapshot.
+// interpretEquityRaw applies the supplied Equity-owned direction and the common
+// ResourceSnapshot funding material to the direction-independent Equity snapshot.
 //
-// It proposes an Equity trigger and a step-snapped amount. LongOnly and final
-// order validation remain in step().
+// Funding fields remain diagnostic. Equity threshold qualification does not
+// consume or reserve resources; final allocation belongs to the downstream
+// ProducerResourceCoordinator.
 func interpretEquityRaw(
 	raw EquityRawResult,
 	legacySignal Signal,
@@ -563,13 +565,11 @@ func interpretEquityRaw(
 	result.SellFundingAvailable =
 		result.ProposedSellBase > 0
 
-	result.BuyTrigger =
-		result.BuyApplicable &&
-			result.BuyFundingAvailable
-
-	result.SellTrigger =
-		result.SellApplicable &&
-			result.SellFundingAvailable
+	// In the parallel-producer architecture Equity signal qualification is
+	// independent of shared-resource admission. Funding availability remains
+	// diagnostic, while ProducerResourceCoordinator owns final allocation.
+	result.BuyTrigger = result.BuyApplicable
+	result.SellTrigger = result.SellApplicable
 
 	result.Selected =
 		result.BuyTrigger ||
@@ -1667,29 +1667,36 @@ func interpretPyramidSideRaw(
 	return result, transition
 }
 
-// combineEntryRawMaterials is the final entry-producer selection engine.
+// collectEntryProducerDecisions evaluates every ordinary entry producer
+// independently and returns every producer that emits a directional decision.
 //
-// Producer priority:
+// Resource priority is NOT applied here. ProducerPriority belongs to the
+// downstream Producer Resource Coordinator and controls only allocation of
+// constrained shared resources. It must never suppress evaluation of another
+// producer.
 //
-//  1. Case11A — Peak-Reversal SELL
-//  2. Case11B — Bottom-Reversal BUY
-//  3. Case13A — Peak SELL
-//  4. Case13B — Bottom BUY
-//  5. Case14B — Uptrend buffered-latch BUY
-//  6. Equity
-//  7. NormalLegacy
+// Ordinary producer resource priority, highest to lowest:
 //
-// The first producer that emits BUY or SELL becomes the final decision.
+//	700  Case11A — Peak-Reversal SELL
+//	600  Case11B — Bottom-Reversal BUY
+//	500  Case13A — Peak SELL
+//	400  Case13B — Bottom BUY
+//	300  Case14B — Uptrend buffered-latch BUY
+//	200  Equity
+//	100  NormalLegacy
 //
-// Ordinary producers receive the same immutable continuation snapshot. Their
-// signal intelligence remains producer-owned; after a committed same-producer/
-// same-side entry, the standardized continuation admission gate replaces the
-// producer's native Pyramid/price admission for that continuation attempt and
-// applies the producer-tier continuation ProfitGateMultiplier.
+// Case3AReplacement has priority 800, but it remains owned by the exit/recovery
+// path and is not evaluated by this ordinary producer collection function.
 //
-// Sizing, LongOnly, lot caps, pending-entry registration, funding approval,
-// committed-reference mutation, and order placement remain outside this function.
-func (t *Trader) combineEntryRawMaterials(
+// Every producer receives the same immutable evaluator/material snapshots for
+// this decision pass. No producer decision returned here consumes funding,
+// mutates pending state, places an order, or prevents another producer from
+// being evaluated.
+//
+// Sizing, ResourceSnapshot construction, resource-request construction,
+// allocation, LongOnly, lot caps, pending-entry registration, committed-
+// reference mutation, and order placement remain outside this function.
+func (t *Trader) collectEntryProducerDecisions(
 	ai AIResult,
 	macd MACDResult,
 	ema EMAPatternResult,
@@ -1698,7 +1705,7 @@ func (t *Trader) combineEntryRawMaterials(
 	price float64,
 	pendingCounts PendingProducerCounts,
 	continuationRefs ProducerContinuationReferences,
-) EntryDecision {
+) []EntryDecision {
 	// Continuation episode mutation is intentionally not performed here.
 	// step.go owns the mirrored AI-direction reset and passes this function an
 	// immutable producer+side reference snapshot for deterministic evaluation.
@@ -1708,7 +1715,10 @@ func (t *Trader) combineEntryRawMaterials(
 		regimeMult = 1.0
 	}
 
-	d := EntryDecision{
+	// baseDecision contains only evaluator/material diagnostics shared by every
+	// producer. Each producer evaluates against its own value-copy so producer-
+	// specific mutation cannot leak into another producer's decision.
+	baseDecision := EntryDecision{
 		Signal:               Flat,
 		Raw:                  ai.Raw,
 		LegacySignal:         Flat,
@@ -1751,33 +1761,25 @@ func (t *Trader) combineEntryRawMaterials(
 		LogicBaseEPS:   macd.BaseEPS,
 		MarketRegime:   t.MarketRegime,
 		RegimeMult:     regimeMult,
+
+		PyramidBuySpacingPass:  pyramid.Buy.SpacingPass,
+		PyramidBuyAdversePass:  pyramid.Buy.AdversePass,
+		PyramidBuyGatePassed:   pyramid.Buy.GatePassed,
+		PyramidSellSpacingPass: pyramid.Sell.SpacingPass,
+		PyramidSellAdversePass: pyramid.Sell.AdversePass,
+		PyramidSellGatePassed:  pyramid.Sell.GatePassed,
+
+		EquityBuyTrigger:  equity.BuyTrigger,
+		EquitySellTrigger: equity.SellTrigger,
 	}
 
-	// Preserve evaluator-level diagnostics regardless of producer outcome.
-	d.PyramidBuySpacingPass =
-		pyramid.Buy.SpacingPass
-	d.PyramidBuyAdversePass =
-		pyramid.Buy.AdversePass
-	d.PyramidBuyGatePassed =
-		pyramid.Buy.GatePassed
+	decisions := make([]EntryDecision, 0, 7)
 
-	d.PyramidSellSpacingPass =
-		pyramid.Sell.SpacingPass
-	d.PyramidSellAdversePass =
-		pyramid.Sell.AdversePass
-	d.PyramidSellGatePassed =
-		pyramid.Sell.GatePassed
-
-	d.EquityBuyTrigger =
-		equity.BuyTrigger
-	d.EquitySellTrigger =
-		equity.SellTrigger
-
-	// -------------------------------------------------------------
-	// Case 11 — Independent reversal producers.
-	// -------------------------------------------------------------
-	if applyCase11ReversalProducer(
-		&d,
+	// Case 11A and Case 11B evaluate independently. Neither directional
+	// producer can suppress the other through helper-level first-match return.
+	case11A := baseDecision
+	if applyCase11APeakReversalProducer(
+		&case11A,
 		ai,
 		macd,
 		ema,
@@ -1785,37 +1787,60 @@ func (t *Trader) combineEntryRawMaterials(
 		price,
 		continuationRefs,
 	) {
-		return d
+		decisions = append(decisions, case11A)
 	}
 
-	// -------------------------------------------------------------
-	// Case 13 — Independent persistent-trend reversal producers.
-	// -------------------------------------------------------------
-	if applyCase13Producer(
-		&d,
+	case11B := baseDecision
+	if applyCase11BBottomReversalProducer(
+		&case11B,
+		ai,
+		macd,
+		ema,
+		pyramid,
+		price,
+		continuationRefs,
+	) {
+		decisions = append(decisions, case11B)
+	}
+
+	// Case 13 — evaluate A and B independently rather than using the legacy
+	// first-match wrapper. This keeps producer collection explicit and removes
+	// hidden priority from producer evaluation.
+	case13A := baseDecision
+	if applyCase13APeakProducer(
+		&case13A,
+		ai,
+		macd,
+		ema,
+		pyramid,
+		price,
+		t.RecentHigh,
+		t.MarketRegime,
+		pendingCounts,
+		continuationRefs,
+	) {
+		decisions = append(decisions, case13A)
+	}
+
+	case13B := baseDecision
+	if applyCase13BBottomProducer(
+		&case13B,
 		ai,
 		macd,
 		ema,
 		pyramid,
 		price,
 		t.RecentLow,
-		t.RecentHigh,
 		t.MarketRegime,
 		pendingCounts,
 		continuationRefs,
 	) {
-		return d
+		decisions = append(decisions, case13B)
 	}
 
-	// -------------------------------------------------------------
-	// Case14B — Buffered-latch BUY in an UP regime.
-	// price <= latch: NormalLegacy territory
-	// latch < price <= buffered latch: Case14B territory
-	// price > buffered latch: no Case14B entry
-	// pending Case14B > 0: Case14B disabled
-	// -------------------------------------------------------------
+	case14B := baseDecision
 	if applyCase14BUptrendBuyProducer(
-		&d,
+		&case14B,
 		ai,
 		macd,
 		ema,
@@ -1825,15 +1850,12 @@ func (t *Trader) combineEntryRawMaterials(
 		pendingCounts,
 		continuationRefs,
 	) {
-		return d
+		decisions = append(decisions, case14B)
 	}
 
-	// -------------------------------------------------------------
-	// Equity — independent Equity threshold + funding producer.
-	// AI / Logic / Pyramid are diagnostics only and do not gate Equity.
-	// -------------------------------------------------------------
+	equityDecision := baseDecision
 	if applyEquityProducer(
-		&d,
+		&equityDecision,
 		ai,
 		macd,
 		ema,
@@ -1842,19 +1864,12 @@ func (t *Trader) combineEntryRawMaterials(
 		pendingCounts,
 		continuationRefs,
 	) {
-		return d
+		decisions = append(decisions, equityDecision)
 	}
 
-	// -------------------------------------------------------------
-	// NormalLegacy — AI + Logic direction.
-	//
-	// First entry uses the native matching complete Pyramid gate.
-	// After a committed same-producer/same-side fill, continuation keeps
-	// the same signal qualification but replaces Pyramid admission with
-	// the standardized committed-reference +/-0.20% gate.
-	// -------------------------------------------------------------
+	normalLegacy := baseDecision
 	if applyNormalLegacyProducer(
-		&d,
+		&normalLegacy,
 		ai,
 		macd,
 		ema,
@@ -1862,10 +1877,10 @@ func (t *Trader) combineEntryRawMaterials(
 		price,
 		continuationRefs,
 	) {
-		return d
+		decisions = append(decisions, normalLegacy)
 	}
 
-	return d
+	return decisions
 }
 
 // SignalToSide converts the intent into a broker side.

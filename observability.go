@@ -39,6 +39,13 @@ const (
 	ProducerStageDecisionDeferred ProducerStage = "decision_deferred"
 	ProducerStageSizingReduced    ProducerStage = "sizing_reduced"
 
+	// Resource-allocation lifecycle. These stages are authoritative backend
+	// evidence for BOT OPS and exist before any exchange OrderID is created.
+	ProducerStageAllocationRequested ProducerStage = "allocation_requested"
+	ProducerStageAllocationApproved  ProducerStage = "allocation_approved"
+	ProducerStageAllocationPartial   ProducerStage = "allocation_partial"
+	ProducerStageAllocationRejected  ProducerStage = "allocation_rejected"
+
 	// Case3A recovery-mode evaluation stages preserve the sequential
 	// decision path under one Case3AReplacement DecisionID.
 	ProducerStageCase3AModeABlocked ProducerStage = "case3a_mode_a_blocked"
@@ -182,6 +189,26 @@ type ProducerEvent struct {
 
 	BaseSize   float64
 	QuoteValue float64
+
+	// Resource-allocation evidence. Zero values are unused for non-allocation
+	// lifecycle stages.
+	ProducerPriority int
+	AllocationStatus string
+	AllocationReason string
+	AllocationMethod string
+
+	RequestedQuote float64
+	RequestedBase  float64
+	AllocatedQuote float64
+	AllocatedBase  float64
+
+	AvailableQuote float64
+	AvailableBase  float64
+
+	AllocationFraction       float64
+	PriorityGroupRequested   float64
+	PriorityGroupAvailable   float64
+	PriorityGroupMemberCount int
 }
 
 type ProducerAttempt struct {
