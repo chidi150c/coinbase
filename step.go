@@ -1410,10 +1410,18 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		pyramidRaw.State,
 	)
 
-	// Preserve the original selected-side Pyramid state behavior using
-	// the decision that existed before the Case 5 override stage.
+	// Construct the legacy AI+Logic direction before any producer override.
+	// This is the selected-side raw material that owns pre-producer Pyramid
+	// win/latch progression.
+	legacyDirection := evaluateLegacyDirection(
+		aiResult,
+		macdResult,
+		emaResult,
+	)
+
 	t.applyPyramidDecisionTransitions(
 		pyramidResult,
+		legacyDirection.Signal,
 	)
 
 	equityResult, _ := t.evaluateEquityProducerMaterial(

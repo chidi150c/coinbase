@@ -203,15 +203,17 @@ func (r ProducerContinuationReferences) Reference(
 func producerTierFor(producer EntryProducer) (ProducerTier, float64) {
 	switch producer {
 	case EntryProducerNormalLegacy,
-		EntryProducerEquity,
-		EntryProducerCase11APeakReversal,
-		EntryProducerCase11BBottomReversal:
+		EntryProducerEquity:
 		return ProducerTierHigh, HighTierProducerMultiplier
 
-	case EntryProducerCase13APeakSell,
-		EntryProducerCase13BBottomBuy,
+	case EntryProducerCase11APeakReversal,
+		EntryProducerCase11BBottomReversal,
 		EntryProducerCase14BUptrendBuy:
 		return ProducerTierMid, MidTierProducerMultiplier
+
+	case EntryProducerCase13APeakSell,
+		EntryProducerCase13BBottomBuy:
+		return ProducerTierLow, LowTierProducerMultiplier
 
 	case EntryProducerCase3AReplacement:
 		panic("producerTierFor: Case3AReplacement is a special-case exemption")

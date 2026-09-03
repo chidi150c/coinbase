@@ -1173,15 +1173,16 @@ func (t *Trader) applyPyramidRawTransitions(
 // --------------------------------------------------------------------------
 func (t *Trader) applyPyramidDecisionTransitions(
 	pyramid PyramidResult,
+	legacySignal Signal,
 ) {
 	state := pyramid.State
 
-	if state.Buy.UpdateWin {
+	if legacySignal == Buy && state.Buy.UpdateWin {
 		t.winLowBuy =
 			state.Buy.NextWin
 	}
 
-	if state.Buy.UpdateLatched {
+	if legacySignal == Buy && state.Buy.UpdateLatched {
 		t.latchedGateBuy =
 			state.Buy.NextLatched
 
@@ -1205,12 +1206,12 @@ func (t *Trader) applyPyramidDecisionTransitions(
 		}
 	}
 
-	if state.Sell.UpdateWin {
+	if legacySignal == Sell && state.Sell.UpdateWin {
 		t.winHighSell =
 			state.Sell.NextWin
 	}
 
-	if state.Sell.UpdateLatched {
+	if legacySignal == Sell && state.Sell.UpdateLatched {
 		t.latchedGateSell =
 			state.Sell.NextLatched
 
