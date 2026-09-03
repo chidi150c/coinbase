@@ -1454,7 +1454,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// Evaluate every ordinary producer independently. Resource priority is not
 	// applied during signal evaluation; it is applied only by the downstream
 	// ProducerResourceCoordinator after per-producer admission and sizing.
-	decisions := t.collectEntryProducerDecisions(
+	tickDecision, decisions := t.collectEntryProducerDecisions(
 		aiResult,
 		macdResult,
 		emaResult,
@@ -1463,6 +1463,47 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		price,
 		pendingCounts,
 		continuationRefs,
+	)
+
+	// Preserve the historical one-per-evaluated-tick Total Lots diagnostic.
+	// The constructor-complete tickDecision keeps FLAT/no-producer diagnostics;
+	// qualifying producers are summarized as one batch without selecting a
+	// winner or restoring removed side-selection aliases.
+	if len(decisions) == 1 {
+		tickDecision = decisions[0]
+	} else if len(decisions) > 1 {
+		producers := make([]string, 0, len(decisions))
+		hasBuy := false
+		hasSell := false
+		for _, decision := range decisions {
+			producers = append(producers, string(decision.Producer))
+			switch decision.Signal {
+			case Buy:
+				hasBuy = true
+			case Sell:
+				hasSell = true
+			}
+		}
+		tickDecision.Producer = EntryProducer(strings.Join(producers, ","))
+		switch {
+		case hasBuy && hasSell:
+			tickDecision.Signal = Mixed
+		case hasBuy:
+			tickDecision.Signal = Buy
+		case hasSell:
+			tickDecision.Signal = Sell
+		}
+	}
+
+	log.Printf(
+		"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver=%d",
+		lsb+lss,
+		tickDecision.Raw,
+		tickDecision.Signal,
+		price,
+		decisionEntryReason(tickDecision),
+		t.cfg.LongOnly,
+		Version,
 	)
 
 	log.Printf(

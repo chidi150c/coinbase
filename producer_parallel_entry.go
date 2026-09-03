@@ -689,12 +689,6 @@ func (t *Trader) processParallelProducerEntriesLocked(
 
 	for i := range decisions {
 		d := decisions[i]
-
-		totalLots := len(t.book(SideBuy).Lots) + len(t.book(SideSell).Lots)
-		log.Printf(
-			"[DEBUG] Total Lots=%d Raw=%s Decision=%s price=%.8f %s LongOnly=%v ver=%d",
-			totalLots, d.Raw, d.Signal, price, decisionEntryReason(d), t.cfg.LongOnly, Version,
-		)
 		intent, attempt := newProducerDecisionLifecycle(&d)
 		if intent == nil || attempt == nil {
 			continue

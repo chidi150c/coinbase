@@ -58,6 +58,8 @@ func (s Signal) String() string {
 		return "BUY"
 	case Sell:
 		return "SELL"
+	case Mixed:
+		return "BUY+SELL"
 	default:
 		return "FLAT"
 	}
@@ -67,6 +69,9 @@ const (
 	Flat Signal = iota
 	Buy
 	Sell
+	// Mixed is diagnostics-only for a parallel tick containing qualifying
+	// producers on both sides. It is never an executable order signal.
+	Mixed
 )
 
 // ExitDecision contains only the information required to
@@ -1711,7 +1716,7 @@ func (t *Trader) collectEntryProducerDecisions(
 	price float64,
 	pendingCounts PendingProducerCounts,
 	continuationRefs ProducerContinuationReferences,
-) []EntryDecision {
+) (EntryDecision, []EntryDecision) {
 	// Continuation episode mutation is intentionally not performed here.
 	// step.go owns the mirrored AI-direction reset and passes this function an
 	// immutable producer+side reference snapshot for deterministic evaluation.
@@ -1886,7 +1891,7 @@ func (t *Trader) collectEntryProducerDecisions(
 		decisions = append(decisions, normalLegacy)
 	}
 
-	return decisions
+	return baseDecision, decisions
 }
 
 // SignalToSide converts the intent into a broker side.
