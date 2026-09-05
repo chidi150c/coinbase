@@ -79,7 +79,7 @@ import (
 	"time"
 )
 
-const Version = 189
+const Version = 191
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -256,9 +256,47 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		)
 	}
 
-	if t.PendingReplacementRetry.Enabled {
-		retry := t.PendingReplacementRetry
+	case3AObligationSnapshots := t.case3AObligationSnapshotsLocked()
+	case3AResurrectionCh := make(chan []EntryDecision, 1)
+	go func(price float64, snapshots []Case3AObligationSnapshot) {
+		case3AResurrectionCh <- evaluateCase3AObligationResurrections(
+			price,
+			snapshots,
+		)
+	}(livePrice, case3AObligationSnapshots)
+
+	// Deferred retries now re-enter through the shared producer collection and
+	// allocation path below. The former direct-submit loop remains structurally
+	// present for this forward mutation but receives no work.
+	retryIDs := make([]string, 0)
+	sort.Strings(retryIDs)
+
+	for _, obligationID := range retryIDs {
+		retry, exists := t.PendingReplacementRetries[obligationID]
+		if !exists {
+			continue
+		}
+
+		obligation := t.Case3AObligations[obligationID]
+		if obligation == nil {
+			log.Printf(
+				"[ERROR] Case3A.retry.orphaned obligation_id=%s",
+				obligationID,
+			)
+			delete(t.PendingReplacementRetries, obligationID)
+			continue
+		}
+		if obligation.Status == Case3AObligationReconcile ||
+			strings.TrimSpace(obligation.ActiveOrderID) != "" {
+			continue
+		}
+
 		repl := retry.Replacement
+		repl.ObligationID = obligationID
+		repl.LimitPx = obligation.TargetPrice
+		repl.BaseAtLimit = obligation.RemainingBase
+		repl.Quote = repl.LimitPx * repl.BaseAtLimit
+		repl.RecoveryNetUSD = obligation.RecoveryRemainingUSD
 
 		sourceEntryOrderID :=
 			strings.TrimSpace(repl.SourceEntryOrderID)
@@ -270,6 +308,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		// pendingExits because maker-exit repricing can change that OrderID.
 		if sourceEntryOrderID != "" &&
 			t.positionExistsByEntryOrderID(sourceEntryOrderID) {
+			obligation.Status = Case3AObligationWaiting
+			obligation.UpdatedAt = time.Now().UTC()
 
 			// log.Printf(
 			// "[TRACE] Case3A.retry.wait "+
@@ -279,14 +319,29 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			// retry.Reason,
 			// )
 
-		} else {
+			continue
+		}
+
+		obligation.Status = Case3AObligationReady
+		obligation.UpdatedAt = time.Now().UTC()
+
+		{
 			/*
 				The retry is a fresh Case3A producer lifecycle.
 
 				Create its lifecycle identity before entering the wrapper.
-				The wrapper will enrich this same ProducerAttempt with
-				produced / pending / failure / cleanup events.
+				Record explicitly why this execution attempt exists, then let
+				the wrapper enrich the same ProducerAttempt with produced /
+				pending / failure / cleanup events.
+
+				The durable obligation carries the identity of the original
+				Case3A decision while newProducerIntentLifecycle() assigns this
+				retry attempt its own DecisionID.
 			*/
+			originDecisionID := obligation.OriginDecisionID
+
+			executionReason := repl.ProducerReason
+
 			attempt :=
 				newProducerIntentLifecycle(
 					&repl,
@@ -299,12 +354,48 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					sourceEntryOrderID,
 				)
 
-				t.PendingReplacementRetry.Enabled = false
-
-				return StepResult{
-					Msg: "HOLD",
-				}, nil
+				obligation.Status = Case3AObligationReconcile
+				obligation.UpdatedAt = time.Now().UTC()
+				delete(t.PendingReplacementRetries, obligationID)
+				continue
 			}
+
+			repl.ProducerReason = fmt.Sprintf(
+				"case3A_retry_decision|"+
+					"obligation_id=%s|"+
+					"retry_cause=%s|"+
+					"origin_decision_id=%s|"+
+					"recovery_method=%s|"+
+					"recovery_usd=%.6f|"+
+					"source_order_id=%s|"+
+					"wait_exit_order_id=%s|"+
+					"limit_price=%.8f",
+				obligationID,
+				strings.TrimSpace(retry.Reason),
+				originDecisionID,
+				repl.RecoveryMethod.String(),
+				repl.RecoveryNetUSD,
+				sourceEntryOrderID,
+				strings.TrimSpace(retry.WaitForExitOrderID),
+				repl.LimitPx,
+			)
+
+			t.addDecisionProducerEvent(
+				&repl,
+				attempt,
+				ProducerStageDecision,
+				"",
+				nil,
+				false,
+				false,
+			)
+
+			// Produced and later exchange lifecycle events retain the
+			// established Case3A replacement execution reason.
+			repl.ProducerReason = executionReason
+			retry.AttemptCount++
+			retry.Replacement = repl
+			t.PendingReplacementRetries[obligationID] = retry
 
 			// produceEntry() ultimately calls registerPendingEntry(),
 			// which acquires t.mu. Never call it while step() owns t.mu.
@@ -355,7 +446,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					orderID,
 				)
 
-				t.PendingReplacementRetry.Enabled = false
+				delete(t.PendingReplacementRetries, obligationID)
 
 				if err := t.saveStateNoLock(); err != nil {
 					// log.Printf(
@@ -1464,6 +1555,39 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		pendingCounts,
 		continuationRefs,
 	)
+
+	// Fan in price-qualified Case3A obligations before resource allocation.
+	// Revalidate each asynchronous result against authoritative state because
+	// entry/exit drains may have changed an obligation after its snapshot.
+	for _, resurrection := range <-case3AResurrectionCh {
+		obligationID := strings.TrimSpace(resurrection.Case3AObligationID)
+		obligation := t.Case3AObligations[obligationID]
+		if obligation == nil ||
+			obligation.Status == Case3AObligationActive ||
+			obligation.Status == Case3AObligationReconcile ||
+			strings.TrimSpace(obligation.ActiveOrderID) != "" ||
+			obligation.RemainingBase <= 0 ||
+			t.positionExistsByEntryOrderID(obligation.SourceEntryOrderID) {
+
+			continue
+		}
+
+		priceStillQualified :=
+			(obligation.Side == SideSell && price >= obligation.TargetPrice) ||
+				(obligation.Side == SideBuy && price <= obligation.TargetPrice)
+		if !priceStillQualified {
+			continue
+		}
+
+		// Refresh mutable quantities from the authoritative obligation rather
+		// than trusting the earlier goroutine snapshot.
+		resurrection.Case3ATargetPrice = obligation.TargetPrice
+		resurrection.Case3ARemainingBase = obligation.RemainingBase
+		resurrection.Case3ARecoveryRemainingUSD = obligation.RecoveryRemainingUSD
+		obligation.Status = Case3AObligationReady
+		obligation.UpdatedAt = time.Now().UTC()
+		decisions = append(decisions, resurrection)
+	}
 
 	// Preserve the historical one-per-evaluated-tick Total Lots diagnostic.
 	// The constructor-complete tickDecision keeps FLAT/no-producer diagnostics;

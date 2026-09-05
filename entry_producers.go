@@ -415,6 +415,18 @@ type EntryDecision struct {
 	ProducerReason      string
 	PendingCancelPolicy PendingSignalCancelPolicy
 	AssignRunner        bool
+
+	// Case3A obligation resurrection metadata. These fields are populated only
+	// for a durable obligation that has reached its immutable target again.
+	Case3AObligationID       string
+	Case3AOriginDecisionID   string
+	Case3ASourceEntryOrderID string
+	Case3ASourceExitOrderID  string
+	Case3ATargetPrice        float64
+	Case3ARemainingBase      float64
+	Case3ARecoveryRemainingUSD float64
+	Case3AProfitGateUSD        float64
+	Case3ARecoveryMethod       RecoveryMethod
 }
 
 type EntryPolicy struct {
@@ -687,6 +699,7 @@ func newProducerDecisionLifecycle(d *EntryDecision) (*PendingIntent, *ProducerAt
 		side = resolvedSide
 	}
 	intent := &PendingIntent{
+		Enabled:   d.Case3AObligationID != "",
 		CreatedAt: createdAt,
 		DecisionID: FormatDecisionID(
 			d.Producer,
@@ -697,6 +710,15 @@ func newProducerDecisionLifecycle(d *EntryDecision) (*PendingIntent, *ProducerAt
 		ProducerReason:      d.ProducerReason,
 		AssignRunner:        d.AssignRunner,
 		Side:                side,
+		ObligationID:        d.Case3AObligationID,
+		SourceEntryOrderID:  d.Case3ASourceEntryOrderID,
+		SourceExitOrderID:   d.Case3ASourceExitOrderID,
+		LimitPx:             d.Case3ATargetPrice,
+		BaseAtLimit:         d.Case3ARemainingBase,
+		Quote:               d.Case3ATargetPrice * d.Case3ARemainingBase,
+		RecoveryNetUSD:      d.Case3ARecoveryRemainingUSD,
+		ProfitGateUSD:       d.Case3AProfitGateUSD,
+		RecoveryMethod:      d.Case3ARecoveryMethod,
 	}
 	attemptSide := fmt.Sprint(d.Signal)
 	if side == SideBuy || side == SideSell {

@@ -343,6 +343,71 @@ func (t *Trader) executeProducerAllocation(
 		wantLimit = false
 	}
 
+	if strings.TrimSpace(req.Decision.Case3AObligationID) != "" {
+		// Resurrected Case3A obligations preserve their immutable economic
+		// target and continue through the established post-only wrapper. The
+		// coordinator may reduce base, but execution never changes TargetPrice.
+		limitPx := req.Decision.Case3ATargetPrice
+		baseAtLimit := base
+		if t.cfg.BaseStep > 0 {
+			baseAtLimit = math.Floor(baseAtLimit/t.cfg.BaseStep) * t.cfg.BaseStep
+		}
+		if limitPx <= 0 || baseAtLimit <= 0 ||
+			baseAtLimit*limitPx < minNotional {
+
+			return "", fmt.Errorf(
+				"Case3A obligation allocation below exchange minimum: obligation_id=%s price=%.8f base=%.8f",
+				req.Decision.Case3AObligationID,
+				limitPx,
+				baseAtLimit,
+			)
+		}
+
+		allocation.AllocatedBase = baseAtLimit
+		allocation.AllocatedQuote = baseAtLimit * limitPx
+		t.prepareIntentFromAllocation(
+			allocation,
+			0,
+			limitPx,
+			baseAtLimit,
+		)
+		intent.Enabled = true
+		intent.ObligationID = req.Decision.Case3AObligationID
+		intent.SourceEntryOrderID = req.Decision.Case3ASourceEntryOrderID
+		intent.SourceExitOrderID = req.Decision.Case3ASourceExitOrderID
+		intent.RecoveryNetUSD = req.Decision.Case3ARecoveryRemainingUSD
+		intent.RecoveryMethod = req.Decision.Case3ARecoveryMethod
+		intent.ProfitGateUSD = req.Decision.Case3AProfitGateUSD
+
+		orderID, err := t.startCase3AReplacement(ctx, intent, attempt)
+
+		t.mu.Lock()
+		if err != nil {
+			t.handleCase3AReplacementError(
+				*intent,
+				intent.SourceExitOrderID,
+				err,
+			)
+		}
+		t.persistProducerAttemptLocked(attempt)
+		t.mu.Unlock()
+
+		if err != nil {
+			return fmt.Sprintf(
+				"HOLD producer=%s obligation_id=%s",
+				req.Producer,
+				intent.ObligationID,
+			), err
+		}
+		return fmt.Sprintf(
+			"OPEN-PENDING producer=%s side=%s order_id=%s obligation_id=%s",
+			req.Producer,
+			req.Side,
+			orderID,
+			intent.ObligationID,
+		), nil
+	}
+
 	if wantLimit {
 		limitPx := price
 		if req.Side == SideBuy {
@@ -799,6 +864,39 @@ func (t *Trader) processParallelProducerEntriesLocked(
 			continue
 		}
 
+		if strings.TrimSpace(d.Case3AObligationID) != "" {
+			// A resurrected Case3A obligation owns exact remaining economics.
+			// Replace ordinary risk/ramp/refund sizing before coordination while
+			// retaining the common resource-allocation machinery.
+			req.RequestedBase = d.Case3ARemainingBase
+			req.RequestedQuote = d.Case3ARemainingBase * price
+			req.CoreBase = req.RequestedBase
+			req.CoreQuote = req.RequestedQuote
+			req.RefundRequestedUSD = 0
+			req.ConfidenceMult = 1
+			req.ProfitGateUSD = d.Case3AProfitGateUSD
+			req.EntryMethod = string(EntryProducerCase3AReplacement)
+			req.Take = 0
+			req.ConsumesLotSlot = true
+
+			if d.Signal == Buy {
+				req.ResourceKind = ResourceKindQuote
+				req.RequestedResource = req.RequestedQuote
+				req.MinimumResource = minNotional
+				req.ResourceStep = snapshot.QuoteStep
+			} else if t.cfg.RequireBaseForShort {
+				req.ResourceKind = ResourceKindBase
+				req.RequestedResource = req.RequestedBase
+				req.MinimumResource = resourceRequestMinBase(snapshot)
+				req.ResourceStep = snapshot.BaseStep
+			} else {
+				req.ResourceKind = ResourceKindNone
+				req.RequestedResource = req.RequestedBase
+				req.MinimumResource = resourceRequestMinBase(snapshot)
+				req.ResourceStep = snapshot.BaseStep
+			}
+		}
+
 		requestAvailable := req.RequestedResource
 		switch req.ResourceKind {
 		case ResourceKindQuote:
@@ -837,7 +935,8 @@ func (t *Trader) processParallelProducerEntriesLocked(
 	// iteration order decide which same-tick shortfall survives.
 	var shortBuyUSD, shortSellUSD float64
 	for _, allocation := range plan.Allocations {
-		if allocation.FundingShortfallUSD <= 0 {
+		if allocation.FundingShortfallUSD <= 0 ||
+			strings.TrimSpace(allocation.Request.Decision.Case3AObligationID) != "" {
 			continue
 		}
 		switch allocation.Request.Side {
