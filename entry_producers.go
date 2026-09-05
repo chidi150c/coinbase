@@ -75,6 +75,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"time"
 )
@@ -274,6 +275,35 @@ func continuationReferenceGate(
 	default:
 		return 0, false
 	}
+}
+
+// traceContinuationEvaluation makes a continuation gate observable even when
+// the producer returns false before creating an EntryDecision. pendingCount is
+// -1 for producers whose evaluator has no pending single-flight guard.
+func traceContinuationEvaluation(
+	producer EntryProducer,
+	side OrderSide,
+	current float64,
+	reference float64,
+	threshold float64,
+	priceGatePass bool,
+	pendingCount int,
+	pendingPass bool,
+) {
+	log.Printf(
+		"[TRACE] producer.continuation.evaluate "+
+			"producer=%s side=%s current=%.8f reference=%.8f threshold=%.8f "+
+			"spacing_pct=%.4f price_gate_pass=%t pending_count=%d pending_pass=%t",
+		producer,
+		side,
+		current,
+		reference,
+		threshold,
+		ContinuationEntrySpacingPct,
+		priceGatePass,
+		pendingCount,
+		pendingPass,
+	)
 }
 
 func applyStandardProducerEconomics(
@@ -541,6 +571,10 @@ func applyNormalLegacyProducer(
 					price,
 					reference,
 				)
+			traceContinuationEvaluation(
+				EntryProducerNormalLegacy, SideBuy, price, reference,
+				nextEntryPrice, entryPass, -1, true,
+			)
 		}
 
 		if !entryPass {
@@ -614,6 +648,10 @@ func applyNormalLegacyProducer(
 					price,
 					reference,
 				)
+			traceContinuationEvaluation(
+				EntryProducerNormalLegacy, SideSell, price, reference,
+				nextEntryPrice, entryPass, -1, true,
+			)
 		}
 
 		if !entryPass {
@@ -966,6 +1004,30 @@ func applyEquityProducer(
 			equitySellPending == 0
 
 	if !equityAvailable {
+		if equity.BuyTrigger {
+			reference := continuationRefs.Reference(EntryProducerEquity, SideBuy)
+			if reference > 0 {
+				threshold, pass := continuationReferenceGate(
+					SideBuy, equity.Raw.EquityUSD, reference,
+				)
+				traceContinuationEvaluation(
+					EntryProducerEquity, SideBuy, equity.Raw.EquityUSD, reference,
+					threshold, pass, equityBuyPending+equitySellPending, false,
+				)
+			}
+		}
+		if equity.SellTrigger {
+			reference := continuationRefs.Reference(EntryProducerEquity, SideSell)
+			if reference > 0 {
+				threshold, pass := continuationReferenceGate(
+					SideSell, equity.Raw.EquityUSD, reference,
+				)
+				traceContinuationEvaluation(
+					EntryProducerEquity, SideSell, equity.Raw.EquityUSD, reference,
+					threshold, pass, equityBuyPending+equitySellPending, false,
+				)
+			}
+		}
 		return false
 	}
 
@@ -996,6 +1058,11 @@ func applyEquityProducer(
 					equity.Raw.EquityUSD,
 					reference,
 				)
+			traceContinuationEvaluation(
+				EntryProducerEquity, SideBuy, equity.Raw.EquityUSD, reference,
+				nextEntryEquity, entryPass,
+				equityBuyPending+equitySellPending, equityAvailable,
+			)
 		}
 
 		if !entryPass {
@@ -1088,6 +1155,11 @@ func applyEquityProducer(
 					equity.Raw.EquityUSD,
 					reference,
 				)
+			traceContinuationEvaluation(
+				EntryProducerEquity, SideSell, equity.Raw.EquityUSD, reference,
+				nextEntryEquity, entryPass,
+				equityBuyPending+equitySellPending, equityAvailable,
+			)
 		}
 
 		if !entryPass {
@@ -1209,6 +1281,10 @@ func applyCase11APeakReversalProducer(
 				price,
 				reference,
 			)
+		traceContinuationEvaluation(
+			EntryProducerCase11APeakReversal, SideSell, price, reference,
+			nextEntryPrice, entryGatePass, -1, true,
+		)
 	}
 
 	confidence := ai.Confidence
@@ -1324,6 +1400,10 @@ func applyCase11BBottomReversalProducer(
 				price,
 				reference,
 			)
+		traceContinuationEvaluation(
+			EntryProducerCase11BBottomReversal, SideBuy, price, reference,
+			nextEntryPrice, entryGatePass, -1, true,
+		)
 	}
 
 	confidence := ai.Confidence
@@ -1462,6 +1542,11 @@ func applyCase13APeakProducer(
 				price,
 				case13AReferencePrice,
 			)
+		traceContinuationEvaluation(
+			EntryProducerCase13APeakSell, SideSell, price, case13AReferencePrice,
+			nextCase13AReentryPrice, case13AReentryPass,
+			case13APending, case13AAvailable,
+		)
 	}
 
 	nearPeakPct := 0.0
@@ -1646,6 +1731,11 @@ func applyCase13BBottomProducer(
 				price,
 				case13BReferencePrice,
 			)
+		traceContinuationEvaluation(
+			EntryProducerCase13BBottomBuy, SideBuy, price, case13BReferencePrice,
+			nextCase13BEntryPrice, case13BEntryGatePass,
+			case13BPending, true,
+		)
 	}
 
 	nearLowPct := 0.0
@@ -1878,6 +1968,11 @@ func applyCase14BUptrendBuyProducer(
 				price,
 				case14BReferencePrice,
 			)
+		traceContinuationEvaluation(
+			EntryProducerCase14BUptrendBuy, SideBuy, price, case14BReferencePrice,
+			nextCase14BEntryPrice, entryGatePass,
+			case14BPending, case14BPending == 0,
+		)
 	}
 
 	// Pending single-flight protection remains authoritative in both first and
