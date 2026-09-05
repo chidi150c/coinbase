@@ -1694,34 +1694,21 @@ func applyCase13BBottomProducer(
 			EntryProducerCase13BBottomBuy,
 			SideBuy,
 		)
-	case13BContinuation :=
-		case13BReferencePrice > 0
-
-	// Case 12 extension for Case 13B:
-	//
-	// The first Case13B BUY may qualify without the adverse latch.
-	// While another Case13B BUY remains pending, a subsequent Case13B
-	// BUY must reach the advanced BUY latch.
 	case13BPending :=
 		pendingCounts.Count(
 			EntryProducerCase13BBottomBuy,
 			SideBuy,
 		)
 
-	case13BAdverseRequired :=
-		case13BPending > 0
+	// Pending count is the simultaneous-duplicate guard, mirroring Case13A.
+	case13BAvailable :=
+		case13BPending == 0
 
-	buyAdverseReached :=
-		pyramid.Buy.Latched > 0 &&
-			price <= pyramid.Buy.Latched
-
-	case13BAdversePass :=
-		!case13BAdverseRequired ||
-			buyAdverseReached
+	case13BContinuation :=
+		case13BReferencePrice > 0
 
 	case13BEntryGatePass :=
-		pyramid.Buy.SpacingPass &&
-			case13BAdversePass
+		pyramid.Buy.SpacingPass
 	nextCase13BEntryPrice := 0.0
 
 	if case13BContinuation {
@@ -1734,7 +1721,7 @@ func applyCase13BBottomProducer(
 		traceContinuationEvaluation(
 			EntryProducerCase13BBottomBuy, SideBuy, price, case13BReferencePrice,
 			nextCase13BEntryPrice, case13BEntryGatePass,
-			case13BPending, true,
+			case13BPending, case13BAvailable,
 		)
 	}
 
@@ -1755,16 +1742,15 @@ func applyCase13BBottomProducer(
 	d.NearRecentLowPct = nearLowPct
 	d.PriceNearRecentLow = priceNearRecentLow
 
-	// The arm identifies the complete bottom environment.
-	//
-	// Case13B normally requires only Pyramid BUY spacing. However, when
-	// another Case13B BUY is already pending, it additionally requires
-	// price to reach the BUY latch advanced during pending registration.
+	// This is the exact directional mirror of Case13A's peak environment.
+	// The committed-reference gate replaces native spacing in continuation
+	// mode; pending single-flight remains authoritative in both modes.
 	bottomBuyArm :=
-		ai.Raw == Buy &&
+		case13BAvailable &&
+			case13BEntryGatePass &&
+			ai.Raw == Buy &&
 			ai.Confidence >= minConfidence &&
 			regime == RegimeDown &&
-			case13BEntryGatePass &&
 			priceNearRecentLow &&
 			macd.LinePrev6 < 0 &&
 			macd.Line < 0 &&
@@ -1775,53 +1761,12 @@ func applyCase13BBottomProducer(
 		bottomBuyArm &&
 			ema.LowBottom
 
-	// log.Printf(
-	// 	"[TRACE] case13B.bottom_buy.evaluate "+
-	// 		"ai_raw=%s confidence=%.2f min_confidence=%.2f regime=%s "+
-	// 		"price=%.8f recent_low=%.8f near_low_pct=%.6f "+
-	// 		"max_near_low_pct=%.2f price_near_low=%t "+
-	// 		"macd_idx6=%.6f macd_line=%.6f macd_hist=%.6f "+
-	// 		"ema_low_bottom=%t "+
-	// 		"pyramid_buy_spacing=%t "+
-	// 		"pending_count=%d adverse_required=%t "+
-	// 		"buy_latched=%.8f adverse_reached=%t adverse_pass=%t|profit_gate_mult=%.2f"+
-	// 		"arm=%t producer=%t ",
-	// 	ai.Raw,
-	// 	ai.Confidence,
-	// 	minConfidence,
-	// 	regime,
-	// 	price,
-	// 	recentLow,
-	// 	nearLowPct,
-	// 	maxNearLowPct,
-	// 	priceNearRecentLow,
-	// 	macd.LinePrev6,
-	// 	macd.Line,
-	// 	macd.Hist,
-	// 	ema.LowBottom,
-	// 	pyramid.Buy.SpacingPass,
-	// 	case13BPending,
-	// 	case13BAdverseRequired,
-	// 	pyramid.Buy.Latched,
-	// 	buyAdverseReached,
-	// 	case13BAdversePass,
-	// 	bottomBuyArm,
-	// 	bottomBuy,
-	// 	profitGateMultiplier,
-	// )
-
 	if !bottomBuy {
 		return false
 	}
 
 	d.Signal = Buy
 
-	// Case13B requires BUY spacing. The complete ordinary Pyramid gate
-	// is not required for the first entry. Its advanced latch is required
-	// only when another Case13B BUY is already pending.
-	// d.PyramidPass =
-	// 	pyramid.Buy.SpacingPass &&
-	// 		case13BAdversePass
 	d.PyramidReason = pyramid.Buy.Reason
 	d.Producer = EntryProducerCase13BBottomBuy
 	d.PendingCancelPolicy = PendingSignalCancelDisabled
@@ -1835,36 +1780,34 @@ func applyCase13BBottomProducer(
 		case13BEntryGatePass,
 	)
 
+	referenceMode := "continuation_reference"
+	if !case13BContinuation {
+		referenceMode = "first_spacing"
+	}
+
 	d.ProducerReason = fmt.Sprintf(
 		"bottom_buy|"+
 			"confidence=%.2f|regime=%s|"+
-			"price=%.8f|recent_low=%.8f|near_low_pct=%.6f|"+
+			"near_low_pct=%.6f|"+
 			"macd_idx6=%.6f|macd_line=%.6f|macd_hist=%.6f|"+
-			"ema_low_bottom=%t|spacing=%t|"+
-			"pending=%d|adverse_required=%t|buy_latched=%.8f|"+
-			"adverse_reached=%t|adverse_pass=%t|"+
-			"reference_price=%.8f|next_entry_price=%.8f|"+
-			"continuation_spacing_pct=%.4f|entry_gate_pass=%t|"+
+			"ema_low_bottom=%t|pending=%d|"+
+			"reference_mode=%s|reference_price=%.8f|next_entry_price=%.8f|"+
+			"continuation_spacing_pct=%.4f|spacing=%t|entry_gate_pass=%t|"+
 			"tier=%s|tier_mult=%.6f|continuation=%t|"+
 			"continuation_profit_factor=%.6f|profit_gate_mult=%.6f",
 		ai.Confidence,
 		regime,
-		price,
-		recentLow,
 		nearLowPct,
 		macd.LinePrev6,
 		macd.Line,
 		macd.Hist,
 		ema.LowBottom,
-		pyramid.Buy.SpacingPass,
 		case13BPending,
-		case13BAdverseRequired,
-		pyramid.Buy.Latched,
-		buyAdverseReached,
-		case13BAdversePass,
+		referenceMode,
 		case13BReferencePrice,
 		nextCase13BEntryPrice,
 		ContinuationEntrySpacingPct,
+		pyramid.Buy.SpacingPass,
 		case13BEntryGatePass,
 		d.ProducerTier,
 		d.ProducerTierMultiplier,

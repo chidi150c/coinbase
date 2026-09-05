@@ -2717,6 +2717,7 @@ type exitFanoutResult struct {
 	EntryOrderID string
 	Reason       string
 	Msg          string
+	Acted        bool
 	Err          error
 }
 
@@ -2749,7 +2750,7 @@ func (t *Trader) fanOutExits(
 			// cand.net,
 			// )
 
-			msg, err := t.closeLotByEntryID(
+			msg, acted, err := t.closeLotByEntryID(
 				ctx,
 				livePrice,
 				cand.side,
@@ -2763,6 +2764,7 @@ func (t *Trader) fanOutExits(
 				EntryOrderID: cand.entryOrderID,
 				Reason:       cand.reason,
 				Msg:          msg,
+				Acted:        acted,
 				Err:          err,
 			}
 		}()
@@ -2789,10 +2791,10 @@ func (t *Trader) closeLotByEntryID(
 	entryOrderID string,
 	exitReason string,
 	exitDecision string,
-) (string, error) {
+) (string, bool, error) {
 	entryOrderID = strings.TrimSpace(entryOrderID)
 	if entryOrderID == "" {
-		return "", fmt.Errorf(
+		return "", false, fmt.Errorf(
 			"close by entry id: empty entry id side=%s reason=%s",
 			side,
 			exitReason,
@@ -2805,7 +2807,7 @@ func (t *Trader) closeLotByEntryID(
 	if idx < 0 {
 		t.mu.Unlock()
 
-		return "", fmt.Errorf(
+		return "", false, fmt.Errorf(
 			"close by entry id: lot not found side=%s entry_id=%s reason=%s",
 			side,
 			entryOrderID,
@@ -2814,7 +2816,7 @@ func (t *Trader) closeLotByEntryID(
 	}
 
 	// closeLot requires t.mu to be held and returns with it held.
-	msg, err := t.closeLot(
+	msg, acted, err := t.closeLot(
 		ctx,
 		livePrice,
 		side,
@@ -2824,7 +2826,7 @@ func (t *Trader) closeLotByEntryID(
 	)
 
 	t.mu.Unlock()
-	return msg, err
+	return msg, acted, err
 }
 
 // --- NEW: side-aware lot closing (no global index) ---
@@ -2835,7 +2837,7 @@ func (t *Trader) closeLot(
 	localIdx int,
 	exitReason string,
 	exitDecision string,
-) (string, error) {
+) (string, bool, error) {
 
 	//Prepare and validate the lot for closing
 
@@ -2847,7 +2849,7 @@ func (t *Trader) closeLot(
 	// 		* Ensure the requested lot index exists.
 	// 		* Fail immediately if the index is out of range.
 	if localIdx < 0 || localIdx >= len(book.Lots) {
-		return "", fmt.Errorf(
+		return "", false, fmt.Errorf(
 			"close lot invalid index side=%s idx=%d lots=%d",
 			side,
 			localIdx,
@@ -2861,7 +2863,7 @@ func (t *Trader) closeLot(
 	// 		* Fail immediately if either check fails.
 	lot := book.Lots[localIdx]
 	if lot == nil {
-		return "", fmt.Errorf(
+		return "", false, fmt.Errorf(
 			"close lot nil position side=%s idx=%d",
 			side,
 			localIdx,
@@ -2870,7 +2872,7 @@ func (t *Trader) closeLot(
 
 	entryOrderID := strings.TrimSpace(lot.EntryOrderID)
 	if entryOrderID == "" {
-		return "", fmt.Errorf(
+		return "", false, fmt.Errorf(
 			"close lot empty entry id side=%s idx=%d",
 			side,
 			localIdx,
@@ -2896,7 +2898,7 @@ func (t *Trader) closeLot(
 	// Skip the exit if nothing remains after rounding.
 	if baseRequested <= 0 {
 		log.Printf("[CLOSE-SKIP] lotSide=%s closeSide=%s baseRaw=%.8f baseRounded=%.8f step=%.8f reason=%s", lot.Side, closeSide, baseRequestedRaw, baseRequested, t.cfg.BaseStep, exitReason)
-		return "", nil
+		return "", false, nil
 	}
 
 	// 	Verify minimum exchange notional:
@@ -2910,7 +2912,7 @@ func (t *Trader) closeLot(
 	}
 	if quote < minNotional {
 		log.Printf("[CLOSE-SKIP] lotSide=%s closeSide=%s base=%.8f livePrice=%.2f notional=%.2f < min %.2f; deferring", lot.Side, closeSide, baseRequested, livePrice, quote, minNotional)
-		return fmt.Sprintf("EXIT-SKIP %s side=%s→%s notional=%.2f < min=%.2f reason=%s", exitTime.Format(time.RFC3339), lot.Side, closeSide, quote, minNotional, exitReason), nil
+		return fmt.Sprintf("EXIT-SKIP %s side=%s→%s notional=%.2f < min=%.2f reason=%s", exitTime.Format(time.RFC3339), lot.Side, closeSide, quote, minNotional, exitReason), false, nil
 	}
 
 	// Determine whether this is a deep-loss stop
@@ -3017,7 +3019,7 @@ func (t *Trader) closeLot(
 
 			case3AAttempt = newProducerIntentLifecycle(&repl)
 			if case3AAttempt == nil {
-				return "", errors.New(
+				return "", false, errors.New(
 					"Case3A decision: failed to create producer lifecycle",
 				)
 			}
@@ -3228,7 +3230,7 @@ func (t *Trader) closeLot(
 		} else {
 			attempt := case3AAttempt
 			if attempt == nil {
-				return "", errors.New(
+				return "", false, errors.New(
 					"Case3A modeA: missing decision lifecycle",
 				)
 			}
@@ -3262,7 +3264,7 @@ func (t *Trader) closeLot(
 				entryOrderID,
 			)
 			if currentIdx < 0 {
-				return "", fmt.Errorf(
+				return "", false, fmt.Errorf(
 					"Case3A modeA replacement returned but source lot disappeared "+
 						"side=%s entry_id=%s replacement_order_id=%s",
 					side,
@@ -3302,7 +3304,7 @@ func (t *Trader) closeLot(
 					the losing SELL may close. The failed attempt has already been
 					recorded, so abort the loss exit and propagate the error.
 				*/
-				return "", fmt.Errorf(
+				return "", false, fmt.Errorf(
 					"Case3A modeA replacement failed; "+
 						"loss exit aborted entry_id=%s: %w",
 					entryOrderID,
@@ -3331,7 +3333,7 @@ func (t *Trader) closeLot(
 			lot.EntryOrderID,
 			lot.FixedTPOrderID,
 			exitReason,
-		), nil
+		), false, nil
 	}
 
 	t.mu.Unlock()
@@ -3385,8 +3387,22 @@ func (t *Trader) closeLot(
 		}
 
 		if err != nil {
-			// log.Printf("[TRACE] pending_exit.start_failed side=%s entry_id=%s err=%v", lot.Side, lot.EntryOrderID, err)
-			return "", nil
+			log.Printf(
+				"[ERROR] pending_exit.start_failed side=%s entry_id=%s limit=%.8f base=%.8f err=%v",
+				lot.Side,
+				lot.EntryOrderID,
+				limitPx,
+				baseRequested,
+				err,
+			)
+			return "", false, fmt.Errorf(
+				"start pending maker exit side=%s entry_id=%s limit=%.8f base=%.8f: %w",
+				lot.Side,
+				lot.EntryOrderID,
+				limitPx,
+				baseRequested,
+				err,
+			)
 		}
 
 		/*
@@ -3418,7 +3434,7 @@ func (t *Trader) closeLot(
 
 			attempt := case3AAttempt
 			if attempt == nil {
-				return "", errors.New(
+				return "", true, errors.New(
 					"Case3A modeB pending-exit: missing decision lifecycle",
 				)
 			}
@@ -3467,7 +3483,7 @@ func (t *Trader) closeLot(
 			limitPx,
 			baseRequested,
 			exitReason,
-		), nil
+		), true, nil
 	}
 
 	// log.Printf(
@@ -3496,7 +3512,7 @@ func (t *Trader) closeLot(
 			postSlack(fmt.Sprintf("ERR step: %v", err))
 		}
 		t.mu.Lock()
-		return "", fmt.Errorf("close order failed: %w", err)
+		return "", false, fmt.Errorf("close order failed: %w", err)
 	}
 
 	if placed != nil {
@@ -3511,7 +3527,7 @@ func (t *Trader) closeLot(
 
 	currentIdx := t.findLotIndexByEntryIDLocked(side, entryOrderID)
 	if currentIdx < 0 {
-		return "", fmt.Errorf(
+		return "", true, fmt.Errorf(
 			"market exit filled but local lot disappeared side=%s entry_id=%s exit_id=%s",
 			side,
 			entryOrderID,
@@ -3562,7 +3578,7 @@ func (t *Trader) closeLot(
 		*/
 		attempt := case3AAttempt
 		if attempt == nil {
-			return "", errors.New(
+			return "", true, errors.New(
 				"Case3A modeB market-exit: missing decision lifecycle",
 			)
 		}
@@ -3627,7 +3643,7 @@ func (t *Trader) closeLot(
 			entryOrderID,
 		)
 		if currentIdx < 0 {
-			return "", fmt.Errorf(
+			return "", true, fmt.Errorf(
 				"Case3A modeB replacement returned but source lot disappeared "+
 					"side=%s entry_id=%s exit_id=%s",
 				side,
@@ -3657,7 +3673,7 @@ func (t *Trader) closeLot(
 		wasNewest,
 	)
 
-	return msg, err
+	return msg, true, err
 
 }
 

@@ -1004,6 +1004,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					continue
 				}
 
+				if res.Acted {
+					succeeded++
+				}
+
 				// log.Printf(
 				// "[TRACE] exit.fanout.done side=%s entry_id=%s reason=%s acted=%t msg=%q",
 				// res.Side,
