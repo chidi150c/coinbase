@@ -214,6 +214,7 @@ type ProducerEvent struct {
 type ProducerAttempt struct {
 	DecisionID string
 	CreatedAt  time.Time
+	HotStart   time.Time `json:"hot_start,omitempty"`
 
 	Producer EntryProducer
 	Side     string
@@ -271,6 +272,7 @@ func newProducerIntentLifecycle(
 	return &ProducerAttempt{
 		DecisionID: intent.DecisionID,
 		CreatedAt:  intent.CreatedAt,
+		HotStart:   intent.HotStart,
 		Producer:   intent.Producer,
 		Side:       fmt.Sprint(intent.Side),
 
@@ -305,8 +307,9 @@ func (t *Trader) addDecisionProducerEvent(
 		errorText = err.Error()
 	}
 
-	attempt.Events[stage] = ProducerEvent{
-		Time:      time.Now().UTC(),
+	eventTime := time.Now().UTC()
+	event := ProducerEvent{
+		Time:      eventTime,
 		CreatedAt: intent.CreatedAt,
 
 		Producer: intent.Producer,
@@ -321,6 +324,14 @@ func (t *Trader) addDecisionProducerEvent(
 		Error:           errorText,
 		CleanupRequired: cleanupRequired,
 	}
+	event.Reason = appendProducerStageTimingReason(
+		event.Reason,
+		producerStageInformation(event),
+		intent.HotStart,
+		attempt,
+		eventTime,
+	)
+	attempt.Events[stage] = event
 
 	if !persist {
 		return
@@ -769,6 +780,56 @@ func (t *Trader) recordProducerAttemptLocked(
 	existingAttempt, exists :=
 		history.Attempts[attempt.DecisionID]
 
+	if attempt.HotStart.IsZero() {
+		if exists && existingAttempt != nil && !existingAttempt.HotStart.IsZero() {
+			attempt.HotStart = existingAttempt.HotStart
+		} else {
+			attempt.HotStart = attempt.CreatedAt
+		}
+	}
+	for stage, event := range attempt.Events {
+		if event.Time.IsZero() {
+			event.Time = time.Now().UTC()
+		}
+		if event.CreatedAt.IsZero() {
+			event.CreatedAt = attempt.CreatedAt
+		}
+		if !strings.Contains(event.Reason, "|stage.elapsed_ms=") {
+			event.Reason = appendProducerStageTimingReason(
+				event.Reason,
+				producerStageInformation(event),
+				attempt.HotStart,
+				attempt,
+				event.Time,
+			)
+			attempt.Events[stage] = event
+		}
+
+		shouldTrace := !exists || existingAttempt == nil
+		if !shouldTrace {
+			prior, priorExists := existingAttempt.Events[stage]
+			shouldTrace = !priorExists || !prior.Time.Equal(event.Time)
+		}
+		if shouldTrace {
+			stageElapsed, hotpathElapsed := producerStageTimingDurations(
+				attempt.HotStart,
+				attempt,
+				event.Time,
+			)
+			log.Printf(
+				"[TRACE] hotpath.producer.stage_timing "+
+					"stage=%s producer=%s decision_id=%s order_id=%s "+
+					"stage_elapsed_ms=%d hotpath_elapsed_ms=%d",
+				event.Stage,
+				event.Producer,
+				event.DecisionID,
+				event.OrderID,
+				stageElapsed.Milliseconds(),
+				hotpathElapsed.Milliseconds(),
+			)
+		}
+	}
+
 	/*
 		Behavior 1 — REGISTER
 
@@ -805,6 +866,31 @@ func (t *Trader) recordProducerAttemptLocked(
 	for stage, event := range attempt.Events {
 		existingAttempt.Events[stage] = event
 	}
+}
+
+// producerStageInformation supplies a compulsory stage-specific component
+// without replacing the producer's original decision reason.
+func producerStageInformation(event ProducerEvent) string {
+	parts := []string{fmt.Sprintf("stage=%s", event.Stage)}
+	if event.OrderID != "" {
+		parts = append(parts, "order_id="+strings.TrimSpace(event.OrderID))
+	}
+	if event.ErrorCode != "" {
+		parts = append(parts, "error_code="+string(event.ErrorCode))
+	}
+	if event.AllocationStatus != "" {
+		parts = append(parts, "allocation_status="+event.AllocationStatus)
+	}
+	if event.AllocationReason != "" {
+		parts = append(parts, "allocation_reason="+event.AllocationReason)
+	}
+	if event.AllocationMethod != "" {
+		parts = append(parts, "allocation_method="+event.AllocationMethod)
+	}
+	if event.CleanupRequired {
+		parts = append(parts, "cleanup_required=true")
+	}
+	return strings.Join(parts, "|")
 }
 
 const ProducerHistoryMaxAttemptsPerProducer = 500

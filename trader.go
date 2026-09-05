@@ -4561,6 +4561,18 @@ type PendingIntent struct {
 	Enabled  bool
 	Producer EntryProducer
 
+	// HotStart is the originating step() start time. It is carried beyond the
+	// step stack so asynchronous pending, fill, cancellation, reconciliation,
+	// and commit stages retain the same cumulative hot-path clock.
+	HotStart time.Time `json:"hot_start,omitempty"`
+
+	// Fine-grained transport checkpoints. These separate broker round-trip time
+	// from local pending registration and state persistence.
+	SubmissionStartedAt time.Time `json:"submission_started_at,omitempty"`
+	ExchangeRespondedAt time.Time `json:"exchange_responded_at,omitempty"`
+	PendingRegisteredAt time.Time `json:"pending_registered_at,omitempty"`
+	StatePersistedAt    time.Time `json:"state_persisted_at,omitempty"`
+
 	Side           OrderSide
 	LimitPx        float64
 	BaseAtLimit    float64
@@ -5024,8 +5036,9 @@ func (t *Trader) produceEntry(
 			return
 		}
 
+		eventTime := time.Now().UTC()
 		event := ProducerEvent{
-			Time:      time.Now().UTC(),
+			Time:      eventTime,
 			CreatedAt: intent.CreatedAt,
 
 			Producer: intent.Producer,
@@ -5035,7 +5048,17 @@ func (t *Trader) produceEntry(
 			DecisionID: intent.DecisionID,
 			OrderID:    produceErr.OrderID,
 
-			Reason: intent.ProducerReason,
+			Reason: appendProducerStageTimingReason(
+				intent.ProducerReason,
+				fmt.Sprintf(
+					"entry_failed|error_code=%s|cleanup_required=%t",
+					produceErr.Code,
+					produceErr.CleanupRequired,
+				),
+				intent.HotStart,
+				attempt,
+				eventTime,
+			),
 
 			ErrorCode:       produceErr.Code,
 			CleanupRequired: produceErr.CleanupRequired,
@@ -5105,6 +5128,7 @@ func (t *Trader) produceEntry(
 
 		return nil, produceErr
 	}
+	intent.PendingRegisteredAt = time.Now().UTC()
 
 	/*
 		Registration succeeded.
@@ -5163,6 +5187,7 @@ func (t *Trader) produceEntry(
 
 		return nil, produceErr
 	}
+	intent.StatePersistedAt = time.Now().UTC()
 
 	/*
 		The entry has now been successfully produced and registered
@@ -5171,9 +5196,17 @@ func (t *Trader) produceEntry(
 		This pending event belongs to the SAME DecisionID and
 		ProducerAttempt created at Decision stage.
 	*/
+	pendingEventTime := time.Now().UTC()
+	pendingStageInformation := fmt.Sprintf(
+		"pending|exchange_order_id=%s|broker.elapsed_ms=%d|response_to_registration.elapsed_ms=%d|registration_to_persistence.elapsed_ms=%d",
+		entry.OrderID,
+		intent.ExchangeRespondedAt.Sub(intent.SubmissionStartedAt).Milliseconds(),
+		intent.PendingRegisteredAt.Sub(intent.ExchangeRespondedAt).Milliseconds(),
+		intent.StatePersistedAt.Sub(intent.PendingRegisteredAt).Milliseconds(),
+	)
 	pendingEvent :=
 		ProducerEvent{
-			Time: time.Now().UTC(),
+			Time: pendingEventTime,
 
 			CreatedAt: intent.CreatedAt,
 
@@ -5189,7 +5222,13 @@ func (t *Trader) produceEntry(
 
 			OrderID: entry.OrderID,
 
-			Reason: intent.ProducerReason,
+			Reason: appendProducerStageTimingReason(
+				intent.ProducerReason,
+				pendingStageInformation,
+				intent.HotStart,
+				attempt,
+				pendingEventTime,
+			),
 
 			// Requested exchange-order economics while the maker entry is pending.
 			Price:      intent.LimitPx,
@@ -5408,12 +5447,39 @@ func (t *Trader) submitPendingIntent(
 		  - start a poller;
 		  - persist Trader state.
 	*/
+	intent.SubmissionStartedAt = time.Now().UTC()
+	if intent.HotStart.IsZero() {
+		intent.HotStart = intent.CreatedAt
+	}
+	log.Printf(
+		"[TRACE] hotpath.producer.submission_started "+
+			"producer=%s decision_id=%s side=%s limit=%.8f base=%.8f hotpath_elapsed_ms=%d",
+		intent.Producer,
+		intent.DecisionID,
+		intent.Side,
+		intent.LimitPx,
+		intent.BaseAtLimit,
+		intent.SubmissionStartedAt.Sub(intent.HotStart).Milliseconds(),
+	)
+
 	orderID, err := t.broker.PlaceLimitPostOnly(
 		ctx,
 		intent.ProductID,
 		intent.Side,
 		intent.LimitPx,
 		intent.BaseAtLimit,
+	)
+	intent.ExchangeRespondedAt = time.Now().UTC()
+	log.Printf(
+		"[TRACE] hotpath.producer.exchange_response "+
+			"producer=%s decision_id=%s side=%s order_id=%s broker_elapsed_ms=%d hotpath_elapsed_ms=%d err=%t",
+		intent.Producer,
+		intent.DecisionID,
+		intent.Side,
+		strings.TrimSpace(orderID),
+		intent.ExchangeRespondedAt.Sub(intent.SubmissionStartedAt).Milliseconds(),
+		intent.ExchangeRespondedAt.Sub(intent.HotStart).Milliseconds(),
+		err != nil,
 	)
 
 	orderID = strings.TrimSpace(orderID)

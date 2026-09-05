@@ -727,6 +727,7 @@ func newProducerDecisionLifecycle(d *EntryDecision) (*PendingIntent, *ProducerAt
 	attempt := &ProducerAttempt{
 		DecisionID: intent.DecisionID,
 		CreatedAt:  intent.CreatedAt,
+		HotStart:   intent.HotStart,
 		Producer:   intent.Producer,
 		Side:       attemptSide,
 		Events: make(

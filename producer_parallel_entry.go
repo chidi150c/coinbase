@@ -25,14 +25,31 @@ func (t *Trader) recordAllocationEventLocked(
 		req.Attempt.Events = make(map[ProducerStage]ProducerEvent)
 	}
 
+	eventTime := time.Now().UTC()
+	reason := req.Intent.ProducerReason
+	stageInformation := fmt.Sprintf(
+		"stage=%s|allocation_status=%s|allocation_reason=%s|allocation_method=%s",
+		stage,
+		allocation.Status,
+		allocation.Reason,
+		allocation.AllocationMethod,
+	)
+	reason = appendProducerStageTimingReason(
+		reason,
+		stageInformation,
+		req.Intent.HotStart,
+		req.Attempt,
+		eventTime,
+	)
+
 	req.Attempt.Events[stage] = ProducerEvent{
-		Time:       time.Now().UTC(),
+		Time:       eventTime,
 		CreatedAt:  req.Intent.CreatedAt,
 		Producer:   req.Producer,
 		Side:       fmt.Sprint(req.Side),
 		Stage:      stage,
 		DecisionID: req.Intent.DecisionID,
-		Reason:     req.Intent.ProducerReason,
+		Reason:     reason,
 
 		ProducerPriority: int(req.Priority),
 		AllocationStatus: string(allocation.Status),
@@ -52,6 +69,76 @@ func (t *Trader) recordAllocationEventLocked(
 		PriorityGroupAvailable:   allocation.PriorityGroupAvailable,
 		PriorityGroupMemberCount: allocation.PriorityGroupMembers,
 	}
+}
+
+// appendProducerStageTimingReason preserves the producer's original decision
+// reason and appends the stage-specific information followed by the time since
+// the preceding lifecycle event and the time since the originating step began.
+func appendProducerStageTimingReason(
+	producerReason string,
+	stageInformation string,
+	hotStart time.Time,
+	attempt *ProducerAttempt,
+	eventTime time.Time,
+) string {
+	stageElapsed, hotpathElapsed := producerStageTimingDurations(
+		hotStart,
+		attempt,
+		eventTime,
+	)
+
+	parts := make([]string, 0, 4)
+	if original := strings.Trim(strings.TrimSpace(producerReason), "|"); original != "" {
+		parts = append(parts, original)
+	}
+	parts = append(
+		parts,
+		strings.Trim(strings.TrimSpace(stageInformation), "|"),
+		fmt.Sprintf("stage.elapsed_ms=%d", stageElapsed.Milliseconds()),
+		fmt.Sprintf("hotpath.elapsed_ms=%d", hotpathElapsed.Milliseconds()),
+	)
+	return strings.Join(parts, "|")
+}
+
+func producerStageTimingDurations(
+	hotStart time.Time,
+	attempt *ProducerAttempt,
+	eventTime time.Time,
+) (time.Duration, time.Duration) {
+	previousTime := time.Time{}
+	if attempt != nil {
+		for _, prior := range attempt.Events {
+			// The event being decorated may already be present in the map.
+			// Only a strictly earlier lifecycle event can be its predecessor.
+			if prior.Time.IsZero() || !prior.Time.Before(eventTime) {
+				continue
+			}
+			if previousTime.IsZero() || prior.Time.After(previousTime) {
+				previousTime = prior.Time
+			}
+		}
+	}
+	if previousTime.IsZero() && attempt != nil {
+		previousTime = attempt.CreatedAt
+	}
+	if hotStart.IsZero() {
+		if attempt != nil && !attempt.CreatedAt.IsZero() {
+			hotStart = attempt.CreatedAt
+		} else {
+			hotStart = eventTime
+		}
+	}
+
+	stageElapsed := eventTime.Sub(previousTime)
+	if previousTime.IsZero() || stageElapsed < 0 {
+		stageElapsed = 0
+	}
+	hotpathElapsed := eventTime.Sub(hotStart)
+	if hotpathElapsed < 0 {
+		hotpathElapsed = 0
+	}
+
+	return stageElapsed, hotpathElapsed
 }
 
 // These tiny helpers keep the event builder independent from a second copy of
@@ -758,6 +845,8 @@ func (t *Trader) processParallelProducerEntriesLocked(
 		if intent == nil || attempt == nil {
 			continue
 		}
+		intent.HotStart = hotStart
+		attempt.HotStart = hotStart
 
 		t.addDecisionProducerEvent(intent, attempt, ProducerStageDecision, "", nil, false, false)
 		if event, ok := attempt.Events[ProducerStageDecision]; ok {
