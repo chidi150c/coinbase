@@ -262,22 +262,138 @@ func (t *Trader) capAllocationToCurrentRefundLocked(
 	return refundUSD
 }
 
-func (t *Trader) consumeRefundReservationLocked(side OrderSide, refundUSD float64) {
-	if refundUSD <= 0 {
+func oppositeRefundServiceSide(shortageSide OrderSide) OrderSide {
+	if shortageSide == SideBuy {
+		return SideSell
+	}
+	return SideBuy
+}
+
+func (t *Trader) upsertRefundObligationLocked(obligation RefundObligation) *RefundObligation {
+	if t.RefundObligations == nil {
+		t.RefundObligations = make(map[string]*RefundObligation)
+	}
+	now := time.Now().UTC()
+	obligation.ID = strings.TrimSpace(obligation.ID)
+	if obligation.ID == "" || obligation.RemainingUSD <= 0 {
+		return nil
+	}
+	if current := t.RefundObligations[obligation.ID]; current != nil {
+		if obligation.RemainingUSD > current.RemainingUSD {
+			current.RemainingUSD = obligation.RemainingUSD
+		}
+		if obligation.OriginalUSD > current.OriginalUSD {
+			current.OriginalUSD = obligation.OriginalUSD
+		}
+		current.Reason = obligation.Reason
+		if obligation.NextRetryAt.After(current.NextRetryAt) {
+			current.NextRetryAt = obligation.NextRetryAt
+		}
+		current.UpdatedAt = now
+		t.syncRefundSummariesLocked()
+		return current
+	}
+	obligation.CreatedAt = now
+	obligation.UpdatedAt = now
+	obligation.Status = RefundObligationWaiting
+	obligation.ServiceSide = oppositeRefundServiceSide(obligation.ShortageSide)
+	t.RefundObligations[obligation.ID] = &obligation
+	t.syncRefundSummariesLocked()
+	return &obligation
+}
+
+// syncRefundSummariesLocked maintains the historical side scalars as the
+// maximum outstanding same-side shortage, never the sum across ticks.
+func (t *Trader) syncRefundSummariesLocked() {
+	buy, sell := 0.0, 0.0
+	for _, obligation := range t.RefundObligations {
+		if obligation == nil || obligation.RemainingUSD <= 0 {
+			continue
+		}
+		switch obligation.ShortageSide {
+		case SideBuy:
+			buy = math.Max(buy, obligation.RemainingUSD)
+		case SideSell:
+			sell = math.Max(sell, obligation.RemainingUSD)
+		}
+	}
+	t.refundBuyUSD = buy
+	t.refundSellUSD = sell
+}
+
+func (t *Trader) reserveRefundObligationLocked(serviceSide OrderSide, amount float64, decisionID string) (string, float64) {
+	if amount <= 0 {
+		return "", 0
+	}
+	var selected *RefundObligation
+	for _, obligation := range t.RefundObligations {
+		if obligation == nil || obligation.ServiceSide != serviceSide ||
+			obligation.RemainingUSD-obligation.ReservedUSD <= 0 {
+			continue
+		}
+		if selected == nil || obligation.RemainingUSD-obligation.ReservedUSD >
+			selected.RemainingUSD-selected.ReservedUSD {
+			selected = obligation
+		}
+	}
+	if selected == nil {
+		return "", 0
+	}
+	reserved := math.Min(amount, selected.RemainingUSD-selected.ReservedUSD)
+	selected.ReservedUSD += reserved
+	selected.ActiveDecisionID = decisionID
+	selected.Status = RefundObligationReserved
+	selected.UpdatedAt = time.Now().UTC()
+	return selected.ID, reserved
+}
+
+func (t *Trader) releaseRefundReservationLocked(intent *PendingIntent) {
+	if intent == nil || strings.TrimSpace(intent.RefundObligationID) == "" {
 		return
 	}
-	switch side {
-	case SideSell:
-		t.refundBuyUSD -= refundUSD
-		if t.refundBuyUSD < 0 {
-			t.refundBuyUSD = 0
-		}
-	case SideBuy:
-		t.refundSellUSD -= refundUSD
-		if t.refundSellUSD < 0 {
-			t.refundSellUSD = 0
-		}
+	obligation := t.RefundObligations[intent.RefundObligationID]
+	if obligation == nil {
+		return
 	}
+	obligation.ReservedUSD -= intent.RefundPortionUSD
+	if obligation.ReservedUSD < 0 {
+		obligation.ReservedUSD = 0
+	}
+	obligation.ActiveDecisionID = ""
+	obligation.Status = RefundObligationWaiting
+	obligation.UpdatedAt = time.Now().UTC()
+}
+
+func (t *Trader) settleRefundFillLocked(intent *PendingIntent, filledRefundUSD float64) {
+	if intent == nil || strings.TrimSpace(intent.RefundObligationID) == "" {
+		return
+	}
+	obligation := t.RefundObligations[intent.RefundObligationID]
+	if obligation == nil {
+		return
+	}
+	if filledRefundUSD < 0 {
+		filledRefundUSD = 0
+	}
+	if filledRefundUSD > obligation.RemainingUSD {
+		filledRefundUSD = obligation.RemainingUSD
+	}
+	obligation.RemainingUSD -= filledRefundUSD
+	obligation.ReservedUSD -= intent.RefundPortionUSD
+	if obligation.ReservedUSD < 0 {
+		obligation.ReservedUSD = 0
+	}
+	if obligation.RemainingUSD <= 1e-9 {
+		delete(t.RefundObligations, obligation.ID)
+	} else {
+		obligation.ActiveDecisionID = ""
+		obligation.Status = RefundObligationWaiting
+		obligation.NextRetryAt = time.Time{}
+		obligation.UpdatedAt = time.Now().UTC()
+	}
+	// Confirmed service is the only operation that reduces obligation state;
+	// compatibility summaries are then derived from remaining obligations.
+	t.syncRefundSummariesLocked()
 }
 
 func (t *Trader) prepareIntentFromAllocation(
@@ -377,22 +493,46 @@ func (t *Trader) executeProducerAllocation(
 	quote = allocation.AllocatedQuote
 	base = allocation.AllocatedBase
 
-	// Preserve the old refund timing: once this producer has actually taken a
-	// refund-service slice into its order sizing, consume that stored refund
-	// before submission. A later broker failure does not recreate it.
+	// Refund is only reserved here. Confirmed exchange fill settlement is the
+	// sole point that consumes the durable obligation.
 	if refundUSD > 0 {
-		t.consumeRefundReservationLocked(req.Side, refundUSD)
+		obligationID, reserved := t.reserveRefundObligationLocked(
+			req.Side,
+			refundUSD,
+			intent.DecisionID,
+		)
+		if reserved+1e-9 < refundUSD {
+			switch req.Side {
+			case SideBuy:
+				allocation.AllocatedQuote = req.CoreQuote + reserved
+				allocation.AllocatedBase = allocation.AllocatedQuote / price
+			case SideSell:
+				allocation.AllocatedBase = req.CoreBase + reserved/price
+				allocation.AllocatedQuote = allocation.AllocatedBase * price
+			}
+			quote = allocation.AllocatedQuote
+			base = allocation.AllocatedBase
+		}
+		refundUSD = reserved
+		intent.RefundObligationID = obligationID
+		intent.RefundPortionUSD = refundUSD
+		intent.RefundCoreQuoteUSD = req.CoreQuote
 		remaining := 0.0
+		refundOrigin := "unknown"
+		refundSourceOrderID := ""
+		if obligation := t.RefundObligations[obligationID]; obligation != nil {
+			remaining = math.Max(0, obligation.RemainingUSD-obligation.ReservedUSD)
+			refundOrigin = string(obligation.OperationKind)
+			refundSourceOrderID = obligation.SourceOrderID
+		}
 		switch req.Side {
 		case SideSell:
-			remaining = t.refundBuyUSD
 			if remaining == 0 {
 				req.Decision.ProducerReason = strings.TrimSpace(req.Decision.ProducerReason + "|refund=buy-full")
 			} else {
 				req.Decision.ProducerReason = strings.TrimSpace(req.Decision.ProducerReason + "|refund=buy-partial")
 			}
 		case SideBuy:
-			remaining = t.refundSellUSD
 			if remaining == 0 {
 				req.Decision.ProducerReason = strings.TrimSpace(req.Decision.ProducerReason + "|refund=sell-full")
 			} else {
@@ -401,10 +541,32 @@ func (t *Trader) executeProducerAllocation(
 		}
 		allocation.Request.Decision.ProducerReason = req.Decision.ProducerReason
 		if intent != nil {
-			intent.ProducerReason = req.Decision.ProducerReason
+			intent.ProducerReason = strings.TrimSpace(fmt.Sprintf(
+				"%s|refund_obligation_id=%s|refund_origin=%s|refund_source_order_id=%s|refund_shortage_side=%s|refund_service_side=%s|refund_reserved_usd=%.8f|refund_remaining_usd=%.8f",
+				req.Decision.ProducerReason,
+				obligationID,
+				refundOrigin,
+				refundSourceOrderID,
+				oppositeRefundServiceSide(req.Side),
+				req.Side,
+				refundUSD,
+				remaining,
+			))
 		}
 	}
 	t.mu.Unlock()
+
+	refundReservationTransferred := false
+	defer func() {
+		if refundReservationTransferred || intent == nil ||
+			strings.TrimSpace(intent.RefundObligationID) == "" {
+			return
+		}
+		t.mu.Lock()
+		t.releaseRefundReservationLocked(intent)
+		_ = t.saveStateNoLock()
+		t.mu.Unlock()
+	}()
 
 	if quote < minNotional || base <= 0 {
 		return "", fmt.Errorf("allocation below exchange minimum after refund reconciliation")
@@ -554,6 +716,7 @@ func (t *Trader) executeProducerAllocation(
 				return fmt.Sprintf("HOLD producer=%s", req.Producer), err
 			}
 			if entry != nil {
+				refundReservationTransferred = true
 				return fmt.Sprintf("OPEN-PENDING producer=%s side=%s order_id=%s", req.Producer, req.Side, entry.OrderID), nil
 			}
 			// Maker size became non-viable inside the wrapper only if an invariant
@@ -737,6 +900,7 @@ func (t *Trader) executeProducerAllocation(
 	}
 
 	t.persistProducerAttemptLocked(attempt)
+	refundReservationTransferred = true
 	t.mu.Unlock()
 
 	// A market fill changed the account synchronously. Force the balance cache
@@ -1117,10 +1281,22 @@ func (t *Trader) processParallelProducerEntriesLocked(
 
 	publishTickRefundShortfallsLocked := func() {
 		if shortBuyUSD > 0 {
-			t.refundBuyUSD = shortBuyUSD
+			t.upsertRefundObligationLocked(RefundObligation{
+				ID: "entry:coordinator:BUY", OperationKind: RefundOperationEntry,
+				ShortageSide: SideBuy, OriginalUSD: shortBuyUSD,
+				RemainingUSD: shortBuyUSD,
+				Reason: fmt.Sprintf("entry_allocation_shortfall|same_tick_aggregate_usd=%.8f", shortBuyUSD),
+			})
+			t.refundBuyUSD = math.Max(t.refundBuyUSD, shortBuyUSD)
 		}
 		if shortSellUSD > 0 {
-			t.refundSellUSD = shortSellUSD
+			t.upsertRefundObligationLocked(RefundObligation{
+				ID: "entry:coordinator:SELL", OperationKind: RefundOperationEntry,
+				ShortageSide: SideSell, OriginalUSD: shortSellUSD,
+				RemainingUSD: shortSellUSD,
+				Reason: fmt.Sprintf("entry_allocation_shortfall|same_tick_aggregate_usd=%.8f", shortSellUSD),
+			})
+			t.refundSellUSD = math.Max(t.refundSellUSD, shortSellUSD)
 		}
 	}
 

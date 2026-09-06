@@ -77,6 +77,7 @@ const (
 	ProducerStageDrainPersistStateFailed ProducerStage = "drain_persist_state_failed"
 	ProducerStageCommitSparePointerNil   ProducerStage = "commit_spare_pointer_nil"
 	ProducerStageRefundConsumed          ProducerStage = "refund_consumed"
+	ProducerStageRefundServiced         ProducerStage = "refund_serviced"
 )
 
 type ProducerHistory struct {

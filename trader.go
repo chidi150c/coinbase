@@ -100,6 +100,40 @@ type SideBook struct {
 	Lots      []*Position `json:"lots"`
 }
 
+type RefundOperationKind string
+type RefundObligationStatus string
+
+const (
+	RefundOperationEntry RefundOperationKind = "entry"
+	RefundOperationExit  RefundOperationKind = "exit"
+
+	RefundObligationWaiting    RefundObligationStatus = "waiting_for_service"
+	RefundObligationReserved   RefundObligationStatus = "reserved"
+	RefundObligationReconcile  RefundObligationStatus = "reconciliation"
+)
+
+// RefundObligation is the durable, producer-independent identity of one
+// resource shortage. BUY shortages are serviced by later SELL executions;
+// SELL shortages are serviced by later BUY executions.
+type RefundObligation struct {
+	ID               string                 `json:"id"`
+	OperationKind    RefundOperationKind    `json:"operation_kind"`
+	SourceDecisionID string                 `json:"source_decision_id,omitempty"`
+	SourceOrderID    string                 `json:"source_order_id,omitempty"`
+	SourceProducer   EntryProducer          `json:"source_producer,omitempty"`
+	ShortageSide     OrderSide              `json:"shortage_side"`
+	ServiceSide      OrderSide              `json:"service_side"`
+	OriginalUSD      float64                `json:"original_usd"`
+	RemainingUSD     float64                `json:"remaining_usd"`
+	ReservedUSD      float64                `json:"reserved_usd,omitempty"`
+	ActiveDecisionID string                 `json:"active_decision_id,omitempty"`
+	Status           RefundObligationStatus `json:"status"`
+	Reason           string                 `json:"reason,omitempty"`
+	CreatedAt        time.Time              `json:"created_at"`
+	UpdatedAt        time.Time              `json:"updated_at"`
+	NextRetryAt      time.Time              `json:"next_retry_at,omitempty"`
+}
+
 // BotState is the persistent snapshot of trader state.
 // NOTE: Persist ONLY the SideBook-based schema now.
 type BotState struct {
@@ -141,6 +175,7 @@ type BotState struct {
 	PendingRecheckSell bool
 	RefundBuyUSD       float64
 	RefundSellUSD      float64
+	RefundObligations  map[string]*RefundObligation
 	SpareBuyUSD        float64
 	SpareSellUSD       float64
 	PreviousAIRaw      Signal
@@ -299,6 +334,7 @@ type Trader struct {
 	// across ticks.
 	refundBuyUSD  float64
 	refundSellUSD float64
+	RefundObligations map[string]*RefundObligation
 	SpareBuyUSD   float64
 	SpareSellUSD  float64
 
@@ -380,6 +416,9 @@ func NewTrader(cfg Config, broker Broker) *Trader {
 		),
 		PendingReplacementRetries: make(
 			map[string]PendingReplacementRetry,
+		),
+		RefundObligations: make(
+			map[string]*RefundObligation,
 		),
 		entryResourceReservations: make(
 			map[string]ProducerResourceReservation,
@@ -1560,6 +1599,7 @@ func (t *Trader) snapshotStateLocked() BotState {
 		PendingRecheckSell:      t.pendingRecheckSell,
 		RefundBuyUSD:            t.refundBuyUSD,
 		RefundSellUSD:           t.refundSellUSD,
+		RefundObligations:       t.RefundObligations,
 		SpareBuyUSD:             t.SpareBuyUSD,
 		SpareSellUSD:            t.SpareSellUSD,
 		PendingExits:            t.pendingExits,
@@ -1760,6 +1800,31 @@ func (t *Trader) loadState() error {
 
 	t.refundBuyUSD = st.RefundBuyUSD
 	t.refundSellUSD = st.RefundSellUSD
+	t.RefundObligations = st.RefundObligations
+	if t.RefundObligations == nil {
+		t.RefundObligations = make(map[string]*RefundObligation)
+	}
+	// Forward-migrate historical scalar Refund state into durable general
+	// obligations. These are not tied to Case3A or to exits.
+	nowRefund := time.Now().UTC()
+	if t.refundBuyUSD > 0 && t.RefundObligations["legacy:BUY"] == nil {
+		t.RefundObligations["legacy:BUY"] = &RefundObligation{
+			ID: "legacy:BUY", OperationKind: RefundOperationEntry,
+			ShortageSide: SideBuy, ServiceSide: SideSell,
+			OriginalUSD: t.refundBuyUSD, RemainingUSD: t.refundBuyUSD,
+			Status: RefundObligationWaiting, Reason: "migrated_scalar_refund_buy",
+			CreatedAt: nowRefund, UpdatedAt: nowRefund,
+		}
+	}
+	if t.refundSellUSD > 0 && t.RefundObligations["legacy:SELL"] == nil {
+		t.RefundObligations["legacy:SELL"] = &RefundObligation{
+			ID: "legacy:SELL", OperationKind: RefundOperationEntry,
+			ShortageSide: SideSell, ServiceSide: SideBuy,
+			OriginalUSD: t.refundSellUSD, RemainingUSD: t.refundSellUSD,
+			Status: RefundObligationWaiting, Reason: "migrated_scalar_refund_sell",
+			CreatedAt: nowRefund, UpdatedAt: nowRefund,
+		}
+	}
 	t.SpareBuyUSD = st.SpareBuyUSD
 	t.SpareSellUSD = st.SpareSellUSD
 
@@ -3336,6 +3401,22 @@ func (t *Trader) closeLot(
 		), false, nil
 	}
 
+	refundExitObligationID := fmt.Sprintf(
+		"exit:%s:%s",
+		strings.TrimSpace(lot.EntryOrderID),
+		closeSide,
+	)
+	if obligation := t.RefundObligations[refundExitObligationID];
+		obligation != nil && time.Now().UTC().Before(obligation.NextRetryAt) {
+		return fmt.Sprintf(
+			"EXIT-DEFER-REFUND side=%s entry_id=%s remaining_usd=%.8f retry_at=%s",
+			lot.Side,
+			lot.EntryOrderID,
+			obligation.RemainingUSD,
+			obligation.NextRetryAt.Format(time.RFC3339Nano),
+		), false, nil
+	}
+
 	t.mu.Unlock()
 
 	var placed *PlacedOrder
@@ -3395,6 +3476,33 @@ func (t *Trader) closeLot(
 				baseRequested,
 				err,
 			)
+			if marketEntryErrorCode(err) == EntryProduceErrInsufficientBalance {
+				requiredUSD := baseRequested * limitPx
+				requiredUSD += requiredUSD * (t.cfg.FeeRatePct / 100.0)
+				obligationID := fmt.Sprintf(
+					"exit:%s:%s",
+					strings.TrimSpace(lot.EntryOrderID),
+					closeSide,
+				)
+				t.upsertRefundObligationLocked(RefundObligation{
+					ID: obligationID,
+					OperationKind: RefundOperationExit,
+					SourceOrderID: strings.TrimSpace(lot.EntryOrderID),
+					SourceProducer: lot.Producer,
+					ShortageSide: closeSide,
+					OriginalUSD: requiredUSD,
+					RemainingUSD: requiredUSD,
+					NextRetryAt: time.Now().UTC().Add(30 * time.Second),
+					Reason: fmt.Sprintf(
+						"exit_funding_shortfall|source_entry_id=%s|close_side=%s|required_quote_usd=%.8f|exchange_error=%q",
+						lot.EntryOrderID,
+						closeSide,
+						requiredUSD,
+						err.Error(),
+					),
+				})
+				_ = t.saveStateNoLock()
+			}
 			return "", false, fmt.Errorf(
 				"start pending maker exit side=%s entry_id=%s limit=%.8f base=%.8f: %w",
 				lot.Side,
@@ -3865,6 +3973,17 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 	// remaining lot-specific obligation is case3a_final_recovery.
 	const case3AFillTol = 1e-9
 	case3AFullFill := baseFilled+case3AFillTol >= baseRequested
+	if case3AFullFill {
+		closeSide := SideSell
+		if lot.Side == SideSell {
+			closeSide = SideBuy
+		}
+		delete(
+			t.RefundObligations,
+			fmt.Sprintf("exit:%s:%s", strings.TrimSpace(lot.EntryOrderID), closeSide),
+		)
+		t.syncRefundSummariesLocked()
+	}
 	case3ARecoveryBefore := lot.RecoveryNetUSD
 
 	case3AUpRecoveryCandidate :=
@@ -4597,6 +4716,8 @@ type PendingIntent struct {
 	ProducerReason string
 
 	RefundPortionUSD float64 `json:"refund_portion_usd"`
+	RefundObligationID string `json:"refund_obligation_id,omitempty"`
+	RefundCoreQuoteUSD float64 `json:"refund_core_quote_usd,omitempty"`
 
 	ProductID  string
 	DecisionID string
@@ -8079,6 +8200,18 @@ func (t *Trader) drainPendingEntry(
 				pending != nil &&
 					pending.CancelRequested
 
+			// Terminal zero-fill outcomes release the temporary attachment;
+			// the durable Refund obligation remains completely outstanding.
+			if pending != nil {
+				t.releaseRefundReservationLocked(pending)
+				pending.ProducerReason = strings.TrimSpace(fmt.Sprintf(
+					"%s|refund_obligation_id=%s|refund_filled_usd=0|refund_reservation_released_usd=%.8f",
+					pending.ProducerReason,
+					pending.RefundObligationID,
+					pending.RefundPortionUSD,
+				))
+			}
+
 			if cancelRequested {
 				// log.Printf(
 				// "[TRACE] postonly.cancel.ack side=%s producer=%s order_id=%s fallback=false reason=signal_changed",
@@ -8363,94 +8496,65 @@ func (t *Trader) commitEntryFill(
 		originalQuote := quoteSpent
 		originalFee := entryFee
 
-		refundBase :=
-			pending.RefundPortionUSD /
-				priceToUse
-
-		if refundBase > baseToUse {
-			refundBase = baseToUse
+		// Core-first settlement: a partial fill belongs to the normal producer
+		// until its complete core request is filled. Only confirmed quote above
+		// that boundary can service Refund.
+		coreQuote := pending.RefundCoreQuoteUSD
+		if coreQuote < 0 {
+			coreQuote = 0
 		}
-
-		if refundBase < 0 {
-			refundBase = 0
+		refundQuote := math.Max(0, originalQuote-coreQuote)
+		refundQuote = math.Min(refundQuote, pending.RefundPortionUSD)
+		refundBase := 0.0
+		if priceToUse > 0 {
+			refundBase = refundQuote / priceToUse
 		}
-
-		keptBase :=
-			baseToUse -
-				refundBase
-
-		if keptBase < 0 {
-			keptBase = 0
+		if refundBase > originalBase {
+			refundBase = originalBase
 		}
-
-		keptQuote := quoteSpent
-		keptFee := entryFee
-
-		refundQuote :=
-			pending.RefundPortionUSD
-
-		refundFee :=
-			refundQuote *
-				(t.cfg.FeeRatePct / 100.0)
-
-		if originalBase > 0 {
-			keptRatio :=
-				keptBase /
-					originalBase
-
-			refundRatio :=
-				refundBase /
-					originalBase
-
-			keptQuote =
-				originalQuote *
-					keptRatio
-
-			keptFee =
-				originalFee *
-					keptRatio
-
-			refundQuote =
-				originalQuote *
-					refundRatio
-
-			refundFee =
-				originalFee *
-					refundRatio
+		keptBase := math.Max(0, originalBase-refundBase)
+		keptQuote := math.Max(0, originalQuote-refundQuote)
+		refundRatio := 0.0
+		if originalQuote > 0 {
+			refundRatio = refundQuote / originalQuote
 		}
+		refundFee := originalFee * refundRatio
+		keptFee := math.Max(0, originalFee-refundFee)
 
 		t.creditRefundService(
 			side,
 			refundQuote,
 			refundFee,
 		)
+		t.settleRefundFillLocked(pending, refundQuote)
+		pending.ProducerReason = strings.TrimSpace(fmt.Sprintf(
+			"%s|refund_obligation_id=%s|refund_filled_usd=%.8f|refund_reserved_usd=%.8f|refund_core_filled_usd=%.8f",
+			pending.ProducerReason,
+			pending.RefundObligationID,
+			refundQuote,
+			pending.RefundPortionUSD,
+			keptQuote,
+		))
+		if refundQuote > 0 {
+			addCommitProducerEvent(
+				ProducerStageRefundServiced,
+				res.OrderID,
+				nil,
+				true,
+			)
+		}
 
 		baseToUse = keptBase
 		quoteSpent = keptQuote
 		entryFee = keptFee
 	}
 
-	if baseToUse <= 0 ||
-		quoteSpent <= 0 {
-
-		/*
-			The refund service consumed the complete filled execution.
-
-			This is successful processing, not a commit failure, but no
-			Position is created.
-
-			Record the distinct lifecycle outcome in the same OpenResult
-			ProducerEvents map so the drain can persist it under the same
-			DecisionID.
-		*/
-		addCommitProducerEvent(
-			ProducerStageRefundConsumed,
-			res.OrderID,
-			nil,
-			false,
-		)
-
-		return nil
+	if baseToUse <= 0 || quoteSpent <= 0 {
+		return &EntryProduceError{
+			Code: EntryProduceErrCommitInvalidExecutionBase,
+			Producer: entry.Producer, Side: fmt.Sprint(side), OrderID: res.OrderID,
+			Err: errors.New("core-first refund settlement left no producer fill"),
+		}
 	}
 
 	newLot := &Position{
