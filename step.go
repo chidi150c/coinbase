@@ -991,6 +991,23 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 			for _, res := range results {
 				if res.Err != nil {
+					// An exit that cannot start solely because its closing-side
+					// resource is unavailable is deferred, not terminal for this
+					// tick. Ordinary opposite-side producers must remain reachable
+					// so the Refund mechanism can restore that resource.
+					if marketEntryErrorCode(res.Err) ==
+						EntryProduceErrInsufficientBalance {
+						log.Printf(
+							"[WARN] exit.fanout.deferred_resource_shortage "+
+								"side=%s entry_id=%s reason=%s err=%v",
+							res.Side,
+							res.EntryOrderID,
+							res.Reason,
+							res.Err,
+						)
+						continue
+					}
+
 					failed++
 
 					// log.Printf(
