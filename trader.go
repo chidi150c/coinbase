@@ -2363,6 +2363,11 @@ type PendingReplacementRetry struct {
 
 type Case3AObligationStatus string
 
+// Resurrected Case3A obligations execute as taker orders. This allowance is
+// added to the configured taker fee when deriving the executable BBO trigger;
+// TargetPrice itself remains the immutable economic target.
+const case3AResurrectionSlippageBps = 5.0
+
 const (
 	Case3AObligationWaiting   Case3AObligationStatus = "waiting_for_exit"
 	Case3AObligationWaitingForTarget Case3AObligationStatus = "waiting_for_target"
@@ -2463,6 +2468,7 @@ func (t *Trader) case3AObligationSnapshotsLocked() []Case3AObligationSnapshot {
 // with the exit scan without reading Trader maps.
 func evaluateCase3AObligationResurrections(
 	price float64,
+	takerFeeRate float64,
 	snapshots []Case3AObligationSnapshot,
 ) []EntryDecision {
 	if price <= 0 || len(snapshots) == 0 {
@@ -2475,8 +2481,15 @@ func evaluateCase3AObligationResurrections(
 			snapshot.TargetPrice <= 0 ||
 			snapshot.RemainingBase <= 0 ||
 			snapshot.SourcePositionExists ||
-			snapshot.Status == Case3AObligationActive ||
+			(snapshot.Status != Case3AObligationActive &&
+				snapshot.Status != Case3AObligationWaitingForTarget) ||
 			snapshot.Status == Case3AObligationReconcile {
+			continue
+		}
+
+		totalBuffer := math.Max(0, takerFeeRate) +
+			case3AResurrectionSlippageBps/10000.0
+		if totalBuffer >= 1 {
 			continue
 		}
 
@@ -2484,10 +2497,10 @@ func evaluateCase3AObligationResurrections(
 		signal := Flat
 		switch snapshot.Side {
 		case SideSell:
-			qualified = price >= snapshot.TargetPrice
+			qualified = price*(1-totalBuffer) >= snapshot.TargetPrice
 			signal = Sell
 		case SideBuy:
-			qualified = price <= snapshot.TargetPrice
+			qualified = price*(1+totalBuffer) <= snapshot.TargetPrice
 			signal = Buy
 		}
 		if !qualified {
@@ -2511,7 +2524,8 @@ func evaluateCase3AObligationResurrections(
 					"origin_decision_id=%s|retry_cause=%s|attempt_count=%d|"+
 					"recovery_method=%s|recovery_remaining_usd=%.6f|"+
 					"source_order_id=%s|source_exit_order_id=%s|"+
-					"target_price=%.8f|observed_price=%.8f|remaining_base=%.8f",
+					"target_price=%.8f|observed_price=%.8f|taker_fee_rate=%.8f|"+
+					"slippage_bps=%.4f|remaining_base=%.8f",
 				snapshot.ObligationID,
 				snapshot.OriginDecisionID,
 				retryCause,
@@ -2522,6 +2536,8 @@ func evaluateCase3AObligationResurrections(
 				snapshot.SourceExitOrderID,
 				snapshot.TargetPrice,
 				price,
+				takerFeeRate,
+				case3AResurrectionSlippageBps,
 				snapshot.RemainingBase,
 			),
 			Case3AObligationID:         snapshot.ObligationID,
@@ -2634,7 +2650,10 @@ func (t *Trader) markCase3AReplacementRetryLocked(repl PendingIntent, waitForExi
 	obligation.ActiveOrderID = ""
 	obligation.ActiveDecisionID = ""
 	obligation.LastReason = reason
-	obligation.Status = Case3AObligationWaitingForTarget
+	// A failed initial Mode B attempt hands execution ownership to the durable
+	// obligation. The next resurrection evaluation may move it to
+	// waiting_for_target when the adjusted target is not currently available.
+	obligation.Status = Case3AObligationActive
 	if strings.TrimSpace(waitForExitOrderID) != "" &&
 		t.positionExistsByEntryOrderID(repl.SourceEntryOrderID) {
 		obligation.Status = Case3AObligationWaiting
@@ -2675,7 +2694,14 @@ func (t *Trader) returnCase3AObligationToTargetWaitLocked(
 	obligation.ActiveOrderID = ""
 	obligation.ActiveDecisionID = ""
 	obligation.LastReason = strings.TrimSpace(reason)
-	obligation.Status = Case3AObligationWaitingForTarget
+	// ready identifies an unsuccessful/partial initial Mode B attempt at this
+	// transition. Activate resurrection ownership first. A later failed target
+	// check or resurrected execution attempt moves active to waiting_for_target.
+	if obligation.Status == Case3AObligationReady {
+		obligation.Status = Case3AObligationActive
+	} else {
+		obligation.Status = Case3AObligationWaitingForTarget
+	}
 	obligation.UpdatedAt = time.Now().UTC()
 	delete(t.PendingReplacementRetries, id)
 }
@@ -2717,6 +2743,42 @@ func (t *Trader) reconcileCase3AObligationLocked(pending *PendingIntent) {
 	}
 }
 
+// completeCase3AObligationLocked is the terminal owner handoff for a fully
+// committed Case3A replacement. The underlay Mode B attempt remains the
+// execution owner through commit; a successful full fill leaves neither an
+// active obligation nor a resurrection retry behind.
+func (t *Trader) completeCase3AObligationLocked(
+	pending *PendingIntent,
+	orderID string,
+	completed *Case3AObligation,
+) {
+	if t == nil || pending == nil || completed == nil {
+		return
+	}
+
+	id := case3AObligationID(pending)
+	delete(t.PendingReplacementRetries, id)
+	delete(t.Case3AObligations, id)
+
+	if err := t.saveStateNoLock(); err != nil {
+		// The exchange fill committed, but durable deletion was not confirmed.
+		// Retain an in-memory reconciliation marker so this process cannot
+		// submit a duplicate replacement.
+		completed.Status = Case3AObligationReconcile
+		completed.ActiveOrderID = strings.TrimSpace(orderID)
+		completed.ActiveDecisionID = strings.TrimSpace(pending.DecisionID)
+		completed.UpdatedAt = time.Now().UTC()
+		t.Case3AObligations[id] = completed
+		log.Printf(
+			"[ERROR] Case3A.obligation.completion_save_failed "+
+				"obligation_id=%s order_id=%s err=%v",
+			id,
+			orderID,
+			err,
+		)
+	}
+}
+
 func (t *Trader) commitCase3AObligationFillLocked(
 	pending *PendingIntent,
 	orderID string,
@@ -2744,25 +2806,7 @@ func (t *Trader) commitCase3AObligationFillLocked(
 	const baseTolerance = 1e-12
 	if obligation.RemainingBase <= baseTolerance {
 		completed := *obligation
-		delete(t.PendingReplacementRetries, id)
-		delete(t.Case3AObligations, id)
-		if err := t.saveStateNoLock(); err != nil {
-			// The exchange fill committed, but durable deletion was not
-			// confirmed. Retain an in-memory reconciliation marker so this
-			// process cannot submit a duplicate replacement.
-			completed.Status = Case3AObligationReconcile
-			completed.ActiveOrderID = strings.TrimSpace(orderID)
-			completed.ActiveDecisionID = strings.TrimSpace(pending.DecisionID)
-			completed.UpdatedAt = time.Now().UTC()
-			t.Case3AObligations[id] = &completed
-			log.Printf(
-				"[ERROR] Case3A.obligation.completion_save_failed "+
-					"obligation_id=%s order_id=%s err=%v",
-				id,
-				orderID,
-				err,
-			)
-		}
+		t.completeCase3AObligationLocked(pending, orderID, &completed)
 		return
 	}
 
@@ -5895,7 +5939,10 @@ func (t *Trader) registerPendingEntry(
 			}
 		}
 
-		obligation.Status = Case3AObligationActive
+		// Registration belongs to the existing underlay Mode B attempt. Keep the
+		// associated obligation ready; active is reserved for resurrection
+		// ownership after that initial attempt is unsuccessful or partial.
+		obligation.Status = Case3AObligationReady
 		obligation.ActiveOrderID = orderID
 		obligation.ActiveDecisionID = strings.TrimSpace(entry.Intent.DecisionID)
 		obligation.AttemptCount++

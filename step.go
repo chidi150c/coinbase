@@ -256,11 +256,52 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		)
 	}
 
+	// An unsuccessful initial Mode B attempt first activates its durable
+	// obligation. If its fee-and-slippage-adjusted target is not currently
+	// available, migrate it to waiting_for_target. Both active and waiting
+	// obligations are eligible for later target evaluation; ready remains owned
+	// exclusively by the original Mode B attempt.
+	case3ATotalBuffer := math.Max(0, t.cfg.FeeRatePct/100.0) +
+		case3AResurrectionSlippageBps/10000.0
+	case3AStateChanged := false
+	for _, obligation := range t.Case3AObligations {
+		if obligation == nil ||
+			strings.TrimSpace(obligation.ActiveOrderID) != "" ||
+			t.positionExistsByEntryOrderID(obligation.SourceEntryOrderID) {
+			continue
+		}
+		if obligation.Status == Case3AObligationWaiting {
+			// The source exit has now committed; the original deferred attempt
+			// can no longer own execution, so resurrection becomes active.
+			obligation.Status = Case3AObligationActive
+			obligation.UpdatedAt = time.Now().UTC()
+			case3AStateChanged = true
+		}
+		if obligation.Status != Case3AObligationActive {
+			continue
+		}
+		qualified := case3ATotalBuffer < 1 && obligation.TargetPrice > 0
+		if obligation.Side == SideSell {
+			qualified = qualified && livePrice*(1-case3ATotalBuffer) >= obligation.TargetPrice
+		} else {
+			qualified = qualified && livePrice*(1+case3ATotalBuffer) <= obligation.TargetPrice
+		}
+		if !qualified {
+			obligation.Status = Case3AObligationWaitingForTarget
+			obligation.UpdatedAt = time.Now().UTC()
+			case3AStateChanged = true
+		}
+	}
+	if case3AStateChanged {
+		_ = t.saveStateNoLock()
+	}
+
 	case3AObligationSnapshots := t.case3AObligationSnapshotsLocked()
 	case3AResurrectionCh := make(chan []EntryDecision, 1)
 	go func(price float64, snapshots []Case3AObligationSnapshot) {
 		case3AResurrectionCh <- evaluateCase3AObligationResurrections(
 			price,
+			t.cfg.FeeRatePct/100.0,
 			snapshots,
 		)
 	}(livePrice, case3AObligationSnapshots)
@@ -1389,7 +1430,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		obligationID := strings.TrimSpace(resurrection.Case3AObligationID)
 		obligation := t.Case3AObligations[obligationID]
 		if obligation == nil ||
-			obligation.Status == Case3AObligationActive ||
+			(obligation.Status != Case3AObligationActive &&
+				obligation.Status != Case3AObligationWaitingForTarget) ||
 			obligation.Status == Case3AObligationReconcile ||
 			strings.TrimSpace(obligation.ActiveOrderID) != "" ||
 			obligation.RemainingBase <= 0 ||
@@ -1398,10 +1440,17 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			continue
 		}
 
-		priceStillQualified :=
-			(obligation.Side == SideSell && price >= obligation.TargetPrice) ||
-				(obligation.Side == SideBuy && price <= obligation.TargetPrice)
+		priceStillQualified := case3ATotalBuffer < 1 && obligation.TargetPrice > 0
+		if obligation.Side == SideSell {
+			priceStillQualified = priceStillQualified &&
+				price*(1-case3ATotalBuffer) >= obligation.TargetPrice
+		} else {
+			priceStillQualified = priceStillQualified &&
+				price*(1+case3ATotalBuffer) <= obligation.TargetPrice
+		}
 		if !priceStillQualified {
+			obligation.Status = Case3AObligationWaitingForTarget
+			obligation.UpdatedAt = time.Now().UTC()
 			continue
 		}
 
@@ -1410,7 +1459,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		resurrection.Case3ATargetPrice = obligation.TargetPrice
 		resurrection.Case3ARemainingBase = obligation.RemainingBase
 		resurrection.Case3ARecoveryRemainingUSD = obligation.RecoveryRemainingUSD
-		obligation.Status = Case3AObligationReady
+		obligation.Status = Case3AObligationActive
 		obligation.UpdatedAt = time.Now().UTC()
 		decisions = append(decisions, resurrection)
 	}

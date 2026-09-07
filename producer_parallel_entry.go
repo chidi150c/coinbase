@@ -592,34 +592,75 @@ func (t *Trader) executeProducerAllocation(
 		wantLimit = false
 	}
 
-	if strings.TrimSpace(req.Decision.Case3AObligationID) != "" {
-		// Resurrected Case3A obligations preserve their immutable economic
-		// target and continue through the established post-only wrapper. The
-		// coordinator may reduce base, but execution never changes TargetPrice.
-		limitPx := req.Decision.Case3ATargetPrice
-		baseAtLimit := base
-		if t.cfg.BaseStep > 0 {
-			baseAtLimit = math.Floor(baseAtLimit/t.cfg.BaseStep) * t.cfg.BaseStep
+	case3AResurrected := strings.TrimSpace(req.Decision.Case3AObligationID) != ""
+	if case3AResurrected {
+		// A resurrected obligation has already failed or outlived its original
+		// maker attempt. It therefore has a dedicated taker path: TargetPrice is
+		// never changed, while the executable BBO must cover taker fee plus the
+		// configured resurrection slippage allowance before submission.
+		bid, ask, bboErr := t.broker.GetBBO(ctx, t.cfg.ProductID)
+		if bboErr != nil || bid <= 0 || ask <= 0 || ask < bid {
+			if bboErr == nil {
+				bboErr = fmt.Errorf("invalid BBO bid=%.8f ask=%.8f", bid, ask)
+			}
+			t.mu.Lock()
+			t.returnCase3AObligationToTargetWaitLocked(
+				intent,
+				fmt.Sprintf("market_resurrection_bbo_unavailable|err=%v", bboErr),
+			)
+			t.persistProducerAttemptLocked(attempt)
+			t.mu.Unlock()
+			return fmt.Sprintf("HOLD producer=%s obligation_id=%s", req.Producer, req.Decision.Case3AObligationID), nil
 		}
-		if limitPx <= 0 || baseAtLimit <= 0 ||
-			baseAtLimit*limitPx < minNotional {
 
+		executablePrice := ask
+		if req.Side == SideSell {
+			executablePrice = bid
+		}
+		takerFeeRate := math.Max(0, t.cfg.FeeRatePct/100.0)
+		totalBuffer := takerFeeRate + case3AResurrectionSlippageBps/10000.0
+		targetPrice := req.Decision.Case3ATargetPrice
+		qualified := targetPrice > 0 && totalBuffer < 1
+		if req.Side == SideSell {
+			qualified = qualified && executablePrice*(1-totalBuffer) >= targetPrice
+		} else {
+			qualified = qualified && executablePrice*(1+totalBuffer) <= targetPrice
+		}
+		if !qualified {
+			t.mu.Lock()
+			t.returnCase3AObligationToTargetWaitLocked(
+				intent,
+				fmt.Sprintf(
+					"market_resurrection_target_wait|target_price=%.8f|executable_price=%.8f|taker_fee_rate=%.8f|slippage_bps=%.4f",
+					targetPrice, executablePrice, takerFeeRate, case3AResurrectionSlippageBps,
+				),
+			)
+			t.persistProducerAttemptLocked(attempt)
+			t.mu.Unlock()
+			return fmt.Sprintf("HOLD producer=%s obligation_id=%s", req.Producer, req.Decision.Case3AObligationID), nil
+		}
+
+		base = math.Min(base, req.Decision.Case3ARemainingBase)
+		if t.cfg.BaseStep > 0 {
+			base = math.Floor(base/t.cfg.BaseStep) * t.cfg.BaseStep
+		}
+		if req.Side == SideBuy {
+			quote = math.Min(quote, base*executablePrice)
+			base = quote / executablePrice
+			if t.cfg.BaseStep > 0 {
+				base = math.Floor(base/t.cfg.BaseStep) * t.cfg.BaseStep
+				quote = base * executablePrice
+			}
+		} else {
+			quote = base * executablePrice
+		}
+		if base <= 0 || quote < minNotional {
 			return "", fmt.Errorf(
-				"Case3A obligation allocation below exchange minimum: obligation_id=%s price=%.8f base=%.8f",
-				req.Decision.Case3AObligationID,
-				limitPx,
-				baseAtLimit,
+				"Case3A market resurrection allocation below exchange minimum: obligation_id=%s price=%.8f base=%.8f",
+				req.Decision.Case3AObligationID, executablePrice, base,
 			)
 		}
 
-		allocation.AllocatedBase = baseAtLimit
-		allocation.AllocatedQuote = baseAtLimit * limitPx
-		t.prepareIntentFromAllocation(
-			allocation,
-			0,
-			limitPx,
-			baseAtLimit,
-		)
 		intent.Enabled = true
 		intent.ObligationID = req.Decision.Case3AObligationID
 		intent.SourceEntryOrderID = req.Decision.Case3ASourceEntryOrderID
@@ -627,34 +668,26 @@ func (t *Trader) executeProducerAllocation(
 		intent.RecoveryNetUSD = req.Decision.Case3ARecoveryRemainingUSD
 		intent.RecoveryMethod = req.Decision.Case3ARecoveryMethod
 		intent.ProfitGateUSD = req.Decision.Case3AProfitGateUSD
-
-		orderID, err := t.startCase3AReplacement(ctx, intent, attempt)
+		intent.ProducerReason = strings.TrimSpace(fmt.Sprintf(
+			"%s|execution=market_resurrection|target_price=%.8f|executable_price=%.8f|taker_fee_rate=%.8f|slippage_bps=%.4f",
+			req.Decision.ProducerReason, targetPrice, executablePrice,
+			takerFeeRate, case3AResurrectionSlippageBps,
+		))
+		price = executablePrice
+		wantLimit = false
 
 		t.mu.Lock()
-		if err != nil {
-			t.handleCase3AReplacementError(
-				*intent,
-				intent.SourceExitOrderID,
-				err,
-			)
+		if obligation := t.Case3AObligations[intent.ObligationID]; obligation != nil {
+			obligation.Status = Case3AObligationActive
+			obligation.ActiveDecisionID = intent.DecisionID
+			obligation.ActiveOrderID = "market_submission_in_progress"
+			obligation.AttemptCount++
+			obligation.LastReason = intent.ProducerReason
+			obligation.UpdatedAt = time.Now().UTC()
+			delete(t.PendingReplacementRetries, intent.ObligationID)
+			_ = t.saveStateNoLock()
 		}
-		t.persistProducerAttemptLocked(attempt)
 		t.mu.Unlock()
-
-		if err != nil {
-			return fmt.Sprintf(
-				"HOLD producer=%s obligation_id=%s",
-				req.Producer,
-				intent.ObligationID,
-			), err
-		}
-		return fmt.Sprintf(
-			"OPEN-PENDING producer=%s side=%s order_id=%s obligation_id=%s",
-			req.Producer,
-			req.Side,
-			orderID,
-			intent.ObligationID,
-		), nil
 	}
 
 	if wantLimit {
@@ -747,7 +780,9 @@ func (t *Trader) executeProducerAllocation(
 	intent.ProfitGateUSD = req.ProfitGateUSD
 	intent.PendingCancelPolicy = req.Decision.PendingCancelPolicy
 	intent.AssignRunner = req.Decision.AssignRunner
-	intent.ProducerReason = req.Decision.ProducerReason
+	if !case3AResurrected {
+		intent.ProducerReason = req.Decision.ProducerReason
+	}
 
 	if attempt.Events == nil {
 		attempt.Events = make(map[ProducerStage]ProducerEvent)
@@ -787,6 +822,13 @@ func (t *Trader) executeProducerAllocation(
 			false,
 			true,
 		)
+		if case3AResurrected {
+			t.returnCase3AObligationToTargetWaitLocked(
+				intent,
+				fmt.Sprintf("market_resurrection_submission_failed|err=%v", err),
+			)
+			_ = t.saveStateNoLock()
+		}
 		t.mu.Unlock()
 		return fmt.Sprintf("HOLD producer=%s", req.Producer), err
 	}
@@ -794,6 +836,10 @@ func (t *Trader) executeProducerAllocation(
 		err = errors.New("market broker returned nil PlacedOrder")
 		t.mu.Lock()
 		t.addDecisionProducerEvent(intent, attempt, ProducerStageEntryFailed, EntryProduceErrBuildOrder, err, false, true)
+		if case3AResurrected {
+			t.reconcileCase3AObligationLocked(intent)
+			_ = t.saveStateNoLock()
+		}
 		t.mu.Unlock()
 		return fmt.Sprintf("HOLD producer=%s", req.Producer), err
 	}
@@ -829,6 +875,10 @@ func (t *Trader) executeProducerAllocation(
 	entry, buildErr := t.buildPendingEntry(intent, placed.ID)
 	if buildErr != nil {
 		t.addDecisionProducerEvent(intent, attempt, ProducerStageEntryFailed, buildErr.Code, buildErr.Err, buildErr.CleanupRequired, true)
+		if case3AResurrected {
+			t.reconcileCase3AObligationLocked(intent)
+			_ = t.saveStateNoLock()
+		}
 		t.mu.Unlock()
 		return fmt.Sprintf("HOLD producer=%s", req.Producer), buildErr
 	}
@@ -838,6 +888,13 @@ func (t *Trader) executeProducerAllocation(
 		Placed:         placed,
 		OrderID:        placed.ID,
 		ProducerEvents: attempt.Events,
+	}
+	case3ARecoveryAppliedUSD := 0.0
+	if case3AResurrected {
+		_, case3ARecoveryAppliedUSD = t.prepareCase3AObligationFillLocked(
+			intent,
+			placed.BaseSize,
+		)
 	}
 
 	commitErr := t.commitEntryFill(entry, &res, now, wallNow)
@@ -867,9 +924,21 @@ func (t *Trader) executeProducerAllocation(
 				attempt.Events[ProducerStageCommitFailed] = event
 			}
 		}
+		if case3AResurrected {
+			t.reconcileCase3AObligationLocked(intent)
+			_ = t.saveStateNoLock()
+		}
 		t.persistProducerAttemptLocked(attempt)
 		t.mu.Unlock()
 		return fmt.Sprintf("HOLD producer=%s", req.Producer), commitErr
+	}
+	if case3AResurrected {
+		t.commitCase3AObligationFillLocked(
+			intent,
+			placed.ID,
+			placed.BaseSize,
+			case3ARecoveryAppliedUSD,
+		)
 	}
 
 	// Preserve the one-shot recheck lifecycle: consume the side flag only
