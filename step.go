@@ -79,7 +79,7 @@ import (
 	"time"
 )
 
-const Version = 193
+const Version = 194
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -358,15 +358,28 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// 	log.Printf("[TRACE] consolidate.startup done px=%.8f minNotional=%.2f", price, minNotional)
 	// }
 
+	exitScanInternalStart := time.Now()
+	dustBuyStart := time.Now()
 	if msg, done, err := t.maybeCloseDustBasket(ctx, SideBuy, price); done || err != nil {
 		t.mu.Unlock()
 		return StepResult{Msg: msg}, err
 	}
+	log.Printf(
+		"[TRACE] hotpath.exit_scan.dust_buy stage_elapsed_ms=%d hotpath_elapsed_ms=%d",
+		time.Since(dustBuyStart).Milliseconds(),
+		time.Since(hotStart).Milliseconds(),
+	)
 
+	dustSellStart := time.Now()
 	if msg, done, err := t.maybeCloseDustBasket(ctx, SideSell, price); done || err != nil {
 		t.mu.Unlock()
 		return StepResult{Msg: msg}, err
 	}
+	log.Printf(
+		"[TRACE] hotpath.exit_scan.dust_sell stage_elapsed_ms=%d hotpath_elapsed_ms=%d",
+		time.Since(dustSellStart).Milliseconds(),
+		time.Since(hotStart).Milliseconds(),
+	)
 
 	// [TRACE] hotpath.after_dust intentionally disabled.
 
@@ -386,6 +399,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	lsb := len(t.book(SideBuy).Lots)
 	lss := len(t.book(SideSell).Lots)
 	if (lsb > 0) || (lss > 0) {
+		lotScanStart := time.Now()
 
 		nearestTakeBuy := 0.0
 		nearestTakeSell := 0.0
@@ -974,6 +988,15 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			t.mu.Unlock()
 			return StepResult{Msg: msg}, err
 		}
+		log.Printf(
+			"[TRACE] hotpath.exit_scan.lot_evaluation "+
+				"stage_elapsed_ms=%d hotpath_elapsed_ms=%d buy_lots=%d sell_lots=%d "+
+				"stop_l2=%d stop_l1=%d profit_l2=%d profit_l1=%d",
+			time.Since(lotScanStart).Milliseconds(),
+			time.Since(hotStart).Milliseconds(),
+			lsb, lss,
+			len(stopL2), len(stopL1), len(profitL2), len(profitL1),
+		)
 
 		// Build the fan-out set while preserving the existing selection policy:
 		//
@@ -1005,6 +1028,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}
 
 		if len(selected) > 0 {
+			fanoutStart := time.Now()
 			// log.Printf(
 			// "[TRACE] exit.fanout.batch candidates=%d stop_l2=%d profit_l2=%d stop_l1=%d profit_l1=%d",
 			// len(selected),
@@ -1022,6 +1046,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				ctx,
 				livePrice,
 				selected,
+				hotStart,
+			)
+			log.Printf(
+				"[TRACE] hotpath.exit_scan.fanout_complete "+
+					"stage_elapsed_ms=%d hotpath_elapsed_ms=%d candidates=%d results=%d",
+				time.Since(fanoutStart).Milliseconds(),
+				time.Since(hotStart).Milliseconds(),
+				len(selected), len(results),
 			)
 
 			var (
@@ -1114,6 +1146,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		t.nearestIdxSell = sellNearestIdx
 
 	}
+	log.Printf(
+		"[TRACE] hotpath.exit_scan.complete stage_elapsed_ms=%d hotpath_elapsed_ms=%d",
+		time.Since(exitScanInternalStart).Milliseconds(),
+		time.Since(hotStart).Milliseconds(),
+	)
 
 	log.Printf(
 		"[TRACE] hotpath.after_exit_scan elapsed_ms=%d",

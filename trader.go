@@ -2841,6 +2841,7 @@ func (t *Trader) fanOutExits(
 	ctx context.Context,
 	livePrice float64,
 	cands []exitCandidate,
+	hotStart time.Time,
 ) []exitFanoutResult {
 	if len(cands) == 0 {
 		return nil
@@ -2856,6 +2857,7 @@ func (t *Trader) fanOutExits(
 
 		go func() {
 			defer wg.Done()
+			workerStart := time.Now()
 
 			// log.Printf(
 			// "[TRACE] exit.fanout.start side=%s idx_snapshot=%d entry_id=%s reason=%s net=%.6f",
@@ -2873,6 +2875,18 @@ func (t *Trader) fanOutExits(
 				cand.entryOrderID,
 				cand.reason,
 				cand.decision,
+				hotStart,
+			)
+			log.Printf(
+				"[TRACE] hotpath.exit_scan.fanout_worker "+
+					"side=%s entry_id=%s acted=%t err=%t "+
+					"stage_elapsed_ms=%d hotpath_elapsed_ms=%d",
+				cand.side,
+				cand.entryOrderID,
+				acted,
+				err != nil,
+				time.Since(workerStart).Milliseconds(),
+				time.Since(hotStart).Milliseconds(),
 			)
 
 			resultsCh <- exitFanoutResult{
@@ -2907,6 +2921,7 @@ func (t *Trader) closeLotByEntryID(
 	entryOrderID string,
 	exitReason string,
 	exitDecision string,
+	hotStart time.Time,
 ) (string, bool, error) {
 	entryOrderID = strings.TrimSpace(entryOrderID)
 	if entryOrderID == "" {
@@ -2917,7 +2932,16 @@ func (t *Trader) closeLotByEntryID(
 		)
 	}
 
+	lockWaitStart := time.Now()
 	t.mu.Lock()
+	log.Printf(
+		"[TRACE] hotpath.exit_scan.lock_acquired "+
+			"side=%s entry_id=%s stage_elapsed_ms=%d hotpath_elapsed_ms=%d",
+		side,
+		entryOrderID,
+		time.Since(lockWaitStart).Milliseconds(),
+		time.Since(hotStart).Milliseconds(),
+	)
 
 	idx := t.findLotIndexByEntryIDLocked(side, entryOrderID)
 	if idx < 0 {
@@ -2939,6 +2963,7 @@ func (t *Trader) closeLotByEntryID(
 		idx,
 		exitReason,
 		exitDecision,
+		hotStart,
 	)
 
 	t.mu.Unlock()
@@ -2953,6 +2978,7 @@ func (t *Trader) closeLot(
 	localIdx int,
 	exitReason string,
 	exitDecision string,
+	hotStart time.Time,
 ) (string, bool, error) {
 
 	//Prepare and validate the lot for closing
@@ -3226,7 +3252,16 @@ func (t *Trader) closeLot(
 
 						normalBase := baseRequested
 
+						spareLookupStart := time.Now()
 						freshSpareBase, freshBaseStep, err := t.currentSpareBaseLocked(ctx)
+						log.Printf(
+							"[TRACE] hotpath.exit_scan.case3a_spare_lookup "+
+								"entry_id=%s stage_elapsed_ms=%d hotpath_elapsed_ms=%d err=%t",
+							entryOrderID,
+							time.Since(spareLookupStart).Milliseconds(),
+							time.Since(hotStart).Milliseconds(),
+							err != nil,
+						)
 						if err != nil {
 							// log.Printf("[TRACE] Case3A.spare_base.failed err=%v", err)
 							freshSpareBase = 0
@@ -3361,10 +3396,20 @@ func (t *Trader) closeLot(
 			*/
 			t.mu.Unlock()
 
+			modeAStart := time.Now()
 			oid, err := t.startCase3AReplacement(
 				ctx,
 				&repl,
 				attempt,
+			)
+			log.Printf(
+				"[TRACE] hotpath.exit_scan.case3a_mode_a_submission "+
+					"entry_id=%s replacement_order_id=%s stage_elapsed_ms=%d hotpath_elapsed_ms=%d err=%t",
+				entryOrderID,
+				oid,
+				time.Since(modeAStart).Milliseconds(),
+				time.Since(hotStart).Milliseconds(),
+				err != nil,
 			)
 
 			t.mu.Lock()
@@ -3506,7 +3551,17 @@ func (t *Trader) closeLot(
 			}
 		}
 
+		makerExitStart := time.Now()
 		err := t.startPendingMakerExit(ctx, lot.Side, lot.EntryOrderID, side, exitReason, exitDecision, limitPx, baseRequested)
+		log.Printf(
+			"[TRACE] hotpath.exit_scan.maker_exit_submission "+
+				"entry_id=%s close_side=%s stage_elapsed_ms=%d hotpath_elapsed_ms=%d err=%t",
+			entryOrderID,
+			closeSide,
+			time.Since(makerExitStart).Milliseconds(),
+			time.Since(hotStart).Milliseconds(),
+			err != nil,
+		)
 		t.mu.Lock()
 
 		waitID := ""
@@ -3600,10 +3655,20 @@ func (t *Trader) closeLot(
 
 			t.mu.Unlock()
 
+			modeBStart := time.Now()
 			_, replErr := t.startCase3AReplacement(
 				ctx,
 				&repl,
 				attempt,
+			)
+			log.Printf(
+				"[TRACE] hotpath.exit_scan.case3a_mode_b_submission "+
+					"entry_id=%s source_exit_order_id=%s stage_elapsed_ms=%d hotpath_elapsed_ms=%d err=%t",
+				entryOrderID,
+				repl.SourceExitOrderID,
+				time.Since(modeBStart).Milliseconds(),
+				time.Since(hotStart).Milliseconds(),
+				replErr != nil,
 			)
 
 			t.mu.Lock()
@@ -3662,7 +3727,17 @@ func (t *Trader) closeLot(
 	// )
 
 	var err error
+	marketExitStart := time.Now()
 	placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote)
+	log.Printf(
+		"[TRACE] hotpath.exit_scan.market_exit_submission "+
+			"entry_id=%s close_side=%s stage_elapsed_ms=%d hotpath_elapsed_ms=%d err=%t",
+		entryOrderID,
+		closeSide,
+		time.Since(marketExitStart).Milliseconds(),
+		time.Since(hotStart).Milliseconds(),
+		err != nil,
+	)
 
 	// log.Printf("[KPI] taker.exit.done side=%s base=%.8f quote_est=%.2f reason=%s", closeSide, baseRequested, quote, exitReason)
 
@@ -3744,10 +3819,20 @@ func (t *Trader) closeLot(
 
 		t.mu.Unlock()
 
+		modeBStart := time.Now()
 		_, replErr := t.startCase3AReplacement(
 			ctx,
 			&repl,
 			attempt,
+		)
+		log.Printf(
+			"[TRACE] hotpath.exit_scan.case3a_mode_b_submission "+
+				"entry_id=%s source_exit_order_id=%s stage_elapsed_ms=%d hotpath_elapsed_ms=%d err=%t",
+			entryOrderID,
+			repl.SourceExitOrderID,
+			time.Since(modeBStart).Milliseconds(),
+			time.Since(hotStart).Milliseconds(),
+			replErr != nil,
 		)
 
 		t.mu.Lock()
@@ -3816,6 +3901,7 @@ func (t *Trader) closeLot(
 		wasNewest = localIdx == len(book.Lots)-1
 	}
 
+	applyExitStart := time.Now()
 	msg, err := t.applyFilledExitLocked(
 		livePrice,
 		priceExec,
@@ -3830,6 +3916,15 @@ func (t *Trader) closeLot(
 		commissionUSD,
 		minNotional,
 		wasNewest,
+	)
+	log.Printf(
+		"[TRACE] hotpath.exit_scan.apply_filled_exit "+
+			"entry_id=%s exit_order_id=%s stage_elapsed_ms=%d hotpath_elapsed_ms=%d err=%t",
+		entryOrderID,
+		placedOrderID(placed),
+		time.Since(applyExitStart).Milliseconds(),
+		time.Since(hotStart).Milliseconds(),
+		err != nil,
 	)
 
 	return msg, true, err
