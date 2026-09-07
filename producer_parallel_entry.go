@@ -640,18 +640,23 @@ func (t *Trader) executeProducerAllocation(
 			return fmt.Sprintf("HOLD producer=%s obligation_id=%s", req.Producer, req.Decision.Case3AObligationID), nil
 		}
 
-		base = math.Min(base, req.Decision.Case3ARemainingBase)
-		if t.cfg.BaseStep > 0 {
-			base = math.Floor(base/t.cfg.BaseStep) * t.cfg.BaseStep
-		}
+		case3ACoreBase := math.Min(
+			math.Min(req.CoreBase, req.Decision.Case3ARemainingBase),
+			base,
+		)
 		if req.Side == SideBuy {
-			quote = math.Min(quote, base*executablePrice)
+			coreQuoteAtExecution := case3ACoreBase * executablePrice
+			quote = math.Min(quote, coreQuoteAtExecution+refundUSD)
 			base = quote / executablePrice
 			if t.cfg.BaseStep > 0 {
 				base = math.Floor(base/t.cfg.BaseStep) * t.cfg.BaseStep
 				quote = base * executablePrice
 			}
 		} else {
+			base = case3ACoreBase + refundUSD/executablePrice
+			if t.cfg.BaseStep > 0 {
+				base = math.Floor(base/t.cfg.BaseStep) * t.cfg.BaseStep
+			}
 			quote = base * executablePrice
 		}
 		if base <= 0 || quote < minNotional {
@@ -668,9 +673,14 @@ func (t *Trader) executeProducerAllocation(
 		intent.RecoveryNetUSD = req.Decision.Case3ARecoveryRemainingUSD
 		intent.RecoveryMethod = req.Decision.Case3ARecoveryMethod
 		intent.ProfitGateUSD = req.Decision.Case3AProfitGateUSD
+		intent.RefundCoreQuoteUSD = case3ACoreBase * executablePrice
+		resurrectionReason := strings.TrimSpace(intent.ProducerReason)
+		if resurrectionReason == "" {
+			resurrectionReason = req.Decision.ProducerReason
+		}
 		intent.ProducerReason = strings.TrimSpace(fmt.Sprintf(
 			"%s|execution=market_resurrection|target_price=%.8f|executable_price=%.8f|taker_fee_rate=%.8f|slippage_bps=%.4f",
-			req.Decision.ProducerReason, targetPrice, executablePrice,
+			resurrectionReason, targetPrice, executablePrice,
 			takerFeeRate, case3AResurrectionSlippageBps,
 		))
 		price = executablePrice
@@ -890,10 +900,32 @@ func (t *Trader) executeProducerAllocation(
 		ProducerEvents: attempt.Events,
 	}
 	case3ARecoveryAppliedUSD := 0.0
+	case3AFilledBase := placed.BaseSize
 	if case3AResurrected {
+		// Refund is extra execution conveyed by Case3A, not Case3A recovery
+		// quantity. Mirror commitEntryFill's core-first split so only the base
+		// retained for the Case3A lot reduces the Case3A obligation.
+		filledQuote := placed.QuoteSpent
+		if filledQuote <= 0 {
+			filledQuote = placed.BaseSize * placed.Price
+		}
+		refundFilledQuote := math.Max(
+			0,
+			filledQuote-intent.RefundCoreQuoteUSD,
+		)
+		refundFilledQuote = math.Min(
+			refundFilledQuote,
+			intent.RefundPortionUSD,
+		)
+		if placed.Price > 0 {
+			case3AFilledBase = math.Max(
+				0,
+				placed.BaseSize-refundFilledQuote/placed.Price,
+			)
+		}
 		_, case3ARecoveryAppliedUSD = t.prepareCase3AObligationFillLocked(
 			intent,
-			placed.BaseSize,
+			case3AFilledBase,
 		)
 	}
 
@@ -936,7 +968,7 @@ func (t *Trader) executeProducerAllocation(
 		t.commitCase3AObligationFillLocked(
 			intent,
 			placed.ID,
-			placed.BaseSize,
+			case3AFilledBase,
 			case3ARecoveryAppliedUSD,
 		)
 	}
@@ -1188,13 +1220,30 @@ func (t *Trader) processParallelProducerEntriesLocked(
 
 		if strings.TrimSpace(d.Case3AObligationID) != "" {
 			// A resurrected Case3A obligation owns exact remaining economics.
-			// Replace ordinary risk/ramp/refund sizing before coordination while
-			// retaining the common resource-allocation machinery.
-			req.RequestedBase = d.Case3ARemainingBase
-			req.RequestedQuote = d.Case3ARemainingBase * price
-			req.CoreBase = req.RequestedBase
-			req.CoreQuote = req.RequestedQuote
-			req.RefundRequestedUSD = 0
+			// Its remaining base is the producer core. Preserve the independently
+			// calculated Refund request as additional sizing; allocation and commit
+			// continue to treat Case3A core first and Refund second.
+			refundRequestedUSD := req.RefundRequestedUSD
+			req.CoreBase = d.Case3ARemainingBase
+			req.CoreQuote = req.CoreBase * price
+			req.RequestedBase = req.CoreBase
+			req.RequestedQuote = req.CoreQuote
+			if d.Signal == Buy && refundRequestedUSD > 0 {
+				extraQuote := refundRequestedUSD
+				if snapshot.QuoteStep > 0 {
+					extraQuote = snapDownResource(extraQuote, snapshot.QuoteStep)
+				}
+				req.RequestedQuote += extraQuote
+				req.RequestedBase = req.RequestedQuote / price
+			} else if d.Signal == Sell && refundRequestedUSD > 0 {
+				extraBase := refundRequestedUSD / price
+				if snapshot.BaseStep > 0 {
+					extraBase = snapDownResource(extraBase, snapshot.BaseStep)
+				}
+				req.RequestedBase += extraBase
+				req.RequestedQuote = req.RequestedBase * price
+			}
+			req.RefundRequestedUSD = refundRequestedUSD
 			req.ConfidenceMult = 1
 			req.ProfitGateUSD = d.Case3AProfitGateUSD
 			req.EntryMethod = string(EntryProducerCase3AReplacement)
