@@ -79,7 +79,7 @@ import (
 	"time"
 )
 
-const Version = 191
+const Version = 192
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -256,8 +256,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		)
 	}
 
-	// An unsuccessful initial Mode B attempt first activates its durable
-	// obligation. If its fee-and-slippage-adjusted target is not currently
+	// An unsuccessful initial Case3A attempt activates its durable obligation
+	// after any required source exit. If its fee-and-slippage-adjusted target is not currently
 	// available, migrate it to waiting_for_target. Both active and waiting
 	// obligations are eligible for later target evaluation; ready remains owned
 	// exclusively by the original Mode B attempt.
@@ -271,8 +271,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			continue
 		}
 		if obligation.Status == Case3AObligationWaiting {
-			// The source exit has now committed; the original deferred attempt
-			// can no longer own execution, so resurrection becomes active.
+			// The source exit has now committed; the original Mode A or Mode B
+			// attempt can no longer own execution, so resurrection becomes active.
 			obligation.Status = Case3AObligationActive
 			obligation.UpdatedAt = time.Now().UTC()
 			case3AStateChanged = true

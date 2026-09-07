@@ -2694,12 +2694,19 @@ func (t *Trader) returnCase3AObligationToTargetWaitLocked(
 	obligation.ActiveOrderID = ""
 	obligation.ActiveDecisionID = ""
 	obligation.LastReason = strings.TrimSpace(reason)
-	// ready identifies an unsuccessful/partial initial Mode B attempt at this
-	// transition. Activate resurrection ownership first. A later failed target
-	// check or resurrected execution attempt moves active to waiting_for_target.
+	// ready identifies an accepted initial Case3A attempt (Mode A or Mode B)
+	// that has now failed out unfilled or only partially filled. The obligation
+	// takes over the remainder, but it cannot execute while the source position
+	// still exists: wait for that exit first, then step() promotes it to active.
 	if obligation.Status == Case3AObligationReady {
-		obligation.Status = Case3AObligationActive
+		if t.positionExistsByEntryOrderID(obligation.SourceEntryOrderID) {
+			obligation.Status = Case3AObligationWaiting
+		} else {
+			obligation.Status = Case3AObligationActive
+		}
 	} else {
+		// This was already a resurrected attempt. A definite zero-fill failure
+		// returns the active obligation to its target wait.
 		obligation.Status = Case3AObligationWaitingForTarget
 	}
 	obligation.UpdatedAt = time.Now().UTC()
@@ -5939,9 +5946,10 @@ func (t *Trader) registerPendingEntry(
 			}
 		}
 
-		// Registration belongs to the existing underlay Mode B attempt. Keep the
-		// associated obligation ready; active is reserved for resurrection
-		// ownership after that initial attempt is unsuccessful or partial.
+		// Registration belongs to the existing underlay Case3A attempt, whether
+		// Mode A or Mode B. Keep the associated obligation ready; active is
+		// reserved for resurrection ownership after that accepted initial
+		// attempt is unsuccessful or partial.
 		obligation.Status = Case3AObligationReady
 		obligation.ActiveOrderID = orderID
 		obligation.ActiveDecisionID = strings.TrimSpace(entry.Intent.DecisionID)
