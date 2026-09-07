@@ -107,9 +107,9 @@ const (
 	RefundOperationEntry RefundOperationKind = "entry"
 	RefundOperationExit  RefundOperationKind = "exit"
 
-	RefundObligationWaiting    RefundObligationStatus = "waiting_for_service"
-	RefundObligationReserved   RefundObligationStatus = "reserved"
-	RefundObligationReconcile  RefundObligationStatus = "reconciliation"
+	RefundObligationWaiting   RefundObligationStatus = "waiting_for_service"
+	RefundObligationReserved  RefundObligationStatus = "reserved"
+	RefundObligationReconcile RefundObligationStatus = "reconciliation"
 )
 
 // RefundObligation is the durable, producer-independent identity of one
@@ -190,18 +190,19 @@ type BotState struct {
 	Case11BReferencePrice float64 `json:"case11b_reference_price,omitempty"`
 	Case13AReferencePrice float64 `json:"case13a_reference_price,omitempty"`
 
-	PendingExits            map[string]*PendingExit
-	PendingEntries          map[string]*PendingEntry
-	MarketRegime            MarketRegime `json:"market_regime,omitempty"`
-	RegimeUntil             time.Time    `json:"regime_until,omitempty"`
-	FreshLowAt              time.Time    `json:"recent_low_break_at,omitempty"`
-	FreshHighAt             time.Time    `json:"recent_high_break_at,omitempty"`
-	RegimeMultiplier        float64
-	RecoveryDebtUSD         float64
-	DustBuyLots             []*Position
-	DustSellLots            []*Position
+	PendingExits              map[string]*PendingExit
+	PendingEntries            map[string]*PendingEntry
+	MarketRegime              MarketRegime `json:"market_regime,omitempty"`
+	RegimeUntil               time.Time    `json:"regime_until,omitempty"`
+	FreshLowAt                time.Time    `json:"recent_low_break_at,omitempty"`
+	FreshHighAt               time.Time    `json:"recent_high_break_at,omitempty"`
+	RegimeMultiplier          float64
+	RecoveryDebtUSD           float64
+	DustBuyLots               []*Position
+	DustSellLots              []*Position
 	Case3AObligations         map[string]*Case3AObligation
 	PendingReplacementRetries map[string]PendingReplacementRetry
+	ResourceQuarantines       map[string]ProducerResourceReservation `json:"resource_quarantines,omitempty"`
 }
 
 type OpenResult struct {
@@ -332,11 +333,11 @@ type Trader struct {
 	// Parallel allocation may aggregate multiple same-side shortfalls inside one
 	// coordinator tick, but publication remains replacement assignment, never +=
 	// across ticks.
-	refundBuyUSD  float64
-	refundSellUSD float64
+	refundBuyUSD      float64
+	refundSellUSD     float64
 	RefundObligations map[string]*RefundObligation
-	SpareBuyUSD   float64
-	SpareSellUSD  float64
+	SpareBuyUSD       float64
+	SpareSellUSD      float64
 
 	MarketRegime MarketRegime
 	RegimeUntil  time.Time
@@ -347,13 +348,14 @@ type Trader struct {
 	FreshLowAt  time.Time
 	FreshHighAt time.Time
 
-	RegimeMultiplier        float64
-	RecoveryDebtUSD         float64
-	dustBuyLots             []*Position
-	dustSellLots            []*Position
+	RegimeMultiplier          float64
+	RecoveryDebtUSD           float64
+	dustBuyLots               []*Position
+	dustSellLots              []*Position
 	Case3AObligations         map[string]*Case3AObligation
 	PendingReplacementRetries map[string]PendingReplacementRetry
-	balanceMu               sync.RWMutex
+	ResourceQuarantines       map[string]ProducerResourceReservation
+	balanceMu                 sync.RWMutex
 
 	balanceSnapshot balanceSnapshot
 
@@ -368,7 +370,8 @@ type Trader struct {
 	pendingEntries map[string]*PendingEntry
 	pendingExits   map[string]*PendingExit
 
-	// Step-local producer resource reservations.
+	// resourceManager is the single owner of step-local producer resource
+	// reservations and producer allocation-plan calculation.
 	//
 	// The parallel producer coordinator reserves approved allocations here
 	// before releasing t.mu for broker I/O. This prevents two independently
@@ -378,7 +381,7 @@ type Trader struct {
 	// registered, that PendingEntry becomes the authoritative reservation. On
 	// pre-registration failure the coordinator releases the transient record.
 	// Key = DecisionID.
-	entryResourceReservations map[string]ProducerResourceReservation
+	resourceManager *ResourceManager
 
 	producerHistory map[EntryProducer]*ProducerHistory
 
@@ -420,9 +423,8 @@ func NewTrader(cfg Config, broker Broker) *Trader {
 		RefundObligations: make(
 			map[string]*RefundObligation,
 		),
-		entryResourceReservations: make(
-			map[string]ProducerResourceReservation,
-		),
+		resourceManager: newResourceManager(),
+		ResourceQuarantines: make(map[string]ProducerResourceReservation),
 
 		stateApplyCh:        make(chan func(*Trader), 128),
 		MarketRegime:        RegimeNormal,
@@ -1595,25 +1597,26 @@ func (t *Trader) snapshotStateLocked() BotState {
 		EquityStageSell: t.equityStageSell,
 		Exits:           t.lastExits,
 
-		PendingRecheckBuy:       t.pendingRecheckBuy,
-		PendingRecheckSell:      t.pendingRecheckSell,
-		RefundBuyUSD:            t.refundBuyUSD,
-		RefundSellUSD:           t.refundSellUSD,
-		RefundObligations:       t.RefundObligations,
-		SpareBuyUSD:             t.SpareBuyUSD,
-		SpareSellUSD:            t.SpareSellUSD,
-		PendingExits:            t.pendingExits,
-		PendingEntries:          t.pendingEntries,
-		MarketRegime:            t.MarketRegime,
-		RegimeUntil:             t.RegimeUntil,
-		FreshLowAt:              t.FreshLowAt,
-		FreshHighAt:             t.FreshHighAt,
-		RegimeMultiplier:        t.RegimeMultiplier,
-		RecoveryDebtUSD:         t.RecoveryDebtUSD,
-		DustBuyLots:             append([]*Position(nil), t.dustBuyLots...),
-		DustSellLots:            append([]*Position(nil), t.dustSellLots...),
+		PendingRecheckBuy:         t.pendingRecheckBuy,
+		PendingRecheckSell:        t.pendingRecheckSell,
+		RefundBuyUSD:              t.refundBuyUSD,
+		RefundSellUSD:             t.refundSellUSD,
+		RefundObligations:         t.RefundObligations,
+		SpareBuyUSD:               t.SpareBuyUSD,
+		SpareSellUSD:              t.SpareSellUSD,
+		PendingExits:              t.pendingExits,
+		PendingEntries:            t.pendingEntries,
+		MarketRegime:              t.MarketRegime,
+		RegimeUntil:               t.RegimeUntil,
+		FreshLowAt:                t.FreshLowAt,
+		FreshHighAt:               t.FreshHighAt,
+		RegimeMultiplier:          t.RegimeMultiplier,
+		RecoveryDebtUSD:           t.RecoveryDebtUSD,
+		DustBuyLots:               append([]*Position(nil), t.dustBuyLots...),
+		DustSellLots:              append([]*Position(nil), t.dustSellLots...),
 		Case3AObligations:         t.Case3AObligations,
 		PendingReplacementRetries: t.PendingReplacementRetries,
+		ResourceQuarantines:       t.ResourceQuarantines,
 	}
 }
 
@@ -1796,6 +1799,10 @@ func (t *Trader) loadState() error {
 	t.pendingEntries = st.PendingEntries
 	if t.pendingEntries == nil {
 		t.pendingEntries = make(map[string]*PendingEntry)
+	}
+	t.ResourceQuarantines = st.ResourceQuarantines
+	if t.ResourceQuarantines == nil {
+		t.ResourceQuarantines = make(map[string]ProducerResourceReservation)
 	}
 
 	t.refundBuyUSD = st.RefundBuyUSD
@@ -2369,11 +2376,11 @@ type Case3AObligationStatus string
 const case3AResurrectionSlippageBps = 5.0
 
 const (
-	Case3AObligationWaiting   Case3AObligationStatus = "waiting_for_exit"
+	Case3AObligationWaiting          Case3AObligationStatus = "waiting_for_exit"
 	Case3AObligationWaitingForTarget Case3AObligationStatus = "waiting_for_target"
-	Case3AObligationReady     Case3AObligationStatus = "ready"
-	Case3AObligationActive    Case3AObligationStatus = "active"
-	Case3AObligationReconcile Case3AObligationStatus = "reconcile"
+	Case3AObligationReady            Case3AObligationStatus = "ready"
+	Case3AObligationActive           Case3AObligationStatus = "active"
+	Case3AObligationReconcile        Case3AObligationStatus = "reconcile"
 )
 
 // Case3AObligation is the durable economic requirement created by a
@@ -2512,13 +2519,13 @@ func evaluateCase3AObligationResurrections(
 			retryCause = "cancelled_unfilled_target_reached"
 		}
 		decisions = append(decisions, EntryDecision{
-			Signal:           signal,
-			Raw:              signal,
-			Producer:         EntryProducerCase3AReplacement,
-			ProducerPriority: producerPriorityFor(EntryProducerCase3AReplacement),
-			Confidence:       1,
+			Signal:               signal,
+			Raw:                  signal,
+			Producer:             EntryProducerCase3AReplacement,
+			ProducerPriority:     producerPriorityFor(EntryProducerCase3AReplacement),
+			Confidence:           1,
 			ProfitGateMultiplier: 1,
-			PendingCancelPolicy: PendingSignalCancelDisabled,
+			PendingCancelPolicy:  PendingSignalCancelDisabled,
 			ProducerReason: fmt.Sprintf(
 				"case3A_obligation_resurrected|obligation_id=%s|"+
 					"origin_decision_id=%s|retry_cause=%s|attempt_count=%d|"+
@@ -2713,9 +2720,10 @@ func (t *Trader) returnCase3AObligationToTargetWaitLocked(
 	delete(t.PendingReplacementRetries, id)
 }
 
-// prepareCase3AObligationFillLocked apportions the recovery balance to the
-// exchange quantity about to be committed. This prevents a partial fill and
-// its later retry from each carrying the full recovery amount.
+// prepareCase3AObligationFillLocked apportions both the recovery balance and
+// profit gate to the Case3A core quantity about to be committed. This prevents
+// a partial fill and its later resurrection from each carrying the full
+// recovery amount or the full original profit gate.
 func (t *Trader) prepareCase3AObligationFillLocked(
 	pending *PendingIntent,
 	filledBase float64,
@@ -2731,11 +2739,26 @@ func (t *Trader) prepareCase3AObligationFillLocked(
 	}
 
 	fill := math.Min(filledBase, obligation.RemainingBase)
-	recoveryForFill := obligation.RecoveryRemainingUSD
+	fillRatio := 1.0
 	if fill < obligation.RemainingBase {
-		recoveryForFill *= fill / obligation.RemainingBase
+		fillRatio = fill / obligation.RemainingBase
+	}
+
+	recoveryForFill := obligation.RecoveryRemainingUSD
+	profitGateForFill := obligation.ProfitGateUSD
+	if profitGateForFill <= 0 {
+		profitGateForFill = pending.ProfitGateUSD
+		if profitGateForFill <= 0 {
+			profitGateForFill = t.cfg.ProfitGateUSD
+		}
+		obligation.ProfitGateUSD = profitGateForFill
+	}
+	if fillRatio < 1 {
+		recoveryForFill *= fillRatio
+		profitGateForFill *= fillRatio
 	}
 	pending.RecoveryNetUSD = recoveryForFill
+	pending.ProfitGateUSD = profitGateForFill
 	return obligation, recoveryForFill
 }
 
@@ -2806,6 +2829,13 @@ func (t *Trader) commitCase3AObligationFillLocked(
 		0,
 		obligation.RecoveryRemainingUSD-recoveryAppliedUSD,
 	)
+	// prepareCase3AObligationFillLocked assigned this committed core fill its
+	// proportional gate. Retain only the unfilled gate on the obligation so a
+	// later resurrection cannot receive the complete original gate again.
+	obligation.ProfitGateUSD = math.Max(
+		0,
+		obligation.ProfitGateUSD-pending.ProfitGateUSD,
+	)
 	obligation.ActiveOrderID = ""
 	obligation.ActiveDecisionID = ""
 	obligation.UpdatedAt = time.Now().UTC()
@@ -2820,10 +2850,12 @@ func (t *Trader) commitCase3AObligationFillLocked(
 	t.returnCase3AObligationToTargetWaitLocked(
 		pending,
 		fmt.Sprintf(
-			"partial_entry_fill_remaining|order_id=%s|filled_base=%.8f|remaining_base=%.8f",
+			"partial_entry_fill_remaining|order_id=%s|filled_base=%.8f|remaining_base=%.8f|remaining_recovery_usd=%.8f|remaining_profit_gate_usd=%.8f",
 			strings.TrimSpace(orderID),
 			filledBase,
 			obligation.RemainingBase,
+			obligation.RecoveryRemainingUSD,
+			obligation.ProfitGateUSD,
 		),
 	)
 }
@@ -3502,8 +3534,7 @@ func (t *Trader) closeLot(
 		strings.TrimSpace(lot.EntryOrderID),
 		closeSide,
 	)
-	if obligation := t.RefundObligations[refundExitObligationID];
-		obligation != nil && time.Now().UTC().Before(obligation.NextRetryAt) {
+	if obligation := t.RefundObligations[refundExitObligationID]; obligation != nil && time.Now().UTC().Before(obligation.NextRetryAt) {
 		return fmt.Sprintf(
 			"EXIT-DEFER-REFUND side=%s entry_id=%s remaining_usd=%.8f retry_at=%s",
 			lot.Side,
@@ -3591,14 +3622,14 @@ func (t *Trader) closeLot(
 					closeSide,
 				)
 				t.upsertRefundObligationLocked(RefundObligation{
-					ID: obligationID,
-					OperationKind: RefundOperationExit,
-					SourceOrderID: strings.TrimSpace(lot.EntryOrderID),
+					ID:             obligationID,
+					OperationKind:  RefundOperationExit,
+					SourceOrderID:  strings.TrimSpace(lot.EntryOrderID),
 					SourceProducer: lot.Producer,
-					ShortageSide: closeSide,
-					OriginalUSD: requiredUSD,
-					RemainingUSD: requiredUSD,
-					NextRetryAt: time.Now().UTC().Add(30 * time.Second),
+					ShortageSide:   closeSide,
+					OriginalUSD:    requiredUSD,
+					RemainingUSD:   requiredUSD,
+					NextRetryAt:    time.Now().UTC().Add(30 * time.Second),
 					Reason: fmt.Sprintf(
 						"exit_funding_shortfall|source_entry_id=%s|close_side=%s|required_quote_usd=%.8f|exchange_error=%q",
 						lot.EntryOrderID,
@@ -4659,7 +4690,9 @@ func (t *Trader) maybeCloseDustBasket(ctx context.Context, side OrderSide, liveP
 // the coordinator used when allocating). Base is the SELL-side base commitment.
 // Only the field appropriate to Side is expected to be non-zero.
 //
-// t.mu protects this map and its records.
+// ResourceManager's actor loop owns the reservation collection. Trader.mu is
+// no longer the reservation lock; callers retain it only for surrounding
+// Trader state invariants during this first migration phase.
 type ProducerResourceReservation struct {
 	DecisionID string
 	Producer   EntryProducer
@@ -4667,10 +4700,13 @@ type ProducerResourceReservation struct {
 	QuoteUSD   float64
 	Base       float64
 	CreatedAt  time.Time
+	Kind       ResourceReservationKind
+	Informational bool
 }
 
-// reserveProducerResourcesLocked atomically installs one step-local resource
-// reservation. Caller must hold t.mu.
+// reserveProducerResourcesLocked validates and delegates one step-local
+// reservation to ResourceManager. Caller currently holds t.mu for surrounding
+// Trader invariants, but ResourceManager is the sole reservation authority.
 //
 // A DecisionID may reserve only once. This makes coordinator retries/fan-out
 // mistakes fail closed instead of silently double-reserving the same decision.
@@ -4710,26 +4746,17 @@ func (t *Trader) reserveProducerResourcesLocked(
 		)
 	}
 
-	if t.entryResourceReservations == nil {
-		t.entryResourceReservations =
-			make(map[string]ProducerResourceReservation)
-	}
-	if _, exists := t.entryResourceReservations[reservation.DecisionID]; exists {
-		return fmt.Errorf(
-			"reserveProducerResourcesLocked: duplicate DecisionID=%s",
-			reservation.DecisionID,
-		)
-	}
-
 	if reservation.CreatedAt.IsZero() {
 		reservation.CreatedAt = time.Now().UTC()
 	}
-	t.entryResourceReservations[reservation.DecisionID] = reservation
-	return nil
+	if t.resourceManager == nil {
+		t.resourceManager = newResourceManager()
+	}
+	return t.resourceManager.reserve(reservation)
 }
 
 // releaseProducerResourcesLocked releases only the transient coordinator
-// reservation. Caller must hold t.mu.
+// reservation through ResourceManager.
 //
 // Once produceEntry/registerPendingEntry succeeds, the PendingEntry registry is
 // the authoritative reservation and this transient record must be removed so
@@ -4737,18 +4764,55 @@ func (t *Trader) reserveProducerResourcesLocked(
 func (t *Trader) releaseProducerResourcesLocked(
 	decisionID string,
 ) {
-	if t == nil || t.entryResourceReservations == nil {
+	if t == nil || t.resourceManager == nil {
 		return
 	}
 	decisionID = strings.TrimSpace(decisionID)
 	if decisionID == "" {
 		return
 	}
-	delete(t.entryResourceReservations, decisionID)
+	delete(t.ResourceQuarantines, decisionID)
+	t.resourceManager.release(decisionID)
 }
 
-// producerResourceReservationsLocked returns current transient commitments.
-// Caller must hold t.mu.
+// quarantineProducerResourcesLocked is the single durable transition for an
+// exchange-ambiguous reservation. The ResourceManager remains the accounting
+// authority; ResourceQuarantines is its restart journal, not a second balance
+// calculator. Caller must hold t.mu.
+func (t *Trader) quarantineProducerResourcesLocked(
+	reservation ProducerResourceReservation,
+) error {
+	if t == nil {
+		return errors.New("quarantine producer resources: nil trader")
+	}
+	reservation.DecisionID = strings.TrimSpace(reservation.DecisionID)
+	if reservation.DecisionID == "" {
+		return errors.New("quarantine producer resources: missing stable ID")
+	}
+	reservation.Kind = ResourceReservationQuarantine
+	reservation.Informational = false
+	if reservation.CreatedAt.IsZero() {
+		reservation.CreatedAt = time.Now().UTC()
+	}
+	if t.resourceManager == nil {
+		t.resourceManager = newResourceManager()
+	}
+	if err := t.resourceManager.quarantine(reservation); err != nil {
+		return err
+	}
+	if t.ResourceQuarantines == nil {
+		t.ResourceQuarantines = make(map[string]ProducerResourceReservation)
+	}
+	t.ResourceQuarantines[reservation.DecisionID] = reservation
+	if err := t.saveStateNoLock(); err != nil {
+		log.Printf("[ERROR] resource.quarantine.save_failed reservation_id=%s err=%v", reservation.DecisionID, err)
+		return err
+	}
+	return nil
+}
+
+// producerResourceReservationsLocked returns the ResourceManager actor's
+// authoritative transient commitments.
 func (t *Trader) producerResourceReservationsLocked() (
 	quoteUSD float64,
 	base float64,
@@ -4757,15 +4821,10 @@ func (t *Trader) producerResourceReservationsLocked() (
 		return 0, 0
 	}
 
-	for _, reservation := range t.entryResourceReservations {
-		switch reservation.Side {
-		case SideBuy:
-			quoteUSD += reservation.QuoteUSD
-		case SideSell:
-			base += reservation.Base
-		}
+	if t.resourceManager == nil {
+		return 0, 0
 	}
-	return quoteUSD, base
+	return t.resourceManager.totals()
 }
 
 // reserveProducerAllocationLocked converts one authoritative coordinator grant
@@ -4811,6 +4870,45 @@ func (t *Trader) reserveProducerAllocationLocked(
 	}
 
 	return t.reserveProducerResourcesLocked(reservation)
+}
+
+// quarantineProducerAllocationLocked transfers an ambiguous submission from
+// transient ownership to an indefinite fail-closed quarantine. Only exchange
+// reconciliation may release the stable DecisionID afterward.
+func (t *Trader) quarantineProducerAllocationLocked(
+	allocation ProducerResourceAllocation,
+) error {
+	req := allocation.Request
+	if req.Intent == nil {
+		return errors.New("quarantine producer allocation: nil intent")
+	}
+	reservation := ProducerResourceReservation{
+		DecisionID: strings.TrimSpace(req.Intent.DecisionID),
+		Producer: req.Producer,
+		Side: req.Side,
+		CreatedAt: time.Now().UTC(),
+		Kind: ResourceReservationQuarantine,
+	}
+	if req.Side == SideBuy {
+		reservation.QuoteUSD = allocation.AllocatedQuote
+	} else if req.Side == SideSell {
+		reservation.Base = allocation.AllocatedBase
+	}
+	return t.quarantineProducerResourcesLocked(reservation)
+}
+
+func isSubmissionUncertain(err error) bool {
+	if err == nil {
+		return false
+	}
+	code := marketEntryErrorCode(err)
+	var produceErr *EntryProduceError
+	if errors.As(err, &produceErr) {
+		code = produceErr.Code
+	}
+	return code == EntryProduceErrSubmitTimeout ||
+		code == EntryProduceErrSubmitNetworkFailed ||
+		code == EntryProduceErrCleanupCancel
 }
 
 type PendingEntry struct {
@@ -4861,8 +4959,8 @@ type PendingIntent struct {
 	Take           float64
 	ProducerReason string
 
-	RefundPortionUSD float64 `json:"refund_portion_usd"`
-	RefundObligationID string `json:"refund_obligation_id,omitempty"`
+	RefundPortionUSD   float64 `json:"refund_portion_usd"`
+	RefundObligationID string  `json:"refund_obligation_id,omitempty"`
 	RefundCoreQuoteUSD float64 `json:"refund_core_quote_usd,omitempty"`
 
 	ProductID  string
@@ -5230,6 +5328,30 @@ func (t *Trader) startCase3AReplacement(
 			QuoteValue: intent.Quote,
 		}
 
+	// The initial Mode A/Mode B replacement and its selected source exit coexist
+	// in the ResourceManager ledger as one atomic transaction window.
+	case3AReservationID := "case3a_initial:" + strings.TrimSpace(intent.ObligationID)
+	case3AReservation := ProducerResourceReservation{
+		DecisionID: case3AReservationID,
+		Producer: EntryProducerCase3AReplacement,
+		Side: intent.Side,
+		CreatedAt: time.Now().UTC(),
+		Kind: ResourceReservationTransient,
+	}
+	if intent.Side == SideBuy {
+		case3AReservation.QuoteUSD = intent.Quote * (1 + t.cfg.FeeRatePct/100.0)
+	} else if t.cfg.RequireBaseForShort {
+		case3AReservation.Base = intent.BaseAtLimit
+	} else {
+		case3AReservation.Informational = true
+	}
+	if t.resourceManager == nil {
+		t.resourceManager = newResourceManager()
+	}
+	if err := t.resourceManager.reserve(case3AReservation); err != nil {
+		return "", fmt.Errorf("Case3A resource transaction reserve: %w", err)
+	}
+
 	entry, err := t.produceEntry(
 		ctx,
 		intent,
@@ -5250,6 +5372,16 @@ func (t *Trader) startCase3AReplacement(
 			err,
 		)
 
+		if isSubmissionUncertain(err) {
+			t.mu.Lock()
+			quarantineErr := t.quarantineProducerResourcesLocked(case3AReservation)
+			t.mu.Unlock()
+			if quarantineErr != nil {
+				log.Printf("[ERROR] Case3A.resource_quarantine_failed obligation_id=%s err=%v", intent.ObligationID, quarantineErr)
+			}
+		} else {
+			t.resourceManager.release(case3AReservationID)
+		}
 		return "", err
 	}
 
@@ -5258,10 +5390,17 @@ func (t *Trader) startCase3AReplacement(
 		nil error from produceEntry() must imply a non-nil entry.
 	*/
 	if entry == nil {
+		t.mu.Lock()
+		quarantineErr := t.quarantineProducerResourcesLocked(case3AReservation)
+		t.mu.Unlock()
+		if quarantineErr != nil {
+			log.Printf("[ERROR] Case3A.resource_quarantine_failed obligation_id=%s err=%v", intent.ObligationID, quarantineErr)
+		}
 		return "", errors.New(
 			"produceEntry returned nil entry with nil error",
 		)
 	}
+	t.resourceManager.release(case3AReservationID)
 
 	return entry.OrderID, nil
 }
@@ -6063,7 +6202,15 @@ func (t *Trader) registerPendingEntry(
 
 	t.pendingEntries[orderID] = entry
 
+	// Exchange acceptance plus durable pending registration resolves any
+	// submission quarantine for this lifecycle. The pending-entry ledger record
+	// replaces the transient/quarantine record on the next atomic snapshot.
+	t.releaseProducerResourcesLocked(entry.Intent.DecisionID)
+
 	if entry.Producer == EntryProducerCase3AReplacement {
+		t.releaseProducerResourcesLocked(
+			"case3a_initial:" + strings.TrimSpace(entry.Intent.ObligationID),
+		)
 		obligation := t.ensureCase3AObligationLocked(entry.Intent, "")
 		if obligation == nil {
 			delete(t.pendingEntries, orderID)
@@ -7246,9 +7393,7 @@ func (t *Trader) rekeyPendingEntry(
 	t.pendingEntries[newOrderID] = entry
 
 	if entry.Producer == EntryProducerCase3AReplacement {
-		if obligation := t.Case3AObligations[
-			case3AObligationID(entry.Intent),
-		]; obligation != nil {
+		if obligation := t.Case3AObligations[case3AObligationID(entry.Intent)]; obligation != nil {
 
 			obligation.ActiveOrderID = newOrderID
 			obligation.UpdatedAt = time.Now().UTC()
@@ -8737,7 +8882,7 @@ func (t *Trader) commitEntryFill(
 
 	if baseToUse <= 0 || quoteSpent <= 0 {
 		return &EntryProduceError{
-			Code: EntryProduceErrCommitInvalidExecutionBase,
+			Code:     EntryProduceErrCommitInvalidExecutionBase,
 			Producer: entry.Producer, Side: fmt.Sprint(side), OrderID: res.OrderID,
 			Err: errors.New("core-first refund settlement left no producer fill"),
 		}

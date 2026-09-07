@@ -49,56 +49,6 @@ type ResourceSnapshot struct {
 	AvailableLotSlots int // -1 means unlimited.
 }
 
-// buildResourceSnapshotLocked performs the ONE balance/spare lookup for an
-// ordinary entry cycle. The caller must hold t.mu because the reservation
-// totals and lot count are derived from Trader-owned state before this call.
-func (t *Trader) buildResourceSnapshotLocked(
-	maxAge time.Duration,
-	reservedShortQuoteWithFee float64,
-	reservedLongBase float64,
-	price float64,
-	minNotional float64,
-) (ResourceSnapshot, bool) {
-	balance, ok := t.getBalanceSpare(
-		maxAge,
-		reservedShortQuoteWithFee,
-		reservedLongBase,
-	)
-
-	snapshot := ResourceSnapshot{
-		UpdatedAt:         balance.Snapshot.UpdatedAt,
-		SymQuote:          balance.Snapshot.SymQuote,
-		SymBase:           balance.Snapshot.SymBase,
-		AvailQuote:        balance.AvailQuote,
-		AvailBase:         balance.AvailBase,
-		QuoteStep:         balance.QuoteStep,
-		BaseStep:          balance.BaseStep,
-		ReservedQuote:     reservedShortQuoteWithFee,
-		ReservedBase:      reservedLongBase,
-		SpareQuote:        balance.SpareQuote,
-		SpareBase:         balance.SpareBase,
-		Price:             price,
-		MinNotional:       minNotional,
-		AvailableLotSlots: -1,
-	}
-
-	if t != nil {
-		snapshot.CurrentLots =
-			len(t.book(SideBuy).Lots) +
-				len(t.book(SideSell).Lots)
-
-		if t.cfg.MaxConcurrentLots > 0 {
-			snapshot.AvailableLotSlots =
-				t.cfg.MaxConcurrentLots - snapshot.CurrentLots
-			if snapshot.AvailableLotSlots < 0 {
-				snapshot.AvailableLotSlots = 0
-			}
-		}
-	}
-
-	return snapshot, ok
-}
-
 type ProducerResourceRequest struct {
 	Decision EntryDecision
 	Intent   *PendingIntent

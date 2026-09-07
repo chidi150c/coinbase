@@ -87,3 +87,155 @@ One [DEBUG] Total Lots message per evaluated tick, including FLAT/no-candidate t
 Working approach
 
 Confirm causes against current deployed code before mutation. Preserve unrelated behavior, especially Filled/Exited rendering. Apart from the deployed Unfilled display fix, the investigations and Go execution/lifecycle changes above remain outstanding.
+
+===================================================================================
+latest below: 
+===================================================================================
+
+Consolidated implementation agreement list
+Completed and confirmed
+BOT OPS Unfilled Order-ID visibility
+Unfilled rows use pending.OrderID.
+Filled and Exited mappings remain unchanged.
+Pending-only attempts remain visible.
+Confirmed using order 66219499081.
+Case3A deferred-retry decision lifecycle
+Every retry creates a proper decision event before produced.
+It records obligation ID, original decision, source order, recovery method/amount, retry cause, waiting exit, and target price.
+The same attempt identity continues through later stages.
+Plural durable Case3A obligations
+Multiple simultaneous obligations are supported.
+Case3AObligations and PendingReplacementRetries are maps.
+Obligations survive restart and unsuccessful execution attempts.
+Zero-fill cancellation, rejection, or expiry returns an obligation to waiting_for_target.
+Partial fills preserve the remaining obligation.
+Confirmed completed obligations are removed immediately.
+Reconciliation uncertainty blocks duplicate resurrection.
+Build and tests passed before deployment under commit 6ab3bf0.
+Case3A obligation overlay rule
+Existing initial Mode A and Mode B behavior remains intact.
+Obligations do not obstruct initial Case3A processing.
+The obligation takes over only at a genuine Case3A failure point.
+A completely successful initial Case3A replacement completes/removes its obligation instead of activating resurrection.
+Resurrected Case3A execution policy
+Preserve the original economic target.
+Resurrection waits for the price to satisfy the fee-and-slippage-adjusted target.
+SELL uses executable bid; BUY uses executable ask.
+Resurrected attempts use a dedicated market/taker route—not post-only.
+RecoveryNetUSD, recovery lineage, and partial-recovery accounting are carried forward.
+This does not globally change ordinary producer execution or generic repricing.
+Exit fan-out correctness
+Acted represents an exit genuinely started or filled.
+succeeded increments only for Acted=true.
+Maker-exit submission errors are propagated.
+pending_exit.start_failed records entry ID, side, limit, size, and error.
+This exposed the insufficient-balance retry loop rather than solving its funding shortage.
+Producer-history submission batching
+Pre-submission lifecycle events remain in memory during the batch.
+History is flushed once after the coordinator submission batch.
+submission_started and exchange_accepted are explicit events.
+The existing pending/broker timing remains available.
+Producer economics and lifecycle meaning remain unchanged.
+Hot-path and exit-scan instrumentation
+Lifecycle stages carry their originating hotStart.
+Required reason suffix:
+stage-specific information|stage.elapsed_ms=N|hotpath.elapsed_ms=N
+Original decision reason remains where it was already included.
+hotpath.producer.stage_timing and internal exit-scan timing were added.
+The observed recurring ~246 ms was identified as the synchronous Binance maker-exit request/response, not exit selection or Refund throttling.
+ResourceManager phase one
+Transient pre-submission producer reservations moved from Trader into an actor-style ResourceManager.
+Resource allocation calculation runs through that manager.
+Submission behavior remained synchronous.
+gofmt, gopls, tests, and build passed.
+Implemented/generated but awaiting your validation
+ResourceManager phase two
+step() now copies immutable balance, lot, and pending-entry exposure.
+ResourceManager calculates:
+reserved quote;
+reserved base;
+spare quote/base;
+pending-entry exposure;
+transient pre-submission reservations;
+current and available lot slots;
+balance freshness/validity.
+Refund throttling and submission ordering remain unchanged.
+Updated resource_manager.go and step.go were generated, but your local gofmt, gopls, test, and build results have not yet been received.
+General Refund-obligation implementation
+Refund obligations are not limited to exits or Case3A.
+Both entry-origin and exit-origin resource shortages can create them.
+Each obligation has a stable identity, source operation/order, shortage side, service side, requested, reserved, filled, and remaining amounts.
+Ordinary producer core allocation comes first; Refund attachment has the lowest priority.
+Refund is attached through the existing coordinator allocation result.
+Case3A may carry a Refund attachment when spare remains available.
+A confirmed Refund fill completes and retires that Refund obligation.
+Restored resources become ordinary spare and are not protected afterward.
+Exit-origin Refund retains the agreed approximately 30-second retry throttle.
+This mutation was supplied, but final deployed behavior and BOT OPS output have not been confirmed.
+Remaining scheduled implementation
+Correct partial-fill ProfitGateUSD apportionment
+RecoveryNetUSD is already proportional to the committed Case3A core fill.
+ProfitGateUSD must also be restored proportionally.
+A partial allocation/fill must not receive the complete original profit gate.
+The unfilled portion retains its corresponding remaining gate in the obligation.
+Asynchronous exit submission overlap
+Move only the slow exit submission portion off the main hot path.
+Exit selection and resource reservation occur first.
+Producer analysis may proceed while Binance processes the exit request.
+A channel/fan-in is compulsory before building the authoritative entry-resource snapshot or submitting any entry.
+Exit results must update resource ownership before entry allocation.
+step() must not return merely because the asynchronous request was launched.
+Refund retry throttling must remain unchanged.
+Complete ResourceManager separation
+Finish moving authoritative funding/resource coordination out of Trader.
+Keep Trader as the owner of trading state, while ResourceManager owns resource arithmetic and transient reservations.
+Remove or retire the unused legacy buildResourceSnapshotLocked() path after the new build passes.
+Avoid maintaining two competing snapshot authorities.
+Resource allocation may be off the main hot path, but no entry may race unresolved exit consumption.
+Case13B symmetry
+Make Case13B the BUY/SELL mirror of Case13A.
+Mirror trigger, continuation, gate, sizing, lifecycle, and accounting behavior.
+Preserve side-specific price and resource semantics.
+This remains unimplemented.
+Refund observability
+Include Refund information prominently in producer reasons:
+refund_obligation_id
+refund_origin
+refund_source_order_id
+refund_shortage_side
+refund_service_side
+refund_requested_usd
+refund_reserved_usd
+refund_filled_usd
+refund_remaining_usd
+BOT OPS should make requested, allocated, filled, outstanding, and retired Refund obligations easy to identify.
+Do not infer Refund involvement merely from order size.
+Initial-entry latency optimization
+Continue measuring:
+decision creation;
+price selection;
+resource snapshot/allocation;
+lifecycle persistence;
+submission start;
+exchange response;
+pending registration;
+final persistence.
+Determine whether delay actually caused the favorable initial price to be missed.
+Investigate the observed 6.3–6.7-second queued/throttled submissions separately from Case3A obligations.
+Do not treat cumulative hotpath.after_decision as exchange latency.
+Producer-stage reason completeness
+Verify every actual lifecycle-writing path supplies:
+meaningful stage-specific information;
+stage.elapsed_ms;
+hotpath.elapsed_ms.
+This includes asynchronous filled, cancellation, cleanup, commit, failure, and reconciliation paths.
+Preserve the original producer reason wherever it is already expected.
+Producer-history pruning protection
+Producer history remains a display/audit store—not the authoritative obligation store.
+Consider explicitly protecting live pending attempts from the 24-hour/500-attempt pruning rules.
+Durable Case3A and Refund obligations must remain independent of history pruning.
+Generic repricing review—deferred
+Repricing remains disabled.
+Do not enable adverse price chasing.
+Any future implementation must preserve producer economics, required profit, fees, and favorable trade points.
+The dedicated Case3A resurrection market route does not activate generic repricing.
