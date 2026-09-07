@@ -473,11 +473,7 @@ func (t *Trader) executeProducerAllocation(
 	// on pending registration the PendingEntry registry becomes authoritative;
 	// on market success the committed position becomes authoritative; and on any
 	// failure no exchange-backed reservation remains.
-	releaseTransientReservation := true
 	defer func() {
-		if !releaseTransientReservation {
-			return
-		}
 		t.mu.Lock()
 		t.releaseProducerResourcesLocked(intent.DecisionID)
 		t.mu.Unlock()
@@ -755,14 +751,6 @@ func (t *Trader) executeProducerAllocation(
 			t.mu.Unlock()
 
 			if err != nil {
-				if isSubmissionUncertain(err) {
-					t.mu.Lock()
-					if quarantineErr := t.quarantineProducerAllocationLocked(allocation); quarantineErr != nil {
-						log.Printf("[ERROR] resource.quarantine.failed decision_id=%s err=%v", intent.DecisionID, quarantineErr)
-					}
-					t.mu.Unlock()
-					releaseTransientReservation = false
-				}
 				log.Printf(
 					"[DEBUG] postonly.error "+
 						"hold_for_recheck side=%s err=%v",
@@ -845,14 +833,6 @@ func (t *Trader) executeProducerAllocation(
 	}
 	intent.ExchangeRespondedAt = time.Now().UTC()
 	if err != nil {
-		if isSubmissionUncertain(err) {
-			t.mu.Lock()
-			if quarantineErr := t.quarantineProducerAllocationLocked(allocation); quarantineErr != nil {
-				log.Printf("[ERROR] resource.quarantine.failed decision_id=%s err=%v", intent.DecisionID, quarantineErr)
-			}
-			t.mu.Unlock()
-			releaseTransientReservation = false
-		}
 		t.mu.Lock()
 		t.addDecisionProducerEvent(
 			intent,
@@ -1352,15 +1332,8 @@ func (t *Trader) processParallelProducerEntriesLocked(
 		return StepResult{Msg: "HOLD no admitted producer requests", Raw: aiRaw, Signal: Flat}, nil
 	}
 
-	if t.resourceManager == nil {
-		t.resourceManager = newResourceManager()
-	}
-	allocationPlanC := t.resourceManager.allocateAsync(
-		snapshot,
-		requests,
-		balanceAvailable,
-	)
-	plan := <-allocationPlanC
+	coordinator := ProducerResourceCoordinator{}
+	plan := coordinator.Allocate(snapshot, requests, balanceAvailable)
 
 	approved := make([]ProducerResourceAllocation, 0, len(plan.Allocations))
 

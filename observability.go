@@ -23,14 +23,14 @@ import (
 type ProducerStage string
 
 const (
-	ProducerStageDecision  ProducerStage = "decision"
-	ProducerStageProduced  ProducerStage = "produced"
+	ProducerStageDecision          ProducerStage = "decision"
+	ProducerStageProduced          ProducerStage = "produced"
 	ProducerStageSubmissionStarted ProducerStage = "submission_started"
 	ProducerStageExchangeAccepted  ProducerStage = "exchange_accepted"
-	ProducerStagePending   ProducerStage = "pending"
-	ProducerStageFilled    ProducerStage = "filled"
-	ProducerStageCommitted ProducerStage = "committed"
-	ProducerStageExited    ProducerStage = "exited"
+	ProducerStagePending           ProducerStage = "pending"
+	ProducerStageFilled            ProducerStage = "filled"
+	ProducerStageCommitted         ProducerStage = "committed"
+	ProducerStageExited            ProducerStage = "exited"
 
 	ProducerStageCancelRequested ProducerStage = "cancel_requested"
 
@@ -79,7 +79,7 @@ const (
 	ProducerStageDrainPersistStateFailed ProducerStage = "drain_persist_state_failed"
 	ProducerStageCommitSparePointerNil   ProducerStage = "commit_spare_pointer_nil"
 	ProducerStageRefundConsumed          ProducerStage = "refund_consumed"
-	ProducerStageRefundServiced         ProducerStage = "refund_serviced"
+	ProducerStageRefundServiced          ProducerStage = "refund_serviced"
 )
 
 type ProducerHistory struct {

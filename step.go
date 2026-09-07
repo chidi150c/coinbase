@@ -396,25 +396,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// - Runners bypass ordinary TP and threshold-stop-loss and exit only through Case 4.
 	// - nearestTakeBuy/Sell are diagnostic/Gate2 snapshots, not separate exit orders.
 	// --------------------------------------------------------------------------------------------------------
-	// Start producer analysis before lot evaluation reaches any exchange-facing
-	// exit fan-out. Buffered results can complete during selected exit I/O, but
-	// are consumed only after every exit result has been reconciled.
-	aiCh := make(chan AIResult, 1)
-	macdSnapCh := make(chan MACDSnapshotResult, 1)
-	emaCh := make(chan EMAPatternResult, 1)
-
-	go func() {
-		aiCh <- t.evaluateAI(signalHistory)
-	}()
-
-	go func() {
-		macdSnapCh <- t.evaluateMACDSnapshot(execHistory)
-	}()
-
-	go func() {
-		emaCh <- t.evaluateEMAPatternSnapshot(execHistory)
-	}()
-
 	lsb := len(t.book(SideBuy).Lots)
 	lss := len(t.book(SideSell).Lots)
 	if (lsb > 0) || (lss > 0) {
@@ -1048,69 +1029,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 		if len(selected) > 0 {
 			fanoutStart := time.Now()
-			if t.resourceManager == nil {
-				t.resourceManager = newResourceManager()
-			}
-
-			// Reserve every selected exit's closing resource before any worker
-			// releases Trader.mu or begins exchange I/O. These reservations bridge
-			// selection to fan-in; afterward the live lot/pending-exit state is again
-			// authoritative and the transient records are released.
-			exitReservationIDs := make([]string, 0, len(selected))
-			exitReservations := make(map[string]ProducerResourceReservation, len(selected))
-			exitReservationByEntry := make(map[string]string, len(selected))
-			for _, cand := range selected {
-				lotIdx := t.findLotIndexByEntryIDLocked(cand.side, cand.entryOrderID)
-				if lotIdx < 0 {
-					continue
-				}
-				book := t.book(cand.side)
-				if book == nil || book.Lots[lotIdx] == nil {
-					continue
-				}
-				lot := book.Lots[lotIdx]
-				base := floorToStep(lot.SizeBase, t.cfg.BaseStep)
-				if base <= 0 {
-					continue
-				}
-
-				closeSide := SideSell
-				if lot.Side == SideSell {
-					closeSide = SideBuy
-				}
-				reservationID := fmt.Sprintf(
-					"exit_submission:%s:%s",
-					strings.TrimSpace(cand.entryOrderID),
-					closeSide,
-				)
-				reservation := ProducerResourceReservation{
-					DecisionID: reservationID,
-					Producer:   lot.Producer,
-					Side:       closeSide,
-					CreatedAt:  time.Now().UTC(),
-				}
-				if closeSide == SideSell {
-					reservation.Base = base
-				} else {
-					reservePrice := math.Max(livePrice, lot.Take)
-					reservation.QuoteUSD = base * reservePrice *
-						(1 + t.cfg.FeeRatePct/100.0)
-				}
-				if err := t.resourceManager.reserve(reservation); err != nil {
-					for _, id := range exitReservationIDs {
-						t.resourceManager.release(id)
-					}
-					t.mu.Unlock()
-					return StepResult{Msg: "HOLD"}, fmt.Errorf(
-						"reserve exit submission resources entry_id=%s: %w",
-						cand.entryOrderID,
-						err,
-					)
-				}
-				exitReservationIDs = append(exitReservationIDs, reservationID)
-				exitReservations[reservationID] = reservation
-				exitReservationByEntry[strings.TrimSpace(cand.entryOrderID)] = reservationID
-			}
 			// log.Printf(
 			// "[TRACE] exit.fanout.batch candidates=%d stop_l2=%d profit_l2=%d stop_l1=%d profit_l1=%d",
 			// len(selected),
@@ -1130,32 +1048,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				selected,
 				hotStart,
 			)
-			uncertainExitEntries := make(map[string]bool)
-			for _, result := range results {
-				if isSubmissionUncertain(result.Err) {
-					uncertainExitEntries[strings.TrimSpace(result.EntryOrderID)] = true
-				}
-			}
-			for _, id := range exitReservationIDs {
-				reservation := exitReservations[id]
-				entryID := strings.TrimSpace(reservation.DecisionID)
-				for candidateEntryID, reservationID := range exitReservationByEntry {
-					if reservationID == id {
-						entryID = candidateEntryID
-						break
-					}
-				}
-				if uncertainExitEntries[entryID] {
-					t.mu.Lock()
-					err := t.quarantineProducerResourcesLocked(reservation)
-					t.mu.Unlock()
-					if err != nil {
-						log.Printf("[ERROR] exit.resource_quarantine_failed entry_id=%s err=%v", entryID, err)
-					}
-					continue
-				}
-				t.resourceManager.release(id)
-			}
 			log.Printf(
 				"[TRACE] hotpath.exit_scan.fanout_complete "+
 					"stage_elapsed_ms=%d hotpath_elapsed_ms=%d candidates=%d results=%d",
@@ -1220,12 +1112,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				}
 			}
 
-			// A genuine non-resource exit failure remains terminal for this tick.
-			// Successful exits no longer discard the producer work that overlapped
-			// their Binance I/O: reacquire t.mu, rebuild resources from authoritative
-			// post-exit state, and continue. No entry submission can occur before this
-			// complete fan-in.
-			if failed > 0 {
+			// Preserve exit-first semantics. A real exit/recovery action owns the
+			// tick, and a genuine exit failure remains terminal for this tick.
+			// If every selected candidate was a nil-error no-op, reacquire t.mu and
+			// continue into Gate Analysis and ordinary producer coordination.
+			if succeeded > 0 || failed > 0 {
 				return StepResult{
 					Msg: fmt.Sprintf(
 						"EXIT-FANOUT total=%d succeeded=%d failed=%d\n%s",
@@ -1235,15 +1126,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						strings.Join(msgs, "\n"),
 					),
 				}, nil
-			}
-			if succeeded > 0 {
-				log.Printf(
-					"EXIT-FANOUT total=%d succeeded=%d failed=%d %s",
-					len(results),
-					succeeded,
-					failed,
-					strings.Join(msgs, " | "),
-				)
 			}
 
 			t.mu.Lock()
@@ -1275,33 +1157,39 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		time.Since(hotStart).Milliseconds(),
 	)
 
-	// Copy Trader-owned exposures while t.mu is held. ResourceManager performs
-	// all reservation/spare arithmetic from this immutable view.
-	exposures := make([]ResourceExposure, 0)
-	feeMult := 1 + t.cfg.FeeRatePct/100.0
-	for _, side := range []OrderSide{SideBuy, SideSell} {
-		if book := t.book(side); book != nil {
-			for _, lot := range book.Lots {
-				if lot != nil {
-					exposure := ResourceExposure{
-						ID: "lot:" + strings.TrimSpace(lot.EntryOrderID),
-						Kind: ResourceReservationLot,
-						Producer: lot.Producer,
-						Side: side,
-					}
-					if side == SideBuy {
-						exposure.Side = SideSell
-						exposure.Base = lot.SizeBase
-					} else {
-						exposure.Side = SideBuy
-						exposure.QuoteUSD = lot.SizeBase * price * feeMult
-					}
-					exposures = append(exposures, exposure)
-				}
+	feeMult := 1.0 + (t.cfg.FeeRatePct / 100.0)
+
+	// Sum reserved base for live long lots.
+	var reservedLongBase float64
+
+	if bb := t.book(SideBuy); bb != nil {
+		for _, lot := range bb.Lots {
+			if lot != nil {
+				reservedLongBase += lot.SizeBase
 			}
 		}
 	}
 
+	// Compute reserved quote for live short lots.
+	var reservedShortQuoteWithFee float64
+
+	if sb := t.book(SideSell); sb != nil {
+		for _, lot := range sb.Lots {
+			if lot == nil {
+				continue
+			}
+
+			q := lot.SizeBase * price
+			reservedShortQuoteWithFee += q * feeMult
+		}
+	}
+
+	// Include reservations held by all active asynchronous entries.
+	//
+	// Pending SELL entries reserve base when short entries require existing base.
+	// Pending BUY entries reserve quote, including estimated entry fees.
+	// Include reservations held by all active asynchronous entries.
+	// t.mu is already held here, so inspect the registry directly.
 	for _, entry := range t.pendingEntries {
 		if entry == nil ||
 			entry.Completed ||
@@ -1309,116 +1197,59 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			continue
 		}
 
-		exposure := ResourceExposure{
-			ID: "pending_entry:" + strings.TrimSpace(entry.OrderID),
-			Kind: ResourceReservationPendingEntry,
-			Producer: entry.Producer,
-			Side: entry.Side,
-		}
-		if entry.Side == SideSell && t.cfg.RequireBaseForShort {
-			exposure.Base = entry.Intent.BaseAtLimit
-		} else if entry.Side == SideBuy {
-			exposure.QuoteUSD = entry.Intent.Quote * feeMult
-		} else {
-			exposure.Informational = true
-		}
-		exposures = append(exposures, exposure)
-	}
-	for orderID, exit := range t.pendingExits {
-		if exit != nil {
-			exposures = append(exposures, ResourceExposure{
-				ID: "pending_exit:" + strings.TrimSpace(orderID),
-				Kind: ResourceReservationPendingExit,
-				Side: exit.Side,
-				Informational: true,
-			})
-		}
-	}
-	for id, obligation := range t.RefundObligations {
-		if obligation != nil && obligation.RemainingUSD > 0 {
-			exposure := ResourceExposure{
-				ID: "refund:" + strings.TrimSpace(id),
-				Kind: ResourceReservationRefund,
-				Producer: obligation.SourceProducer,
-				Side: obligation.ServiceSide,
-				Informational: true,
+		intent := entry.Intent
+
+		switch entry.Side {
+		case SideSell:
+			if t.cfg.RequireBaseForShort {
+				reservedLongBase += intent.BaseAtLimit
 			}
-			if obligation.Status == RefundObligationReconcile && obligation.ReservedUSD > 0 {
-				exposure.Informational = false
-				if obligation.ServiceSide == SideBuy {
-					exposure.QuoteUSD = obligation.ReservedUSD
-				} else if price > 0 {
-					exposure.Base = obligation.ReservedUSD / price
-				}
-			}
-			exposures = append(exposures, exposure)
+
+		case SideBuy:
+			reservedShortQuoteWithFee += intent.Quote * feeMult
 		}
-	}
-	for id, obligation := range t.Case3AObligations {
-		if obligation != nil && obligation.RemainingBase > 0 {
-			exposure := ResourceExposure{
-				ID: "case3a:" + strings.TrimSpace(id),
-				Kind: ResourceReservationCase3A,
-				Producer: EntryProducerCase3AReplacement,
-				Side: obligation.Side,
-				Informational: true,
-			}
-			if obligation.Status == Case3AObligationReconcile {
-				exposure.Informational = false
-				if obligation.Side == SideBuy {
-					exposure.QuoteUSD = obligation.RemainingBase * obligation.TargetPrice * feeMult
-				} else if t.cfg.RequireBaseForShort {
-					exposure.Base = obligation.RemainingBase
-				} else {
-					exposure.Informational = true
-				}
-			}
-			exposures = append(exposures, exposure)
-		}
-	}
-	for id, quarantine := range t.ResourceQuarantines {
-		quarantine.DecisionID = strings.TrimSpace(id)
-		exposures = append(exposures, ResourceExposure{
-			ID: quarantine.DecisionID,
-			Kind: ResourceReservationQuarantine,
-			Producer: quarantine.Producer,
-			Side: quarantine.Side,
-			Base: quarantine.Base,
-			QuoteUSD: quarantine.QuoteUSD,
-		})
 	}
 
 	// Build the ONE immutable resource snapshot for this entry-allocation
 	// cycle. Existing pending reservations above are already included exactly
 	// once in the spare calculation. Equity and every ordinary producer reuse
-	// this same snapshot; no second funding calculation is permitted.
+	// this same snapshot; no later getBalanceSpare() lookup is permitted.
 	//
 	// ResourceSnapshot remains the authoritative funding view. The historical
 	// SpareBuyUSD/SpareSellUSD compatibility mirrors are refreshed downstream
 	// by processParallelProducerEntriesLocked() after the complete AllocationPlan
 	// has been established, so step() does not create a second funding authority
 	// or duplicate pending reservations here.
-	balance, _ := t.getBalanceSnapshot(0)
-	if t.resourceManager == nil {
-		t.resourceManager = newResourceManager()
-	}
-	resourceSnapshotResult := <-t.resourceManager.buildSnapshotAsync(
-		ResourceSnapshotInput{
-			Balance:             balance,
-			MaxAge:              balanceSnapshotMaxAge,
-			Price:               price,
-			MinNotional:         minNotional,
-			FeeRatePct:          t.cfg.FeeRatePct,
-			RequireBaseForShort: t.cfg.RequireBaseForShort,
-			MaxConcurrentLots:   t.cfg.MaxConcurrentLots,
-			Exposures:           exposures,
-		},
-	)
-	resourceSnapshot := resourceSnapshotResult.snapshot
-	resourceSnapshotOK := resourceSnapshotResult.snapshotOK
+	resourceSnapshot, resourceSnapshotOK :=
+		t.buildResourceSnapshotLocked(
+			balanceSnapshotMaxAge,
+			reservedShortQuoteWithFee,
+			reservedLongBase,
+			price,
+			minNotional,
+		)
+	//-------------------------------------------------------------
+	//2. Fan out only AI, MACD and EMA
+	//-----------------------------------------------------------
+	aiCh := make(chan AIResult, 1)
+	macdSnapCh := make(chan MACDSnapshotResult, 1)
+	emaCh := make(chan EMAPatternResult, 1)
+
+	go func() {
+		aiCh <- t.evaluateAI(signalHistory)
+	}()
+
+	go func() {
+		macdSnapCh <- t.evaluateMACDSnapshot(execHistory)
+	}()
+
+	go func() {
+		emaCh <- t.evaluateEMAPatternSnapshot(execHistory)
+	}()
+
 	// -------------------------------------------------------------
-	// Evaluate Pyramid on the main thread while the three producer-analysis
-	// goroutines finish. Exit fan-in and resource reconciliation are complete.
+	// 3. Evaluate Pyramid on the main thread
+	// While those three goroutines run:
 	// -------------------------------------------------------------
 	pyramidRaw :=
 		t.evaluatePyramidRaw(
@@ -2017,6 +1848,60 @@ func (t *Trader) setBalanceSnapshot(snapshot balanceSnapshot) {
 	t.balanceMu.Lock()
 	t.balanceSnapshot = snapshot
 	t.balanceMu.Unlock()
+}
+
+type BalanceSpare struct {
+	Snapshot balanceSnapshot
+
+	AvailQuote float64
+	QuoteStep  float64
+	AvailBase  float64
+	BaseStep   float64
+
+	SpareQuote float64
+	SpareBase  float64
+}
+
+func (t *Trader) getBalanceSpare(
+	maxAge time.Duration,
+	reservedShortQuoteWithFee float64,
+	reservedLongBase float64,
+) (BalanceSpare, bool) {
+
+	snapshot, ok := t.getBalanceSnapshot(maxAge)
+	if !ok {
+		return BalanceSpare{
+			Snapshot: snapshot,
+		}, false
+	}
+
+	spareQuote :=
+		snapshot.AvailQuote -
+			reservedShortQuoteWithFee
+
+	spareBase :=
+		snapshot.AvailBase -
+			reservedLongBase
+
+	if spareQuote < 0 {
+		spareQuote = 0
+	}
+
+	if spareBase < 0 {
+		spareBase = 0
+	}
+
+	return BalanceSpare{
+		Snapshot: snapshot,
+
+		AvailQuote: snapshot.AvailQuote,
+		QuoteStep:  snapshot.QuoteStep,
+		AvailBase:  snapshot.AvailBase,
+		BaseStep:   snapshot.BaseStep,
+
+		SpareQuote: spareQuote,
+		SpareBase:  spareBase,
+	}, true
 }
 
 func (t *Trader) getBalanceSnapshot(maxAge time.Duration) (balanceSnapshot, bool) {
