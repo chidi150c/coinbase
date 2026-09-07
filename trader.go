@@ -5279,6 +5279,7 @@ func (t *Trader) produceEntry(
 		t.submitPendingIntent(
 			ctx,
 			intent,
+			attempt,
 		)
 
 	if produceErr != nil {
@@ -5596,6 +5597,7 @@ func (t *Trader) validatePendingIntent(
 func (t *Trader) submitPendingIntent(
 	ctx context.Context,
 	intent *PendingIntent,
+	attempt *ProducerAttempt,
 ) (string, *EntryProduceError) {
 	if t == nil {
 		return "", &EntryProduceError{
@@ -5639,6 +5641,15 @@ func (t *Trader) submitPendingIntent(
 	if intent.HotStart.IsZero() {
 		intent.HotStart = intent.CreatedAt
 	}
+	t.addDecisionProducerEvent(
+		intent,
+		attempt,
+		ProducerStageSubmissionStarted,
+		"",
+		nil,
+		false,
+		false,
+	)
 	log.Printf(
 		"[TRACE] hotpath.producer.submission_started "+
 			"producer=%s decision_id=%s side=%s limit=%.8f base=%.8f hotpath_elapsed_ms=%d",
@@ -5761,6 +5772,31 @@ func (t *Trader) submitPendingIntent(
 			Side:     fmt.Sprint(intent.Side),
 		}
 	}
+
+	// Exchange acceptance is distinct from local pending registration. Keep
+	// this event in memory; the caller flushes the complete attempt after the
+	// response path has reached pending or entry_failed.
+	acceptedTime := time.Now().UTC()
+	acceptedEvent := ProducerEvent{
+		Time:       acceptedTime,
+		CreatedAt:  intent.CreatedAt,
+		Producer:   intent.Producer,
+		Side:       fmt.Sprint(intent.Side),
+		Stage:      ProducerStageExchangeAccepted,
+		DecisionID: intent.DecisionID,
+		OrderID:    orderID,
+		Price:      intent.LimitPx,
+		BaseSize:   intent.BaseAtLimit,
+		QuoteValue: intent.Quote,
+	}
+	acceptedEvent.Reason = appendProducerStageTimingReason(
+		intent.ProducerReason,
+		fmt.Sprintf("exchange_accepted|exchange_order_id=%s", orderID),
+		intent.HotStart,
+		attempt,
+		acceptedTime,
+	)
+	attempt.Events[ProducerStageExchangeAccepted] = acceptedEvent
 
 	return orderID, nil
 }

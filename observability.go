@@ -25,6 +25,8 @@ type ProducerStage string
 const (
 	ProducerStageDecision  ProducerStage = "decision"
 	ProducerStageProduced  ProducerStage = "produced"
+	ProducerStageSubmissionStarted ProducerStage = "submission_started"
+	ProducerStageExchangeAccepted  ProducerStage = "exchange_accepted"
 	ProducerStagePending   ProducerStage = "pending"
 	ProducerStageFilled    ProducerStage = "filled"
 	ProducerStageCommitted ProducerStage = "committed"
@@ -865,6 +867,24 @@ func (t *Trader) recordProducerAttemptLocked(
 	}
 
 	for stage, event := range attempt.Events {
+		// The first pending event owns the transport breakdown measured at
+		// exchange acceptance and local registration. A later pending update
+		// (currently produced only by repricing) may advance the live OrderID,
+		// but must not erase broker/registration/persistence timing evidence.
+		if stage == ProducerStagePending {
+			if prior, ok := existingAttempt.Events[ProducerStagePending]; ok &&
+				strings.Contains(prior.Reason, "|broker.elapsed_ms=") &&
+				!strings.Contains(event.Reason, "|broker.elapsed_ms=") {
+				if orderID := strings.TrimSpace(event.OrderID); orderID != "" {
+					prior.OrderID = orderID
+					prior.Reason = strings.TrimSpace(
+						prior.Reason + "|pending_order_id_updated=" + orderID,
+					)
+				}
+				existingAttempt.Events[stage] = prior
+				continue
+			}
+		}
 		existingAttempt.Events[stage] = event
 	}
 }

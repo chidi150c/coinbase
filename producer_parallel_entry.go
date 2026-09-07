@@ -608,7 +608,7 @@ func (t *Trader) executeProducerAllocation(
 				intent,
 				fmt.Sprintf("market_resurrection_bbo_unavailable|err=%v", bboErr),
 			)
-			t.persistProducerAttemptLocked(attempt)
+			t.recordProducerAttemptLocked(attempt)
 			t.mu.Unlock()
 			return fmt.Sprintf("HOLD producer=%s obligation_id=%s", req.Producer, req.Decision.Case3AObligationID), nil
 		}
@@ -635,7 +635,7 @@ func (t *Trader) executeProducerAllocation(
 					targetPrice, executablePrice, takerFeeRate, case3AResurrectionSlippageBps,
 				),
 			)
-			t.persistProducerAttemptLocked(attempt)
+			t.recordProducerAttemptLocked(attempt)
 			t.mu.Unlock()
 			return fmt.Sprintf("HOLD producer=%s obligation_id=%s", req.Producer, req.Decision.Case3AObligationID), nil
 		}
@@ -747,7 +747,7 @@ func (t *Trader) executeProducerAllocation(
 			t.mu.Lock()
 			if err == nil && entry != nil {
 			}
-			t.persistProducerAttemptLocked(attempt)
+			t.recordProducerAttemptLocked(attempt)
 			t.mu.Unlock()
 
 			if err != nil {
@@ -797,8 +797,9 @@ func (t *Trader) executeProducerAllocation(
 	if attempt.Events == nil {
 		attempt.Events = make(map[ProducerStage]ProducerEvent)
 	}
+	producedTime := time.Now().UTC()
 	attempt.Events[ProducerStageProduced] = ProducerEvent{
-		Time:       time.Now().UTC(),
+		Time:       producedTime,
 		CreatedAt:  intent.CreatedAt,
 		Producer:   intent.Producer,
 		Side:       fmt.Sprint(req.Side),
@@ -809,6 +810,15 @@ func (t *Trader) executeProducerAllocation(
 		BaseSize:   marketBase,
 		QuoteValue: marketQuote,
 	}
+
+	// Direct-market execution does not pass through submitPendingIntent(), so
+	// record the same transport boundary stages here. Both remain in memory
+	// until the terminal synchronous result is persisted once.
+	intent.SubmissionStartedAt = time.Now().UTC()
+	t.addDecisionProducerEvent(
+		intent, attempt, ProducerStageSubmissionStarted,
+		"", nil, false, false,
+	)
 
 	placed, err := t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, req.Side, marketQuote)
 	if err != nil && marketQuote > minNotional && isBinanceInsufficientBalance(err) {
@@ -821,6 +831,7 @@ func (t *Trader) executeProducerAllocation(
 		}
 		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, req.Side, marketQuote)
 	}
+	intent.ExchangeRespondedAt = time.Now().UTC()
 	if err != nil {
 		t.mu.Lock()
 		t.addDecisionProducerEvent(
@@ -830,7 +841,7 @@ func (t *Trader) executeProducerAllocation(
 			marketEntryErrorCode(err),
 			fmt.Errorf("direct market entry submission failed: side=%s quote=%.8f: %w", req.Side, marketQuote, err),
 			false,
-			true,
+			false,
 		)
 		if case3AResurrected {
 			t.returnCase3AObligationToTargetWaitLocked(
@@ -845,7 +856,7 @@ func (t *Trader) executeProducerAllocation(
 	if placed == nil {
 		err = errors.New("market broker returned nil PlacedOrder")
 		t.mu.Lock()
-		t.addDecisionProducerEvent(intent, attempt, ProducerStageEntryFailed, EntryProduceErrBuildOrder, err, false, true)
+		t.addDecisionProducerEvent(intent, attempt, ProducerStageEntryFailed, EntryProduceErrBuildOrder, err, false, false)
 		if case3AResurrected {
 			t.reconcileCase3AObligationLocked(intent)
 			_ = t.saveStateNoLock()
@@ -853,6 +864,28 @@ func (t *Trader) executeProducerAllocation(
 		t.mu.Unlock()
 		return fmt.Sprintf("HOLD producer=%s", req.Producer), err
 	}
+
+	acceptedTime := time.Now().UTC()
+	acceptedEvent := ProducerEvent{
+		Time:       acceptedTime,
+		CreatedAt:  intent.CreatedAt,
+		Producer:   intent.Producer,
+		Side:       fmt.Sprint(req.Side),
+		Stage:      ProducerStageExchangeAccepted,
+		DecisionID: intent.DecisionID,
+		OrderID:    placed.ID,
+		Price:      placed.Price,
+		BaseSize:   placed.BaseSize,
+		QuoteValue: placed.QuoteSpent,
+	}
+	acceptedEvent.Reason = appendProducerStageTimingReason(
+		intent.ProducerReason,
+		fmt.Sprintf("exchange_accepted|exchange_order_id=%s", placed.ID),
+		intent.HotStart,
+		attempt,
+		acceptedTime,
+	)
+	attempt.Events[ProducerStageExchangeAccepted] = acceptedEvent
 
 	attempt.Events[ProducerStageFilled] = ProducerEvent{
 		Time:       time.Now().UTC(),
@@ -884,7 +917,7 @@ func (t *Trader) executeProducerAllocation(
 
 	entry, buildErr := t.buildPendingEntry(intent, placed.ID)
 	if buildErr != nil {
-		t.addDecisionProducerEvent(intent, attempt, ProducerStageEntryFailed, buildErr.Code, buildErr.Err, buildErr.CleanupRequired, true)
+		t.addDecisionProducerEvent(intent, attempt, ProducerStageEntryFailed, buildErr.Code, buildErr.Err, buildErr.CleanupRequired, false)
 		if case3AResurrected {
 			t.reconcileCase3AObligationLocked(intent)
 			_ = t.saveStateNoLock()
@@ -960,7 +993,7 @@ func (t *Trader) executeProducerAllocation(
 			t.reconcileCase3AObligationLocked(intent)
 			_ = t.saveStateNoLock()
 		}
-		t.persistProducerAttemptLocked(attempt)
+		t.recordProducerAttemptLocked(attempt)
 		t.mu.Unlock()
 		return fmt.Sprintf("HOLD producer=%s", req.Producer), commitErr
 	}
@@ -1000,7 +1033,7 @@ func (t *Trader) executeProducerAllocation(
 		}
 	}
 
-	t.persistProducerAttemptLocked(attempt)
+	t.recordProducerAttemptLocked(attempt)
 	refundReservationTransferred = true
 	t.mu.Unlock()
 
@@ -1128,8 +1161,9 @@ func (t *Trader) processParallelProducerEntriesLocked(
 				admission.ErrorCode,
 				admission.Err,
 				false,
-				true,
+				false,
 			)
+			t.recordProducerAttemptLocked(attempt)
 			continue
 		}
 
@@ -1161,7 +1195,7 @@ func (t *Trader) processParallelProducerEntriesLocked(
 			rejected.Status = AllocationRejected
 			rejected.Reason = AllocationReasonBalanceUnavailable
 			t.recordAllocationEventLocked(rejected, ProducerStageAllocationRejected)
-			t.persistProducerAttemptLocked(attempt)
+			t.recordProducerAttemptLocked(attempt)
 			continue
 		}
 
@@ -1184,8 +1218,9 @@ func (t *Trader) processParallelProducerEntriesLocked(
 				intent, attempt, ProducerStageDecisionFailed,
 				EntryProduceErrDecisionInvalidConfidence,
 				fmt.Errorf("decision confidence must be > 0: %.8f", d.Confidence),
-				false, true,
+				false, false,
 			)
+			t.recordProducerAttemptLocked(attempt)
 			continue
 		}
 
@@ -1197,8 +1232,9 @@ func (t *Trader) processParallelProducerEntriesLocked(
 					"ordinary producer missing standardized ProfitGateMultiplier: producer=%s tier=%s continuation=%t",
 					d.Producer, d.ProducerTier, d.IsContinuation,
 				),
-				false, true,
+				false, false,
 			)
+			t.recordProducerAttemptLocked(attempt)
 			continue
 		}
 
@@ -1213,8 +1249,9 @@ func (t *Trader) processParallelProducerEntriesLocked(
 				EntryProduceErrInvalidQuantity,
 				err,
 				false,
-				true,
+				false,
 			)
+			t.recordProducerAttemptLocked(attempt)
 			continue
 		}
 
@@ -1290,6 +1327,7 @@ func (t *Trader) processParallelProducerEntriesLocked(
 	}
 
 	if len(requests) == 0 {
+		_ = t.saveProducerHistoryNoLock()
 		t.mu.Unlock()
 		return StepResult{Msg: "HOLD no admitted producer requests", Raw: aiRaw, Signal: Flat}, nil
 	}
@@ -1325,6 +1363,10 @@ func (t *Trader) processParallelProducerEntriesLocked(
 
 	for _, allocation := range plan.Allocations {
 		t.recordAllocationEventLocked(allocation, allocationFinalStage(allocation.Status))
+		// Register every attempt in memory now so asynchronous pollers and later
+		// lifecycle stages enrich the same object. Disk persistence is batched
+		// after all approved submissions in this coordinator cycle.
+		t.recordProducerAttemptLocked(allocation.Request.Attempt)
 
 		if allocation.Status == AllocationRejected {
 			if allocation.Reason == AllocationReasonLotCapacity {
@@ -1335,8 +1377,6 @@ func (t *Trader) processParallelProducerEntriesLocked(
 		// Funding shortfall is meaningful for both rejected and partial grants.
 		// Preserve historical DEBUG behavior independently from refund mutation.
 		t.preserveFundingFailureDebugLocked(allocation, snapshot, price)
-
-		t.persistProducerAttemptLocked(allocation.Request.Attempt)
 
 		if allocation.Status == AllocationApproved || allocation.Status == AllocationPartial {
 			if allocation.Status == AllocationPartial {
@@ -1424,6 +1464,7 @@ func (t *Trader) processParallelProducerEntriesLocked(
 	if len(approved) == 0 {
 		publishTickRefundShortfallsLocked()
 		_ = t.saveStateNoLock()
+		_ = t.saveProducerHistoryNoLock()
 		t.mu.Unlock()
 		return StepResult{Msg: "HOLD allocation rejected", Raw: aiRaw, Signal: Flat}, nil
 	}
@@ -1455,6 +1496,13 @@ func (t *Trader) processParallelProducerEntriesLocked(
 			errs = append(errs, fmt.Errorf("%s: %w", allocation.Request.Producer, err))
 		}
 	}
+
+	// One producer-history rewrite per coordinator execution batch. All stage
+	// events retained their own event timestamps in memory, but no approved
+	// producer waited for history I/O before its broker submission.
+	t.mu.Lock()
+	_ = t.saveProducerHistoryNoLock()
+	t.mu.Unlock()
 
 	// Publish funding shortfalls created by THIS coordinator tick only after all
 	// approved allocations had their historical opportunity to consume the
