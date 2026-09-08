@@ -96,6 +96,7 @@ const (
 	ProducerPriorityCase14B           ProducerPriority = 300
 	ProducerPriorityEquity            ProducerPriority = 200
 	ProducerPriorityNormalLegacy      ProducerPriority = 100
+	ProducerPriorityCase15B           ProducerPriority = 50
 )
 
 const (
@@ -116,6 +117,8 @@ const (
 	EntryProducerCase13BBottomBuy EntryProducer = "Case13BBottomBuy"
 
 	EntryProducerCase14BUptrendBuy EntryProducer = "Case14BUptrendBuy"
+
+	EntryProducerCase15BDowntrendRecoveryBuy EntryProducer = "Case15BDowntrendRecoveryBuy"
 )
 
 // producerPriorityFor is the single authoritative mapping used by resource
@@ -145,6 +148,9 @@ func producerPriorityFor(producer EntryProducer) ProducerPriority {
 
 	case EntryProducerNormalLegacy:
 		return ProducerPriorityNormalLegacy
+
+	case EntryProducerCase15BDowntrendRecoveryBuy:
+		return ProducerPriorityCase15B
 
 	default:
 		return 0
@@ -213,7 +219,8 @@ func producerTierFor(producer EntryProducer) (ProducerTier, float64) {
 		return ProducerTierMid, MidTierProducerMultiplier
 
 	case EntryProducerCase13APeakSell,
-		EntryProducerCase13BBottomBuy:
+		EntryProducerCase13BBottomBuy,
+		EntryProducerCase15BDowntrendRecoveryBuy:
 		return ProducerTierLow, LowTierProducerMultiplier
 
 	case EntryProducerCase3AReplacement:
@@ -493,7 +500,8 @@ func entryPolicyForSource(source EntryProducer) EntryPolicy {
 			ResetRegime:      false,
 		}
 	case EntryProducerCase11APeakReversal,
-		EntryProducerCase11BBottomReversal:
+		EntryProducerCase11BBottomReversal,
+		EntryProducerCase15BDowntrendRecoveryBuy:
 		return EntryPolicy{
 			ResetLastAdd:     true,
 			ResetWinExtreme:  true,
@@ -521,6 +529,151 @@ func entryPolicyForSource(source EntryProducer) EntryPolicy {
 	default:
 		panic(fmt.Sprintf("entryPolicyForSource: unsupported source %q", source))
 	}
+}
+
+// applyCase15BDowntrendRecoveryBuyProducer captures an emerging BUY reversal
+// while price remains in the narrow buffered area immediately above the
+// Pyramid BUY latch. It is an ordinary producer: only its signal admission is
+// specialized; lifecycle, resource, Refund, execution, continuation and
+// observability behavior are supplied by the shared producer pipeline.
+func applyCase15BDowntrendRecoveryBuyProducer(
+	d *EntryDecision,
+	ai AIResult,
+	macd MACDResult,
+	ema EMAPatternResult,
+	pyramid PyramidResult,
+	price float64,
+	regime MarketRegime,
+	pendingCounts PendingProducerCounts,
+	continuationRefs ProducerContinuationReferences,
+) bool {
+	if d == nil {
+		return false
+	}
+
+	const (
+		minConfidence      = 0.55
+		nearLatchBufferPct = 0.56
+	)
+
+	reference := continuationRefs.Reference(
+		EntryProducerCase15BDowntrendRecoveryBuy,
+		SideBuy,
+	)
+	continuation := reference > 0
+	pending := pendingCounts.Count(
+		EntryProducerCase15BDowntrendRecoveryBuy,
+		SideBuy,
+	)
+
+	latchValid := pyramid.Buy.Latched > 0
+	bufferedLatch := 0.0
+	if latchValid {
+		bufferedLatch = pyramid.Buy.Latched * (1.0 + nearLatchBufferPct/100.0)
+	}
+
+	actualLatchReached := latchValid && price <= pyramid.Buy.Latched
+	withinLatchWindow := latchValid &&
+		!actualLatchReached &&
+		price <= bufferedLatch
+	entryGatePass := withinLatchWindow && pyramid.Buy.SpacingPass
+	nextEntryPrice := 0.0
+
+	if continuation {
+		nextEntryPrice, entryGatePass = continuationReferenceGate(
+			SideBuy,
+			price,
+			reference,
+		)
+		traceContinuationEvaluation(
+			EntryProducerCase15BDowntrendRecoveryBuy,
+			SideBuy,
+			price,
+			reference,
+			nextEntryPrice,
+			entryGatePass,
+			pending,
+			pending == 0,
+		)
+	}
+
+	downtrendRecoveryBuy := pending == 0 &&
+		entryGatePass &&
+		ai.Raw == Buy &&
+		ai.Confidence >= minConfidence &&
+		regime == RegimeDown &&
+		ema.PatternBuy &&
+		ema.PriceDownUp &&
+		macd.LinePrev6 < 0 &&
+		macd.Line < 0 &&
+		macd.Line > macd.LinePrev6 &&
+		macd.Hist > 0
+
+	if !downtrendRecoveryBuy {
+		return false
+	}
+
+	d.Signal = Buy
+	d.PyramidPass = pyramid.Buy.GatePassed
+	d.PyramidReason = pyramid.Buy.Reason
+	d.Producer = EntryProducerCase15BDowntrendRecoveryBuy
+	d.PendingCancelPolicy = PendingSignalCancelDisabled
+
+	applyStandardProducerEconomics(
+		d,
+		EntryProducerCase15BDowntrendRecoveryBuy,
+		continuation,
+		reference,
+		nextEntryPrice,
+		entryGatePass,
+	)
+
+	referenceMode := "continuation_reference"
+	if !continuation {
+		referenceMode = "first_buffered_latch"
+	}
+
+	d.ProducerReason = fmt.Sprintf(
+		"downtrend_recovery_buy|"+
+			"ai_raw=%s|confidence=%.6f|min_confidence=%.6f|regime=%s|"+
+			"pattern_buy=%t|price_down_up=%t|"+
+			"macd_idx6=%.6f|macd_line=%.6f|macd_recovering=%t|macd_hist=%.6f|"+
+			"price=%.8f|latch=%.8f|buffered_latch=%.8f|actual_latch=%t|within_window=%t|"+
+			"spacing=%t|pending=%d|reference_mode=%s|reference_price=%.8f|"+
+			"next_entry_price=%.8f|continuation_spacing_pct=%.4f|entry_gate_pass=%t|"+
+			"tier=%s|tier_mult=%.6f|priority=%d|continuation=%t|"+
+			"continuation_profit_factor=%.6f|profit_gate_mult=%.6f",
+		ai.Raw,
+		ai.Confidence,
+		minConfidence,
+		regime,
+		ema.PatternBuy,
+		ema.PriceDownUp,
+		macd.LinePrev6,
+		macd.Line,
+		macd.Line > macd.LinePrev6,
+		macd.Hist,
+		price,
+		pyramid.Buy.Latched,
+		bufferedLatch,
+		actualLatchReached,
+		withinLatchWindow,
+		pyramid.Buy.SpacingPass,
+		pending,
+		referenceMode,
+		reference,
+		nextEntryPrice,
+		ContinuationEntrySpacingPct,
+		entryGatePass,
+		d.ProducerTier,
+		d.ProducerTierMultiplier,
+		d.ProducerPriority,
+		d.IsContinuation,
+		ContinuationProfitGateFactor,
+		d.ProfitGateMultiplier,
+	)
+
+	return true
 }
 
 // applyNormalLegacyProducer evaluates the standard AI + Logic producer.

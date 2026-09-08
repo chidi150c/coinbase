@@ -1695,6 +1695,7 @@ func interpretPyramidSideRaw(
 //	300  Case14B — Uptrend buffered-latch BUY
 //	200  Equity
 //	100  NormalLegacy
+//	 50  Case15B — Downtrend recovery BUY
 //
 // Case3AReplacement has priority 800, but it remains owned by the exit/recovery
 // path and is not evaluated by this ordinary producer collection function.
@@ -1784,7 +1785,7 @@ func (t *Trader) collectEntryProducerDecisions(
 		EquitySellTrigger: equity.SellTrigger,
 	}
 
-	decisions := make([]EntryDecision, 0, 7)
+	decisions := make([]EntryDecision, 0, 8)
 
 	// Case 11A and Case 11B evaluate independently. Neither directional
 	// producer can suppress the other through helper-level first-match return.
@@ -1862,6 +1863,21 @@ func (t *Trader) collectEntryProducerDecisions(
 		continuationRefs,
 	) {
 		decisions = append(decisions, case14B)
+	}
+
+	case15B := baseDecision
+	if applyCase15BDowntrendRecoveryBuyProducer(
+		&case15B,
+		ai,
+		macd,
+		ema,
+		pyramid,
+		price,
+		t.MarketRegime,
+		pendingCounts,
+		continuationRefs,
+	) {
+		decisions = append(decisions, case15B)
 	}
 
 	equityDecision := baseDecision
