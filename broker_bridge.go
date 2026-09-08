@@ -273,13 +273,17 @@ func (bb *BridgeBroker) GetRecentCandles(ctx context.Context, product, granulari
 // --- Orders (market) ---
 
 func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, side OrderSide, quoteUSD float64) (*PlacedOrder, error) {
+	return bb.PlaceMarketQuoteWithClientID(ctx, product, side, quoteUSD, uuid.New().String())
+}
+
+func (bb *BridgeBroker) PlaceMarketQuoteWithClientID(ctx context.Context, product string, side OrderSide, quoteUSD float64, clientOrderID string) (*PlacedOrder, error) {
 	// Minimal update: send side and quote_size to unified /order/market endpoint.
 	u := bb.base + "/order/market"
 	body := map[string]any{
 		"product_id":      product,
 		"side":            strings.ToUpper(string(side)),
 		"quote_size":      fmt.Sprintf("%.2f", quoteUSD),
-		"client_order_id": uuid.New().String(), // minimal addition: dedupe-safe ID for retries
+		"client_order_id": firstNonEmpty(strings.TrimSpace(clientOrderID), uuid.New().String()),
 	}
 	bs, _ := json.Marshal(body)
 
@@ -314,7 +318,7 @@ func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, si
 		quote, _ := strconv.ParseFloat(norm.QuoteSpent, 64)
 
 		// Micro-retry enrichment: poll /order/{order_id} briefly for fills (and commission).
-		id := firstNonEmpty(norm.OrderID, uuid.New().String())
+		id := firstNonEmpty(norm.OrderID, strings.TrimSpace(clientOrderID))
 		commission := 0.0
 		const attempts = 6
 		const sleepDur = 250 * time.Millisecond
@@ -362,7 +366,7 @@ func (bb *BridgeBroker) PlaceMarketQuote(ctx context.Context, product string, si
 		}
 	}
 	if strings.TrimSpace(id) == "" {
-		id = uuid.New().String()
+		id = strings.TrimSpace(clientOrderID)
 	}
 
 	// Micro-retry enrichment: poll /order/{order_id} briefly for fills (and commission).
@@ -536,6 +540,10 @@ func (bb *BridgeBroker) GetExchangeFilters(ctx context.Context, product string) 
 // PlaceLimitPostOnly places a post-only limit order and returns the bridge order_id.
 // The bridge is expected to enforce maker-only semantics (post_only) and reject/adjust as needed.
 func (bb *BridgeBroker) PlaceLimitPostOnly(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64) (string, error) {
+	return bb.PlaceLimitPostOnlyWithClientID(ctx, product, side, limitPrice, baseSize, uuid.New().String())
+}
+
+func (bb *BridgeBroker) PlaceLimitPostOnlyWithClientID(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64, clientOrderID string) (string, error) {
 	// Best-effort: apply exchange LOT_SIZE.StepSize and PRICE_FILTER.TickSize if the bridge exposes them.
 	f := bb.getExchangeFiltersCached(product) // ignore error to preserve baseline behavior
 	if f.StepSize > 0 {
@@ -551,7 +559,7 @@ func (bb *BridgeBroker) PlaceLimitPostOnly(ctx context.Context, product string, 
 		"side":            strings.ToUpper(string(side)),
 		"limit_price":     formatWithStepCoinbase(limitPrice, f.TickSize, 10),
 		"base_size":       formatWithStepCoinbase(baseSize, f.StepSize, 10),
-		"client_order_id": uuid.New().String(),
+		"client_order_id": firstNonEmpty(strings.TrimSpace(clientOrderID), uuid.New().String()),
 	}
 	bs, _ := json.Marshal(body)
 
@@ -591,8 +599,9 @@ func (bb *BridgeBroker) PlaceLimitPostOnly(ctx context.Context, product string, 
 			}
 		}
 	}
-	// If bridge returns nothing recognizable, synthesize a client id so caller can still poll/cancel gracefully.
-	return uuid.New().String(), nil
+	// Preserve the caller-owned idempotency key so an accepted-but-unrecognized
+	// response remains queryable and reconcilable instead of inventing a second ID.
+	return strings.TrimSpace(clientOrderID), nil
 }
 
 // GetOrder fetches an order summary and maps it into PlacedOrder.

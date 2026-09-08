@@ -79,7 +79,7 @@ import (
 	"time"
 )
 
-const Version = 196
+const Version = 197
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -209,6 +209,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// resource snapshots.
 	t.producerAllocationMu.Lock()
 	defer t.producerAllocationMu.Unlock()
+	var deferredIndependentExits []exitCandidate
+	t.reconcileResourceQuarantines(ctx)
 
 	// Use wall clock as authoritative "now" for pyramiding timings; fall back for zero candle time.
 	wallNow := time.Now().UTC()
@@ -1027,6 +1029,19 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			selected = append(selected, profitL1[0])
 		}
 
+		// Case3A-capable loss exits preserve their original synchronous ordering.
+		// Independent profit exits are deferred until the entry plan is fully
+		// reserved, then their Binance submissions overlap ordinary entries.
+		critical := make([]exitCandidate, 0, len(selected))
+		for _, candidate := range selected {
+			if strings.HasPrefix(candidate.reason, "threshold_stop_loss") {
+				critical = append(critical, candidate)
+			} else {
+				deferredIndependentExits = append(deferredIndependentExits, candidate)
+			}
+		}
+		selected = critical
+
 		if len(selected) > 0 {
 			fanoutStart := time.Now()
 			// log.Printf(
@@ -1209,6 +1224,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			reservedShortQuoteWithFee += intent.Quote * feeMult
 		}
 	}
+
+	// Refresh the durable authoritative ledger from live lifecycle state, then
+	// use its totals as the only reservation input to allocation. Submission and
+	// reconciliation records survive this refresh and remain quarantined.
+	if err := t.rebuildDerivedResourceLedgerLocked(price); err != nil {
+		t.mu.Unlock()
+		return StepResult{Msg: "HOLD resource ledger rebuild failed"}, err
+	}
+	reservedShortQuoteWithFee, reservedLongBase =
+		t.producerResourceReservationsLocked()
 
 	// Build the ONE immutable resource snapshot for this entry-allocation
 	// cycle. Existing pending reservations above are already included exactly
@@ -1586,6 +1611,30 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// Equity-stage timing during request preparation, spare compatibility mirrors,
 	// and execution of every approved/partial allocation. step() supplies the
 	// single frozen ResourceSnapshot and does not re-run legacy inline sizing.
+	var independentExitResults <-chan []exitFanoutResult
+	var independentExitStart chan bool
+	if len(deferredIndependentExits) > 0 {
+		resultsCh := make(chan []exitFanoutResult, 1)
+		startCh := make(chan bool, 1)
+		independentExitResults = resultsCh
+		independentExitStart = startCh
+		candidates := append([]exitCandidate(nil), deferredIndependentExits...)
+		go func() {
+			if execute := <-startCh; !execute {
+				close(resultsCh)
+				return
+			}
+			results := t.fanOutExits(ctx, livePrice, candidates, hotStart)
+			if t.resourceManager != nil {
+				for _, candidate := range candidates {
+					t.resourceManager.Release("exit-preflight:" + strings.TrimSpace(candidate.entryOrderID))
+				}
+				_ = t.saveState()
+			}
+			resultsCh <- results
+			close(resultsCh)
+		}()
+	}
 	return t.processParallelProducerEntriesLocked(
 		ctx,
 		decisions,
@@ -1599,6 +1648,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		wallNow,
 		hotStart,
 		aiResult.Raw,
+		independentExitResults,
+		independentExitStart,
+		deferredIndependentExits,
 	)
 }
 

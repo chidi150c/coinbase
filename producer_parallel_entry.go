@@ -473,9 +473,12 @@ func (t *Trader) executeProducerAllocation(
 	// on pending registration the PendingEntry registry becomes authoritative;
 	// on market success the committed position becomes authoritative; and on any
 	// failure no exchange-backed reservation remains.
+	releaseSubmissionReservation := true
 	defer func() {
 		t.mu.Lock()
-		t.releaseProducerResourcesLocked(intent.DecisionID)
+		if releaseSubmissionReservation {
+			t.releaseProducerResourcesLocked(intent.DecisionID)
+		}
 		t.mu.Unlock()
 	}()
 
@@ -751,6 +754,15 @@ func (t *Trader) executeProducerAllocation(
 			t.mu.Unlock()
 
 			if err != nil {
+				if marketEntryErrorCode(err) == EntryProduceErrSubmitTimeout {
+				t.mu.Lock()
+				if t.resourceManager != nil {
+					_ = t.resourceManager.Quarantine("submission:" + intent.DecisionID)
+					releaseSubmissionReservation = false
+					_ = t.saveStateNoLock()
+				}
+				t.mu.Unlock()
+				}
 				log.Printf(
 					"[DEBUG] postonly.error "+
 						"hold_for_recheck side=%s err=%v",
@@ -820,7 +832,16 @@ func (t *Trader) executeProducerAllocation(
 		"", nil, false, false,
 	)
 
-	placed, err := t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, req.Side, marketQuote)
+	var placed *PlacedOrder
+	var err error
+	if broker, ok := t.broker.(IdempotentBroker); ok {
+		placed, err = broker.PlaceMarketQuoteWithClientID(
+			ctx, t.cfg.ProductID, req.Side, marketQuote,
+			stableClientOrderID(intent.DecisionID),
+		)
+	} else {
+		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, req.Side, marketQuote)
+	}
 	if err != nil && marketQuote > minNotional && isBinanceInsufficientBalance(err) {
 		marketQuote = minNotional
 		marketBase = marketQuote / price
@@ -834,6 +855,10 @@ func (t *Trader) executeProducerAllocation(
 	intent.ExchangeRespondedAt = time.Now().UTC()
 	if err != nil {
 		t.mu.Lock()
+		if marketEntryErrorCode(err) == EntryProduceErrSubmitTimeout && t.resourceManager != nil {
+			_ = t.resourceManager.Quarantine("submission:" + intent.DecisionID)
+			releaseSubmissionReservation = false
+		}
 		t.addDecisionProducerEvent(
 			intent,
 			attempt,
@@ -1104,10 +1129,45 @@ func (t *Trader) processParallelProducerEntriesLocked(
 	wallNow time.Time,
 	hotStart time.Time,
 	aiRaw Signal,
+	independentExitResults <-chan []exitFanoutResult,
+	independentExitStart chan bool,
+	independentExitCandidates []exitCandidate,
 ) (StepResult, error) {
+	exitsStarted := false
+	startIndependentExits := func(execute bool) {
+		if independentExitStart != nil && !exitsStarted {
+			independentExitStart <- execute
+			close(independentExitStart)
+			exitsStarted = true
+		}
+	}
+	reserveIndependentExitsOnly := func() error {
+		if len(independentExitCandidates) == 0 {
+			return nil
+		}
+		if err := t.reserveProducerAllocationBatchLocked(nil, independentExitCandidates); err != nil {
+			return err
+		}
+		if err := t.saveStateNoLock(); err != nil {
+			for _, candidate := range independentExitCandidates {
+				t.resourceManager.Release("exit-preflight:" + strings.TrimSpace(candidate.entryOrderID))
+			}
+			return err
+		}
+		return nil
+	}
 	if len(decisions) == 0 {
+		if err := reserveIndependentExitsOnly(); err != nil {
+			t.mu.Unlock()
+			startIndependentExits(false)
+			return StepResult{Msg: "HOLD exit preflight reservation failed", Raw: aiRaw, Signal: Flat}, err
+		}
 		t.mu.Unlock()
-		return StepResult{Msg: "FLAT", Raw: aiRaw, Signal: Flat}, nil
+		startIndependentExits(true)
+		return mergeIndependentExitResults(
+			StepResult{Msg: "FLAT", Raw: aiRaw, Signal: Flat}, nil,
+			independentExitResults,
+		)
 	}
 
 	// Preserve startup consolidation behavior before lot-slot capacity is
@@ -1328,8 +1388,17 @@ func (t *Trader) processParallelProducerEntriesLocked(
 
 	if len(requests) == 0 {
 		_ = t.saveProducerHistoryNoLock()
+		if err := reserveIndependentExitsOnly(); err != nil {
+			t.mu.Unlock()
+			startIndependentExits(false)
+			return StepResult{Msg: "HOLD exit preflight reservation failed", Raw: aiRaw, Signal: Flat}, err
+		}
 		t.mu.Unlock()
-		return StepResult{Msg: "HOLD no admitted producer requests", Raw: aiRaw, Signal: Flat}, nil
+		startIndependentExits(true)
+		return mergeIndependentExitResults(
+			StepResult{Msg: "HOLD no admitted producer requests", Raw: aiRaw, Signal: Flat}, nil,
+			independentExitResults,
+		)
 	}
 
 	coordinator := ProducerResourceCoordinator{}
@@ -1407,34 +1476,28 @@ func (t *Trader) processParallelProducerEntriesLocked(
 	// submissions begin. Existing pending reservations remain paramount and were
 	// already reflected in the frozen snapshot. These transient reservations
 	// protect the gap between plan finalization and PendingEntry/commit ownership.
-	reservedDecisionIDs := make([]string, 0, len(approved))
-	for _, allocation := range approved {
-		if err := t.reserveProducerAllocationLocked(allocation); err != nil {
-			for _, decisionID := range reservedDecisionIDs {
-				t.releaseProducerResourcesLocked(decisionID)
+	if err := t.reserveProducerAllocationBatchLocked(approved, independentExitCandidates); err != nil {
+		t.mu.Unlock()
+		startIndependentExits(false)
+		return mergeIndependentExitResults(StepResult{
+			Msg: "HOLD resource reservation failed", Raw: aiRaw, Signal: Flat,
+		}, fmt.Errorf("producer resource reservation batch failed: %w", err), independentExitResults)
+	}
+	if err := t.saveStateNoLock(); err != nil {
+		for _, allocation := range approved {
+			if allocation.Request.Intent != nil {
+				t.releaseProducerResourcesLocked(allocation.Request.Intent.DecisionID)
 			}
-			t.mu.Unlock()
-			return StepResult{
-					Msg:    "HOLD resource reservation failed",
-					Raw:    aiRaw,
-					Signal: Flat,
-				}, fmt.Errorf(
-					"producer resource reservation failed producer=%s decision_id=%s: %w",
-					allocation.Request.Producer,
-					allocation.Request.Intent.DecisionID,
-					err,
-				)
 		}
-
-		if allocation.Request.Intent != nil &&
-			strings.TrimSpace(allocation.Request.Intent.DecisionID) != "" &&
-			(allocation.Request.Side == SideBuy ||
-				(allocation.Request.Side == SideSell && t.cfg.RequireBaseForShort)) {
-			reservedDecisionIDs = append(
-				reservedDecisionIDs,
-				allocation.Request.Intent.DecisionID,
-			)
+		for _, candidate := range independentExitCandidates {
+			t.resourceManager.Release("exit-preflight:" + strings.TrimSpace(candidate.entryOrderID))
 		}
+		t.mu.Unlock()
+		startIndependentExits(false)
+		return mergeIndependentExitResults(
+			StepResult{Msg: "HOLD resource ledger persistence failed", Raw: aiRaw, Signal: Flat},
+			err, independentExitResults,
+		)
 	}
 
 	publishTickRefundShortfallsLocked := func() {
@@ -1466,7 +1529,11 @@ func (t *Trader) processParallelProducerEntriesLocked(
 		_ = t.saveStateNoLock()
 		_ = t.saveProducerHistoryNoLock()
 		t.mu.Unlock()
-		return StepResult{Msg: "HOLD allocation rejected", Raw: aiRaw, Signal: Flat}, nil
+		startIndependentExits(true)
+		return mergeIndependentExitResults(
+			StepResult{Msg: "HOLD allocation rejected", Raw: aiRaw, Signal: Flat}, nil,
+			independentExitResults,
+		)
 	}
 
 	// The full plan and all transient reservations have been established while
@@ -1474,26 +1541,39 @@ func (t *Trader) processParallelProducerEntriesLocked(
 	// (owned by step) prevents another complete allocation cycle from racing this
 	// batch's frozen plan.
 	t.mu.Unlock()
+	startIndependentExits(true)
 
+	type allocationResult struct {
+		index int
+		msg string
+		err error
+	}
+	results := make(chan allocationResult, len(approved))
+	for i, allocation := range approved {
+		i, allocation := i, allocation
+		go func() {
+			msg, err := t.executeProducerAllocation(
+				ctx, allocation, price, minNotional, now, wallNow, hotStart,
+			)
+			results <- allocationResult{index: i, msg: msg, err: err}
+		}()
+	}
+	ordered := make([]allocationResult, len(approved))
+	for range approved {
+		result := <-results
+		ordered[result.index] = result
+	}
 	messages := make([]string, 0, len(approved))
 	errs := make([]error, 0)
 	var lastSignal Signal = Flat
-	for _, allocation := range approved {
-		msg, err := t.executeProducerAllocation(
-			ctx,
-			allocation,
-			price,
-			minNotional,
-			now,
-			wallNow,
-			hotStart,
-		)
-		if msg != "" {
-			messages = append(messages, msg)
+	for i, allocation := range approved {
+		result := ordered[i]
+		if result.msg != "" {
+			messages = append(messages, result.msg)
 		}
 		lastSignal = allocation.Request.Decision.Signal
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", allocation.Request.Producer, err))
+		if result.err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", allocation.Request.Producer, result.err))
 		}
 	}
 
@@ -1523,5 +1603,42 @@ func (t *Trader) processParallelProducerEntriesLocked(
 		result.Msg = "HOLD"
 	}
 
-	return result, errors.Join(errs...)
+	return mergeIndependentExitResults(result, errors.Join(errs...), independentExitResults)
+}
+
+func mergeIndependentExitResults(
+	result StepResult,
+	entryErr error,
+	resultsCh <-chan []exitFanoutResult,
+) (StepResult, error) {
+	if resultsCh == nil {
+		return result, entryErr
+	}
+	results := <-resultsCh
+	var messages []string
+	var exitErrs []error
+	succeeded := 0
+	for _, exit := range results {
+		if exit.Acted {
+			succeeded++
+		}
+		if strings.TrimSpace(exit.Msg) != "" {
+			messages = append(messages, exit.Msg)
+		}
+		if exit.Err != nil {
+			exitErrs = append(exitErrs, exit.Err)
+		}
+	}
+	if len(results) > 0 {
+		exitSummary := fmt.Sprintf(
+			"EXIT-FANOUT total=%d succeeded=%d failed=%d",
+			len(results), succeeded, len(exitErrs),
+		)
+		messages = append([]string{exitSummary}, messages...)
+	}
+	if strings.TrimSpace(result.Msg) != "" {
+		messages = append(messages, result.Msg)
+	}
+	result.Msg = strings.Join(messages, "\n")
+	return result, errors.Join(append([]error{entryErr}, exitErrs...)...)
 }

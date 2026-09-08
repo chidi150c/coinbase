@@ -13,6 +13,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"strings"
 	"time"
 )
 
@@ -83,4 +86,17 @@ type Broker interface {
 	CancelOrder(ctx context.Context, product, orderID string) error
 	GetExchangeFilters(ctx context.Context, product string) (ExFilters, error)
 	GetBBO(ctx context.Context, product string) (float64, float64, error)
+}
+
+// IdempotentBroker optionally accepts caller-owned client order IDs. The
+// ResourceManager uses the same durable owner ID for submission and later
+// reconciliation without widening the mandatory Broker contract.
+type IdempotentBroker interface {
+	PlaceMarketQuoteWithClientID(ctx context.Context, product string, side OrderSide, quoteUSD float64, clientOrderID string) (*PlacedOrder, error)
+	PlaceLimitPostOnlyWithClientID(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64, clientOrderID string) (string, error)
+}
+
+func stableClientOrderID(ownerID string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(ownerID)))
+	return "bot-" + hex.EncodeToString(sum[:16])
 }

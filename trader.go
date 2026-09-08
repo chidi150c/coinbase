@@ -202,6 +202,7 @@ type BotState struct {
 	DustSellLots              []*Position
 	Case3AObligations         map[string]*Case3AObligation
 	PendingReplacementRetries map[string]PendingReplacementRetry
+	ResourceLedger            ResourceLedgerState `json:"resource_ledger,omitempty"`
 }
 
 type OpenResult struct {
@@ -247,6 +248,7 @@ type Trader struct {
 	// This lock prevents a second step from building a competing frozen resource
 	// snapshot while the current AllocationPlan is being realized.
 	producerAllocationMu sync.Mutex
+	statePersistMu       sync.Mutex
 
 	equityUSD     float64
 	previousAIRaw Signal
@@ -368,17 +370,10 @@ type Trader struct {
 	pendingEntries map[string]*PendingEntry
 	pendingExits   map[string]*PendingExit
 
-	// Step-local producer resource reservations.
-	//
-	// The parallel producer coordinator reserves approved allocations here
-	// before releasing t.mu for broker I/O. This prevents two independently
-	// admitted producers from consuming the same frozen-snapshot capacity.
-	//
-	// These reservations are transient: once an exchange-backed PendingEntry is
-	// registered, that PendingEntry becomes the authoritative reservation. On
-	// pre-registration failure the coordinator releases the transient record.
-	// Key = DecisionID.
-	entryResourceReservations map[string]ProducerResourceReservation
+	// ResourceManager is the sole runtime reservation ledger. Trader retains
+	// order and strategy lifecycle objects, but never maintains a competing
+	// spendable-resource map.
+	resourceManager *ResourceManager
 
 	producerHistory map[EntryProducer]*ProducerHistory
 
@@ -417,11 +412,9 @@ func NewTrader(cfg Config, broker Broker) *Trader {
 		PendingReplacementRetries: make(
 			map[string]PendingReplacementRetry,
 		),
+		resourceManager: NewResourceManager(ResourceLedgerState{}),
 		RefundObligations: make(
 			map[string]*RefundObligation,
-		),
-		entryResourceReservations: make(
-			map[string]ProducerResourceReservation,
 		),
 
 		stateApplyCh:        make(chan func(*Trader), 128),
@@ -1614,6 +1607,7 @@ func (t *Trader) snapshotStateLocked() BotState {
 		DustSellLots:              append([]*Position(nil), t.dustSellLots...),
 		Case3AObligations:         t.Case3AObligations,
 		PendingReplacementRetries: t.PendingReplacementRetries,
+		ResourceLedger:            t.resourceManager.State(),
 	}
 }
 
@@ -1622,6 +1616,8 @@ func (t *Trader) saveStateFrom(st BotState) error {
 	if t.stateFile == "" || !t.cfg.PersistState {
 		return nil
 	}
+	t.statePersistMu.Lock()
+	defer t.statePersistMu.Unlock()
 	bs, err := json.MarshalIndent(st, "", " ")
 	if err != nil {
 		return err
@@ -1780,6 +1776,11 @@ func (t *Trader) loadState() error {
 	t.PendingReplacementRetries = st.PendingReplacementRetries
 	if t.PendingReplacementRetries == nil {
 		t.PendingReplacementRetries = make(map[string]PendingReplacementRetry)
+	}
+	if t.resourceManager == nil {
+		t.resourceManager = NewResourceManager(st.ResourceLedger)
+	} else {
+		t.resourceManager.Restore(st.ResourceLedger)
 	}
 
 	// Restore equity stages
@@ -2025,6 +2026,7 @@ func (t *Trader) RehydratePending(
 				current, ok := t.pendingEntries[orderID]
 				if ok && current == persisted {
 					delete(t.pendingEntries, orderID)
+					if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
 				}
 
 				t.mu.Unlock()
@@ -2084,6 +2086,7 @@ func (t *Trader) RehydratePending(
 			current, ok := t.pendingEntries[orderID]
 			if ok && current == persisted {
 				delete(t.pendingEntries, orderID)
+				if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
 			}
 
 			if err := t.saveStateNoLock(); err != nil {
@@ -3385,6 +3388,34 @@ func (t *Trader) closeLot(
 					"Case3A modeA: missing decision lifecycle",
 				)
 			}
+			if t.resourceManager == nil {
+				t.resourceManager = NewResourceManager(ResourceLedgerState{})
+			}
+			transactionID := "case3a-mode-a:" + repl.DecisionID
+			case3AReservationID := "submission:" + repl.DecisionID
+			if err := t.resourceManager.ReserveBatch([]ResourceReservation{
+				{
+					ID: case3AReservationID, TransactionID: transactionID,
+					OwnerID: repl.ObligationID, Kind: ResourceReservationSubmission,
+					ClientOrderID: stableClientOrderID(repl.DecisionID), ProductID: t.cfg.ProductID,
+					State: ResourceReservationReserved,
+					Producer: EntryProducerCase3AReplacement, Side: repl.Side,
+					Base: repl.BaseAtLimit, CreatedAt: time.Now().UTC(),
+				},
+				{
+					ID: transactionID + ":source-exit", TransactionID: transactionID,
+					OwnerID: entryOrderID, Kind: ResourceReservationCase3A,
+					State: ResourceReservationReserved, Side: closeSide,
+					Informational: true, CreatedAt: time.Now().UTC(),
+				},
+			}); err != nil {
+				return "", false, fmt.Errorf("Case3A modeA atomic reservation failed: %w", err)
+			}
+			if err := t.saveStateNoLock(); err != nil {
+				t.resourceManager.Release(case3AReservationID, transactionID+":source-exit")
+				return "", false, fmt.Errorf("Case3A modeA reservation persistence failed: %w", err)
+			}
+			defer t.resourceManager.Release(transactionID + ":source-exit")
 
 			/*
 				startCase3AReplacement() enters produceEntry(), whose registration
@@ -3402,6 +3433,11 @@ func (t *Trader) closeLot(
 				&repl,
 				attempt,
 			)
+			if err != nil && marketEntryErrorCode(err) == EntryProduceErrSubmitTimeout {
+				_ = t.resourceManager.Quarantine(case3AReservationID)
+			} else {
+				t.resourceManager.Release(case3AReservationID)
+			}
 			log.Printf(
 				"[TRACE] hotpath.exit_scan.case3a_mode_a_submission "+
 					"entry_id=%s replacement_order_id=%s stage_elapsed_ms=%d hotpath_elapsed_ms=%d err=%t",
@@ -3727,7 +3763,32 @@ func (t *Trader) closeLot(
 
 	var err error
 	marketExitStart := time.Now()
-	placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote)
+	marketReservationID := "exit-market:" + entryOrderID
+	if t.resourceManager == nil {
+		t.resourceManager = NewResourceManager(ResourceLedgerState{})
+	}
+	if reserveErr := t.resourceManager.ReserveBatch([]ResourceReservation{{
+		ID: marketReservationID, OwnerID: entryOrderID,
+		ClientOrderID: stableClientOrderID(marketReservationID), ProductID: t.cfg.ProductID,
+		Kind: ResourceReservationSubmission, State: ResourceReservationReserved,
+		Side: closeSide, Informational: true, CreatedAt: time.Now().UTC(),
+	}}); reserveErr != nil {
+		t.mu.Lock()
+		return "", false, fmt.Errorf("reserve market exit entry_id=%s: %w", entryOrderID, reserveErr)
+	}
+	if persistErr := t.saveState(); persistErr != nil {
+		t.resourceManager.Release(marketReservationID)
+		t.mu.Lock()
+		return "", false, fmt.Errorf("persist market exit reservation entry_id=%s: %w", entryOrderID, persistErr)
+	}
+	if broker, ok := t.broker.(IdempotentBroker); ok {
+		placed, err = broker.PlaceMarketQuoteWithClientID(
+			ctx, t.cfg.ProductID, closeSide, quote,
+			stableClientOrderID(marketReservationID),
+		)
+	} else {
+		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, quote)
+	}
 	log.Printf(
 		"[TRACE] hotpath.exit_scan.market_exit_submission "+
 			"entry_id=%s close_side=%s stage_elapsed_ms=%d hotpath_elapsed_ms=%d err=%t",
@@ -3741,12 +3802,18 @@ func (t *Trader) closeLot(
 	// log.Printf("[KPI] taker.exit.done side=%s base=%.8f quote_est=%.2f reason=%s", closeSide, baseRequested, quote, exitReason)
 
 	if err != nil {
+		if marketEntryErrorCode(err) == EntryProduceErrSubmitTimeout {
+			_ = t.resourceManager.Quarantine(marketReservationID)
+		} else {
+			t.resourceManager.Release(marketReservationID)
+		}
 		if t.cfg.UseDirectSlack {
 			postSlack(fmt.Sprintf("ERR step: %v", err))
 		}
 		t.mu.Lock()
 		return "", false, fmt.Errorf("close order failed: %w", err)
 	}
+	t.resourceManager.Release(marketReservationID)
 
 	if placed != nil {
 		// log.Printf("[TRACE] order.close placed price=%.8f baseFilled=%.8f quoteSpent=%.2f fee=%.4f", placed.Price, placed.BaseSize, placed.QuoteSpent, placed.CommissionUSD)
@@ -4551,12 +4618,43 @@ func (t *Trader) maybeCloseDustBasket(ctx context.Context, side OrderSide, liveP
 
 	var placed *PlacedOrder
 	var err error
-
-	placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, notional)
+	dustOwnerID := strings.Join(entryIDs, ",")
+	dustReservationID := "exit-dust:" + stableClientOrderID(dustOwnerID)
+	if t.resourceManager == nil {
+		t.resourceManager = NewResourceManager(ResourceLedgerState{})
+	}
+	if reserveErr := t.resourceManager.ReserveBatch([]ResourceReservation{{
+		ID: dustReservationID, OwnerID: dustOwnerID,
+		ClientOrderID: stableClientOrderID(dustReservationID), ProductID: t.cfg.ProductID,
+		Kind: ResourceReservationSubmission, State: ResourceReservationReserved,
+		Side: closeSide, Informational: true, CreatedAt: time.Now().UTC(),
+	}}); reserveErr != nil {
+		t.mu.Lock()
+		return "", false, reserveErr
+	}
+	if persistErr := t.saveState(); persistErr != nil {
+		t.resourceManager.Release(dustReservationID)
+		t.mu.Lock()
+		return "", false, persistErr
+	}
+	if broker, ok := t.broker.(IdempotentBroker); ok {
+		placed, err = broker.PlaceMarketQuoteWithClientID(
+			ctx, t.cfg.ProductID, closeSide, notional,
+			stableClientOrderID(dustReservationID),
+		)
+	} else {
+		placed, err = t.broker.PlaceMarketQuote(ctx, t.cfg.ProductID, closeSide, notional)
+	}
 	if err != nil {
+		if marketEntryErrorCode(err) == EntryProduceErrSubmitTimeout {
+			_ = t.resourceManager.Quarantine(dustReservationID)
+		} else {
+			t.resourceManager.Release(dustReservationID)
+		}
 		t.mu.Lock()
 		return "", false, err
 	}
+	t.resourceManager.Release(dustReservationID)
 
 	t.mu.Lock()
 
@@ -4709,22 +4807,18 @@ func (t *Trader) reserveProducerResourcesLocked(
 		)
 	}
 
-	if t.entryResourceReservations == nil {
-		t.entryResourceReservations =
-			make(map[string]ProducerResourceReservation)
-	}
-	if _, exists := t.entryResourceReservations[reservation.DecisionID]; exists {
-		return fmt.Errorf(
-			"reserveProducerResourcesLocked: duplicate DecisionID=%s",
-			reservation.DecisionID,
-		)
-	}
-
 	if reservation.CreatedAt.IsZero() {
 		reservation.CreatedAt = time.Now().UTC()
 	}
-	t.entryResourceReservations[reservation.DecisionID] = reservation
-	return nil
+	if t.resourceManager == nil {
+		t.resourceManager = NewResourceManager(ResourceLedgerState{})
+	}
+	return t.resourceManager.ReserveBatch([]ResourceReservation{{
+		ID: reservation.DecisionID, Kind: ResourceReservationSubmission,
+		State: ResourceReservationReserved, Producer: reservation.Producer,
+		Side: reservation.Side, QuoteUSD: reservation.QuoteUSD,
+		Base: reservation.Base, CreatedAt: reservation.CreatedAt,
+	}})
 }
 
 // releaseProducerResourcesLocked releases only the transient coordinator
@@ -4736,14 +4830,14 @@ func (t *Trader) reserveProducerResourcesLocked(
 func (t *Trader) releaseProducerResourcesLocked(
 	decisionID string,
 ) {
-	if t == nil || t.entryResourceReservations == nil {
+	if t == nil || t.resourceManager == nil {
 		return
 	}
 	decisionID = strings.TrimSpace(decisionID)
 	if decisionID == "" {
 		return
 	}
-	delete(t.entryResourceReservations, decisionID)
+	t.resourceManager.Release(decisionID, "submission:"+decisionID)
 }
 
 // producerResourceReservationsLocked returns current transient commitments.
@@ -4756,15 +4850,139 @@ func (t *Trader) producerResourceReservationsLocked() (
 		return 0, 0
 	}
 
-	for _, reservation := range t.entryResourceReservations {
-		switch reservation.Side {
-		case SideBuy:
-			quoteUSD += reservation.QuoteUSD
-		case SideSell:
-			base += reservation.Base
+	if t.resourceManager == nil {
+		return 0, 0
+	}
+	return t.resourceManager.Totals()
+}
+
+// rebuildDerivedResourceLedgerLocked reconstructs durable ownership records
+// from authoritative Trader lifecycle state while preserving live submission
+// and reconciliation quarantines. Caller holds t.mu.
+func (t *Trader) rebuildDerivedResourceLedgerLocked(price float64) error {
+	if t.resourceManager == nil {
+		t.resourceManager = NewResourceManager(ResourceLedgerState{})
+	}
+	feeMult := 1 + t.cfg.FeeRatePct/100
+	records := make([]ResourceReservation, 0)
+	for side, book := range t.books {
+		if book == nil {
+			continue
+		}
+		for i, lot := range book.Lots {
+			if lot == nil || lot.SizeBase <= 0 {
+				continue
+			}
+			ownerID := strings.TrimSpace(lot.EntryOrderID)
+			if ownerID == "" {
+				ownerID = fmt.Sprintf("%s:%d", side, i)
+			}
+			r := ResourceReservation{
+				ID: "lot:" + ownerID, OwnerID: ownerID,
+				Kind: ResourceReservationLot, State: ResourceReservationPending,
+				Side: side, CreatedAt: lot.OpenTime,
+			}
+			if side == SideBuy {
+				r.Base = lot.SizeBase
+			} else {
+				r.QuoteUSD = lot.SizeBase * price * feeMult
+			}
+			records = append(records, r)
 		}
 	}
-	return quoteUSD, base
+	for orderID, entry := range t.pendingEntries {
+		if entry == nil || entry.Completed || entry.Intent == nil {
+			continue
+		}
+		r := ResourceReservation{
+			ID: "pending-entry:" + orderID, OwnerID: entry.Intent.DecisionID,
+			Kind: ResourceReservationPendingEntry, State: ResourceReservationPending,
+			Producer: entry.Producer, Side: entry.Side, CreatedAt: entry.Intent.CreatedAt,
+		}
+		if entry.Side == SideBuy {
+			r.QuoteUSD = entry.Intent.Quote * feeMult
+		} else if t.cfg.RequireBaseForShort {
+			r.Base = entry.Intent.BaseAtLimit
+		} else {
+			r.Informational = true
+		}
+		records = append(records, r)
+	}
+	for orderID, pending := range t.pendingExits {
+		if pending == nil {
+			continue
+		}
+		records = append(records, ResourceReservation{
+			ID: "pending-exit:" + orderID, OwnerID: pending.EntryOrderID,
+			Kind: ResourceReservationPendingExit, State: ResourceReservationPending,
+			Side: oppositeSide(pending.Side), Informational: true,
+		})
+	}
+	for id, obligation := range t.RefundObligations {
+		if obligation == nil {
+			continue
+		}
+		records = append(records, ResourceReservation{
+			ID: "refund:" + id, OwnerID: id, Kind: ResourceReservationRefund,
+			State: ResourceReservationPending, Side: obligation.ServiceSide,
+			Informational: true, CreatedAt: obligation.CreatedAt,
+		})
+	}
+	for id, obligation := range t.Case3AObligations {
+		if obligation == nil {
+			continue
+		}
+		records = append(records, ResourceReservation{
+			ID: "case3a:" + id, OwnerID: id, Kind: ResourceReservationCase3A,
+			State: ResourceReservationPending, Producer: EntryProducerCase3AReplacement,
+			Side: obligation.Side, Informational: true, CreatedAt: obligation.CreatedAt,
+		})
+	}
+	return t.resourceManager.ReplaceDerived(records)
+}
+
+// reconcileResourceQuarantines releases only exchange-confirmed no-fill
+// terminal submissions. Filled, open, and lookup-uncertain submissions remain
+// quarantined until their owning lifecycle performs accounting.
+func (t *Trader) reconcileResourceQuarantines(ctx context.Context) {
+	if t == nil || t.resourceManager == nil || t.broker == nil {
+		return
+	}
+	changed := false
+	for _, reservation := range t.resourceManager.Quarantines() {
+		lookupID := strings.TrimSpace(reservation.ClientOrderID)
+		if lookupID == "" {
+			continue
+		}
+		productID := strings.TrimSpace(reservation.ProductID)
+		if productID == "" {
+			productID = t.cfg.ProductID
+		}
+		order, err := t.broker.GetOrder(ctx, productID, lookupID)
+		if err != nil || order == nil {
+			continue
+		}
+		switch strings.ToUpper(strings.TrimSpace(order.Status)) {
+		case "CANCELED", "CANCELLED", "REJECTED", "EXPIRED":
+			t.resourceManager.Release(reservation.ID)
+			changed = true
+		default:
+			log.Printf(
+				"[WARN] resource.reconciliation_retained reservation_id=%s client_order_id=%s status=%s base=%.8f quote=%.8f",
+				reservation.ID, lookupID, order.Status, order.BaseSize, order.QuoteSpent,
+			)
+		}
+	}
+	if changed {
+		_ = t.saveState()
+	}
+}
+
+func oppositeSide(side OrderSide) OrderSide {
+	if side == SideBuy {
+		return SideSell
+	}
+	return SideBuy
 }
 
 // reserveProducerAllocationLocked converts one authoritative coordinator grant
@@ -4810,6 +5028,64 @@ func (t *Trader) reserveProducerAllocationLocked(
 	}
 
 	return t.reserveProducerResourcesLocked(reservation)
+}
+
+// reserveProducerAllocationBatchLocked installs the complete coordinator plan
+// as one ledger transaction. No broker request may start unless every counted
+// allocation is present in the authoritative ledger.
+func (t *Trader) reserveProducerAllocationBatchLocked(
+	allocations []ProducerResourceAllocation,
+	exits []exitCandidate,
+) error {
+	if t.resourceManager == nil {
+		t.resourceManager = NewResourceManager(ResourceLedgerState{})
+	}
+	reservations := make([]ResourceReservation, 0, len(allocations))
+	now := time.Now().UTC()
+	transactionID := fmt.Sprintf("entry-batch:%d", now.UnixNano())
+	for _, allocation := range allocations {
+		req := allocation.Request
+		if req.Intent == nil {
+			return errors.New("entry allocation batch contains nil PendingIntent")
+		}
+		reservation := ResourceReservation{
+			ID: "submission:" + strings.TrimSpace(req.Intent.DecisionID),
+			TransactionID: transactionID,
+			OwnerID: strings.TrimSpace(req.Intent.DecisionID),
+			ClientOrderID: stableClientOrderID(req.Intent.DecisionID),
+			ProductID: t.cfg.ProductID,
+			Kind: ResourceReservationSubmission,
+			State: ResourceReservationReserved,
+			Producer: req.Producer,
+			Side: req.Side,
+			CreatedAt: now,
+		}
+		switch req.Side {
+		case SideBuy:
+			reservation.QuoteUSD = allocation.AllocatedQuote
+		case SideSell:
+			if !t.cfg.RequireBaseForShort {
+				continue
+			}
+			reservation.Base = allocation.AllocatedBase
+		default:
+			return fmt.Errorf("entry allocation batch has unsupported side=%s", req.Side)
+		}
+		reservations = append(reservations, reservation)
+	}
+	for _, exit := range exits {
+		ownerID := strings.TrimSpace(exit.entryOrderID)
+		if ownerID == "" {
+			return errors.New("exit allocation batch contains empty entry order ID")
+		}
+		reservations = append(reservations, ResourceReservation{
+			ID: "exit-preflight:" + ownerID, TransactionID: transactionID,
+			OwnerID: ownerID, Kind: ResourceReservationSubmission,
+			State: ResourceReservationReserved, Side: oppositeSide(exit.side),
+			Informational: true, ProductID: t.cfg.ProductID, CreatedAt: now,
+		})
+	}
+	return t.resourceManager.ReserveBatch(reservations)
 }
 
 type PendingEntry struct {
@@ -5425,7 +5701,7 @@ func (t *Trader) produceEntry(
 		re-entry spacing is owned by case13AReferencePrice.
 	*/
 	if err :=
-		t.saveStateNoLock(); err != nil {
+		t.saveState(); err != nil {
 
 		/*
 			Registration persistence failed. Remove only the pending entry
@@ -5443,6 +5719,7 @@ func (t *Trader) produceEntry(
 				t.pendingEntries,
 				orderID,
 			)
+			if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
 		}
 
 		t.mu.Unlock()
@@ -5755,13 +6032,18 @@ func (t *Trader) submitPendingIntent(
 		intent.SubmissionStartedAt.Sub(intent.HotStart).Milliseconds(),
 	)
 
-	orderID, err := t.broker.PlaceLimitPostOnly(
-		ctx,
-		intent.ProductID,
-		intent.Side,
-		intent.LimitPx,
-		intent.BaseAtLimit,
-	)
+	var orderID string
+	var err error
+	if broker, ok := t.broker.(IdempotentBroker); ok {
+		orderID, err = broker.PlaceLimitPostOnlyWithClientID(
+			ctx, intent.ProductID, intent.Side, intent.LimitPx,
+			intent.BaseAtLimit, stableClientOrderID(intent.DecisionID),
+		)
+	} else {
+		orderID, err = t.broker.PlaceLimitPostOnly(
+			ctx, intent.ProductID, intent.Side, intent.LimitPx, intent.BaseAtLimit,
+		)
+	}
 	intent.ExchangeRespondedAt = time.Now().UTC()
 	log.Printf(
 		"[TRACE] hotpath.producer.exchange_response "+
@@ -6003,6 +6285,9 @@ func (t *Trader) buildPendingEntry(
 		current, ok := t.pendingEntries[entry.OrderID]
 		if ok && current == entry {
 			delete(t.pendingEntries, entry.OrderID)
+			if t.resourceManager != nil {
+				t.resourceManager.Release("pending-entry:" + strings.TrimSpace(entry.OrderID))
+			}
 		}
 	}
 
@@ -6061,11 +6346,41 @@ func (t *Trader) registerPendingEntry(
 	}
 
 	t.pendingEntries[orderID] = entry
+	if t.resourceManager == nil {
+		t.resourceManager = NewResourceManager(ResourceLedgerState{})
+	}
+	pendingReservation := ResourceReservation{
+		ID: "pending-entry:" + orderID,
+		OwnerID: strings.TrimSpace(entry.Intent.DecisionID),
+		Kind: ResourceReservationPendingEntry,
+		State: ResourceReservationPending,
+		Producer: entry.Producer,
+		Side: entry.Side,
+		CreatedAt: time.Now().UTC(),
+	}
+	if entry.Side == SideBuy {
+		pendingReservation.QuoteUSD = entry.Intent.Quote * (1 + t.cfg.FeeRatePct/100)
+	} else if t.cfg.RequireBaseForShort {
+		pendingReservation.Base = entry.Intent.BaseAtLimit
+	} else {
+		pendingReservation.Informational = true
+	}
+	if err := t.resourceManager.Upsert(pendingReservation); err != nil {
+		delete(t.pendingEntries, orderID)
+		if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
+		return &EntryProduceError{
+			Code: EntryProduceErrRegisterNilPendingIntent,
+			Producer: entry.Producer, Side: fmt.Sprint(entry.Side),
+			OrderID: orderID, CleanupRequired: true, Err: err,
+		}
+	}
 
 	if entry.Producer == EntryProducerCase3AReplacement {
 		obligation := t.ensureCase3AObligationLocked(entry.Intent, "")
 		if obligation == nil {
 			delete(t.pendingEntries, orderID)
+			if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
+			t.resourceManager.Release("pending-entry:" + orderID)
 			return &EntryProduceError{
 				Code:            EntryProduceErrRegisterNilPendingIntent,
 				Producer:        entry.Producer,
@@ -7230,6 +7545,7 @@ func (t *Trader) rekeyPendingEntry(
 	}
 
 	delete(t.pendingEntries, oldOrderID)
+	if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + oldOrderID) }
 
 	if oldOrderID != "" {
 		entry.Intent.History = appendOrderHistory(
@@ -9069,13 +9385,46 @@ func (t *Trader) startPendingMakerExit(ctx context.Context, lotSide OrderSide, e
 	if limitPx <= 0 || baseRequested <= 0 {
 		return fmt.Errorf("invalid pending maker exit limit=%.8f base=%.8f entry_id=%s", limitPx, baseRequested, entryOrderID)
 	}
+	reservationID := "exit-submission:" + entryOrderID
+	if t.resourceManager == nil {
+		t.resourceManager = NewResourceManager(ResourceLedgerState{})
+	}
+	if err := t.resourceManager.ReserveBatch([]ResourceReservation{{
+		ID: reservationID, OwnerID: entryOrderID,
+		ClientOrderID: stableClientOrderID(reservationID), ProductID: t.cfg.ProductID,
+		Kind: ResourceReservationSubmission, State: ResourceReservationReserved,
+		Side: closeSide, Informational: true, CreatedAt: time.Now().UTC(),
+	}}); err != nil {
+		return fmt.Errorf("reserve pending maker exit entry_id=%s: %w", entryOrderID, err)
+	}
+	if err := t.saveState(); err != nil {
+		t.resourceManager.Release(reservationID)
+		return fmt.Errorf("persist pending maker exit reservation entry_id=%s: %w", entryOrderID, err)
+	}
 
-	oid, err := t.broker.PlaceLimitPostOnly(ctx, t.cfg.ProductID, closeSide, limitPx, baseRequested)
+	var oid string
+	var err error
+	if broker, ok := t.broker.(IdempotentBroker); ok {
+		oid, err = broker.PlaceLimitPostOnlyWithClientID(
+			ctx, t.cfg.ProductID, closeSide, limitPx, baseRequested,
+			stableClientOrderID(reservationID),
+		)
+	} else {
+		oid, err = t.broker.PlaceLimitPostOnly(ctx, t.cfg.ProductID, closeSide, limitPx, baseRequested)
+	}
 	if err != nil {
+		if marketEntryErrorCode(err) == EntryProduceErrSubmitTimeout {
+			_ = t.resourceManager.Quarantine(reservationID)
+			_ = t.saveState()
+		} else {
+			t.resourceManager.Release(reservationID)
+		}
 		return err
 	}
 	oid = strings.TrimSpace(oid)
 	if oid == "" {
+		_ = t.resourceManager.Quarantine(reservationID)
+		_ = t.saveState()
 		return fmt.Errorf("empty maker exit order id entry_id=%s", entryOrderID)
 	}
 
@@ -9093,6 +9442,7 @@ func (t *Trader) startPendingMakerExit(ctx context.Context, lotSide OrderSide, e
 	if lot == nil {
 		t.mu.Unlock()
 		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, oid)
+		t.resourceManager.Release(reservationID)
 		return fmt.Errorf("lot disappeared before pending exit registration entry_id=%s", entryOrderID)
 	}
 
@@ -9100,6 +9450,7 @@ func (t *Trader) startPendingMakerExit(ctx context.Context, lotSide OrderSide, e
 		existing := strings.TrimSpace(lot.FixedTPOrderID)
 		t.mu.Unlock()
 		_ = t.broker.CancelOrder(ctx, t.cfg.ProductID, oid)
+		t.resourceManager.Release(reservationID)
 		return fmt.Errorf("lot already has pending exit entry_id=%s exit_id=%s", entryOrderID, existing)
 	}
 
@@ -9119,6 +9470,12 @@ func (t *Trader) startPendingMakerExit(ctx context.Context, lotSide OrderSide, e
 		Deadline:      time.Now().Add(time.Duration(t.cfg.LimitTimeoutSec) * time.Second),
 		ResultC:       resultCh,
 	}
+	_ = t.resourceManager.Upsert(ResourceReservation{
+		ID: "pending-exit:" + oid, OwnerID: entryOrderID,
+		Kind: ResourceReservationPendingExit, State: ResourceReservationPending,
+		Side: closeSide, Informational: true, CreatedAt: time.Now().UTC(),
+	})
+	t.resourceManager.Release(reservationID)
 
 	t.pendingExits[oid] = p
 
@@ -9433,6 +9790,9 @@ func (t *Trader) completePendingExit(ctx context.Context, candles []Candle, live
 	orderID := strings.TrimSpace(res.OrderID)
 	if orderID == "" {
 		orderID = strings.TrimSpace(p.OrderID)
+	}
+	if t.resourceManager != nil {
+		defer t.resourceManager.Release("pending-exit:" + orderID)
 	}
 
 	book := t.book(p.Side)
