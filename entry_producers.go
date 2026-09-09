@@ -96,7 +96,10 @@ const (
 	ProducerPriorityCase14B           ProducerPriority = 300
 	ProducerPriorityEquity            ProducerPriority = 200
 	ProducerPriorityNormalLegacy      ProducerPriority = 100
-	ProducerPriorityCase15B           ProducerPriority = 50
+	ProducerPriorityCase15B           ProducerPriority = 99
+	ProducerPriorityCase16A           ProducerPriority = 98
+	ProducerPriorityCase16B           ProducerPriority = 97
+	ProducerPriorityCase15A           ProducerPriority = 96
 )
 
 const (
@@ -119,6 +122,12 @@ const (
 	EntryProducerCase14BUptrendBuy EntryProducer = "Case14BUptrendBuy"
 
 	EntryProducerCase15BDowntrendRecoveryBuy EntryProducer = "Case15BDowntrendRecoveryBuy"
+
+	EntryProducerCase16ANormalPeakRolloverSell EntryProducer = "Case16ANormalPeakRolloverSell"
+
+	EntryProducerCase16BNormalBottomRolloverBuy EntryProducer = "Case16BNormalBottomRolloverBuy"
+
+	EntryProducerCase15AUptrendRecoverySell EntryProducer = "Case15AUptrendRecoverySell"
 )
 
 // producerPriorityFor is the single authoritative mapping used by resource
@@ -151,6 +160,15 @@ func producerPriorityFor(producer EntryProducer) ProducerPriority {
 
 	case EntryProducerCase15BDowntrendRecoveryBuy:
 		return ProducerPriorityCase15B
+
+	case EntryProducerCase16ANormalPeakRolloverSell:
+		return ProducerPriorityCase16A
+
+	case EntryProducerCase16BNormalBottomRolloverBuy:
+		return ProducerPriorityCase16B
+
+	case EntryProducerCase15AUptrendRecoverySell:
+		return ProducerPriorityCase15A
 
 	default:
 		return 0
@@ -220,7 +238,10 @@ func producerTierFor(producer EntryProducer) (ProducerTier, float64) {
 
 	case EntryProducerCase13APeakSell,
 		EntryProducerCase13BBottomBuy,
-		EntryProducerCase15BDowntrendRecoveryBuy:
+		EntryProducerCase15BDowntrendRecoveryBuy,
+		EntryProducerCase15AUptrendRecoverySell,
+		EntryProducerCase16ANormalPeakRolloverSell,
+		EntryProducerCase16BNormalBottomRolloverBuy:
 		return ProducerTierLow, LowTierProducerMultiplier
 
 	case EntryProducerCase3AReplacement:
@@ -501,7 +522,10 @@ func entryPolicyForSource(source EntryProducer) EntryPolicy {
 		}
 	case EntryProducerCase11APeakReversal,
 		EntryProducerCase11BBottomReversal,
-		EntryProducerCase15BDowntrendRecoveryBuy:
+		EntryProducerCase15BDowntrendRecoveryBuy,
+		EntryProducerCase15AUptrendRecoverySell,
+		EntryProducerCase16ANormalPeakRolloverSell,
+		EntryProducerCase16BNormalBottomRolloverBuy:
 		return EntryPolicy{
 			ResetLastAdd:     true,
 			ResetWinExtreme:  true,
@@ -672,6 +696,376 @@ func applyCase15BDowntrendRecoveryBuyProducer(
 		d.ProfitGateMultiplier,
 	)
 
+	return true
+}
+
+// applyCase15AUptrendRecoverySellProducer is the exact SELL-side mirror of
+// Case15B. It detects an emerging bearish reversal in an UP regime while price
+// remains at or above the buffered Pyramid SELL-latch floor.
+func applyCase15AUptrendRecoverySellProducer(
+	d *EntryDecision,
+	ai AIResult,
+	macd MACDResult,
+	ema EMAPatternResult,
+	pyramid PyramidResult,
+	price float64,
+	regime MarketRegime,
+	pendingCounts PendingProducerCounts,
+	continuationRefs ProducerContinuationReferences,
+) bool {
+	if d == nil {
+		return false
+	}
+
+	const (
+		minConfidence      = 0.55
+		nearLatchBufferPct = 0.56
+	)
+
+	reference := continuationRefs.Reference(
+		EntryProducerCase15AUptrendRecoverySell,
+		SideSell,
+	)
+	continuation := reference > 0
+	pending := pendingCounts.Count(
+		EntryProducerCase15AUptrendRecoverySell,
+		SideSell,
+	)
+
+	latchValid := pyramid.Sell.Latched > 0
+	bufferedLatch := 0.0
+	if latchValid {
+		bufferedLatch = pyramid.Sell.Latched * (1.0 - nearLatchBufferPct/100.0)
+	}
+	actualLatchReached := latchValid && price >= pyramid.Sell.Latched
+	withinLatchWindow := latchValid && price >= bufferedLatch
+	entryGatePass := withinLatchWindow && pyramid.Sell.SpacingPass
+	nextEntryPrice := 0.0
+
+	if continuation {
+		nextEntryPrice, entryGatePass = continuationReferenceGate(
+			SideSell,
+			price,
+			reference,
+		)
+		traceContinuationEvaluation(
+			EntryProducerCase15AUptrendRecoverySell,
+			SideSell,
+			price,
+			reference,
+			nextEntryPrice,
+			entryGatePass,
+			pending,
+			pending == 0,
+		)
+	}
+
+	uptrendRecoverySell := pending == 0 &&
+		entryGatePass &&
+		ai.Raw == Sell &&
+		ai.Confidence >= minConfidence &&
+		regime == RegimeUp &&
+		ema.PatternSell &&
+		ema.PriceUpDown &&
+		macd.LinePrev6 > 0 &&
+		macd.Line > 0 &&
+		macd.Line < macd.LinePrev6 &&
+		macd.Hist < 0
+	if !uptrendRecoverySell {
+		return false
+	}
+
+	d.Signal = Sell
+	d.PyramidPass = pyramid.Sell.GatePassed
+	d.PyramidReason = pyramid.Sell.Reason
+	d.Producer = EntryProducerCase15AUptrendRecoverySell
+	d.PendingCancelPolicy = PendingSignalCancelDisabled
+	applyStandardProducerEconomics(
+		d,
+		EntryProducerCase15AUptrendRecoverySell,
+		continuation,
+		reference,
+		nextEntryPrice,
+		entryGatePass,
+	)
+
+	referenceMode := "continuation_reference"
+	if !continuation {
+		referenceMode = "first_buffered_latch"
+	}
+	d.ProducerReason = fmt.Sprintf(
+		"uptrend_recovery_sell|"+
+			"ai_raw=%s|confidence=%.6f|min_confidence=%.6f|regime=%s|"+
+			"pattern_sell=%t|price_up_down=%t|"+
+			"macd_idx6=%.6f|macd_line=%.6f|macd_weakening=%t|macd_hist=%.6f|"+
+			"price=%.8f|latch=%.8f|buffered_latch=%.8f|actual_latch=%t|within_window=%t|"+
+			"spacing=%t|pending=%d|reference_mode=%s|reference_price=%.8f|"+
+			"next_entry_price=%.8f|continuation_spacing_pct=%.4f|entry_gate_pass=%t|"+
+			"tier=%s|tier_mult=%.6f|priority=%d|continuation=%t|"+
+			"continuation_profit_factor=%.6f|profit_gate_mult=%.6f",
+		ai.Raw,
+		ai.Confidence,
+		minConfidence,
+		regime,
+		ema.PatternSell,
+		ema.PriceUpDown,
+		macd.LinePrev6,
+		macd.Line,
+		macd.Line < macd.LinePrev6,
+		macd.Hist,
+		price,
+		pyramid.Sell.Latched,
+		bufferedLatch,
+		actualLatchReached,
+		withinLatchWindow,
+		pyramid.Sell.SpacingPass,
+		pending,
+		referenceMode,
+		reference,
+		nextEntryPrice,
+		ContinuationEntrySpacingPct,
+		entryGatePass,
+		d.ProducerTier,
+		d.ProducerTierMultiplier,
+		d.ProducerPriority,
+		d.IsContinuation,
+		ContinuationProfitGateFactor,
+		d.ProfitGateMultiplier,
+	)
+	return true
+}
+
+// applyCase16ANormalPeakRolloverSellProducer detects a weakening positive
+// impulse close to the recent high in NORMAL regime. Its first-entry boundary
+// is open toward more favorable SELL prices; continuation replaces only that
+// recent-high admission with the standard committed-reference gate.
+func applyCase16ANormalPeakRolloverSellProducer(
+	d *EntryDecision,
+	ai AIResult,
+	macd MACDResult,
+	ema EMAPatternResult,
+	pyramid PyramidResult,
+	price float64,
+	recentHigh float64,
+	regime MarketRegime,
+	pendingCounts PendingProducerCounts,
+	continuationRefs ProducerContinuationReferences,
+) bool {
+	if d == nil {
+		return false
+	}
+
+	const (
+		minConfidence    = 0.55
+		nearHighRangePct = 0.15
+	)
+
+	reference := continuationRefs.Reference(
+		EntryProducerCase16ANormalPeakRolloverSell,
+		SideSell,
+	)
+	continuation := reference > 0
+	pending := pendingCounts.Count(
+		EntryProducerCase16ANormalPeakRolloverSell,
+		SideSell,
+	)
+	lowerBoundary := 0.0
+	if recentHigh > 0 {
+		lowerBoundary = recentHigh * (1.0 - nearHighRangePct/100.0)
+	}
+	nearHigh := recentHigh > 0 && price >= lowerBoundary
+	entryGatePass := nearHigh && pyramid.Sell.SpacingPass
+	nextEntryPrice := 0.0
+	if continuation {
+		nextEntryPrice, entryGatePass = continuationReferenceGate(
+			SideSell,
+			price,
+			reference,
+		)
+		traceContinuationEvaluation(
+			EntryProducerCase16ANormalPeakRolloverSell,
+			SideSell,
+			price,
+			reference,
+			nextEntryPrice,
+			entryGatePass,
+			pending,
+			pending == 0,
+		)
+	}
+
+	normalPeakRolloverSell := pending == 0 &&
+		entryGatePass &&
+		ai.Raw == Sell &&
+		ai.Confidence >= minConfidence &&
+		regime == RegimeNormal &&
+		recentHigh > 0 &&
+		macd.LinePrev6 > 0 &&
+		macd.Line > 0 &&
+		macd.Line < macd.LinePrev6 &&
+		macd.Hist < 0 &&
+		ema.Spread > 0 &&
+		ema.EMA2050 > 0
+	if !normalPeakRolloverSell {
+		return false
+	}
+
+	d.Signal = Sell
+	d.PyramidPass = pyramid.Sell.GatePassed
+	d.PyramidReason = pyramid.Sell.Reason
+	d.Producer = EntryProducerCase16ANormalPeakRolloverSell
+	d.PendingCancelPolicy = PendingSignalCancelDisabled
+	applyStandardProducerEconomics(
+		d,
+		EntryProducerCase16ANormalPeakRolloverSell,
+		continuation,
+		reference,
+		nextEntryPrice,
+		entryGatePass,
+	)
+	referenceMode := "continuation_reference"
+	if !continuation {
+		referenceMode = "first_recent_high_area"
+	}
+	distancePct := 0.0
+	if recentHigh > 0 {
+		distancePct = (recentHigh - price) / recentHigh * 100.0
+	}
+	d.ProducerReason = fmt.Sprintf(
+		"normal_peak_rollover_sell|"+
+			"ai_raw=%s|confidence=%.6f|min_confidence=%.6f|regime=%s|"+
+			"macd_idx6=%.6f|macd_line=%.6f|macd_weakening=%t|macd_hist=%.6f|"+
+			"ema_spread=%.6f|ema2050=%.6f|price=%.8f|recent_high=%.8f|"+
+			"near_high_range_pct=%.6f|distance_from_high_pct=%.6f|lower_boundary=%.8f|near_high=%t|"+
+			"spacing=%t|pending=%d|reference_mode=%s|reference_price=%.8f|"+
+			"next_entry_price=%.8f|continuation_spacing_pct=%.4f|entry_gate_pass=%t|"+
+			"tier=%s|tier_mult=%.6f|priority=%d|continuation=%t|"+
+			"continuation_profit_factor=%.6f|profit_gate_mult=%.6f",
+		ai.Raw, ai.Confidence, minConfidence, regime,
+		macd.LinePrev6, macd.Line, macd.Line < macd.LinePrev6, macd.Hist,
+		ema.Spread, ema.EMA2050, price, recentHigh,
+		nearHighRangePct, distancePct, lowerBoundary, nearHigh,
+		pyramid.Sell.SpacingPass, pending, referenceMode, reference,
+		nextEntryPrice, ContinuationEntrySpacingPct, entryGatePass,
+		d.ProducerTier, d.ProducerTierMultiplier, d.ProducerPriority,
+		d.IsContinuation, ContinuationProfitGateFactor, d.ProfitGateMultiplier,
+	)
+	return true
+}
+
+// applyCase16BNormalBottomRolloverBuyProducer is the exact BUY-side mirror of
+// Case16A around the recent low.
+func applyCase16BNormalBottomRolloverBuyProducer(
+	d *EntryDecision,
+	ai AIResult,
+	macd MACDResult,
+	ema EMAPatternResult,
+	pyramid PyramidResult,
+	price float64,
+	recentLow float64,
+	regime MarketRegime,
+	pendingCounts PendingProducerCounts,
+	continuationRefs ProducerContinuationReferences,
+) bool {
+	if d == nil {
+		return false
+	}
+
+	const (
+		minConfidence   = 0.55
+		nearLowRangePct = 0.15
+	)
+
+	reference := continuationRefs.Reference(
+		EntryProducerCase16BNormalBottomRolloverBuy,
+		SideBuy,
+	)
+	continuation := reference > 0
+	pending := pendingCounts.Count(
+		EntryProducerCase16BNormalBottomRolloverBuy,
+		SideBuy,
+	)
+	upperBoundary := 0.0
+	if recentLow > 0 {
+		upperBoundary = recentLow * (1.0 + nearLowRangePct/100.0)
+	}
+	nearLow := recentLow > 0 && price <= upperBoundary
+	entryGatePass := nearLow && pyramid.Buy.SpacingPass
+	nextEntryPrice := 0.0
+	if continuation {
+		nextEntryPrice, entryGatePass = continuationReferenceGate(
+			SideBuy,
+			price,
+			reference,
+		)
+		traceContinuationEvaluation(
+			EntryProducerCase16BNormalBottomRolloverBuy,
+			SideBuy,
+			price,
+			reference,
+			nextEntryPrice,
+			entryGatePass,
+			pending,
+			pending == 0,
+		)
+	}
+
+	normalBottomRolloverBuy := pending == 0 &&
+		entryGatePass &&
+		ai.Raw == Buy &&
+		ai.Confidence >= minConfidence &&
+		regime == RegimeNormal &&
+		recentLow > 0 &&
+		macd.LinePrev6 < 0 &&
+		macd.Line < 0 &&
+		macd.Line > macd.LinePrev6 &&
+		macd.Hist > 0 &&
+		ema.Spread < 0 &&
+		ema.EMA2050 < 0
+	if !normalBottomRolloverBuy {
+		return false
+	}
+
+	d.Signal = Buy
+	d.PyramidPass = pyramid.Buy.GatePassed
+	d.PyramidReason = pyramid.Buy.Reason
+	d.Producer = EntryProducerCase16BNormalBottomRolloverBuy
+	d.PendingCancelPolicy = PendingSignalCancelDisabled
+	applyStandardProducerEconomics(
+		d,
+		EntryProducerCase16BNormalBottomRolloverBuy,
+		continuation,
+		reference,
+		nextEntryPrice,
+		entryGatePass,
+	)
+	referenceMode := "continuation_reference"
+	if !continuation {
+		referenceMode = "first_recent_low_area"
+	}
+	distancePct := 0.0
+	if recentLow > 0 {
+		distancePct = (price - recentLow) / recentLow * 100.0
+	}
+	d.ProducerReason = fmt.Sprintf(
+		"normal_bottom_rollover_buy|"+
+			"ai_raw=%s|confidence=%.6f|min_confidence=%.6f|regime=%s|"+
+			"macd_idx6=%.6f|macd_line=%.6f|macd_recovering=%t|macd_hist=%.6f|"+
+			"ema_spread=%.6f|ema2050=%.6f|price=%.8f|recent_low=%.8f|"+
+			"near_low_range_pct=%.6f|distance_from_low_pct=%.6f|upper_boundary=%.8f|near_low=%t|"+
+			"spacing=%t|pending=%d|reference_mode=%s|reference_price=%.8f|"+
+			"next_entry_price=%.8f|continuation_spacing_pct=%.4f|entry_gate_pass=%t|"+
+			"tier=%s|tier_mult=%.6f|priority=%d|continuation=%t|"+
+			"continuation_profit_factor=%.6f|profit_gate_mult=%.6f",
+		ai.Raw, ai.Confidence, minConfidence, regime,
+		macd.LinePrev6, macd.Line, macd.Line > macd.LinePrev6, macd.Hist,
+		ema.Spread, ema.EMA2050, price, recentLow,
+		nearLowRangePct, distancePct, upperBoundary, nearLow,
+		pyramid.Buy.SpacingPass, pending, referenceMode, reference,
+		nextEntryPrice, ContinuationEntrySpacingPct, entryGatePass,
+		d.ProducerTier, d.ProducerTierMultiplier, d.ProducerPriority,
+		d.IsContinuation, ContinuationProfitGateFactor, d.ProfitGateMultiplier,
+	)
 	return true
 }
 
