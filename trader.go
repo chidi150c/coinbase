@@ -2567,6 +2567,25 @@ func case3AObligationID(intent *PendingIntent) string {
 	return strings.TrimSpace(intent.DecisionID)
 }
 
+func (t *Trader) case3AObligationForSourceLocked(
+	sourceEntryOrderID string,
+) *Case3AObligation {
+	if t == nil {
+		return nil
+	}
+	sourceEntryOrderID = strings.TrimSpace(sourceEntryOrderID)
+	if sourceEntryOrderID == "" {
+		return nil
+	}
+	for _, obligation := range t.Case3AObligations {
+		if obligation != nil &&
+			strings.TrimSpace(obligation.SourceEntryOrderID) == sourceEntryOrderID {
+			return obligation
+		}
+	}
+	return nil
+}
+
 func (t *Trader) ensureCase3AObligationLocked(
 	repl *PendingIntent,
 	waitForExitOrderID string,
@@ -3078,6 +3097,13 @@ func (t *Trader) closeLot(
 		!isL2DeepLoss &&
 		t.cfg.LimitTimeoutSec > 0
 
+	// A pending maker exit already owns this source lot. Keep monitoring that
+	// exit, but do not create another Case3A decision lifecycle on every scan.
+	// The original lifecycle, PendingReplacementRetry and durable obligation
+	// remain authoritative until the source exit commits.
+	sourceExitAlreadyPending := usePendingMakerExit &&
+		strings.TrimSpace(lot.FixedTPOrderID) != ""
+
 	// =============================================================================
 	// CASE 3 - SELL LOSS RECOVERY & PROTECTION
 	//
@@ -3115,7 +3141,8 @@ func (t *Trader) closeLot(
 	// Calculate the estimated net P&L
 	net := gross - lot.EntryFee - estExitFee
 
-	if lot.Side == SideSell &&
+	if !sourceExitAlreadyPending &&
+		lot.Side == SideSell &&
 		strings.HasPrefix(exitReason, "threshold_stop_loss") {
 
 		// =============================================================================
@@ -3136,7 +3163,7 @@ func (t *Trader) closeLot(
 		//	  *  Recovery Mode B (RecoveryByProfitTarget)
 		//===============================================================================
 
-		if net < 0 {
+		if net < 0 && !sourceExitAlreadyPending {
 			Case3ALossUSD = -net
 
 			// A losing SELL threshold stop is the Case3A decision boundary.
@@ -3168,7 +3195,13 @@ func (t *Trader) closeLot(
 					"Case3A decision: failed to create producer lifecycle",
 				)
 			}
-			repl.ObligationID = repl.DecisionID
+			if existing := t.case3AObligationForSourceLocked(
+				lot.EntryOrderID,
+			); existing != nil {
+				repl.ObligationID = existing.ObligationID
+			} else {
+				repl.ObligationID = repl.DecisionID
+			}
 			repl.ProducerReason = strings.TrimSpace(
 				repl.ProducerReason +
 					"|obligation_id=" + repl.ObligationID,
@@ -3354,6 +3387,35 @@ func (t *Trader) closeLot(
 		}
 	}
 
+	// Create or refresh the single durable obligation before either recovery
+	// mode performs exchange I/O. While the source position exists, the
+	// obligation remains waiting_for_exit; acceptance moves it to ready.
+	if repl.Enabled {
+		if existing := t.Case3AObligations[repl.ObligationID]; existing != nil {
+			repl.Side = existing.Side
+			repl.LimitPx = existing.TargetPrice
+			repl.BaseAtLimit = existing.RemainingBase
+			repl.Quote = repl.LimitPx * repl.BaseAtLimit
+			repl.RecoveryMethod = existing.RecoveryMethod
+			repl.RecoveryNetUSD = existing.RecoveryRemainingUSD
+			repl.ProfitGateUSD = existing.ProfitGateUSD
+		}
+		obligation := t.ensureCase3AObligationLocked(&repl, "")
+		if obligation == nil {
+			return "", false, errors.New(
+				"Case3A decision: failed to create durable obligation",
+			)
+		}
+		obligation.Status = Case3AObligationWaiting
+		obligation.UpdatedAt = time.Now().UTC()
+		if err := t.saveStateNoLock(); err != nil {
+			return "", false, fmt.Errorf(
+				"Case3A decision: persist durable obligation: %w",
+				err,
+			)
+		}
+	}
+
 	// ============================================================================
 	// Case 3A Mode A - replacement must start before the losing SELL is closed.
 	// ============================================================================
@@ -3499,8 +3561,21 @@ func (t *Trader) closeLot(
 				/*
 					Mode A requires the replacement to start successfully before
 					the losing SELL may close. The failed attempt has already been
-					recorded, so abort the loss exit and propagate the error.
+					recorded, so abort the loss exit and preserve the same durable
+					obligation for a later Mode A attempt.
 				*/
+				if obligation := t.Case3AObligations[repl.ObligationID]; obligation != nil {
+					obligation.Status = Case3AObligationWaiting
+					obligation.ActiveOrderID = ""
+					obligation.ActiveDecisionID = ""
+					obligation.AttemptCount++
+					obligation.LastReason = fmt.Sprintf(
+						"initial_mode_a_replacement_failed: %v",
+						err,
+					)
+					obligation.UpdatedAt = time.Now().UTC()
+					_ = t.saveStateNoLock()
+				}
 				return "", false, fmt.Errorf(
 					"Case3A modeA replacement failed; "+
 						"loss exit aborted entry_id=%s: %w",
@@ -3522,7 +3597,7 @@ func (t *Trader) closeLot(
 		}
 	}
 
-	if usePendingMakerExit && strings.TrimSpace(lot.FixedTPOrderID) != "" {
+	if sourceExitAlreadyPending {
 		return fmt.Sprintf(
 			"PENDING_EXIT_EXISTS %s side=%s entry_id=%s exit_id=%s reason=%s",
 			exitTime.Format(time.RFC3339),
@@ -10080,4 +10155,28 @@ func (t *Trader) handleCase3AReplacementError(
 		anchorID,
 		err,
 	)
+}
+
+// case3ADeferredRetryNeedsReconcile identifies failures for which a deferred
+// Mode B submission may have reached the exchange. These failures must never
+// release the obligation into another attempt until reconciliation establishes
+// whether an order exists or filled.
+func case3ADeferredRetryNeedsReconcile(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var produceErr *EntryProduceError
+	if !errors.As(err, &produceErr) {
+		return true
+	}
+
+	switch produceErr.Code {
+	case EntryProduceErrSubmitTimeout,
+		EntryProduceErrSubmitNetworkFailed,
+		EntryProduceErrCleanupCancel:
+		return true
+	default:
+		return false
+	}
 }

@@ -79,7 +79,7 @@ import (
 	"time"
 )
 
-const Version = 199
+const Version = 200
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -258,11 +258,164 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		)
 	}
 
-	// An unsuccessful initial Case3A attempt activates its durable obligation
-	// after any required source exit. If its fee-and-slippage-adjusted target is not currently
-	// available, migrate it to waiting_for_target. Both active and waiting
-	// obligations are eligible for later target evaluation; ready remains owned
-	// exclusively by the original Mode B attempt.
+	// PendingReplacementRetries owns exactly one deferred Mode B attempt after
+	// the source exit has committed. This is the underlay Case3A retry using the
+	// base returned by that exit; obligation resurrection takes ownership only
+	// if this attempt fails out or later leaves an unfilled remainder.
+	retryIDs := make([]string, 0, len(t.PendingReplacementRetries))
+	for obligationID := range t.PendingReplacementRetries {
+		retryIDs = append(retryIDs, obligationID)
+	}
+	sort.Strings(retryIDs)
+
+	for _, obligationID := range retryIDs {
+		retry, exists := t.PendingReplacementRetries[obligationID]
+		if !exists {
+			continue
+		}
+
+		obligation := t.Case3AObligations[obligationID]
+		if obligation == nil {
+			log.Printf(
+				"[ERROR] Case3A.deferred_mode_b.orphaned obligation_id=%s",
+				obligationID,
+			)
+			delete(t.PendingReplacementRetries, obligationID)
+			continue
+		}
+		if (obligation.Status != Case3AObligationWaiting &&
+			obligation.Status != Case3AObligationActive &&
+			obligation.Status != Case3AObligationWaitingForTarget) ||
+			strings.TrimSpace(obligation.ActiveOrderID) != "" ||
+			t.positionExistsByEntryOrderID(obligation.SourceEntryOrderID) {
+			continue
+		}
+
+		repl := retry.Replacement
+		repl.Enabled = true
+		repl.ObligationID = obligationID
+		repl.SourceEntryOrderID = obligation.SourceEntryOrderID
+		repl.SourceExitOrderID = obligation.SourceExitOrderID
+		repl.Side = obligation.Side
+		repl.LimitPx = obligation.TargetPrice
+		repl.BaseAtLimit = obligation.RemainingBase
+		repl.Quote = repl.LimitPx * repl.BaseAtLimit
+		repl.RecoveryMethod = obligation.RecoveryMethod
+		repl.RecoveryNetUSD = obligation.RecoveryRemainingUSD
+		repl.ProfitGateUSD = obligation.ProfitGateUSD
+		repl.HotStart = hotStart
+
+		executionReason := strings.TrimSpace(repl.ProducerReason)
+		attempt := newProducerIntentLifecycle(&repl)
+		if attempt == nil {
+			log.Printf(
+				"[ERROR] Case3A.deferred_mode_b.lifecycle_create_failed obligation_id=%s",
+				obligationID,
+			)
+			continue
+		}
+
+		repl.ProducerReason = fmt.Sprintf(
+			"case3A_retry_decision|mode=ModeB|retry_kind=deferred_after_exit_commit|"+
+				"obligation_id=%s|origin_decision_id=%s|retry_cause=%s|"+
+				"recovery_method=%s|recovery_usd=%.6f|source_order_id=%s|"+
+				"source_exit_order_id=%s|target_price=%.8f|remaining_base=%.8f",
+			obligationID,
+			obligation.OriginDecisionID,
+			strings.TrimSpace(retry.Reason),
+			obligation.RecoveryMethod.String(),
+			obligation.RecoveryRemainingUSD,
+			obligation.SourceEntryOrderID,
+			obligation.SourceExitOrderID,
+			obligation.TargetPrice,
+			obligation.RemainingBase,
+		)
+		t.addDecisionProducerEvent(
+			&repl,
+			attempt,
+			ProducerStageDecision,
+			"",
+			nil,
+			false,
+			false,
+		)
+		if executionReason == "" {
+			executionReason = repl.ProducerReason
+		}
+		repl.ProducerReason = executionReason
+
+		// Consume the one-shot retry durably before exchange I/O. A crash cannot
+		// submit it twice; the surviving obligation becomes the recovery owner.
+		delete(t.PendingReplacementRetries, obligationID)
+		// Quarantine the obligation before exchange I/O. Successful pending
+		// registration replaces this with ready and the Binance order ID; a crash
+		// or ambiguous interruption cannot expose it to resurrection meanwhile.
+		obligation.Status = Case3AObligationReconcile
+		obligation.ActiveDecisionID = repl.DecisionID
+		obligation.ActiveOrderID = "deferred_mode_b_submission_in_progress"
+		obligation.LastReason = "deferred_mode_b_submission_started"
+		obligation.UpdatedAt = time.Now().UTC()
+		if err := t.saveStateNoLock(); err != nil {
+			obligation.ActiveDecisionID = ""
+			obligation.ActiveOrderID = ""
+			t.PendingReplacementRetries[obligationID] = retry
+			log.Printf(
+				"[ERROR] Case3A.deferred_mode_b.state_save_failed obligation_id=%s err=%v",
+				obligationID,
+				err,
+			)
+			continue
+		}
+
+		t.mu.Unlock()
+		orderID, retryErr := t.startCase3AReplacement(ctx, &repl, attempt)
+		t.mu.Lock()
+
+		t.recordProducerAttemptLocked(attempt)
+		if err := t.saveProducerHistoryNoLock(); err != nil {
+			log.Printf(
+				"[WARN] producer history save failed producer=%s decision_id=%s err=%v",
+				attempt.Producer,
+				attempt.DecisionID,
+				err,
+			)
+		}
+
+		obligation = t.Case3AObligations[obligationID]
+		if obligation == nil {
+			continue
+		}
+		if retryErr == nil {
+			// registerPendingEntry() has already moved the obligation to ready
+			// and attached the authoritative Binance OrderID.
+			log.Printf(
+				"[TRACE] Case3A.deferred_mode_b.started obligation_id=%s order_id=%s",
+				obligationID,
+				orderID,
+			)
+			continue
+		}
+
+		obligation.ActiveDecisionID = ""
+		obligation.ActiveOrderID = ""
+		obligation.AttemptCount++
+		obligation.LastReason = fmt.Sprintf(
+			"deferred_mode_b_retry_failed: %v",
+			retryErr,
+		)
+		obligation.UpdatedAt = time.Now().UTC()
+		if case3ADeferredRetryNeedsReconcile(retryErr) {
+			obligation.Status = Case3AObligationReconcile
+		} else {
+			obligation.Status = Case3AObligationActive
+		}
+		_ = t.saveStateNoLock()
+	}
+
+	// Once the one-time deferred Mode B retry is exhausted, an unsuccessful
+	// Case3A attempt activates its durable obligation. If its fee-and-slippage-
+	// adjusted target is unavailable, migrate it to waiting_for_target. Ready
+	// remains owned exclusively by an accepted underlay Mode A/Mode B attempt.
 	case3ATotalBuffer := math.Max(0, t.cfg.FeeRatePct/100.0) +
 		case3AResurrectionSlippageBps/10000.0
 	case3AStateChanged := false
@@ -270,6 +423,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		if obligation == nil ||
 			strings.TrimSpace(obligation.ActiveOrderID) != "" ||
 			t.positionExistsByEntryOrderID(obligation.SourceEntryOrderID) {
+			continue
+		}
+		// The one-time deferred underlay Mode B retry owns this obligation until
+		// it is consumed. Never let target-based resurrection bypass that retry.
+		if _, retryPending := t.PendingReplacementRetries[obligation.ObligationID]; retryPending {
 			continue
 		}
 		if obligation.Status == Case3AObligationWaiting {
