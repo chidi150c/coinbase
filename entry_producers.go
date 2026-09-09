@@ -2048,7 +2048,6 @@ func applyCase14BUptrendBuyProducer(
 
 	withinLatchWindow :=
 		latchValid &&
-			!actualLatchReached &&
 			price <= bufferedLatch
 
 	entryGatePass :=
