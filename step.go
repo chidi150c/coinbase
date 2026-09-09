@@ -79,7 +79,7 @@ import (
 	"time"
 )
 
-const Version = 198
+const Version = 199
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {

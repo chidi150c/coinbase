@@ -532,7 +532,7 @@ func entryPolicyForSource(source EntryProducer) EntryPolicy {
 }
 
 // applyCase15BDowntrendRecoveryBuyProducer captures an emerging BUY reversal
-// while price remains in the narrow buffered area immediately above the
+// while price remains at or below the buffered ceiling derived from the
 // Pyramid BUY latch. It is an ordinary producer: only its signal admission is
 // specialized; lifecycle, resource, Refund, execution, continuation and
 // observability behavior are supplied by the shared producer pipeline.
@@ -574,7 +574,6 @@ func applyCase15BDowntrendRecoveryBuyProducer(
 
 	actualLatchReached := latchValid && price <= pyramid.Buy.Latched
 	withinLatchWindow := latchValid &&
-		!actualLatchReached &&
 		price <= bufferedLatch
 	entryGatePass := withinLatchWindow && pyramid.Buy.SpacingPass
 	nextEntryPrice := 0.0
