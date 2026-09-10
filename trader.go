@@ -2026,7 +2026,9 @@ func (t *Trader) RehydratePending(
 				current, ok := t.pendingEntries[orderID]
 				if ok && current == persisted {
 					delete(t.pendingEntries, orderID)
-					if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
+					if t.resourceManager != nil {
+						t.resourceManager.Release("pending-entry:" + orderID)
+					}
 				}
 
 				t.mu.Unlock()
@@ -2086,7 +2088,9 @@ func (t *Trader) RehydratePending(
 			current, ok := t.pendingEntries[orderID]
 			if ok && current == persisted {
 				delete(t.pendingEntries, orderID)
-				if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
+				if t.resourceManager != nil {
+					t.resourceManager.Release("pending-entry:" + orderID)
+				}
 			}
 
 			if err := t.saveStateNoLock(); err != nil {
@@ -3460,7 +3464,7 @@ func (t *Trader) closeLot(
 					ID: case3AReservationID, TransactionID: transactionID,
 					OwnerID: repl.ObligationID, Kind: ResourceReservationSubmission,
 					ClientOrderID: stableClientOrderID(repl.DecisionID), ProductID: t.cfg.ProductID,
-					State: ResourceReservationReserved,
+					State:    ResourceReservationReserved,
 					Producer: EntryProducerCase3AReplacement, Side: repl.Side,
 					Base: repl.BaseAtLimit, CreatedAt: time.Now().UTC(),
 				},
@@ -5124,16 +5128,16 @@ func (t *Trader) reserveProducerAllocationBatchLocked(
 			return errors.New("entry allocation batch contains nil PendingIntent")
 		}
 		reservation := ResourceReservation{
-			ID: "submission:" + strings.TrimSpace(req.Intent.DecisionID),
+			ID:            "submission:" + strings.TrimSpace(req.Intent.DecisionID),
 			TransactionID: transactionID,
-			OwnerID: strings.TrimSpace(req.Intent.DecisionID),
+			OwnerID:       strings.TrimSpace(req.Intent.DecisionID),
 			ClientOrderID: stableClientOrderID(req.Intent.DecisionID),
-			ProductID: t.cfg.ProductID,
-			Kind: ResourceReservationSubmission,
-			State: ResourceReservationReserved,
-			Producer: req.Producer,
-			Side: req.Side,
-			CreatedAt: now,
+			ProductID:     t.cfg.ProductID,
+			Kind:          ResourceReservationSubmission,
+			State:         ResourceReservationReserved,
+			Producer:      req.Producer,
+			Side:          req.Side,
+			CreatedAt:     now,
 		}
 		switch req.Side {
 		case SideBuy:
@@ -5794,7 +5798,9 @@ func (t *Trader) produceEntry(
 				t.pendingEntries,
 				orderID,
 			)
-			if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
+			if t.resourceManager != nil {
+				t.resourceManager.Release("pending-entry:" + orderID)
+			}
 		}
 
 		t.mu.Unlock()
@@ -6425,12 +6431,12 @@ func (t *Trader) registerPendingEntry(
 		t.resourceManager = NewResourceManager(ResourceLedgerState{})
 	}
 	pendingReservation := ResourceReservation{
-		ID: "pending-entry:" + orderID,
-		OwnerID: strings.TrimSpace(entry.Intent.DecisionID),
-		Kind: ResourceReservationPendingEntry,
-		State: ResourceReservationPending,
-		Producer: entry.Producer,
-		Side: entry.Side,
+		ID:        "pending-entry:" + orderID,
+		OwnerID:   strings.TrimSpace(entry.Intent.DecisionID),
+		Kind:      ResourceReservationPendingEntry,
+		State:     ResourceReservationPending,
+		Producer:  entry.Producer,
+		Side:      entry.Side,
 		CreatedAt: time.Now().UTC(),
 	}
 	if entry.Side == SideBuy {
@@ -6442,9 +6448,11 @@ func (t *Trader) registerPendingEntry(
 	}
 	if err := t.resourceManager.Upsert(pendingReservation); err != nil {
 		delete(t.pendingEntries, orderID)
-		if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
+		if t.resourceManager != nil {
+			t.resourceManager.Release("pending-entry:" + orderID)
+		}
 		return &EntryProduceError{
-			Code: EntryProduceErrRegisterNilPendingIntent,
+			Code:     EntryProduceErrRegisterNilPendingIntent,
 			Producer: entry.Producer, Side: fmt.Sprint(entry.Side),
 			OrderID: orderID, CleanupRequired: true, Err: err,
 		}
@@ -6454,7 +6462,9 @@ func (t *Trader) registerPendingEntry(
 		obligation := t.ensureCase3AObligationLocked(entry.Intent, "")
 		if obligation == nil {
 			delete(t.pendingEntries, orderID)
-			if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
+			if t.resourceManager != nil {
+				t.resourceManager.Release("pending-entry:" + orderID)
+			}
 			t.resourceManager.Release("pending-entry:" + orderID)
 			return &EntryProduceError{
 				Code:            EntryProduceErrRegisterNilPendingIntent,
@@ -7620,7 +7630,9 @@ func (t *Trader) rekeyPendingEntry(
 	}
 
 	delete(t.pendingEntries, oldOrderID)
-	if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + oldOrderID) }
+	if t.resourceManager != nil {
+		t.resourceManager.Release("pending-entry:" + oldOrderID)
+	}
 
 	if oldOrderID != "" {
 		entry.Intent.History = appendOrderHistory(

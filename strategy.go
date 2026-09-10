@@ -1800,6 +1800,7 @@ func (t *Trader) collectEntryProducerDecisions(
 		ema,
 		pyramid,
 		price,
+		pendingCounts,
 		continuationRefs,
 	) {
 		decisions = append(decisions, case11A)
@@ -1813,6 +1814,7 @@ func (t *Trader) collectEntryProducerDecisions(
 		ema,
 		pyramid,
 		price,
+		pendingCounts,
 		continuationRefs,
 	) {
 		decisions = append(decisions, case11B)
@@ -1952,6 +1954,7 @@ func (t *Trader) collectEntryProducerDecisions(
 		ema,
 		pyramid,
 		price,
+		pendingCounts,
 		continuationRefs,
 	) {
 		decisions = append(decisions, normalLegacy)

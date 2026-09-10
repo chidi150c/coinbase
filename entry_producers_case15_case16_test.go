@@ -4,10 +4,10 @@ import "testing"
 
 func TestCase15Case16ProducerPriorities(t *testing.T) {
 	want := map[EntryProducer]ProducerPriority{
-		EntryProducerCase15BDowntrendRecoveryBuy: 99,
-		EntryProducerCase16ANormalPeakRolloverSell: 98,
+		EntryProducerCase15BDowntrendRecoveryBuy:    99,
+		EntryProducerCase16ANormalPeakRolloverSell:  98,
 		EntryProducerCase16BNormalBottomRolloverBuy: 97,
-		EntryProducerCase15AUptrendRecoverySell: 96,
+		EntryProducerCase15AUptrendRecoverySell:     96,
 	}
 	for producer, priority := range want {
 		if got := producerPriorityFor(producer); got != priority {

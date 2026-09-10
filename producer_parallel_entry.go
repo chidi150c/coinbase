@@ -755,13 +755,13 @@ func (t *Trader) executeProducerAllocation(
 
 			if err != nil {
 				if marketEntryErrorCode(err) == EntryProduceErrSubmitTimeout {
-				t.mu.Lock()
-				if t.resourceManager != nil {
-					_ = t.resourceManager.Quarantine("submission:" + intent.DecisionID)
-					releaseSubmissionReservation = false
-					_ = t.saveStateNoLock()
-				}
-				t.mu.Unlock()
+					t.mu.Lock()
+					if t.resourceManager != nil {
+						_ = t.resourceManager.Quarantine("submission:" + intent.DecisionID)
+						releaseSubmissionReservation = false
+						_ = t.saveStateNoLock()
+					}
+					t.mu.Unlock()
 				}
 				log.Printf(
 					"[DEBUG] postonly.error "+
@@ -1545,8 +1545,8 @@ func (t *Trader) processParallelProducerEntriesLocked(
 
 	type allocationResult struct {
 		index int
-		msg string
-		err error
+		msg   string
+		err   error
 	}
 	results := make(chan allocationResult, len(approved))
 	for i, allocation := range approved {

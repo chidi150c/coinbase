@@ -1086,6 +1086,7 @@ func applyNormalLegacyProducer(
 	ema EMAPatternResult,
 	pyramid PyramidResult,
 	price float64,
+	pendingCounts PendingProducerCounts,
 	continuationRefs ProducerContinuationReferences,
 ) bool {
 	if d == nil {
@@ -1101,6 +1102,10 @@ func applyNormalLegacyProducer(
 
 	switch legacy.Signal {
 	case Buy:
+		pending := pendingCounts.Count(EntryProducerNormalLegacy, SideBuy)
+		if pending != 0 {
+			return false
+		}
 		reference :=
 			continuationRefs.Reference(
 				EntryProducerNormalLegacy,
@@ -1119,7 +1124,7 @@ func applyNormalLegacyProducer(
 				)
 			traceContinuationEvaluation(
 				EntryProducerNormalLegacy, SideBuy, price, reference,
-				nextEntryPrice, entryPass, -1, true,
+				nextEntryPrice, entryPass, pending, pending == 0,
 			)
 		}
 
@@ -1150,6 +1155,7 @@ func applyNormalLegacyProducer(
 				"strong_negative=%t|momentum_up=%t|pattern_buy=%t|"+
 				"spacing=%t|adverse=%t|pyramid_gate=%t|"+
 				"latched=%.8f|gate_price=%.8f|"+
+				"pending_count=%d|pending_pass=%t|"+
 				"tier=%s|tier_mult=%.6f|continuation=%t|"+
 				"continuation_reference=%.8f|next_entry_price=%.8f|"+
 				"continuation_spacing_pct=%.4f|entry_gate_pass=%t|"+
@@ -1164,6 +1170,8 @@ func applyNormalLegacyProducer(
 			pyramid.Buy.GatePassed,
 			pyramid.Buy.Latched,
 			pyramid.Buy.EffectiveGatePrice,
+			pending,
+			pending == 0,
 			d.ProducerTier,
 			d.ProducerTierMultiplier,
 			d.IsContinuation,
@@ -1178,6 +1186,10 @@ func applyNormalLegacyProducer(
 		return true
 
 	case Sell:
+		pending := pendingCounts.Count(EntryProducerNormalLegacy, SideSell)
+		if pending != 0 {
+			return false
+		}
 		reference :=
 			continuationRefs.Reference(
 				EntryProducerNormalLegacy,
@@ -1196,7 +1208,7 @@ func applyNormalLegacyProducer(
 				)
 			traceContinuationEvaluation(
 				EntryProducerNormalLegacy, SideSell, price, reference,
-				nextEntryPrice, entryPass, -1, true,
+				nextEntryPrice, entryPass, pending, pending == 0,
 			)
 		}
 
@@ -1227,6 +1239,7 @@ func applyNormalLegacyProducer(
 				"strong_positive=%t|momentum_down=%t|pattern_sell=%t|"+
 				"spacing=%t|adverse=%t|pyramid_gate=%t|"+
 				"latched=%.8f|gate_price=%.8f|"+
+				"pending_count=%d|pending_pass=%t|"+
 				"tier=%s|tier_mult=%.6f|continuation=%t|"+
 				"continuation_reference=%.8f|next_entry_price=%.8f|"+
 				"continuation_spacing_pct=%.4f|entry_gate_pass=%t|"+
@@ -1241,6 +1254,8 @@ func applyNormalLegacyProducer(
 			pyramid.Sell.GatePassed,
 			pyramid.Sell.Latched,
 			pyramid.Sell.EffectiveGatePrice,
+			pending,
+			pending == 0,
 			d.ProducerTier,
 			d.ProducerTierMultiplier,
 			d.IsContinuation,
@@ -1797,6 +1812,7 @@ func applyCase11APeakReversalProducer(
 	ema EMAPatternResult,
 	pyramid PyramidResult,
 	price float64,
+	pendingCounts PendingProducerCounts,
 	continuationRefs ProducerContinuationReferences,
 ) bool {
 	if d == nil {
@@ -1810,6 +1826,10 @@ func applyCase11APeakReversalProducer(
 			EntryProducerCase11APeakReversal,
 			SideSell,
 		)
+	pending := pendingCounts.Count(EntryProducerCase11APeakReversal, SideSell)
+	if pending != 0 {
+		return false
+	}
 
 	macdPrePeakThreshold :=
 		macd.EPS - macdPeakBuffer
@@ -1829,7 +1849,7 @@ func applyCase11APeakReversalProducer(
 			)
 		traceContinuationEvaluation(
 			EntryProducerCase11APeakReversal, SideSell, price, reference,
-			nextEntryPrice, entryGatePass, -1, true,
+			nextEntryPrice, entryGatePass, pending, pending == 0,
 		)
 	}
 
@@ -1873,6 +1893,7 @@ func applyCase11APeakReversalProducer(
 			"ai_raw=%s|ai_confidence=%.6f|case11a_confidence=%.6f|confidence_fallback=%t|"+
 			"macd_idx6=%.6f|eps=%.6f|buffer=%.2f|threshold=%.6f|"+
 			"macd_zone=%t|ema_high_peak=%t|"+
+			"pending_count=%d|pending_pass=%t|"+
 			"reference_mode=%s|reference_price=%.8f|next_entry_price=%.8f|"+
 			"continuation_spacing_pct=%.4f|entry_gate_pass=%t|pyramid_sell=%t|"+
 			"tier=%s|tier_mult=%.6f|continuation=%t|"+
@@ -1887,6 +1908,8 @@ func applyCase11APeakReversalProducer(
 		macdPrePeakThreshold,
 		macdPrePeakZone,
 		ema.HighPeak,
+		pending,
+		pending == 0,
 		map[bool]string{true: "continuation_reference", false: "first_pyramid"}[continuation],
 		reference,
 		nextEntryPrice,
@@ -1916,6 +1939,7 @@ func applyCase11BBottomReversalProducer(
 	ema EMAPatternResult,
 	pyramid PyramidResult,
 	price float64,
+	pendingCounts PendingProducerCounts,
 	continuationRefs ProducerContinuationReferences,
 ) bool {
 	if d == nil {
@@ -1929,6 +1953,10 @@ func applyCase11BBottomReversalProducer(
 			EntryProducerCase11BBottomReversal,
 			SideBuy,
 		)
+	pending := pendingCounts.Count(EntryProducerCase11BBottomReversal, SideBuy)
+	if pending != 0 {
+		return false
+	}
 
 	macdPreBottomThreshold :=
 		-macd.EPS + macdBottomBuffer
@@ -1948,7 +1976,7 @@ func applyCase11BBottomReversalProducer(
 			)
 		traceContinuationEvaluation(
 			EntryProducerCase11BBottomReversal, SideBuy, price, reference,
-			nextEntryPrice, entryGatePass, -1, true,
+			nextEntryPrice, entryGatePass, pending, pending == 0,
 		)
 	}
 
@@ -1992,6 +2020,7 @@ func applyCase11BBottomReversalProducer(
 			"ai_raw=%s|ai_confidence=%.6f|case11b_confidence=%.6f|confidence_fallback=%t|"+
 			"macd_idx6=%.6f|eps=%.6f|buffer=%.2f|threshold=%.6f|"+
 			"macd_zone=%t|ema_low_bottom=%t|"+
+			"pending_count=%d|pending_pass=%t|"+
 			"reference_mode=%s|reference_price=%.8f|next_entry_price=%.8f|"+
 			"continuation_spacing_pct=%.4f|entry_gate_pass=%t|pyramid_buy=%t|"+
 			"tier=%s|tier_mult=%.6f|continuation=%t|"+
@@ -2006,6 +2035,8 @@ func applyCase11BBottomReversalProducer(
 		macdPreBottomThreshold,
 		macdPreBottomZone,
 		ema.LowBottom,
+		pending,
+		pending == 0,
 		map[bool]string{true: "continuation_reference", false: "first_pyramid"}[continuation],
 		reference,
 		nextEntryPrice,
