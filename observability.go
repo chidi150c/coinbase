@@ -28,6 +28,7 @@ const (
 	ProducerStageSubmissionStarted ProducerStage = "submission_started"
 	ProducerStageExchangeAccepted  ProducerStage = "exchange_accepted"
 	ProducerStagePending           ProducerStage = "pending"
+	ProducerStageRepriced          ProducerStage = "repriced"
 	ProducerStageFilled            ProducerStage = "filled"
 	ProducerStageCommitted         ProducerStage = "committed"
 	ProducerStageExited            ProducerStage = "exited"

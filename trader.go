@@ -2026,9 +2026,7 @@ func (t *Trader) RehydratePending(
 				current, ok := t.pendingEntries[orderID]
 				if ok && current == persisted {
 					delete(t.pendingEntries, orderID)
-					if t.resourceManager != nil {
-						t.resourceManager.Release("pending-entry:" + orderID)
-					}
+					if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
 				}
 
 				t.mu.Unlock()
@@ -2088,9 +2086,7 @@ func (t *Trader) RehydratePending(
 			current, ok := t.pendingEntries[orderID]
 			if ok && current == persisted {
 				delete(t.pendingEntries, orderID)
-				if t.resourceManager != nil {
-					t.resourceManager.Release("pending-entry:" + orderID)
-				}
+				if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
 			}
 
 			if err := t.saveStateNoLock(); err != nil {
@@ -3464,7 +3460,7 @@ func (t *Trader) closeLot(
 					ID: case3AReservationID, TransactionID: transactionID,
 					OwnerID: repl.ObligationID, Kind: ResourceReservationSubmission,
 					ClientOrderID: stableClientOrderID(repl.DecisionID), ProductID: t.cfg.ProductID,
-					State:    ResourceReservationReserved,
+					State: ResourceReservationReserved,
 					Producer: EntryProducerCase3AReplacement, Side: repl.Side,
 					Base: repl.BaseAtLimit, CreatedAt: time.Now().UTC(),
 				},
@@ -5128,16 +5124,16 @@ func (t *Trader) reserveProducerAllocationBatchLocked(
 			return errors.New("entry allocation batch contains nil PendingIntent")
 		}
 		reservation := ResourceReservation{
-			ID:            "submission:" + strings.TrimSpace(req.Intent.DecisionID),
+			ID: "submission:" + strings.TrimSpace(req.Intent.DecisionID),
 			TransactionID: transactionID,
-			OwnerID:       strings.TrimSpace(req.Intent.DecisionID),
+			OwnerID: strings.TrimSpace(req.Intent.DecisionID),
 			ClientOrderID: stableClientOrderID(req.Intent.DecisionID),
-			ProductID:     t.cfg.ProductID,
-			Kind:          ResourceReservationSubmission,
-			State:         ResourceReservationReserved,
-			Producer:      req.Producer,
-			Side:          req.Side,
-			CreatedAt:     now,
+			ProductID: t.cfg.ProductID,
+			Kind: ResourceReservationSubmission,
+			State: ResourceReservationReserved,
+			Producer: req.Producer,
+			Side: req.Side,
+			CreatedAt: now,
 		}
 		switch req.Side {
 		case SideBuy:
@@ -5798,9 +5794,7 @@ func (t *Trader) produceEntry(
 				t.pendingEntries,
 				orderID,
 			)
-			if t.resourceManager != nil {
-				t.resourceManager.Release("pending-entry:" + orderID)
-			}
+			if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
 		}
 
 		t.mu.Unlock()
@@ -6431,12 +6425,12 @@ func (t *Trader) registerPendingEntry(
 		t.resourceManager = NewResourceManager(ResourceLedgerState{})
 	}
 	pendingReservation := ResourceReservation{
-		ID:        "pending-entry:" + orderID,
-		OwnerID:   strings.TrimSpace(entry.Intent.DecisionID),
-		Kind:      ResourceReservationPendingEntry,
-		State:     ResourceReservationPending,
-		Producer:  entry.Producer,
-		Side:      entry.Side,
+		ID: "pending-entry:" + orderID,
+		OwnerID: strings.TrimSpace(entry.Intent.DecisionID),
+		Kind: ResourceReservationPendingEntry,
+		State: ResourceReservationPending,
+		Producer: entry.Producer,
+		Side: entry.Side,
 		CreatedAt: time.Now().UTC(),
 	}
 	if entry.Side == SideBuy {
@@ -6448,11 +6442,9 @@ func (t *Trader) registerPendingEntry(
 	}
 	if err := t.resourceManager.Upsert(pendingReservation); err != nil {
 		delete(t.pendingEntries, orderID)
-		if t.resourceManager != nil {
-			t.resourceManager.Release("pending-entry:" + orderID)
-		}
+		if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
 		return &EntryProduceError{
-			Code:     EntryProduceErrRegisterNilPendingIntent,
+			Code: EntryProduceErrRegisterNilPendingIntent,
 			Producer: entry.Producer, Side: fmt.Sprint(entry.Side),
 			OrderID: orderID, CleanupRequired: true, Err: err,
 		}
@@ -6462,9 +6454,7 @@ func (t *Trader) registerPendingEntry(
 		obligation := t.ensureCase3AObligationLocked(entry.Intent, "")
 		if obligation == nil {
 			delete(t.pendingEntries, orderID)
-			if t.resourceManager != nil {
-				t.resourceManager.Release("pending-entry:" + orderID)
-			}
+			if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
 			t.resourceManager.Release("pending-entry:" + orderID)
 			return &EntryProduceError{
 				Code:            EntryProduceErrRegisterNilPendingIntent,
@@ -6897,6 +6887,56 @@ func (t *Trader) runPendingEntryPoller(
 		producerEvents[ProducerStageCancelRequested] = event
 	}
 
+	// Repricing may occur repeatedly within one producer attempt. Use a unique
+	// transport-map key for every occurrence while retaining the canonical
+	// ProducerEvent.Stage consumed by history and BOT OPS.
+	addRepriceProducerEvent := func(
+		stage ProducerStage,
+		sequence int,
+		when time.Time,
+		eventOrderID string,
+		detail string,
+		errorText string,
+		price float64,
+		base float64,
+	) {
+		if entry == nil || entry.Intent == nil {
+			return
+		}
+		decisionID := strings.TrimSpace(entry.Intent.DecisionID)
+		if decisionID == "" {
+			return
+		}
+		if when.IsZero() {
+			when = time.Now().UTC()
+		}
+		key := ProducerStage(fmt.Sprintf("%s_%06d", stage, sequence))
+		reason := strings.TrimSpace(entry.ProducerReason)
+		if strings.TrimSpace(detail) != "" {
+			reason += "|" + strings.TrimPrefix(strings.TrimSpace(detail), "|")
+		}
+		producerEvents[key] = ProducerEvent{
+			Time:       when,
+			CreatedAt:  entry.Intent.CreatedAt,
+			Producer:   entry.Producer,
+			Side:       fmt.Sprint(entry.Side),
+			Stage:      stage,
+			DecisionID: decisionID,
+			OrderID:    eventOrderID,
+			Reason:     reason,
+			Error:      errorText,
+			Price:      price,
+			BaseSize:   base,
+			QuoteValue: price * base,
+		}
+		log.Printf(
+			"[PRODUCER] stage=%s producer=%s side=%s decision_id=%s "+
+				"order_id=%s reason=%q error=%q",
+			stage, entry.Producer, entry.Side, decisionID,
+			eventOrderID, reason, errorText,
+		)
+	}
+
 poll:
 	for time.Now().Before(deadline) {
 		select {
@@ -7132,7 +7172,8 @@ poll:
 				newID,
 					newLastLimitPx,
 					newRepriceCount,
-					didReprice := t.maybeRepriceOnce(
+					didReprice,
+					repriceObservation := t.maybeRepriceOnce(
 					pollCtx,
 					entry,
 					orderID,
@@ -7142,6 +7183,42 @@ poll:
 					offsetBps,
 					repriceCount,
 				)
+
+				if repriceObservation.Attempted {
+					sequence := repriceObservation.Sequence
+					outcome := "failed"
+					eventOrderID := repriceObservation.OldOrderID
+					if repriceObservation.Accepted {
+						outcome = "accepted"
+						eventOrderID = repriceObservation.NewOrderID
+					}
+					detail := fmt.Sprintf(
+						"reprice_sequence=%d|reprice_outcome=%s|old_order_id=%s|new_order_id=%s|old_limit=%.8f|new_limit=%.8f|new_base=%.8f|cancel_error=%q|place_error=%q",
+						sequence,
+						outcome,
+						repriceObservation.OldOrderID,
+						repriceObservation.NewOrderID,
+						repriceObservation.OldLimitPx,
+						repriceObservation.NewLimitPx,
+						repriceObservation.NewBase,
+						repriceObservation.CancelError,
+						repriceObservation.Error,
+					)
+					errorText := repriceObservation.Error
+					if errorText == "" && repriceObservation.CancelError != "" {
+						errorText = repriceObservation.CancelError
+					}
+					addRepriceProducerEvent(
+						ProducerStageRepriced,
+						sequence,
+						repriceObservation.CompletedAt,
+						eventOrderID,
+						detail,
+						errorText,
+						repriceObservation.NewLimitPx,
+						repriceObservation.NewBase,
+					)
+				}
 
 				if didReprice &&
 					newID != orderID {
@@ -7630,9 +7707,7 @@ func (t *Trader) rekeyPendingEntry(
 	}
 
 	delete(t.pendingEntries, oldOrderID)
-	if t.resourceManager != nil {
-		t.resourceManager.Release("pending-entry:" + oldOrderID)
-	}
+	if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + oldOrderID) }
 
 	if oldOrderID != "" {
 		entry.Intent.History = appendOrderHistory(
@@ -7706,14 +7781,15 @@ func (t *Trader) maybeRepriceOnce(
 	newLastLimitPx float64,
 	newRepriceCount int,
 	didReprice bool,
+	observation RepriceObservation,
 ) {
 	if entry == nil {
-		return orderID, lastLimitPx, repriceCount, false
+		return orderID, lastLimitPx, repriceCount, false, observation
 	}
 
 	intent := entry.Intent
 	if intent == nil {
-		return orderID, lastLimitPx, repriceCount, false
+		return orderID, lastLimitPx, repriceCount, false, observation
 	}
 
 	side := entry.Side
@@ -7722,12 +7798,12 @@ func (t *Trader) maybeRepriceOnce(
 
 	// Global guards
 	if !t.cfg.RepriceEnable {
-		return orderID, lastLimitPx, repriceCount, false
+		return orderID, lastLimitPx, repriceCount, false, observation
 	}
 
 	if t.cfg.RepriceMaxCount > 0 &&
 		repriceCount >= t.cfg.RepriceMaxCount {
-		return orderID, lastLimitPx, repriceCount, false
+		return orderID, lastLimitPx, repriceCount, false, observation
 	}
 
 	bid, ask, bErr := t.broker.GetBBO(
@@ -7764,7 +7840,7 @@ func (t *Trader) maybeRepriceOnce(
 		cancelPx()
 
 		if gErr != nil || px <= 0 {
-			return orderID, lastLimitPx, repriceCount, false
+			return orderID, lastLimitPx, repriceCount, false, observation
 		}
 
 		if side == SideBuy {
@@ -7796,7 +7872,7 @@ func (t *Trader) maybeRepriceOnce(
 				cand := ask - tick
 
 				if cand <= 0 {
-					return orderID, lastLimitPx, repriceCount, false
+					return orderID, lastLimitPx, repriceCount, false, observation
 				}
 
 				newLimitPx = cand
@@ -7920,7 +7996,16 @@ func (t *Trader) maybeRepriceOnce(
 	)
 
 	if !shouldReprice {
-		return orderID, lastLimitPx, repriceCount, false
+		return orderID, lastLimitPx, repriceCount, false, observation
+	}
+
+	observation = RepriceObservation{
+		Attempted:   true,
+		Sequence:    repriceCount + 1,
+		OldOrderID:  orderID,
+		OldLimitPx:  lastLimitPx,
+		NewLimitPx:  newLimitPx,
+		NewBase:     newBase,
 	}
 
 	if useBBO {
@@ -7941,11 +8026,14 @@ func (t *Trader) maybeRepriceOnce(
 		// )
 	}
 
-	_ = t.broker.CancelOrder(
+	cancelErr := t.broker.CancelOrder(
 		pctx,
 		t.cfg.ProductID,
 		orderID,
 	)
+	if cancelErr != nil {
+		observation.CancelError = cancelErr.Error()
+	}
 
 	newID, perr :=
 		t.broker.PlaceLimitPostOnly(
@@ -7958,12 +8046,25 @@ func (t *Trader) maybeRepriceOnce(
 
 	if perr != nil ||
 		strings.TrimSpace(newID) == "" {
+		observation.CompletedAt = time.Now().UTC()
+		if perr != nil {
+			observation.Error = perr.Error()
+		} else {
+			observation.Error = "repriced submission returned an empty exchange order id"
+		}
+		if observation.CancelError != "" {
+			observation.Error = "cancel_error=" + observation.CancelError + "|place_error=" + observation.Error
+		}
 
 		return orderID,
 			lastLimitPx,
 			repriceCount,
-			false
+			false,
+			observation
 	}
+	observation.Accepted = true
+	observation.CompletedAt = time.Now().UTC()
+	observation.NewOrderID = newID
 
 	// log.Printf(
 	// "[TRACE] postonly.reprice side=%s old_id=%s new_id=%s limit=%.8f baseReq=%.8f",
@@ -7982,7 +8083,22 @@ func (t *Trader) maybeRepriceOnce(
 	return newID,
 		newLimitPx,
 		repriceCount + 1,
-		true
+		true,
+		observation
+}
+
+type RepriceObservation struct {
+	Attempted   bool
+	Accepted    bool
+	Sequence    int
+	CompletedAt time.Time
+	OldOrderID  string
+	NewOrderID  string
+	OldLimitPx  float64
+	NewLimitPx  float64
+	NewBase     float64
+	CancelError string
+	Error       string
 }
 
 // Entry Drain result
