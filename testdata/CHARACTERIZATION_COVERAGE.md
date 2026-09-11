@@ -26,6 +26,11 @@ Authoritative bot version: `201`
 | Recovery reconciliation | Uncertain recovery is quarantined and cannot produce a resurrection decision |
 | Recovery market route | Resurrection validates executable BBO against target plus taker fee/slippage, disables maker execution, and commits through the shared fill path |
 | Recovery completion | A fully committed recovery removes both its durable obligation and any deferred retry |
+| Refund lifecycle | Obligations derive the opposite service side, reserve the largest outstanding debt, preserve debt on release, reduce only on confirmed service, and delete at completion |
+| Refund ordering | Refund sizing attaches only after all producer core allocations have been considered |
+| Refund exit throttle | Exit insufficient-balance obligations persist a 30-second NextRetryAt and defer only that exit while the deadline is active |
+| Repricing | Enable/count/drift/improvement/edge guards precede cancel-replace, accepted reprices update economic fields, and a canonical repriced event carries old/new identity |
+| Partial fills and uncertainty | Entry polling retains accumulated fill fields and terminal lifecycle stages; quarantined reservations reconcile against exchange state before release |
 
 ## Required before v2 cutover
 
@@ -36,9 +41,7 @@ The following require deterministic broker, clock, persistence, and scheduler se
 - Tick ordering and parallel producer fan-in.
 - Concurrent independent exit and entry submission.
 - Complete Binance request payload matrices across market, post-only, and Recovery routes.
-- Partial entry and exit fill accumulation.
-- Repricing, cancellation, timeout uncertainty, and reconciliation.
-- Refund obligation creation, reservation, servicing, retry throttling, and completion.
+- Complete dynamic exit partial-fill accumulation and cancel-replace execution matrices.
 - Recovery reconciliation against actual exchange state and crash-boundary persistence failures.
 - Position/runner mutation, exit accounting, producer economics, lifecycle events, and pruning.
 - Startup reconstruction and crash recovery.
