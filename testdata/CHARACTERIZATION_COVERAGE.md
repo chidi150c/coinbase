@@ -17,6 +17,9 @@ Authoritative bot version: `201`
 | Recovery resurrection | BUY/SELL targets include taker fee plus five-basis-point slippage |
 | Entry transport ordering | Exchange acceptance is registered and persisted before the asynchronous poller reaches the broker |
 | Exit transport ordering | Exit submission reservation and accepted pending exit are persisted before the asynchronous watcher reaches the broker |
+| Exit fan-out | Independent exit submissions reach the broker concurrently rather than serially |
+| Recovery Mode A ordering | The replacement SELL submission occurs before the losing source BUY exit |
+| Recovery Mode B ordering | The losing source BUY exit occurs before the initial replacement SELL, and both submissions occur in one close operation |
 
 ## Required before v2 cutover
 
@@ -30,7 +33,7 @@ The following require deterministic broker, clock, persistence, and scheduler se
 - Partial entry and exit fill accumulation.
 - Repricing, cancellation, timeout uncertainty, and reconciliation.
 - Refund obligation creation, reservation, servicing, retry throttling, and completion.
-- Recovery Mode A, initial same-tick Mode B, one-time post-exit Mode B retry, partial recovery, reconciliation, target wait, market resurrection, and completion.
+- Recovery one-time post-exit Mode B retry, partial recovery, reconciliation, target wait, market resurrection, and completion.
 - Position/runner mutation, exit accounting, producer economics, lifecycle events, and pruning.
 - Startup reconstruction and crash recovery.
 

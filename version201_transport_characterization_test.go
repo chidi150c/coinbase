@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,29 +12,50 @@ import (
 )
 
 type orderingBroker struct {
-	mu           sync.Mutex
-	nextOrderID  string
-	statePath    string
-	pollObserved chan bool
+	mu            sync.Mutex
+	nextOrderID   string
+	statePath     string
+	pollObserved  chan bool
+	availableBase float64
+	events        []string
+	marketStarted chan OrderSide
+	marketRelease <-chan struct{}
+	nextMarketID  int
 }
 
 func (b *orderingBroker) Name() string                                         { return "ordering" }
 func (b *orderingBroker) GetNowPrice(context.Context, string) (float64, error) { return 100, nil }
-func (b *orderingBroker) PlaceMarketQuote(context.Context, string, OrderSide, float64) (*PlacedOrder, error) {
-	return nil, errors.New("unexpected market order")
+func (b *orderingBroker) PlaceMarketQuote(ctx context.Context, _ string, side OrderSide, quote float64) (*PlacedOrder, error) {
+	b.mu.Lock()
+	b.nextMarketID++
+	id := b.nextMarketID
+	b.events = append(b.events, "market:"+string(side))
+	b.mu.Unlock()
+	if b.marketStarted != nil {
+		b.marketStarted <- side
+	}
+	if b.marketRelease != nil {
+		select {
+		case <-b.marketRelease:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return &PlacedOrder{ID: fmt.Sprintf("market-%d", id), Side: side, Price: 100, BaseSize: quote / 100, QuoteSpent: quote, Status: "FILLED"}, nil
 }
 func (b *orderingBroker) GetRecentCandles(context.Context, string, string, int) ([]Candle, error) {
 	return nil, nil
 }
 func (b *orderingBroker) GetAvailableBase(context.Context, string) (string, float64, float64, error) {
-	return "BTC", 10, 0.00001, nil
+	return "BTC", b.availableBase, 0.00001, nil
 }
 func (b *orderingBroker) GetAvailableQuote(context.Context, string) (string, float64, float64, error) {
 	return "USDT", 1000, 0.01, nil
 }
-func (b *orderingBroker) PlaceLimitPostOnly(context.Context, string, OrderSide, float64, float64) (string, error) {
+func (b *orderingBroker) PlaceLimitPostOnly(_ context.Context, _ string, side OrderSide, _ float64, _ float64) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.events = append(b.events, "limit:"+string(side))
 	return b.nextOrderID, nil
 }
 func (b *orderingBroker) GetOrder(ctx context.Context, _ string, orderID string) (*PlacedOrder, error) {
@@ -46,6 +67,12 @@ func (b *orderingBroker) GetOrder(ctx context.Context, _ string, orderID string)
 	}
 	<-ctx.Done()
 	return nil, ctx.Err()
+}
+
+func (b *orderingBroker) eventSnapshot() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.events...)
 }
 func (b *orderingBroker) CancelOrder(context.Context, string, string) error { return nil }
 func (b *orderingBroker) GetExchangeFilters(context.Context, string) (ExFilters, error) {
@@ -70,6 +97,89 @@ func newOrderingTrader(t *testing.T, broker *orderingBroker) *Trader {
 		PendingReplacementRetries:      make(map[string]PendingReplacementRetry),
 		producerContinuationReferences: make(ProducerContinuationReferences),
 		resourceManager:                NewResourceManager(ResourceLedgerState{}),
+	}
+}
+
+func TestVersion201ExitFanoutSubmissionsOverlap(t *testing.T) {
+	release := make(chan struct{})
+	broker := &orderingBroker{availableBase: 10, marketStarted: make(chan OrderSide, 2), marketRelease: release}
+	tr := newOrderingTrader(t, broker)
+	tr.cfg.PersistState = false
+	tr.stateFile = ""
+	tr.cfg.LimitTimeoutSec = 0
+	tr.cfg.MinNotional = 1
+	tr.cfg.BaseStep = 0.001
+	tr.books[SideBuy].Lots = []*Position{{OpenPrice: 100, Side: SideBuy, SizeBase: 0.1, OpenTime: time.Now().UTC(), EntryOrderID: "buy-entry", Producer: EntryProducerNormalLegacy}}
+	tr.books[SideSell].Lots = []*Position{{OpenPrice: 100, Side: SideSell, SizeBase: 0.1, OpenTime: time.Now().UTC(), EntryOrderID: "sell-entry", Producer: EntryProducerNormalLegacy}}
+	done := make(chan []exitFanoutResult, 1)
+	go func() {
+		done <- tr.fanOutExits(context.Background(), 100, []exitCandidate{{side: SideBuy, entryOrderID: "buy-entry", reason: "characterization"}, {side: SideSell, entryOrderID: "sell-entry", reason: "characterization"}}, time.Now())
+	}()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-broker.marketStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("exit submissions did not overlap")
+		}
+	}
+	close(release)
+	select {
+	case results := <-done:
+		if len(results) != 2 {
+			t.Fatalf("fanout results=%d", len(results))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fanout did not complete")
+	}
+}
+
+func TestVersion201RecoveryModeAReplacementPrecedesExit(t *testing.T) {
+	broker := &orderingBroker{nextOrderID: "replacement", availableBase: 10, pollObserved: make(chan bool, 1)}
+	tr := newOrderingTrader(t, broker)
+	tr.cfg.PersistState = false
+	tr.stateFile = ""
+	tr.cfg.MinNotional = 1
+	tr.cfg.BaseStep = 0.00001
+	tr.cfg.ProfitGateUSD = 1
+	tr.MarketRegime = RegimeNormal
+	tr.books[SideSell].Lots = []*Position{{OpenPrice: 100, Side: SideSell, SizeBase: 0.1, OpenTime: time.Now().UTC(), EntryOrderID: "source", Producer: EntryProducerCase11APeakReversal}}
+	_, acted, err := tr.closeLotByEntryID(context.Background(), 110, SideSell, "source", "threshold_stop_loss", "L1_THRESHOLD_WARNING", time.Now())
+	if err != nil || !acted {
+		t.Fatalf("Mode A close failed acted=%t err=%v", acted, err)
+	}
+	events := broker.eventSnapshot()
+	if len(events) < 2 || events[0] != "limit:SELL" || events[1] != "market:BUY" {
+		t.Fatalf("Mode A ordering changed: %v", events)
+	}
+	for _, entry := range tr.pendingEntries {
+		if entry.Cancel != nil {
+			entry.Cancel()
+		}
+	}
+}
+
+func TestVersion201RecoveryModeBExitPrecedesSameCallReplacement(t *testing.T) {
+	broker := &orderingBroker{nextOrderID: "replacement", availableBase: 0, pollObserved: make(chan bool, 1)}
+	tr := newOrderingTrader(t, broker)
+	tr.cfg.PersistState = false
+	tr.stateFile = ""
+	tr.cfg.MinNotional = 1
+	tr.cfg.BaseStep = 0.00001
+	tr.cfg.ProfitGateUSD = 1
+	tr.MarketRegime = RegimeDown
+	tr.books[SideSell].Lots = []*Position{{OpenPrice: 100, Side: SideSell, SizeBase: 0.1, OpenTime: time.Now().UTC(), EntryOrderID: "source", Producer: EntryProducerCase11APeakReversal}}
+	_, acted, err := tr.closeLotByEntryID(context.Background(), 110, SideSell, "source", "threshold_stop_loss", "L1_THRESHOLD_WARNING", time.Now())
+	if err != nil || !acted {
+		t.Fatalf("Mode B close failed acted=%t err=%v", acted, err)
+	}
+	events := broker.eventSnapshot()
+	if len(events) < 2 || events[0] != "market:BUY" || events[1] != "limit:SELL" {
+		t.Fatalf("Mode B ordering changed: %v", events)
+	}
+	for _, entry := range tr.pendingEntries {
+		if entry.Cancel != nil {
+			entry.Cancel()
+		}
 	}
 }
 
