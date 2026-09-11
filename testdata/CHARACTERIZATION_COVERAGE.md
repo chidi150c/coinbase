@@ -20,6 +20,8 @@ Authoritative bot version: `201`
 | Exit fan-out | Independent exit submissions reach the broker concurrently rather than serially |
 | Recovery Mode A ordering | The replacement SELL submission occurs before the losing source BUY exit |
 | Recovery Mode B ordering | The losing source BUY exit occurs before the initial replacement SELL, and both submissions occur in one close operation |
+| Recovery deferred Mode B | The retry is consumed and quarantined durably before submission, accepted orders become ready through pending registration, and terminal failure hands off to active or reconciliation state |
+| Recovery retry precedence | A pending one-time Mode B retry prevents target-controlled resurrection from taking ownership early |
 
 ## Required before v2 cutover
 
@@ -33,7 +35,7 @@ The following require deterministic broker, clock, persistence, and scheduler se
 - Partial entry and exit fill accumulation.
 - Repricing, cancellation, timeout uncertainty, and reconciliation.
 - Refund obligation creation, reservation, servicing, retry throttling, and completion.
-- Recovery one-time post-exit Mode B retry, partial recovery, reconciliation, target wait, market resurrection, and completion.
+- Recovery partial recovery, reconciliation processing, target wait, market resurrection execution, and completion.
 - Position/runner mutation, exit accounting, producer economics, lifecycle events, and pruning.
 - Startup reconstruction and crash recovery.
 
