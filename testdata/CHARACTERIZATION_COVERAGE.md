@@ -15,6 +15,8 @@ Authoritative bot version: `201`
 | Admission | Case3B blocks MID/HIGH but not LOW; LongOnly blocks SELL |
 | Entry policy | NormalLegacy resets regime; Equity does not reset producer state |
 | Recovery resurrection | BUY/SELL targets include taker fee plus five-basis-point slippage |
+| Entry transport ordering | Exchange acceptance is registered and persisted before the asynchronous poller reaches the broker |
+| Exit transport ordering | Exit submission reservation and accepted pending exit are persisted before the asynchronous watcher reaches the broker |
 
 ## Required before v2 cutover
 
@@ -24,8 +26,7 @@ The following require deterministic broker, clock, persistence, and scheduler se
 - Continuation reference advancement and BUY/SELL latch rebasing.
 - Tick ordering and parallel producer fan-in.
 - Concurrent independent exit and entry submission.
-- Binance request payloads, prices, quantities, and post-only flags.
-- Accepted-order pending registration, persistence, then poller startup.
+- Complete Binance request payload matrices across market, post-only, and Recovery routes.
 - Partial entry and exit fill accumulation.
 - Repricing, cancellation, timeout uncertainty, and reconciliation.
 - Refund obligation creation, reservation, servicing, retry throttling, and completion.
