@@ -279,7 +279,7 @@ func (t *Trader) evaluateAI(
 
 	case pUp <= result.BuyThreshold:
 
-		result.Raw = Buy
+		result.Raw = Sell
 
 		result.Confidence =
 			confidenceRiskMultiplier(
@@ -291,7 +291,7 @@ func (t *Trader) evaluateAI(
 
 	case pUp >= result.SellThreshold:
 
-		result.Raw = Sell
+		result.Raw = Buy
 
 		result.Confidence =
 			confidenceRiskMultiplier(
@@ -761,10 +761,10 @@ func interpretMACD(
 
 	switch {
 	case result.StrongNegative && result.MomentumUp:
-		result.Opinion = Buy
+		result.Opinion = Sell
 
 	case result.StrongPositive && result.MomentumDown:
-		result.Opinion = Sell
+		result.Opinion = Buy
 
 	default:
 		result.Opinion = Flat
