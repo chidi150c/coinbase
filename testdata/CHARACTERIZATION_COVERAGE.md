@@ -22,6 +22,10 @@ Authoritative bot version: `201`
 | Recovery Mode B ordering | The losing source BUY exit occurs before the initial replacement SELL, and both submissions occur in one close operation |
 | Recovery deferred Mode B | The retry is consumed and quarantined durably before submission, accepted orders become ready through pending registration, and terminal failure hands off to active or reconciliation state |
 | Recovery retry precedence | A pending one-time Mode B retry prevents target-controlled resurrection from taking ownership early |
+| Recovery partial fill | Recovery USD is apportioned by core fill, remaining base/USD survive, and initial versus resurrected attempts return to active versus target-wait state |
+| Recovery reconciliation | Uncertain recovery is quarantined and cannot produce a resurrection decision |
+| Recovery market route | Resurrection validates executable BBO against target plus taker fee/slippage, disables maker execution, and commits through the shared fill path |
+| Recovery completion | A fully committed recovery removes both its durable obligation and any deferred retry |
 
 ## Required before v2 cutover
 
@@ -35,7 +39,7 @@ The following require deterministic broker, clock, persistence, and scheduler se
 - Partial entry and exit fill accumulation.
 - Repricing, cancellation, timeout uncertainty, and reconciliation.
 - Refund obligation creation, reservation, servicing, retry throttling, and completion.
-- Recovery partial recovery, reconciliation processing, target wait, market resurrection execution, and completion.
+- Recovery reconciliation against actual exchange state and crash-boundary persistence failures.
 - Position/runner mutation, exit accounting, producer economics, lifecycle events, and pruning.
 - Startup reconstruction and crash recovery.
 
