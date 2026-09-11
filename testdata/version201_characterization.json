@@ -1,0 +1,38 @@
+{
+  "source_commit": "3188e3d1bd1626a8efeb66aac0e0966d09f8a1e4",
+  "bot_version": 201,
+  "case16a_snapshot": {
+    "price": 78881.995,
+    "recent_high": 78978.39,
+    "confidence": 0.59,
+    "macd_prev6": 39.81532,
+    "macd_line": 30.50008,
+    "macd_hist": -4.42483,
+    "ema_spread": 0.000124,
+    "ema2050": 0.000711,
+    "passes": true,
+    "producer": "Case16ANormalPeakRolloverSell",
+    "signal": "SELL",
+    "priority": 98,
+    "tier": "LOW"
+  },
+  "allocation": {
+    "price": 10,
+    "spare_quote": 100,
+    "high_requested": 80,
+    "low_requested": 80,
+    "high_allocated": 80,
+    "low_allocated": 20,
+    "equal_a_allocated": 50,
+    "equal_b_allocated": 50
+  },
+  "recovery": {
+    "target": 100,
+    "taker_fee_rate": 0.001,
+    "slippage_bps": 5,
+    "sell_below_trigger": 100.14,
+    "sell_at_trigger": 100.16,
+    "buy_above_trigger": 99.86,
+    "buy_at_trigger": 99.84
+  }
+}
