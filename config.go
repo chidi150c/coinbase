@@ -238,8 +238,8 @@ func loadConfigFromEnv() Config {
 		RepriceMaxCount:       getEnvInt("REPRICE_MAX_COUNT", 0),
 
 		// Strategy thresholds
-		BuyThreshold:     getEnvFloat("BUY_THRESHOLD", 0.34),
-		SellThreshold:    getEnvFloat("SELL_THRESHOLD", 0.574),
+		BuyThreshold:     getEnvFloat("BUY_THRESHOLD", 0.57),
+		SellThreshold:    getEnvFloat("SELL_THRESHOLD", 0.34),
 		UseMAFilter:      getEnvBool("USE_MA_FILTER", true),
 		UseMACDSlopeGate: getEnvBool("USE_MACD_SLOPE_GATE", false),
 		MACDLineEPS:      getEnvFloat("MACD_LINE_EPS", 0.0),

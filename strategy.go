@@ -277,25 +277,25 @@ func (t *Trader) evaluateAI(
 
 	switch {
 
-	case pUp <= result.BuyThreshold:
+	case pUp <= result.SellThreshold:
 
 		result.Raw = Sell
 
 		result.Confidence =
 			confidenceRiskMultiplier(
-				Buy,
+				Sell,
 				pUp,
 				result.BuyThreshold,
 				result.SellThreshold,
 			)
 
-	case pUp >= result.SellThreshold:
+	case pUp >= result.BuyThreshold:
 
 		result.Raw = Buy
 
 		result.Confidence =
 			confidenceRiskMultiplier(
-				Sell,
+				Buy,
 				pUp,
 				result.BuyThreshold,
 				result.SellThreshold,
@@ -1987,33 +1987,33 @@ func confidenceRiskMultiplier(sig Signal, pUp, buyThreshold, sellThreshold float
 	const (
 		minConf    = 0.20
 		maxConf    = 1.00
-		sellStrong = 0.70
-		buyStrong  = 0.20
+		buyStrong = 0.70
+		sellStrong  = 0.20
 		curve      = 1.50 // >1 = stricter near threshold, stronger only when farther away
 	)
 
 	switch sig {
-	case Buy:
-		if pUp > buyThreshold {
+	case Sell:
+		if pUp > sellThreshold {
 			return 0.00
 		}
-		if pUp <= buyStrong {
+		if pUp <= sellStrong {
 			return maxConf
 		}
 
-		x := (buyThreshold - pUp) / (buyThreshold - buyStrong)
+		x := (sellThreshold - pUp) / (sellThreshold - sellStrong)
 		x = math.Pow(clamp01(x), curve)
 		return minConf + x*(maxConf-minConf)
 
-	case Sell:
-		if pUp < sellThreshold {
+	case Buy:
+		if pUp < buyThreshold {
 			return 0.00
 		}
-		if pUp >= sellStrong {
+		if pUp >= buyStrong {
 			return maxConf
 		}
 
-		x := (pUp - sellThreshold) / (sellStrong - sellThreshold)
+		x := (pUp - buyThreshold) / (buyStrong - buyThreshold)
 		x = math.Pow(clamp01(x), curve)
 		return minConf + x*(maxConf-minConf)
 	}

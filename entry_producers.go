@@ -622,7 +622,7 @@ func applyCase15BDowntrendRecoveryBuyProducer(
 
 	downtrendRecoveryBuy := pending == 0 &&
 		entryGatePass &&
-		ai.Raw == Buy &&
+		ai.Raw == Sell &&
 		ai.Confidence >= minConfidence &&
 		regime == RegimeDown &&
 		ema.PatternBuy &&
@@ -762,7 +762,7 @@ func applyCase15AUptrendRecoverySellProducer(
 
 	uptrendRecoverySell := pending == 0 &&
 		entryGatePass &&
-		ai.Raw == Sell &&
+		ai.Raw == Buy &&
 		ai.Confidence >= minConfidence &&
 		regime == RegimeUp &&
 		ema.PatternSell &&
@@ -896,7 +896,7 @@ func applyCase16ANormalPeakRolloverSellProducer(
 
 	normalPeakRolloverSell := pending == 0 &&
 		entryGatePass &&
-		ai.Raw == Sell &&
+		ai.Raw == Buy &&
 		ai.Confidence >= minConfidence &&
 		regime == RegimeNormal &&
 		recentHigh > 0 &&
@@ -1012,7 +1012,7 @@ func applyCase16BNormalBottomRolloverBuyProducer(
 
 	normalBottomRolloverBuy := pending == 0 &&
 		entryGatePass &&
-		ai.Raw == Buy &&
+		ai.Raw == Sell &&
 		ai.Confidence >= minConfidence &&
 		regime == RegimeNormal &&
 		recentLow > 0 &&
@@ -2149,7 +2149,7 @@ func applyCase13APeakProducer(
 	peakSellArm :=
 		case13AAvailable &&
 			case13AReentryPass &&
-			ai.Raw == Sell &&
+			ai.Raw == Buy &&
 			ai.Confidence >= minConfidence &&
 			regime == RegimeUp &&
 			priceNearRecentHigh &&
@@ -2325,7 +2325,7 @@ func applyCase13BBottomProducer(
 	bottomBuyArm :=
 		case13BAvailable &&
 			case13BEntryGatePass &&
-			ai.Raw == Buy &&
+			ai.Raw == Sell &&
 			ai.Confidence >= minConfidence &&
 			regime == RegimeDown &&
 			priceNearRecentLow &&
@@ -2503,10 +2503,10 @@ func applyCase14BUptrendBuyProducer(
 
 	uptrendBuy :=
 		case14BAvailable &&
-			ai.Raw == Buy &&
+			ai.Raw == Sell &&
 			ai.Confidence >= minConfidence &&
-			legacy.Signal == Buy &&
-			legacy.LogicOpinion == Buy &&
+			legacy.Signal == Sell &&
+			legacy.LogicOpinion == Sell &&
 			regime == RegimeUp &&
 			ema.PatternBuy
 
