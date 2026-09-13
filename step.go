@@ -1466,26 +1466,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		}, nil
 	}
 
-	// Standardized continuation episode reset.
-	//
-	// Continuation state is producer + side specific, but the episode reset is
-	// mirrored by AI direction:
-	//
-	//   current AI BUY  -> clear every ordinary SELL continuation reference
-	//   current AI SELL -> clear every ordinary BUY continuation reference
-	//
-	// FLAT preserves both sides. Repeated BUY/SELL ticks are intentionally
-	// idempotent so stale persisted continuation state self-heals after restart.
-	if aiResult.Raw == Buy {
-		t.clearProducerContinuationSide(
-			SideSell,
-		)
-	}
-	if aiResult.Raw == Sell {
-		t.clearProducerContinuationSide(
-			SideBuy,
-		)
-	}
+	// Apply the reset signal declared for each producer-side continuation.
+	// Case11 retains its agreed AI-controlled episode reset, while opposite-
+	// polarity Cases 13, 15 and 16 retain their reference for as long as their
+	// qualifying AI signal remains active. FLAT preserves every reference.
+	t.resetProducerContinuationReferences(aiResult.Raw)
 
 	// Producers consume an immutable snapshot for this decision pass. Any
 	// committed entry later in the tick advances Trader-owned continuation state

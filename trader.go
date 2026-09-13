@@ -741,6 +741,36 @@ func (t *Trader) clearProducerContinuationSide(
 	}
 }
 
+// resetProducerContinuationReferences applies the reset signal declared by
+// each producer-side continuation without clearing unrelated producers that
+// happen to trade the same side. Caller must hold t.mu when concurrent
+// mutation is possible.
+func (t *Trader) resetProducerContinuationReferences(
+	aiRaw Signal,
+) {
+	if aiRaw == Flat || t.producerContinuationReferences == nil {
+		return
+	}
+
+	for producer, bySide := range t.producerContinuationReferences {
+		if bySide == nil {
+			continue
+		}
+
+		for side := range bySide {
+			resetSignal, configured :=
+				continuationResetSignalFor(producer, side)
+			if configured && aiRaw == resetSignal {
+				delete(bySide, side)
+			}
+		}
+
+		if len(bySide) == 0 {
+			delete(t.producerContinuationReferences, producer)
+		}
+	}
+}
+
 // mergeLots merges lot at fromIdx into lot at toIdx inside the given book.
 // toIdx is the survivor.
 func mergeLots(book *SideBook, fromIdx, toIdx int, px float64) {
@@ -2026,7 +2056,9 @@ func (t *Trader) RehydratePending(
 				current, ok := t.pendingEntries[orderID]
 				if ok && current == persisted {
 					delete(t.pendingEntries, orderID)
-					if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
+					if t.resourceManager != nil {
+						t.resourceManager.Release("pending-entry:" + orderID)
+					}
 				}
 
 				t.mu.Unlock()
@@ -2086,7 +2118,9 @@ func (t *Trader) RehydratePending(
 			current, ok := t.pendingEntries[orderID]
 			if ok && current == persisted {
 				delete(t.pendingEntries, orderID)
-				if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
+				if t.resourceManager != nil {
+					t.resourceManager.Release("pending-entry:" + orderID)
+				}
 			}
 
 			if err := t.saveStateNoLock(); err != nil {
@@ -3460,7 +3494,7 @@ func (t *Trader) closeLot(
 					ID: case3AReservationID, TransactionID: transactionID,
 					OwnerID: repl.ObligationID, Kind: ResourceReservationSubmission,
 					ClientOrderID: stableClientOrderID(repl.DecisionID), ProductID: t.cfg.ProductID,
-					State: ResourceReservationReserved,
+					State:    ResourceReservationReserved,
 					Producer: EntryProducerCase3AReplacement, Side: repl.Side,
 					Base: repl.BaseAtLimit, CreatedAt: time.Now().UTC(),
 				},
@@ -5124,16 +5158,16 @@ func (t *Trader) reserveProducerAllocationBatchLocked(
 			return errors.New("entry allocation batch contains nil PendingIntent")
 		}
 		reservation := ResourceReservation{
-			ID: "submission:" + strings.TrimSpace(req.Intent.DecisionID),
+			ID:            "submission:" + strings.TrimSpace(req.Intent.DecisionID),
 			TransactionID: transactionID,
-			OwnerID: strings.TrimSpace(req.Intent.DecisionID),
+			OwnerID:       strings.TrimSpace(req.Intent.DecisionID),
 			ClientOrderID: stableClientOrderID(req.Intent.DecisionID),
-			ProductID: t.cfg.ProductID,
-			Kind: ResourceReservationSubmission,
-			State: ResourceReservationReserved,
-			Producer: req.Producer,
-			Side: req.Side,
-			CreatedAt: now,
+			ProductID:     t.cfg.ProductID,
+			Kind:          ResourceReservationSubmission,
+			State:         ResourceReservationReserved,
+			Producer:      req.Producer,
+			Side:          req.Side,
+			CreatedAt:     now,
 		}
 		switch req.Side {
 		case SideBuy:
@@ -5794,7 +5828,9 @@ func (t *Trader) produceEntry(
 				t.pendingEntries,
 				orderID,
 			)
-			if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
+			if t.resourceManager != nil {
+				t.resourceManager.Release("pending-entry:" + orderID)
+			}
 		}
 
 		t.mu.Unlock()
@@ -6425,12 +6461,12 @@ func (t *Trader) registerPendingEntry(
 		t.resourceManager = NewResourceManager(ResourceLedgerState{})
 	}
 	pendingReservation := ResourceReservation{
-		ID: "pending-entry:" + orderID,
-		OwnerID: strings.TrimSpace(entry.Intent.DecisionID),
-		Kind: ResourceReservationPendingEntry,
-		State: ResourceReservationPending,
-		Producer: entry.Producer,
-		Side: entry.Side,
+		ID:        "pending-entry:" + orderID,
+		OwnerID:   strings.TrimSpace(entry.Intent.DecisionID),
+		Kind:      ResourceReservationPendingEntry,
+		State:     ResourceReservationPending,
+		Producer:  entry.Producer,
+		Side:      entry.Side,
 		CreatedAt: time.Now().UTC(),
 	}
 	if entry.Side == SideBuy {
@@ -6442,9 +6478,11 @@ func (t *Trader) registerPendingEntry(
 	}
 	if err := t.resourceManager.Upsert(pendingReservation); err != nil {
 		delete(t.pendingEntries, orderID)
-		if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
+		if t.resourceManager != nil {
+			t.resourceManager.Release("pending-entry:" + orderID)
+		}
 		return &EntryProduceError{
-			Code: EntryProduceErrRegisterNilPendingIntent,
+			Code:     EntryProduceErrRegisterNilPendingIntent,
 			Producer: entry.Producer, Side: fmt.Sprint(entry.Side),
 			OrderID: orderID, CleanupRequired: true, Err: err,
 		}
@@ -6454,7 +6492,9 @@ func (t *Trader) registerPendingEntry(
 		obligation := t.ensureCase3AObligationLocked(entry.Intent, "")
 		if obligation == nil {
 			delete(t.pendingEntries, orderID)
-			if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + orderID) }
+			if t.resourceManager != nil {
+				t.resourceManager.Release("pending-entry:" + orderID)
+			}
 			t.resourceManager.Release("pending-entry:" + orderID)
 			return &EntryProduceError{
 				Code:            EntryProduceErrRegisterNilPendingIntent,
@@ -7707,7 +7747,9 @@ func (t *Trader) rekeyPendingEntry(
 	}
 
 	delete(t.pendingEntries, oldOrderID)
-	if t.resourceManager != nil { t.resourceManager.Release("pending-entry:" + oldOrderID) }
+	if t.resourceManager != nil {
+		t.resourceManager.Release("pending-entry:" + oldOrderID)
+	}
 
 	if oldOrderID != "" {
 		entry.Intent.History = appendOrderHistory(
@@ -8000,12 +8042,12 @@ func (t *Trader) maybeRepriceOnce(
 	}
 
 	observation = RepriceObservation{
-		Attempted:   true,
-		Sequence:    repriceCount + 1,
-		OldOrderID:  orderID,
-		OldLimitPx:  lastLimitPx,
-		NewLimitPx:  newLimitPx,
-		NewBase:     newBase,
+		Attempted:  true,
+		Sequence:   repriceCount + 1,
+		OldOrderID: orderID,
+		OldLimitPx: lastLimitPx,
+		NewLimitPx: newLimitPx,
+		NewBase:    newBase,
 	}
 
 	if useBBO {

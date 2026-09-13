@@ -305,6 +305,46 @@ func continuationReferenceGate(
 	}
 }
 
+// continuationResetSignalFor returns the AI signal that terminates one
+// producer-side continuation episode. The reset contract is producer-specific:
+// Cases 13, 15 and 16 intentionally consume the AI polarity opposite to their
+// entry side, while NormalLegacy, Equity, Case11 and Case14 retain their
+// side-aligned reset behavior. FLAT preserves every continuation reference.
+func continuationResetSignalFor(
+	producer EntryProducer,
+	side OrderSide,
+) (Signal, bool) {
+	switch producer {
+	case EntryProducerNormalLegacy,
+		EntryProducerEquity:
+		switch side {
+		case SideBuy:
+			return Sell, true
+		case SideSell:
+			return Buy, true
+		}
+
+	case EntryProducerCase11APeakReversal:
+		return Buy, side == SideSell
+
+	case EntryProducerCase11BBottomReversal,
+		EntryProducerCase14BUptrendBuy:
+		return Sell, side == SideBuy
+
+	case EntryProducerCase13APeakSell,
+		EntryProducerCase15AUptrendRecoverySell,
+		EntryProducerCase16ANormalPeakRolloverSell:
+		return Sell, side == SideSell
+
+	case EntryProducerCase13BBottomBuy,
+		EntryProducerCase15BDowntrendRecoveryBuy,
+		EntryProducerCase16BNormalBottomRolloverBuy:
+		return Buy, side == SideBuy
+	}
+
+	return Flat, false
+}
+
 // traceContinuationEvaluation makes a continuation gate observable even when
 // the producer returns false before creating an EntryDecision. pendingCount is
 // -1 for producers whose evaluator has no pending single-flight guard.
@@ -476,12 +516,12 @@ type EntryDecision struct {
 
 	// Case3A obligation resurrection metadata. These fields are populated only
 	// for a durable obligation that has reached its immutable target again.
-	Case3AObligationID       string
-	Case3AOriginDecisionID   string
-	Case3ASourceEntryOrderID string
-	Case3ASourceExitOrderID  string
-	Case3ATargetPrice        float64
-	Case3ARemainingBase      float64
+	Case3AObligationID         string
+	Case3AOriginDecisionID     string
+	Case3ASourceEntryOrderID   string
+	Case3ASourceExitOrderID    string
+	Case3ATargetPrice          float64
+	Case3ARemainingBase        float64
 	Case3ARecoveryRemainingUSD float64
 	Case3AProfitGateUSD        float64
 	Case3ARecoveryMethod       RecoveryMethod
@@ -2503,10 +2543,10 @@ func applyCase14BUptrendBuyProducer(
 
 	uptrendBuy :=
 		case14BAvailable &&
-			ai.Raw == Sell &&
+			ai.Raw == Buy &&
 			ai.Confidence >= minConfidence &&
-			legacy.Signal == Sell &&
-			legacy.LogicOpinion == Sell &&
+			legacy.Signal == Buy &&
+			legacy.LogicOpinion == Buy &&
 			regime == RegimeUp &&
 			ema.PatternBuy
 

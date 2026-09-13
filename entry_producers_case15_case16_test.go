@@ -24,7 +24,7 @@ func TestCase16ASuppliedSnapshotPasses(t *testing.T) {
 	d := EntryDecision{}
 	passed := applyCase16ANormalPeakRolloverSellProducer(
 		&d,
-		AIResult{Raw: Sell, Confidence: 0.59},
+		AIResult{Raw: Buy, Confidence: 0.59},
 		MACDResult{LinePrev6: 39.81532, Line: 30.50008, Hist: -4.42483},
 		EMAPatternResult{Spread: 0.000124, EMA2050: 0.000711},
 		PyramidResult{Sell: PyramidSideResult{SpacingPass: true}},
@@ -46,7 +46,7 @@ func TestCase16BMirrorPasses(t *testing.T) {
 	d := EntryDecision{}
 	passed := applyCase16BNormalBottomRolloverBuyProducer(
 		&d,
-		AIResult{Raw: Buy, Confidence: 0.59},
+		AIResult{Raw: Sell, Confidence: 0.59},
 		MACDResult{LinePrev6: -39.81532, Line: -30.50008, Hist: 4.42483},
 		EMAPatternResult{Spread: -0.000124, EMA2050: -0.000711},
 		PyramidResult{Buy: PyramidSideResult{SpacingPass: true}},
@@ -65,7 +65,7 @@ func TestCase15AMirrorPasses(t *testing.T) {
 	d := EntryDecision{}
 	passed := applyCase15AUptrendRecoverySellProducer(
 		&d,
-		AIResult{Raw: Sell, Confidence: 0.59},
+		AIResult{Raw: Buy, Confidence: 0.59},
 		MACDResult{LinePrev6: 39.81532, Line: 30.50008, Hist: -4.42483},
 		EMAPatternResult{PatternSell: true, PriceUpDown: true},
 		PyramidResult{Sell: PyramidSideResult{Latched: 79000, SpacingPass: true}},
