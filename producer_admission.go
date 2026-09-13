@@ -56,7 +56,7 @@ func producerAdmissionBlocked(
 //     non-LOW producers may not SELL below the latest SELL threshold-stop-loss
 //     exit price from the preceding 24 hours.
 //
-//   - Case3AReplacement explicitly bypasses the SELL-side protection.
+//   - Recovery replacements bypass their corresponding reentry protection.
 //
 //   - LongOnly blocks SELL.
 //
@@ -84,11 +84,14 @@ func (t *Trader) evaluateProducerAdmissionLocked(
 	// exempts Case3AReplacement. Do not silently invent a BUY exemption.
 	case3AReplacement :=
 		d.Producer == EntryProducerCase3AReplacement
+	case3BReplacement :=
+		d.Producer == EntryProducerCase3BReplacement
 
 	// -------------------------------------------------------------------------
 	// LossReentryProtection — DOWN-Regime BUY Protection
 	// -------------------------------------------------------------------------
 	if side == SideBuy &&
+		!case3BReplacement &&
 		d.ProducerTier != ProducerTierLow &&
 		t.MarketRegime == RegimeDown {
 

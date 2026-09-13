@@ -53,6 +53,8 @@ const (
 	// decision path under one Case3AReplacement DecisionID.
 	ProducerStageCase3AModeABlocked ProducerStage = "case3a_mode_a_blocked"
 	ProducerStageCase3AModeBBlocked ProducerStage = "case3a_mode_b_blocked"
+	ProducerStageCase3BModeABlocked ProducerStage = "case3b_mode_a_blocked"
+	ProducerStageCase3BModeBBlocked ProducerStage = "case3b_mode_b_blocked"
 
 	// Case3A realized-recovery lifecycle stages.
 	//
@@ -64,6 +66,8 @@ const (
 	// ProducerStageExited remains the terminal producer-exposure stage.
 	ProducerStageCase3APartialRecovery ProducerStage = "case3a_partial_recovery"
 	ProducerStageCase3AFinalRecovery   ProducerStage = "case3a_final_recovery"
+	ProducerStageCase3BPartialRecovery ProducerStage = "case3b_partial_recovery"
+	ProducerStageCase3BFinalRecovery   ProducerStage = "case3b_final_recovery"
 
 	ProducerStageCleanupCancelled    ProducerStage = "cleanup_cancelled"
 	ProducerStageCleanupCancelFailed ProducerStage = "cleanup_cancel_failed"

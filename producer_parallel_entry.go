@@ -690,14 +690,15 @@ func (t *Trader) executeProducerAllocation(
 		wantLimit = false
 
 		t.mu.Lock()
-		if obligation := t.Case3AObligations[intent.ObligationID]; obligation != nil {
+		obligations, retries := t.recoveryObligationMapsLocked(intent.Producer)
+		if obligation := obligations[intent.ObligationID]; obligation != nil {
 			obligation.Status = Case3AObligationActive
 			obligation.ActiveDecisionID = intent.DecisionID
 			obligation.ActiveOrderID = "market_submission_in_progress"
 			obligation.AttemptCount++
 			obligation.LastReason = intent.ProducerReason
 			obligation.UpdatedAt = time.Now().UTC()
-			delete(t.PendingReplacementRetries, intent.ObligationID)
+			delete(retries, intent.ObligationID)
 			_ = t.saveStateNoLock()
 		}
 		t.mu.Unlock()
@@ -1284,7 +1285,7 @@ func (t *Trader) processParallelProducerEntriesLocked(
 			continue
 		}
 
-		if d.Producer != EntryProducerCase3AReplacement && d.ProfitGateMultiplier <= 0 {
+		if !isRecoveryReplacementProducer(d.Producer) && d.ProfitGateMultiplier <= 0 {
 			t.addDecisionProducerEvent(
 				intent, attempt, ProducerStageDecisionFailed,
 				EntryProduceErrInvalidProfitGate,
@@ -1343,7 +1344,7 @@ func (t *Trader) processParallelProducerEntriesLocked(
 			req.RefundRequestedUSD = refundRequestedUSD
 			req.ConfidenceMult = 1
 			req.ProfitGateUSD = d.Case3AProfitGateUSD
-			req.EntryMethod = string(EntryProducerCase3AReplacement)
+			req.EntryMethod = string(d.Producer)
 			req.Take = 0
 			req.ConsumesLotSlot = true
 

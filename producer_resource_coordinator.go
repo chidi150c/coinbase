@@ -573,7 +573,8 @@ func (t *Trader) buildProducerResourceRequestLocked(
 
 	confMult := d.Confidence
 	profitGateMultiplier := d.ProfitGateMultiplier
-	if d.Producer == EntryProducerCase3AReplacement {
+	if d.Producer == EntryProducerCase3AReplacement ||
+		d.Producer == EntryProducerCase3BReplacement {
 		if profitGateMultiplier <= 0 {
 			profitGateMultiplier = 1
 		}

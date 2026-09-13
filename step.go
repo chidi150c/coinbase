@@ -262,25 +262,39 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// the source exit has committed. This is the underlay Case3A retry using the
 	// base returned by that exit; obligation resurrection takes ownership only
 	// if this attempt fails out or later leaves an unfilled remainder.
-	retryIDs := make([]string, 0, len(t.PendingReplacementRetries))
-	for obligationID := range t.PendingReplacementRetries {
-		retryIDs = append(retryIDs, obligationID)
+	type recoveryRetryKey struct {
+		producer     EntryProducer
+		obligationID string
 	}
-	sort.Strings(retryIDs)
+	retryIDs := make([]recoveryRetryKey, 0, len(t.PendingReplacementRetries)+len(t.PendingCase3BRetries))
+	for obligationID := range t.PendingReplacementRetries {
+		retryIDs = append(retryIDs, recoveryRetryKey{EntryProducerCase3AReplacement, obligationID})
+	}
+	for obligationID := range t.PendingCase3BRetries {
+		retryIDs = append(retryIDs, recoveryRetryKey{EntryProducerCase3BReplacement, obligationID})
+	}
+	sort.Slice(retryIDs, func(i, j int) bool {
+		if retryIDs[i].producer == retryIDs[j].producer {
+			return retryIDs[i].obligationID < retryIDs[j].obligationID
+		}
+		return retryIDs[i].producer < retryIDs[j].producer
+	})
 
-	for _, obligationID := range retryIDs {
-		retry, exists := t.PendingReplacementRetries[obligationID]
+	for _, retryKey := range retryIDs {
+		obligationID := retryKey.obligationID
+		obligations, retries := t.recoveryObligationMapsLocked(retryKey.producer)
+		retry, exists := retries[obligationID]
 		if !exists {
 			continue
 		}
 
-		obligation := t.Case3AObligations[obligationID]
+		obligation := obligations[obligationID]
 		if obligation == nil {
 			log.Printf(
 				"[ERROR] Case3A.deferred_mode_b.orphaned obligation_id=%s",
 				obligationID,
 			)
-			delete(t.PendingReplacementRetries, obligationID)
+			delete(retries, obligationID)
 			continue
 		}
 		if (obligation.Status != Case3AObligationWaiting &&
@@ -346,7 +360,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 		// Consume the one-shot retry durably before exchange I/O. A crash cannot
 		// submit it twice; the surviving obligation becomes the recovery owner.
-		delete(t.PendingReplacementRetries, obligationID)
+		delete(retries, obligationID)
 		// Quarantine the obligation before exchange I/O. Successful pending
 		// registration replaces this with ready and the Binance order ID; a crash
 		// or ambiguous interruption cannot expose it to resurrection meanwhile.
@@ -358,7 +372,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		if err := t.saveStateNoLock(); err != nil {
 			obligation.ActiveDecisionID = ""
 			obligation.ActiveOrderID = ""
-			t.PendingReplacementRetries[obligationID] = retry
+			retries[obligationID] = retry
 			log.Printf(
 				"[ERROR] Case3A.deferred_mode_b.state_save_failed obligation_id=%s err=%v",
 				obligationID,
@@ -381,7 +395,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			)
 		}
 
-		obligation = t.Case3AObligations[obligationID]
+		obligation = obligations[obligationID]
 		if obligation == nil {
 			continue
 		}
@@ -419,37 +433,46 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	case3ATotalBuffer := math.Max(0, t.cfg.FeeRatePct/100.0) +
 		case3AResurrectionSlippageBps/10000.0
 	case3AStateChanged := false
-	for _, obligation := range t.Case3AObligations {
-		if obligation == nil ||
-			strings.TrimSpace(obligation.ActiveOrderID) != "" ||
-			t.positionExistsByEntryOrderID(obligation.SourceEntryOrderID) {
-			continue
-		}
-		// The one-time deferred underlay Mode B retry owns this obligation until
-		// it is consumed. Never let target-based resurrection bypass that retry.
-		if _, retryPending := t.PendingReplacementRetries[obligation.ObligationID]; retryPending {
-			continue
-		}
-		if obligation.Status == Case3AObligationWaiting {
-			// The source exit has now committed; the original Mode A or Mode B
-			// attempt can no longer own execution, so resurrection becomes active.
-			obligation.Status = Case3AObligationActive
-			obligation.UpdatedAt = time.Now().UTC()
-			case3AStateChanged = true
-		}
-		if obligation.Status != Case3AObligationActive {
-			continue
-		}
-		qualified := case3ATotalBuffer < 1 && obligation.TargetPrice > 0
-		if obligation.Side == SideSell {
-			qualified = qualified && livePrice*(1-case3ATotalBuffer) >= obligation.TargetPrice
-		} else {
-			qualified = qualified && livePrice*(1+case3ATotalBuffer) <= obligation.TargetPrice
-		}
-		if !qualified {
-			obligation.Status = Case3AObligationWaitingForTarget
-			obligation.UpdatedAt = time.Now().UTC()
-			case3AStateChanged = true
+	recoveryQueues := []struct {
+		obligations map[string]*Case3AObligation
+		retries     map[string]PendingReplacementRetry
+	}{
+		{t.Case3AObligations, t.PendingReplacementRetries},
+		{t.Case3BObligations, t.PendingCase3BRetries},
+	}
+	for _, queue := range recoveryQueues {
+		for _, obligation := range queue.obligations {
+			if obligation == nil ||
+				strings.TrimSpace(obligation.ActiveOrderID) != "" ||
+				t.positionExistsByEntryOrderID(obligation.SourceEntryOrderID) {
+				continue
+			}
+			// The one-time deferred underlay Mode B retry owns this obligation until
+			// it is consumed. Never let target-based resurrection bypass that retry.
+			if _, retryPending := queue.retries[obligation.ObligationID]; retryPending {
+				continue
+			}
+			if obligation.Status == Case3AObligationWaiting {
+				// The source exit has now committed; the original Mode A or Mode B
+				// attempt can no longer own execution, so resurrection becomes active.
+				obligation.Status = Case3AObligationActive
+				obligation.UpdatedAt = time.Now().UTC()
+				case3AStateChanged = true
+			}
+			if obligation.Status != Case3AObligationActive {
+				continue
+			}
+			qualified := case3ATotalBuffer < 1 && obligation.TargetPrice > 0
+			if obligation.Side == SideSell {
+				qualified = qualified && livePrice*(1-case3ATotalBuffer) >= obligation.TargetPrice
+			} else {
+				qualified = qualified && livePrice*(1+case3ATotalBuffer) <= obligation.TargetPrice
+			}
+			if !qualified {
+				obligation.Status = Case3AObligationWaitingForTarget
+				obligation.UpdatedAt = time.Now().UTC()
+				case3AStateChanged = true
+			}
 		}
 	}
 	if case3AStateChanged {
@@ -457,7 +480,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	}
 
 	case3AObligationSnapshots := t.case3AObligationSnapshotsLocked()
+	case3BObligationSnapshots := t.case3BObligationSnapshotsLocked()
 	case3AResurrectionCh := make(chan []EntryDecision, 1)
+	case3BResurrectionCh := make(chan []EntryDecision, 1)
 	go func(price float64, snapshots []Case3AObligationSnapshot) {
 		case3AResurrectionCh <- evaluateCase3AObligationResurrections(
 			price,
@@ -465,6 +490,13 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			snapshots,
 		)
 	}(livePrice, case3AObligationSnapshots)
+	go func(price float64, snapshots []Case3AObligationSnapshot) {
+		case3BResurrectionCh <- evaluateCase3BObligationResurrections(
+			price,
+			t.cfg.FeeRatePct/100.0,
+			snapshots,
+		)
+	}(livePrice, case3BObligationSnapshots)
 
 	// Fresh-state initialization for the equity strategy baseline.
 	// Run once after valid live equity is available.
@@ -716,7 +748,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			net float64,
 		) bool {
 			if lot == nil ||
-				lot.Producer != EntryProducerCase3AReplacement {
+				!isRecoveryReplacementProducer(lot.Producer) {
 				return true
 			}
 
@@ -727,7 +759,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			// First Case3A profit exit while the replacement is in UP:
 			// allow the ordinary ProfitGateUSD exit. The confirmed-fill
 			// path credits realized recovery and marks Case3AUpRecoveryUsed.
-			if t.MarketRegime == RegimeUp &&
+			favorableRecoveryRegime :=
+				(lot.Producer == EntryProducerCase3AReplacement && t.MarketRegime == RegimeUp) ||
+					(lot.Producer == EntryProducerCase3BReplacement && t.MarketRegime == RegimeDown)
+			if favorableRecoveryRegime &&
 				!lot.Case3AUpRecoveryUsed {
 				return net >= lot.ProfitGateUSD
 			}
@@ -1631,42 +1666,51 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// Fan in price-qualified Case3A obligations before resource allocation.
 	// Revalidate each asynchronous result against authoritative state because
 	// entry/exit drains may have changed an obligation after its snapshot.
-	for _, resurrection := range <-case3AResurrectionCh {
-		obligationID := strings.TrimSpace(resurrection.Case3AObligationID)
-		obligation := t.Case3AObligations[obligationID]
-		if obligation == nil ||
-			(obligation.Status != Case3AObligationActive &&
-				obligation.Status != Case3AObligationWaitingForTarget) ||
-			obligation.Status == Case3AObligationReconcile ||
-			strings.TrimSpace(obligation.ActiveOrderID) != "" ||
-			obligation.RemainingBase <= 0 ||
-			t.positionExistsByEntryOrderID(obligation.SourceEntryOrderID) {
+	resurrectionBatches := []struct {
+		decisions   []EntryDecision
+		obligations map[string]*Case3AObligation
+	}{
+		{<-case3AResurrectionCh, t.Case3AObligations},
+		{<-case3BResurrectionCh, t.Case3BObligations},
+	}
+	for _, batch := range resurrectionBatches {
+		for _, resurrection := range batch.decisions {
+			obligationID := strings.TrimSpace(resurrection.Case3AObligationID)
+			obligation := batch.obligations[obligationID]
+			if obligation == nil ||
+				(obligation.Status != Case3AObligationActive &&
+					obligation.Status != Case3AObligationWaitingForTarget) ||
+				obligation.Status == Case3AObligationReconcile ||
+				strings.TrimSpace(obligation.ActiveOrderID) != "" ||
+				obligation.RemainingBase <= 0 ||
+				t.positionExistsByEntryOrderID(obligation.SourceEntryOrderID) {
 
-			continue
-		}
+				continue
+			}
 
-		priceStillQualified := case3ATotalBuffer < 1 && obligation.TargetPrice > 0
-		if obligation.Side == SideSell {
-			priceStillQualified = priceStillQualified &&
-				price*(1-case3ATotalBuffer) >= obligation.TargetPrice
-		} else {
-			priceStillQualified = priceStillQualified &&
-				price*(1+case3ATotalBuffer) <= obligation.TargetPrice
-		}
-		if !priceStillQualified {
-			obligation.Status = Case3AObligationWaitingForTarget
+			priceStillQualified := case3ATotalBuffer < 1 && obligation.TargetPrice > 0
+			if obligation.Side == SideSell {
+				priceStillQualified = priceStillQualified &&
+					price*(1-case3ATotalBuffer) >= obligation.TargetPrice
+			} else {
+				priceStillQualified = priceStillQualified &&
+					price*(1+case3ATotalBuffer) <= obligation.TargetPrice
+			}
+			if !priceStillQualified {
+				obligation.Status = Case3AObligationWaitingForTarget
+				obligation.UpdatedAt = time.Now().UTC()
+				continue
+			}
+
+			// Refresh mutable quantities from the authoritative obligation rather
+			// than trusting the earlier goroutine snapshot.
+			resurrection.Case3ATargetPrice = obligation.TargetPrice
+			resurrection.Case3ARemainingBase = obligation.RemainingBase
+			resurrection.Case3ARecoveryRemainingUSD = obligation.RecoveryRemainingUSD
+			obligation.Status = Case3AObligationActive
 			obligation.UpdatedAt = time.Now().UTC()
-			continue
+			decisions = append(decisions, resurrection)
 		}
-
-		// Refresh mutable quantities from the authoritative obligation rather
-		// than trusting the earlier goroutine snapshot.
-		resurrection.Case3ATargetPrice = obligation.TargetPrice
-		resurrection.Case3ARemainingBase = obligation.RemainingBase
-		resurrection.Case3ARecoveryRemainingUSD = obligation.RecoveryRemainingUSD
-		obligation.Status = Case3AObligationActive
-		obligation.UpdatedAt = time.Now().UTC()
-		decisions = append(decisions, resurrection)
 	}
 
 	// Preserve the historical one-per-evaluated-tick Total Lots diagnostic.

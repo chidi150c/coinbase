@@ -1700,8 +1700,8 @@ func interpretPyramidSideRaw(
 //	 97  Case16B — Normal bottom-rollover BUY
 //	 96  Case15A — Uptrend recovery SELL
 //
-// Case3AReplacement has priority 800, but it remains owned by the exit/recovery
-// path and is not evaluated by this ordinary producer collection function.
+// Case3AReplacement and Case3BReplacement have priority 800, but remain owned
+// by the exit/recovery path and are not evaluated here.
 //
 // Every producer receives the same immutable evaluator/material snapshots for
 // this decision pass. No producer decision returned here consumes funding,
@@ -1987,8 +1987,8 @@ func confidenceRiskMultiplier(sig Signal, pUp, buyThreshold, sellThreshold float
 	const (
 		minConf    = 0.20
 		maxConf    = 1.00
-		buyStrong = 0.70
-		sellStrong  = 0.20
+		buyStrong  = 0.70
+		sellStrong = 0.20
 		curve      = 1.50 // >1 = stricter near threshold, stronger only when farther away
 	)
 

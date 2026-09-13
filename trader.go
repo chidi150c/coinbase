@@ -202,6 +202,8 @@ type BotState struct {
 	DustSellLots              []*Position
 	Case3AObligations         map[string]*Case3AObligation
 	PendingReplacementRetries map[string]PendingReplacementRetry
+	Case3BObligations         map[string]*Case3AObligation
+	PendingCase3BRetries      map[string]PendingReplacementRetry
 	ResourceLedger            ResourceLedgerState `json:"resource_ledger,omitempty"`
 }
 
@@ -355,6 +357,8 @@ type Trader struct {
 	dustSellLots              []*Position
 	Case3AObligations         map[string]*Case3AObligation
 	PendingReplacementRetries map[string]PendingReplacementRetry
+	Case3BObligations         map[string]*Case3AObligation
+	PendingCase3BRetries      map[string]PendingReplacementRetry
 	balanceMu                 sync.RWMutex
 
 	balanceSnapshot balanceSnapshot
@@ -410,6 +414,12 @@ func NewTrader(cfg Config, broker Broker) *Trader {
 			map[string]*Case3AObligation,
 		),
 		PendingReplacementRetries: make(
+			map[string]PendingReplacementRetry,
+		),
+		Case3BObligations: make(
+			map[string]*Case3AObligation,
+		),
+		PendingCase3BRetries: make(
 			map[string]PendingReplacementRetry,
 		),
 		resourceManager: NewResourceManager(ResourceLedgerState{}),
@@ -664,7 +674,7 @@ func (t *Trader) setProducerContinuationReference(
 	reference float64,
 ) {
 	if producer == EntryProducerNone ||
-		producer == EntryProducerCase3AReplacement ||
+		isRecoveryReplacementProducer(producer) ||
 		(side != SideBuy && side != SideSell) {
 		return
 	}
@@ -1637,6 +1647,8 @@ func (t *Trader) snapshotStateLocked() BotState {
 		DustSellLots:              append([]*Position(nil), t.dustSellLots...),
 		Case3AObligations:         t.Case3AObligations,
 		PendingReplacementRetries: t.PendingReplacementRetries,
+		Case3BObligations:         t.Case3BObligations,
+		PendingCase3BRetries:      t.PendingCase3BRetries,
 		ResourceLedger:            t.resourceManager.State(),
 	}
 }
@@ -1806,6 +1818,14 @@ func (t *Trader) loadState() error {
 	t.PendingReplacementRetries = st.PendingReplacementRetries
 	if t.PendingReplacementRetries == nil {
 		t.PendingReplacementRetries = make(map[string]PendingReplacementRetry)
+	}
+	t.Case3BObligations = st.Case3BObligations
+	if t.Case3BObligations == nil {
+		t.Case3BObligations = make(map[string]*Case3AObligation)
+	}
+	t.PendingCase3BRetries = st.PendingCase3BRetries
+	if t.PendingCase3BRetries == nil {
+		t.PendingCase3BRetries = make(map[string]PendingReplacementRetry)
 	}
 	if t.resourceManager == nil {
 		t.resourceManager = NewResourceManager(st.ResourceLedger)
@@ -2025,7 +2045,7 @@ func (t *Trader) RehydratePending(
 			//
 			// Case3A recovery entries must not create a normal
 			// BUY/SELL market-preference flag.
-			if persisted.Producer != EntryProducerCase3AReplacement {
+			if !isRecoveryReplacementProducer(persisted.Producer) {
 				t.mu.Lock()
 
 				switch persisted.Side {
@@ -2103,7 +2123,7 @@ func (t *Trader) RehydratePending(
 			t.mu.Lock()
 
 			// Only normal entries create the one-shot market preference.
-			if persisted.Producer != EntryProducerCase3AReplacement {
+			if !isRecoveryReplacementProducer(persisted.Producer) {
 				switch persisted.Side {
 				case SideBuy:
 					t.pendingRecheckBuy = true
@@ -2169,7 +2189,7 @@ func (t *Trader) RehydratePending(
 			continue
 		}
 
-		if persisted.Producer == EntryProducerCase3AReplacement {
+		if isRecoveryReplacementProducer(persisted.Producer) {
 			persisted.CommitEligible =
 				t.Case3ACommitEligible
 		} else {
@@ -2456,24 +2476,47 @@ type Case3AObligationSnapshot struct {
 	AttemptCount         int
 }
 
-func (t *Trader) case3AObligationSnapshotsLocked() []Case3AObligationSnapshot {
-	if t == nil || len(t.Case3AObligations) == 0 {
+func isRecoveryReplacementProducer(producer EntryProducer) bool {
+	return producer == EntryProducerCase3AReplacement ||
+		producer == EntryProducerCase3BReplacement
+}
+
+func (t *Trader) recoveryObligationMapsLocked(
+	producer EntryProducer,
+) (map[string]*Case3AObligation, map[string]PendingReplacementRetry) {
+	if t == nil {
+		return nil, nil
+	}
+	if producer == EntryProducerCase3BReplacement {
+		return t.Case3BObligations, t.PendingCase3BRetries
+	}
+	return t.Case3AObligations, t.PendingReplacementRetries
+}
+
+func (t *Trader) recoveryObligationSnapshotsLocked(
+	producer EntryProducer,
+) []Case3AObligationSnapshot {
+	if t == nil {
+		return nil
+	}
+	obligations, retries := t.recoveryObligationMapsLocked(producer)
+	if len(obligations) == 0 {
 		return nil
 	}
 
-	ids := make([]string, 0, len(t.Case3AObligations))
-	for id := range t.Case3AObligations {
+	ids := make([]string, 0, len(obligations))
+	for id := range obligations {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 
 	snapshots := make([]Case3AObligationSnapshot, 0, len(ids))
 	for _, id := range ids {
-		obligation := t.Case3AObligations[id]
+		obligation := obligations[id]
 		if obligation == nil {
 			continue
 		}
-		retry := t.PendingReplacementRetries[id]
+		retry := retries[id]
 		retryReason := strings.TrimSpace(retry.Reason)
 		if retryReason == "" {
 			retryReason = obligation.LastReason
@@ -2500,13 +2543,23 @@ func (t *Trader) case3AObligationSnapshotsLocked() []Case3AObligationSnapshot {
 	return snapshots
 }
 
+func (t *Trader) case3AObligationSnapshotsLocked() []Case3AObligationSnapshot {
+	return t.recoveryObligationSnapshotsLocked(EntryProducerCase3AReplacement)
+}
+
+func (t *Trader) case3BObligationSnapshotsLocked() []Case3AObligationSnapshot {
+	return t.recoveryObligationSnapshotsLocked(EntryProducerCase3BReplacement)
+}
+
 // evaluateCase3AObligationResurrections is deliberately pure: it receives a
 // frozen price and copied obligation state, making it safe to run concurrently
 // with the exit scan without reading Trader maps.
-func evaluateCase3AObligationResurrections(
+func evaluateRecoveryObligationResurrections(
 	price float64,
 	takerFeeRate float64,
 	snapshots []Case3AObligationSnapshot,
+	producer EntryProducer,
+	reasonPrefix string,
 ) []EntryDecision {
 	if price <= 0 || len(snapshots) == 0 {
 		return nil
@@ -2551,13 +2604,13 @@ func evaluateCase3AObligationResurrections(
 		decisions = append(decisions, EntryDecision{
 			Signal:               signal,
 			Raw:                  signal,
-			Producer:             EntryProducerCase3AReplacement,
-			ProducerPriority:     producerPriorityFor(EntryProducerCase3AReplacement),
+			Producer:             producer,
+			ProducerPriority:     producerPriorityFor(producer),
 			Confidence:           1,
 			ProfitGateMultiplier: 1,
 			PendingCancelPolicy:  PendingSignalCancelDisabled,
 			ProducerReason: fmt.Sprintf(
-				"case3A_obligation_resurrected|obligation_id=%s|"+
+				reasonPrefix+"_obligation_resurrected|obligation_id=%s|"+
 					"origin_decision_id=%s|retry_cause=%s|attempt_count=%d|"+
 					"recovery_method=%s|recovery_remaining_usd=%.6f|"+
 					"source_order_id=%s|source_exit_order_id=%s|"+
@@ -2591,6 +2644,28 @@ func evaluateCase3AObligationResurrections(
 	return decisions
 }
 
+func evaluateCase3AObligationResurrections(
+	price float64,
+	takerFeeRate float64,
+	snapshots []Case3AObligationSnapshot,
+) []EntryDecision {
+	return evaluateRecoveryObligationResurrections(
+		price, takerFeeRate, snapshots,
+		EntryProducerCase3AReplacement, "case3A",
+	)
+}
+
+func evaluateCase3BObligationResurrections(
+	price float64,
+	takerFeeRate float64,
+	snapshots []Case3AObligationSnapshot,
+) []EntryDecision {
+	return evaluateRecoveryObligationResurrections(
+		price, takerFeeRate, snapshots,
+		EntryProducerCase3BReplacement, "case3B",
+	)
+}
+
 func case3AObligationID(intent *PendingIntent) string {
 	if intent == nil {
 		return ""
@@ -2601,7 +2676,8 @@ func case3AObligationID(intent *PendingIntent) string {
 	return strings.TrimSpace(intent.DecisionID)
 }
 
-func (t *Trader) case3AObligationForSourceLocked(
+func (t *Trader) recoveryObligationForSourceLocked(
+	producer EntryProducer,
 	sourceEntryOrderID string,
 ) *Case3AObligation {
 	if t == nil {
@@ -2611,7 +2687,8 @@ func (t *Trader) case3AObligationForSourceLocked(
 	if sourceEntryOrderID == "" {
 		return nil
 	}
-	for _, obligation := range t.Case3AObligations {
+	obligations, _ := t.recoveryObligationMapsLocked(producer)
+	for _, obligation := range obligations {
 		if obligation != nil &&
 			strings.TrimSpace(obligation.SourceEntryOrderID) == sourceEntryOrderID {
 			return obligation
@@ -2620,12 +2697,28 @@ func (t *Trader) case3AObligationForSourceLocked(
 	return nil
 }
 
+func (t *Trader) case3AObligationForSourceLocked(
+	sourceEntryOrderID string,
+) *Case3AObligation {
+	return t.recoveryObligationForSourceLocked(
+		EntryProducerCase3AReplacement, sourceEntryOrderID,
+	)
+}
+
+func (t *Trader) case3BObligationForSourceLocked(
+	sourceEntryOrderID string,
+) *Case3AObligation {
+	return t.recoveryObligationForSourceLocked(
+		EntryProducerCase3BReplacement, sourceEntryOrderID,
+	)
+}
+
 func (t *Trader) ensureCase3AObligationLocked(
 	repl *PendingIntent,
 	waitForExitOrderID string,
 ) *Case3AObligation {
 	if t == nil || repl == nil ||
-		repl.Producer != EntryProducerCase3AReplacement {
+		!isRecoveryReplacementProducer(repl.Producer) {
 		return nil
 	}
 
@@ -2635,10 +2728,15 @@ func (t *Trader) ensureCase3AObligationLocked(
 	}
 	repl.ObligationID = id
 
-	if t.Case3AObligations == nil {
+	if repl.Producer == EntryProducerCase3BReplacement {
+		if t.Case3BObligations == nil {
+			t.Case3BObligations = make(map[string]*Case3AObligation)
+		}
+	} else if t.Case3AObligations == nil {
 		t.Case3AObligations = make(map[string]*Case3AObligation)
 	}
-	if existing := t.Case3AObligations[id]; existing != nil {
+	obligations, _ := t.recoveryObligationMapsLocked(repl.Producer)
+	if existing := obligations[id]; existing != nil {
 		if existing.SourceExitOrderID == "" {
 			existing.SourceExitOrderID = strings.TrimSpace(repl.SourceExitOrderID)
 			if existing.SourceExitOrderID == "" {
@@ -2675,7 +2773,7 @@ func (t *Trader) ensureCase3AObligationLocked(
 	if obligation.SourceExitOrderID == "" {
 		obligation.SourceExitOrderID = strings.TrimSpace(waitForExitOrderID)
 	}
-	t.Case3AObligations[id] = obligation
+	obligations[id] = obligation
 	return obligation
 }
 
@@ -2690,12 +2788,17 @@ func (t *Trader) markCase3AReplacementRetryLocked(repl PendingIntent, waitForExi
 		return
 	}
 
-	if t.PendingReplacementRetries == nil {
+	if repl.Producer == EntryProducerCase3BReplacement {
+		if t.PendingCase3BRetries == nil {
+			t.PendingCase3BRetries = make(map[string]PendingReplacementRetry)
+		}
+	} else if t.PendingReplacementRetries == nil {
 		t.PendingReplacementRetries = make(map[string]PendingReplacementRetry)
 	}
+	_, retries := t.recoveryObligationMapsLocked(repl.Producer)
 
 	obligation.AttemptCount++
-	t.PendingReplacementRetries[obligation.ObligationID] = PendingReplacementRetry{
+	retries[obligation.ObligationID] = PendingReplacementRetry{
 		ObligationID:       obligation.ObligationID,
 		Replacement:        repl,
 		WaitForExitOrderID: waitForExitOrderID,
@@ -2734,12 +2837,13 @@ func (t *Trader) returnCase3AObligationToTargetWaitLocked(
 	reason string,
 ) {
 	if t == nil || pending == nil ||
-		pending.Producer != EntryProducerCase3AReplacement {
+		!isRecoveryReplacementProducer(pending.Producer) {
 		return
 	}
 
 	id := case3AObligationID(pending)
-	obligation := t.Case3AObligations[id]
+	obligations, retries := t.recoveryObligationMapsLocked(pending.Producer)
+	obligation := obligations[id]
 	if obligation == nil {
 		obligation = t.ensureCase3AObligationLocked(pending, "")
 	}
@@ -2766,7 +2870,7 @@ func (t *Trader) returnCase3AObligationToTargetWaitLocked(
 		obligation.Status = Case3AObligationWaitingForTarget
 	}
 	obligation.UpdatedAt = time.Now().UTC()
-	delete(t.PendingReplacementRetries, id)
+	delete(retries, id)
 }
 
 // prepareCase3AObligationFillLocked apportions the recovery balance to the
@@ -2777,11 +2881,12 @@ func (t *Trader) prepareCase3AObligationFillLocked(
 	filledBase float64,
 ) (*Case3AObligation, float64) {
 	if t == nil || pending == nil || filledBase <= 0 ||
-		pending.Producer != EntryProducerCase3AReplacement {
+		!isRecoveryReplacementProducer(pending.Producer) {
 		return nil, 0
 	}
 
-	obligation := t.Case3AObligations[case3AObligationID(pending)]
+	obligations, _ := t.recoveryObligationMapsLocked(pending.Producer)
+	obligation := obligations[case3AObligationID(pending)]
 	if obligation == nil || obligation.RemainingBase <= 0 {
 		return obligation, pending.RecoveryNetUSD
 	}
@@ -2799,10 +2904,11 @@ func (t *Trader) reconcileCase3AObligationLocked(pending *PendingIntent) {
 	if t == nil || pending == nil {
 		return
 	}
-	if obligation := t.Case3AObligations[case3AObligationID(pending)]; obligation != nil {
+	obligations, retries := t.recoveryObligationMapsLocked(pending.Producer)
+	if obligation := obligations[case3AObligationID(pending)]; obligation != nil {
 		obligation.Status = Case3AObligationReconcile
 		obligation.UpdatedAt = time.Now().UTC()
-		delete(t.PendingReplacementRetries, obligation.ObligationID)
+		delete(retries, obligation.ObligationID)
 	}
 }
 
@@ -2820,8 +2926,9 @@ func (t *Trader) completeCase3AObligationLocked(
 	}
 
 	id := case3AObligationID(pending)
-	delete(t.PendingReplacementRetries, id)
-	delete(t.Case3AObligations, id)
+	obligations, retries := t.recoveryObligationMapsLocked(pending.Producer)
+	delete(retries, id)
+	delete(obligations, id)
 
 	if err := t.saveStateNoLock(); err != nil {
 		// The exchange fill committed, but durable deletion was not confirmed.
@@ -2831,7 +2938,7 @@ func (t *Trader) completeCase3AObligationLocked(
 		completed.ActiveOrderID = strings.TrimSpace(orderID)
 		completed.ActiveDecisionID = strings.TrimSpace(pending.DecisionID)
 		completed.UpdatedAt = time.Now().UTC()
-		t.Case3AObligations[id] = completed
+		obligations[id] = completed
 		log.Printf(
 			"[ERROR] Case3A.obligation.completion_save_failed "+
 				"obligation_id=%s order_id=%s err=%v",
@@ -2852,7 +2959,8 @@ func (t *Trader) commitCase3AObligationFillLocked(
 		return
 	}
 	id := case3AObligationID(pending)
-	obligation := t.Case3AObligations[id]
+	obligations, _ := t.recoveryObligationMapsLocked(pending.Producer)
+	obligation := obligations[id]
 	if obligation == nil {
 		return
 	}
@@ -3154,14 +3262,14 @@ func (t *Trader) closeLot(
 	// 		→ no replacement
 	// =============================================================================
 
-	Case3ALossUSD := 0.0
+	recoveryLossUSD := 0.0
 
 	// Case3A owns one producer lifecycle per qualifying losing SELL stop.
 	// The lifecycle is created at detection time (stage=decision) and then
 	// enriched through Mode A / Mode B evaluation and, when possible, the
 	// ordinary produced -> pending -> filled -> committed entry lifecycle.
 	var repl PendingIntent
-	var case3AAttempt *ProducerAttempt
+	var recoveryAttempt *ProducerAttempt
 	// Estimate the exit fee
 	estExitFee := quote * (t.cfg.FeeRatePct / 100.0)
 	// Estimate the commission that would be paid if the position were closed at the current price.
@@ -3175,7 +3283,7 @@ func (t *Trader) closeLot(
 	net := gross - lot.EntryFee - estExitFee
 
 	if !sourceExitAlreadyPending &&
-		lot.Side == SideSell &&
+		(lot.Side == SideSell || lot.Side == SideBuy) &&
 		strings.HasPrefix(exitReason, "threshold_stop_loss") {
 
 		// =============================================================================
@@ -3197,18 +3305,26 @@ func (t *Trader) closeLot(
 		//===============================================================================
 
 		if net < 0 && !sourceExitAlreadyPending {
-			Case3ALossUSD = -net
+			recoveryLossUSD = -net
+			replacementProducer := EntryProducerCase3AReplacement
+			reasonPrefix := "case3A"
+			modeABlockedStage := ProducerStageCase3AModeABlocked
+			if lot.Side == SideBuy {
+				replacementProducer = EntryProducerCase3BReplacement
+				reasonPrefix = "case3B"
+				modeABlockedStage = ProducerStageCase3BModeABlocked
+			}
 
 			// A losing SELL threshold stop is the Case3A decision boundary.
 			// Create the producer lifecycle immediately so blocked recovery
 			// attempts remain observable instead of disappearing silently.
 			repl = PendingIntent{
-				Side:                SideSell,
+				Side:                lot.Side,
 				SourceEntryOrderID:  lot.EntryOrderID,
-				Producer:            EntryProducerCase3AReplacement,
+				Producer:            replacementProducer,
 				PendingCancelPolicy: PendingSignalCancelDisabled,
 				ProducerReason: fmt.Sprintf(
-					"case3A_decision|"+
+					reasonPrefix+"_decision|"+
 						"source_producer=%s|source_side=%s|"+
 						"source_exit=threshold_stop_loss|"+
 						"source_net_pnl=%.6f|loss_usd=%.6f|"+
@@ -3216,20 +3332,20 @@ func (t *Trader) closeLot(
 					lot.Producer,
 					lot.Side,
 					net,
-					Case3ALossUSD,
+					recoveryLossUSD,
 					t.MarketRegime,
 					lot.EntryOrderID,
 				),
 			}
 
-			case3AAttempt = newProducerIntentLifecycle(&repl)
-			if case3AAttempt == nil {
+			recoveryAttempt = newProducerIntentLifecycle(&repl)
+			if recoveryAttempt == nil {
 				return "", false, errors.New(
 					"Case3A decision: failed to create producer lifecycle",
 				)
 			}
-			if existing := t.case3AObligationForSourceLocked(
-				lot.EntryOrderID,
+			if existing := t.recoveryObligationForSourceLocked(
+				replacementProducer, lot.EntryOrderID,
 			); existing != nil {
 				repl.ObligationID = existing.ObligationID
 			} else {
@@ -3242,7 +3358,7 @@ func (t *Trader) closeLot(
 
 			t.addDecisionProducerEvent(
 				&repl,
-				case3AAttempt,
+				recoveryAttempt,
 				ProducerStageDecision,
 				"",
 				nil,
@@ -3262,13 +3378,13 @@ func (t *Trader) closeLot(
 			// )
 
 			// Start with the newly realized stop-loss from this source lot.
-			recoveryNetUSD := Case3ALossUSD
+			recoveryNetUSD := recoveryLossUSD
 
 			// If the source lot is itself a Case3A replacement, carry its
 			// unrecovered trade-specific obligation forward into the next
 			// replacement. This preserves the recovery chain instead of
 			// resetting RecoveryNetUSD to only the newest stop-loss.
-			if lot.Producer == EntryProducerCase3AReplacement &&
+			if lot.Producer == replacementProducer &&
 				lot.RecoveryNetUSD > 0 {
 				recoveryNetUSD += lot.RecoveryNetUSD
 			}
@@ -3280,7 +3396,7 @@ func (t *Trader) closeLot(
 				log.Printf(
 					"[TRACE] Case3A.recovery_preview side=%s loss=%.6f recovery=%.6f debt_before=%.6f debt_after=%.6f",
 					lot.Side,
-					Case3ALossUSD,
+					recoveryLossUSD,
 					recoveryNetUSD,
 					beforeDebt,
 					afterDebt,
@@ -3289,6 +3405,9 @@ func (t *Trader) closeLot(
 				replacementEntryPrice := livePrice
 				recoveryExitPrice := lot.OpenPrice
 				priceMove := replacementEntryPrice - recoveryExitPrice
+				if lot.Side == SideBuy {
+					priceMove = recoveryExitPrice - replacementEntryPrice
+				}
 
 				if priceMove > 0 {
 
@@ -3303,7 +3422,7 @@ func (t *Trader) closeLot(
 								"recovery_per_base=%.8f|price_move=%.8f|recovery_usd=%.6f|source_order_id=%s",
 							recoveryPerBase, priceMove, recoveryNetUSD, lot.EntryOrderID,
 						)
-						t.addDecisionProducerEvent(&repl, case3AAttempt, ProducerStageDecisionBlocked, "", nil, false, true)
+						t.addDecisionProducerEvent(&repl, recoveryAttempt, ProducerStageDecisionBlocked, "", nil, false, true)
 
 						// log.Printf(
 						// "[TRACE] Case3A.recovery_per_base.skip side=%s regime=%s recovery_net=%.6f price_move=%.8f recovery_per_base=%.8f reason=non_positive_recovery_move",
@@ -3322,7 +3441,15 @@ func (t *Trader) closeLot(
 						normalBase := baseRequested
 
 						spareLookupStart := time.Now()
-						freshSpareBase, freshBaseStep, err := t.currentSpareBaseLocked(ctx)
+						freshSpareBase := 0.0
+						freshSpareQuote := 0.0
+						freshBaseStep := t.cfg.BaseStep
+						var err error
+						if repl.Side == SideBuy {
+							freshSpareQuote, err = t.currentSpareQuoteLocked(ctx)
+						} else {
+							freshSpareBase, freshBaseStep, err = t.currentSpareBaseLocked(ctx)
+						}
 						log.Printf(
 							"[TRACE] hotpath.exit_scan.case3a_spare_lookup "+
 								"entry_id=%s stage_elapsed_ms=%d hotpath_elapsed_ms=%d err=%t",
@@ -3342,8 +3469,13 @@ func (t *Trader) closeLot(
 						}
 
 						modeARequiredBase := normalBase + extraBase
+						modeARequiredQuote := modeARequiredBase * replacementEntryPrice
+						modeAAvailable := freshSpareBase >= modeARequiredBase
+						if repl.Side == SideBuy {
+							modeAAvailable = freshSpareQuote >= modeARequiredQuote
+						}
 
-						if freshSpareBase >= modeARequiredBase {
+						if modeAAvailable {
 							// Mode A is permitted in every regime, including UP.
 							repl.Enabled = true
 							repl.LimitPx = replacementEntryPrice
@@ -3352,7 +3484,7 @@ func (t *Trader) closeLot(
 							repl.RecoveryMethod = RecoveryByPositionSize
 							repl.ProfitGateUSD = t.cfg.ProfitGateUSD
 							repl.ProducerReason = fmt.Sprintf(
-								"case3A_replacement|method=%s|recovery_usd=%.6f|regime=%s|source_order_id=%s",
+								reasonPrefix+"_replacement|method=%s|recovery_usd=%.6f|regime=%s|source_order_id=%s",
 								RecoveryByPositionSize.String(),
 								recoveryNetUSD,
 								t.MarketRegime,
@@ -3360,15 +3492,24 @@ func (t *Trader) closeLot(
 							)
 						} else {
 							modeAReason := fmt.Sprintf(
-								"case3A_mode_a_blocked|reason=insufficient_spare_base|"+
+								reasonPrefix+"_mode_a_blocked|reason=insufficient_spare_base|"+
 									"spare_base=%.8f|required_base=%.8f|normal_base=%.8f|extra_base=%.8f|"+
 									"recovery_usd=%.6f|regime=%s|source_order_id=%s",
 								freshSpareBase, modeARequiredBase, normalBase, extraBase,
 								recoveryNetUSD, t.MarketRegime, lot.EntryOrderID,
 							)
+							if repl.Side == SideBuy {
+								modeAReason = fmt.Sprintf(
+									reasonPrefix+"_mode_a_blocked|reason=insufficient_spare_quote|"+
+										"spare_quote=%.8f|required_quote=%.8f|normal_base=%.8f|extra_base=%.8f|"+
+										"recovery_usd=%.6f|regime=%s|source_order_id=%s",
+									freshSpareQuote, modeARequiredQuote, normalBase, extraBase,
+									recoveryNetUSD, t.MarketRegime, lot.EntryOrderID,
+								)
+							}
 							if err != nil {
 								modeAReason = fmt.Sprintf(
-									"case3A_mode_a_blocked|reason=spare_base_lookup_failed|error=%q|"+
+									reasonPrefix+"_mode_a_blocked|reason=spare_balance_lookup_failed|error=%q|"+
 										"required_base=%.8f|normal_base=%.8f|extra_base=%.8f|"+
 										"recovery_usd=%.6f|regime=%s|source_order_id=%s",
 									err.Error(), modeARequiredBase, normalBase, extraBase,
@@ -3377,7 +3518,7 @@ func (t *Trader) closeLot(
 							}
 
 							repl.ProducerReason = modeAReason
-							t.addDecisionProducerEvent(&repl, case3AAttempt, ProducerStageCase3AModeABlocked, "", nil, false, true)
+							t.addDecisionProducerEvent(&repl, recoveryAttempt, modeABlockedStage, "", nil, false, true)
 
 							// Mode B is the insufficient-spare fallback in every regime.
 							repl.Enabled = true
@@ -3387,7 +3528,7 @@ func (t *Trader) closeLot(
 							repl.RecoveryMethod = RecoveryByProfitTarget
 							repl.ProfitGateUSD = t.cfg.ProfitGateUSD
 							repl.ProducerReason = fmt.Sprintf(
-								"case3A_replacement|method=%s|recovery_usd=%.6f|regime=%s|source_order_id=%s",
+								reasonPrefix+"_replacement|method=%s|recovery_usd=%.6f|regime=%s|source_order_id=%s",
 								RecoveryByProfitTarget.String(), recoveryNetUSD, t.MarketRegime, lot.EntryOrderID,
 							)
 						}
@@ -3414,7 +3555,7 @@ func (t *Trader) closeLot(
 							"replacement_entry=%.8f|recovery_exit=%.8f|price_move=%.8f|recovery_usd=%.6f|source_order_id=%s",
 						replacementEntryPrice, recoveryExitPrice, priceMove, recoveryNetUSD, lot.EntryOrderID,
 					)
-					t.addDecisionProducerEvent(&repl, case3AAttempt, ProducerStageDecisionBlocked, "", nil, false, true)
+					t.addDecisionProducerEvent(&repl, recoveryAttempt, ProducerStageDecisionBlocked, "", nil, false, true)
 				}
 			}
 		}
@@ -3424,7 +3565,9 @@ func (t *Trader) closeLot(
 	// mode performs exchange I/O. While the source position exists, the
 	// obligation remains waiting_for_exit; acceptance moves it to ready.
 	if repl.Enabled {
-		if existing := t.Case3AObligations[repl.ObligationID]; existing != nil {
+		repl.Quote = repl.LimitPx * repl.BaseAtLimit
+		obligations, _ := t.recoveryObligationMapsLocked(repl.Producer)
+		if existing := obligations[repl.ObligationID]; existing != nil {
 			repl.Side = existing.Side
 			repl.LimitPx = existing.TargetPrice
 			repl.BaseAtLimit = existing.RemainingBase
@@ -3474,10 +3617,10 @@ func (t *Trader) closeLot(
 				"case3A_decision_blocked|reason=replacement_already_started|replacement_order_id=%s|source_order_id=%s",
 				lot.Case3AReplacementOrderID, lot.EntryOrderID,
 			)
-			t.addDecisionProducerEvent(&repl, case3AAttempt, ProducerStageDecisionBlocked, "", nil, false, true)
+			t.addDecisionProducerEvent(&repl, recoveryAttempt, ProducerStageDecisionBlocked, "", nil, false, true)
 
 		} else {
-			attempt := case3AAttempt
+			attempt := recoveryAttempt
 			if attempt == nil {
 				return "", false, errors.New(
 					"Case3A modeA: missing decision lifecycle",
@@ -3486,20 +3629,31 @@ func (t *Trader) closeLot(
 			if t.resourceManager == nil {
 				t.resourceManager = NewResourceManager(ResourceLedgerState{})
 			}
-			transactionID := "case3a-mode-a:" + repl.DecisionID
+			recoveryPrefix := "case3a"
+			recoveryKind := ResourceReservationCase3A
+			if repl.Producer == EntryProducerCase3BReplacement {
+				recoveryPrefix = "case3b"
+				recoveryKind = ResourceReservationCase3B
+			}
+			transactionID := recoveryPrefix + "-mode-a:" + repl.DecisionID
 			case3AReservationID := "submission:" + repl.DecisionID
+			submissionReservation := ResourceReservation{
+				ID: case3AReservationID, TransactionID: transactionID,
+				OwnerID: repl.ObligationID, Kind: ResourceReservationSubmission,
+				ClientOrderID: stableClientOrderID(repl.DecisionID), ProductID: t.cfg.ProductID,
+				State: ResourceReservationReserved, Producer: repl.Producer, Side: repl.Side,
+				CreatedAt: time.Now().UTC(),
+			}
+			if repl.Side == SideBuy {
+				submissionReservation.QuoteUSD = repl.Quote
+			} else {
+				submissionReservation.Base = repl.BaseAtLimit
+			}
 			if err := t.resourceManager.ReserveBatch([]ResourceReservation{
-				{
-					ID: case3AReservationID, TransactionID: transactionID,
-					OwnerID: repl.ObligationID, Kind: ResourceReservationSubmission,
-					ClientOrderID: stableClientOrderID(repl.DecisionID), ProductID: t.cfg.ProductID,
-					State:    ResourceReservationReserved,
-					Producer: EntryProducerCase3AReplacement, Side: repl.Side,
-					Base: repl.BaseAtLimit, CreatedAt: time.Now().UTC(),
-				},
+				submissionReservation,
 				{
 					ID: transactionID + ":source-exit", TransactionID: transactionID,
-					OwnerID: entryOrderID, Kind: ResourceReservationCase3A,
+					OwnerID: entryOrderID, Kind: recoveryKind,
 					State: ResourceReservationReserved, Side: closeSide,
 					Informational: true, CreatedAt: time.Now().UTC(),
 				},
@@ -3597,7 +3751,8 @@ func (t *Trader) closeLot(
 					recorded, so abort the loss exit and preserve the same durable
 					obligation for a later Mode A attempt.
 				*/
-				if obligation := t.Case3AObligations[repl.ObligationID]; obligation != nil {
+				obligations, _ := t.recoveryObligationMapsLocked(repl.Producer)
+				if obligation := obligations[repl.ObligationID]; obligation != nil {
 					obligation.Status = Case3AObligationWaiting
 					obligation.ActiveOrderID = ""
 					obligation.ActiveDecisionID = ""
@@ -3789,7 +3944,7 @@ func (t *Trader) closeLot(
 			repl.RecoveryMethod == RecoveryByProfitTarget {
 			repl.SourceExitOrderID = strings.TrimSpace(waitID)
 
-			attempt := case3AAttempt
+			attempt := recoveryAttempt
 			if attempt == nil {
 				return "", true, errors.New(
 					"Case3A modeB pending-exit: missing decision lifecycle",
@@ -3984,7 +4139,7 @@ func (t *Trader) closeLot(
 			startCase3AReplacement() may acquire t.mu inside produceEntry(), so
 			release closeLot's lock while the replacement pipeline runs.
 		*/
-		attempt := case3AAttempt
+		attempt := recoveryAttempt
 		if attempt == nil {
 			return "", true, errors.New(
 				"Case3A modeB market-exit: missing decision lifecycle",
@@ -4179,6 +4334,32 @@ func (t *Trader) currentSpareBaseLocked(ctx context.Context) (float64, float64, 
 	return spareBase, baseStep, nil
 }
 
+func (t *Trader) currentSpareQuoteLocked(ctx context.Context) (float64, error) {
+	var reservedQuote float64
+	for _, entry := range t.pendingEntries {
+		if entry == nil ||
+			entry.Completed ||
+			entry.Intent == nil ||
+			entry.Side != SideBuy {
+			continue
+		}
+		reservedQuote += entry.Intent.Quote
+	}
+
+	t.mu.Unlock()
+	_, availQuote, _, err := t.broker.GetAvailableQuote(ctx, t.cfg.ProductID)
+	t.mu.Lock()
+	if err != nil {
+		return 0, err
+	}
+
+	spareQuote := availQuote - reservedQuote
+	if spareQuote < 0 {
+		spareQuote = 0
+	}
+	return spareQuote, nil
+}
+
 // recordCase3ARecoveryLifecycleEventLocked records an authoritative Case3A
 // recovery exit on the SAME producer attempt that owns entryOrderID.
 //
@@ -4199,7 +4380,7 @@ func (t *Trader) recordCase3ARecoveryLifecycleEventLocked(
 ) bool {
 	if t == nil ||
 		lot == nil ||
-		lot.Producer != EntryProducerCase3AReplacement {
+		!isRecoveryReplacementProducer(lot.Producer) {
 		return false
 	}
 
@@ -4306,12 +4487,15 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 	}
 	case3ARecoveryBefore := lot.RecoveryNetUSD
 
+	recoveryFavorableRegime :=
+		(lot.Producer == EntryProducerCase3AReplacement && t.MarketRegime == RegimeUp) ||
+			(lot.Producer == EntryProducerCase3BReplacement && t.MarketRegime == RegimeDown)
 	case3AUpRecoveryCandidate :=
 		case3AFullFill &&
-			lot.Producer == EntryProducerCase3AReplacement &&
+			isRecoveryReplacementProducer(lot.Producer) &&
 			case3ARecoveryBefore > 0 &&
 			!lot.Case3AUpRecoveryUsed &&
-			t.MarketRegime == RegimeUp &&
+			recoveryFavorableRegime &&
 			!strings.HasPrefix(exitReason, "threshold_stop_loss") &&
 			pl >= lot.ProfitGateUSD
 
@@ -4351,7 +4535,7 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 			case3ARecoveryExcessPnL = math.Max(0, -case3ARecoveryAfter)
 		}
 	} else if case3AFullFill &&
-		lot.Producer == EntryProducerCase3AReplacement &&
+		isRecoveryReplacementProducer(lot.Producer) &&
 		case3ARecoveryBefore > 0 &&
 		!strings.HasPrefix(exitReason, "threshold_stop_loss") &&
 		pl+case3AFillTol >= case3ARecoveryBefore {
@@ -4449,13 +4633,21 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 		lot,
 		rec,
 	) {
+		partialRecoveryStage := ProducerStageCase3APartialRecovery
+		finalRecoveryStage := ProducerStageCase3AFinalRecovery
+		recoveryReasonPrefix := "case3a"
+		if lot.Producer == EntryProducerCase3BReplacement {
+			partialRecoveryStage = ProducerStageCase3BPartialRecovery
+			finalRecoveryStage = ProducerStageCase3BFinalRecovery
+			recoveryReasonPrefix = "case3b"
+		}
 		if case3AUpPartialRecovery {
 			t.recordCase3ARecoveryLifecycleEventLocked(
 				lot,
 				rec,
-				ProducerStageCase3APartialRecovery,
+				partialRecoveryStage,
 				fmt.Sprintf(
-					"case3a_partial_recovery|recovery_net_before=%.6f"+
+					recoveryReasonPrefix+"_partial_recovery|recovery_net_before=%.6f"+
 						"|recovered_net=%.6f|recovery_net_after=%.6f"+
 						"|lot_remains_open=true",
 					case3ARecoveryBefore,
@@ -4469,9 +4661,9 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 			t.recordCase3ARecoveryLifecycleEventLocked(
 				lot,
 				rec,
-				ProducerStageCase3AFinalRecovery,
+				finalRecoveryStage,
 				fmt.Sprintf(
-					"case3a_final_recovery|recovery_net_before=%.6f"+
+					recoveryReasonPrefix+"_final_recovery|recovery_net_before=%.6f"+
 						"|recovered_net=%.6f|recovery_net_after=%.6f"+
 						"|recovery_complete=true|recovery_excess_pnl=%.6f",
 					case3ARecoveryBefore,
@@ -5046,6 +5238,16 @@ func (t *Trader) rebuildDerivedResourceLedgerLocked(price float64) error {
 			Side: obligation.Side, Informational: true, CreatedAt: obligation.CreatedAt,
 		})
 	}
+	for id, obligation := range t.Case3BObligations {
+		if obligation == nil {
+			continue
+		}
+		records = append(records, ResourceReservation{
+			ID: "case3b:" + id, OwnerID: id, Kind: ResourceReservationCase3B,
+			State: ResourceReservationPending, Producer: EntryProducerCase3BReplacement,
+			Side: obligation.Side, Informational: true, CreatedAt: obligation.CreatedAt,
+		})
+	}
 	return t.resourceManager.ReplaceDerived(records)
 }
 
@@ -5522,6 +5724,9 @@ func (t *Trader) startCase3AReplacement(
 		return "", errors.New(
 			"Case3A replacement: nil intent",
 		)
+	}
+	if !isRecoveryReplacementProducer(intent.Producer) {
+		return "", fmt.Errorf("recovery replacement: invalid producer %s", intent.Producer)
 	}
 
 	if attempt == nil {
@@ -6355,7 +6560,7 @@ func (t *Trader) buildPendingEntry(
 		entry.ProducerReason,
 	)
 
-	if intent.Producer == EntryProducerCase3AReplacement {
+	if isRecoveryReplacementProducer(intent.Producer) {
 		entry.CommitEligible = t.Case3ACommitEligible
 	}
 
@@ -6487,7 +6692,7 @@ func (t *Trader) registerPendingEntry(
 		}
 	}
 
-	if entry.Producer == EntryProducerCase3AReplacement {
+	if isRecoveryReplacementProducer(entry.Producer) {
 		obligation := t.ensureCase3AObligationLocked(entry.Intent, "")
 		if obligation == nil {
 			delete(t.pendingEntries, orderID)
@@ -6514,7 +6719,8 @@ func (t *Trader) registerPendingEntry(
 		obligation.ActiveDecisionID = strings.TrimSpace(entry.Intent.DecisionID)
 		obligation.AttemptCount++
 		obligation.UpdatedAt = time.Now().UTC()
-		delete(t.PendingReplacementRetries, obligation.ObligationID)
+		_, retries := t.recoveryObligationMapsLocked(entry.Producer)
+		delete(retries, obligation.ObligationID)
 	}
 
 	// log.Printf(
@@ -7763,8 +7969,9 @@ func (t *Trader) rekeyPendingEntry(
 
 	t.pendingEntries[newOrderID] = entry
 
-	if entry.Producer == EntryProducerCase3AReplacement {
-		if obligation := t.Case3AObligations[case3AObligationID(entry.Intent)]; obligation != nil {
+	if isRecoveryReplacementProducer(entry.Producer) {
+		obligations, _ := t.recoveryObligationMapsLocked(entry.Producer)
+		if obligation := obligations[case3AObligationID(entry.Intent)]; obligation != nil {
 
 			obligation.ActiveOrderID = newOrderID
 			obligation.UpdatedAt = time.Now().UTC()
@@ -8495,7 +8702,7 @@ func (t *Trader) drainPendingEntry(
 			)
 
 			if pending != nil &&
-				pending.Producer == EntryProducerCase3AReplacement {
+				isRecoveryReplacementProducer(pending.Producer) {
 
 				t.reconcileCase3AObligationLocked(pending)
 			}
@@ -8687,7 +8894,7 @@ func (t *Trader) drainPendingEntry(
 				)
 
 				if pending != nil &&
-					pending.Producer == EntryProducerCase3AReplacement {
+					isRecoveryReplacementProducer(pending.Producer) {
 
 					t.reconcileCase3AObligationLocked(pending)
 					_ = t.saveStateNoLock()
@@ -8724,7 +8931,7 @@ func (t *Trader) drainPendingEntry(
 			*/
 			var case3ARecoveryAppliedUSD float64
 			if pending != nil &&
-				pending.Producer == EntryProducerCase3AReplacement &&
+				isRecoveryReplacementProducer(pending.Producer) &&
 				res.Placed != nil {
 
 				_, case3ARecoveryAppliedUSD =
@@ -8816,7 +9023,7 @@ func (t *Trader) drainPendingEntry(
 				)
 
 				if pending != nil &&
-					pending.Producer == EntryProducerCase3AReplacement {
+					isRecoveryReplacementProducer(pending.Producer) {
 
 					t.reconcileCase3AObligationLocked(pending)
 					if stateErr := t.saveStateNoLock(); stateErr != nil {
@@ -8834,7 +9041,7 @@ func (t *Trader) drainPendingEntry(
 			}
 
 			if pending != nil &&
-				pending.Producer == EntryProducerCase3AReplacement &&
+				isRecoveryReplacementProducer(pending.Producer) &&
 				res.Placed != nil {
 
 				t.commitCase3AObligationFillLocked(
@@ -8972,7 +9179,7 @@ func (t *Trader) drainPendingEntry(
 			}
 
 			if pending != nil &&
-				pending.Producer == EntryProducerCase3AReplacement {
+				isRecoveryReplacementProducer(pending.Producer) {
 
 				if res.Filled && res.Placed != nil {
 					// A factual exchange fill was rejected by correlation checks.
@@ -9520,7 +9727,7 @@ func (t *Trader) commitEntryFill(
 	// Equity was advanced above using account equity. Every other ordinary
 	// producer uses the actual broker execution price. Case3A is explicitly
 	// exempt from ordinary producer standardization.
-	if entry.Producer != EntryProducerCase3AReplacement &&
+	if !isRecoveryReplacementProducer(entry.Producer) &&
 		entry.Producer != EntryProducerEquity {
 		t.setProducerContinuationReference(
 			entry.Producer,
@@ -9579,7 +9786,7 @@ func (t *Trader) Case3ACommitEligible(
 		return false
 	}
 
-	if entry.Producer != EntryProducerCase3AReplacement {
+	if !isRecoveryReplacementProducer(entry.Producer) {
 		return true
 	}
 
@@ -10234,8 +10441,10 @@ func (t *Trader) handleCase3AReplacementError(
 				more precise observability ErrorCode.
 			*/
 			retryClass := "initial_modeB_replacement_retryable"
-			if strings.Contains(repl.ProducerReason, "case3A_obligation_resurrected") {
-				retryClass = "case3a_obligation_resurrection_retryable"
+			if strings.Contains(repl.ProducerReason, "case3A_obligation_resurrected") ||
+				strings.Contains(repl.ProducerReason, "case3B_obligation_resurrected") {
+				retryClass = strings.ToLower(string(repl.Producer)) +
+					"_obligation_resurrection_retryable"
 			}
 			t.markCase3AReplacementRetryLocked(
 				repl,

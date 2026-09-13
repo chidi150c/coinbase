@@ -18,6 +18,7 @@ const (
 	ResourceReservationPendingExit  ResourceReservationKind = "pending_exit"
 	ResourceReservationRefund       ResourceReservationKind = "refund"
 	ResourceReservationCase3A       ResourceReservationKind = "case3a"
+	ResourceReservationCase3B       ResourceReservationKind = "case3b"
 	ResourceReservationSubmission   ResourceReservationKind = "submission"
 	ResourceReservationQuarantine   ResourceReservationKind = "quarantine"
 
@@ -260,7 +261,8 @@ func (m *ResourceManager) ReplaceDerived(reservations []ResourceReservation) err
 		switch reservation.Kind {
 		case ResourceReservationLot, ResourceReservationPendingEntry,
 			ResourceReservationPendingExit, ResourceReservationRefund,
-			ResourceReservationCase3A:
+			ResourceReservationCase3A,
+			ResourceReservationCase3B:
 			delete(m.reservations, id)
 		}
 	}

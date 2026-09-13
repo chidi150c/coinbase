@@ -89,6 +89,7 @@ type ProducerPriority int
 
 const (
 	ProducerPriorityCase3AReplacement ProducerPriority = 800
+	ProducerPriorityCase3BReplacement ProducerPriority = 800
 	ProducerPriorityCase11A           ProducerPriority = 700
 	ProducerPriorityCase11B           ProducerPriority = 600
 	ProducerPriorityCase13A           ProducerPriority = 500
@@ -110,6 +111,8 @@ const (
 	EntryProducerEquity EntryProducer = "Equity"
 
 	EntryProducerCase3AReplacement EntryProducer = "Case3AReplacement"
+
+	EntryProducerCase3BReplacement EntryProducer = "Case3BReplacement"
 
 	EntryProducerCase11APeakReversal EntryProducer = "Case11APeakReversal"
 
@@ -136,6 +139,8 @@ func producerPriorityFor(producer EntryProducer) ProducerPriority {
 	switch producer {
 	case EntryProducerCase3AReplacement:
 		return ProducerPriorityCase3AReplacement
+	case EntryProducerCase3BReplacement:
+		return ProducerPriorityCase3BReplacement
 
 	case EntryProducerCase11APeakReversal:
 		return ProducerPriorityCase11A
@@ -244,8 +249,9 @@ func producerTierFor(producer EntryProducer) (ProducerTier, float64) {
 		EntryProducerCase16BNormalBottomRolloverBuy:
 		return ProducerTierLow, LowTierProducerMultiplier
 
-	case EntryProducerCase3AReplacement:
-		panic("producerTierFor: Case3AReplacement is a special-case exemption")
+	case EntryProducerCase3AReplacement,
+		EntryProducerCase3BReplacement:
+		panic("producerTierFor: recovery replacements are special-case exemptions")
 
 	default:
 		panic(fmt.Sprintf("producerTierFor: unsupported producer %q", producer))
@@ -553,7 +559,8 @@ func entryPolicyForSource(source EntryProducer) EntryPolicy {
 			ResetRegime:      false,
 		}
 
-	case EntryProducerCase3AReplacement:
+	case EntryProducerCase3AReplacement,
+		EntryProducerCase3BReplacement:
 		return EntryPolicy{
 			ResetLastAdd:     true,
 			ResetWinExtreme:  true,
