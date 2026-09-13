@@ -31,7 +31,7 @@
 //  3. OPEN evaluation (if no exit fired):
 //     - Build one frozen ResourceSnapshot after existing reservations
 //     - Evaluate all ordinary producers independently
-//     - Apply per-producer admission (Case3B/LongOnly) without terminating the batch
+//     - Apply per-producer admission (LossReentryProtection/LongOnly) without terminating the batch
 //     - Build all producer sizing/resource requests from the same snapshot
 //     - Allocate by ProducerPriority with proportional equal-priority sharing
 //     - Execute every approved/partial allocation independently
@@ -1798,7 +1798,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 }
 
 // -----------------------------------------------------------------------------
-// Case 3B - Latest Threshold-Stop-Loss Exit Lookup
+// LossReentryProtection - Latest Threshold-Stop-Loss Exit Lookup
 //
 // Returns the most recent losing threshold-stop-loss exit for the requested
 // side within the supplied time window.

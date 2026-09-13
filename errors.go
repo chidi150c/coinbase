@@ -73,7 +73,7 @@ const (
 	EntryProduceErrCommitSparePointerNil       EntryProduceErrorCode = "commit_spare_pointer_nil"
 	EntryProduceErrExecutionBalanceUnavailable EntryProduceErrorCode = "execution_balance_unavailable"
 	EntryProduceErrDecisionBalanceUnavailable  EntryProduceErrorCode = "decision_balance_unavailable"
-	EntryProduceErrDecisionCase3BBlocked       EntryProduceErrorCode = "decision_case3b_blocked"
+	EntryProduceErrDecisionLossReentryBlocked  EntryProduceErrorCode = "decision_loss_reentry_blocked"
 	EntryProduceErrDecisionLongOnlyBlocked     EntryProduceErrorCode = "decision_long_only_blocked"
 	EntryProduceErrDecisionLotCapReached       EntryProduceErrorCode = "decision_lot_cap_reached"
 	EntryProduceErrDecisionInvalidConfidence   EntryProduceErrorCode = "decision_invalid_confidence"

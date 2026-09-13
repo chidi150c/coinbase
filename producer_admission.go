@@ -43,19 +43,20 @@ func producerAdmissionBlocked(
 // evaluateProducerAdmissionLocked applies non-resource entry protections to one
 // producer decision.
 //
-// Caller must hold t.mu because Case3B reads t.lastExits and the current regime.
+// Caller must hold t.mu because LossReentryProtection reads t.lastExits and the
+// current regime.
 //
 // V1 admission policy preserved from the old inline step() path:
 //
-//   - Case3B DOWN-regime BUY protection:
+//   - LossReentryProtection DOWN-regime BUY protection:
 //     non-LOW producers may not BUY above the latest BUY threshold-stop-loss
 //     exit price from the preceding 24 hours.
 //
-//   - Case3B UP-regime SELL protection:
+//   - LossReentryProtection UP-regime SELL protection:
 //     non-LOW producers may not SELL below the latest SELL threshold-stop-loss
 //     exit price from the preceding 24 hours.
 //
-//   - Case3AReplacement explicitly bypasses Case3B.
+//   - Case3AReplacement explicitly bypasses the SELL-side protection.
 //
 //   - LongOnly blocks SELL.
 //
@@ -79,13 +80,13 @@ func (t *Trader) evaluateProducerAdmissionLocked(
 		)
 	}
 
-	// Preserve the existing Case3B asymmetry exactly: only SELL explicitly
+	// Preserve the existing protection asymmetry exactly: only SELL explicitly
 	// exempts Case3AReplacement. Do not silently invent a BUY exemption.
 	case3AReplacement :=
 		d.Producer == EntryProducerCase3AReplacement
 
 	// -------------------------------------------------------------------------
-	// Case 3B-Opposite — DOWN-Regime BUY Protection
+	// LossReentryProtection — DOWN-Regime BUY Protection
 	// -------------------------------------------------------------------------
 	if side == SideBuy &&
 		d.ProducerTier != ProducerTierLow &&
@@ -103,18 +104,18 @@ func (t *Trader) evaluateProducerAdmissionLocked(
 			price > lastLossExit.ClosePrice {
 
 			return producerAdmissionBlocked(
-				EntryProduceErrDecisionCase3BBlocked,
+				EntryProduceErrDecisionLossReentryBlocked,
 				fmt.Errorf(
-					"Case3B BUY blocked above latest threshold-stop loss exit price %.8f",
+					"LossReentryProtection BUY blocked above latest threshold-stop-loss exit price %.8f",
 					lastLossExit.ClosePrice,
 				),
-				"HOLD Case3B block BUY above latest loss-exit SELL price",
+				"HOLD LossReentryProtection block BUY above latest loss-exit SELL price",
 			)
 		}
 	}
 
 	// -------------------------------------------------------------------------
-	// Case 3B — UP-Regime SELL Protection
+	// LossReentryProtection — UP-Regime SELL Protection
 	// -------------------------------------------------------------------------
 	if side == SideSell &&
 		!case3AReplacement &&
@@ -133,12 +134,12 @@ func (t *Trader) evaluateProducerAdmissionLocked(
 			price < lastLossExit.ClosePrice {
 
 			return producerAdmissionBlocked(
-				EntryProduceErrDecisionCase3BBlocked,
+				EntryProduceErrDecisionLossReentryBlocked,
 				fmt.Errorf(
-					"Case3B SELL blocked below latest threshold-stop loss exit price %.8f",
+					"LossReentryProtection SELL blocked below latest threshold-stop-loss exit price %.8f",
 					lastLossExit.ClosePrice,
 				),
-				"HOLD Case3B block SELL below latest loss-exit BUY price",
+				"HOLD LossReentryProtection block SELL below latest loss-exit BUY price",
 			)
 		}
 	}

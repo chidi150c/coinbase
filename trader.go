@@ -3139,11 +3139,10 @@ func (t *Trader) closeLot(
 		strings.TrimSpace(lot.FixedTPOrderID) != ""
 
 	// =============================================================================
-	// CASE 3 - SELL LOSS RECOVERY & PROTECTION
+	// SELL LOSS RECOVERY
 	//
-	// Case 3 introduces two complementary strategies:
-	//   • Case 3A - Recover intelligently in a continuing DOWN regime
-	//   • Case 3B - Prevent repeating weak SELLs in an UP regime.
+	// Case3A recovers qualifying losing SELL threshold-stop exits.
+	// LossReentryProtection is an independent producer-admission policy.
 	//
 	// Sufficient spare base
 	// 		→ Case 3A Mode A in any regime
