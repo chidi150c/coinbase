@@ -109,14 +109,6 @@ type Config struct {
 	BaseAsset         string
 	PaperQuoteBalance float64
 
-	// Repricer (maker-chase) guardrails
-	RepriceEnable         bool
-	RepriceIntervalMs     int
-	RepriceMinImprovTicks int
-	RepriceMinEdgeUSD     float64
-	RepriceMaxDriftBps    float64
-	RepriceMaxCount       int
-
 	// Strategy thresholds
 	BuyThreshold     float64
 	SellThreshold    float64
@@ -228,14 +220,6 @@ func loadConfigFromEnv() Config {
 		PaperBaseBalance:  getEnvFloat("PAPER_BASE_BALANCE", 0.0),
 		BaseAsset:         getEnv("BASE_ASSET", ""),
 		PaperQuoteBalance: getEnvFloat("PAPER_QUOTE_BALANCE", 0.0),
-
-		// Repricer (maker-chase) guardrails
-		RepriceEnable:         getEnvBool("REPRICE_ENABLE", true),
-		RepriceIntervalMs:     getEnvInt("REPRICE_INTERVAL_MS", 1000),
-		RepriceMinImprovTicks: getEnvInt("REPRICE_MIN_IMPROV_TICKS", 0),
-		RepriceMinEdgeUSD:     getEnvFloat("REPRICE_MIN_EDGE_USD", 0.0),
-		RepriceMaxDriftBps:    getEnvFloat("REPRICE_MAX_DRIFT_BPS", 1.5),
-		RepriceMaxCount:       getEnvInt("REPRICE_MAX_COUNT", 0),
 
 		// Strategy thresholds
 		BuyThreshold:     getEnvFloat("BUY_THRESHOLD", 0.57),

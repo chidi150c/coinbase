@@ -2245,7 +2245,7 @@ func (t *Trader) RehydratePending(
 		// ------------------------------------------------------------
 		// Existing exchange order is still live.
 		//
-		// Resume using the SAME generic poll/reprice implementation
+		// Resume using the same generic polling implementation
 		// used for newly produced entries.
 		// ------------------------------------------------------------
 		t.startEntryPoller(
@@ -5460,7 +5460,7 @@ type PendingIntent struct {
 	// Current live exchange order ID.
 	OrderID string
 
-	// Late-fill/reprice tracking.
+	// Legacy exchange-order IDs retained for restart-safe reconciliation.
 	History []string `json:"history,omitempty"`
 
 	AccumBase   float64
@@ -5536,7 +5536,7 @@ func (t *Trader) ensurePendingEntries() {
 		↓
 	pendingEntries[OrderID]
 		↓
-	generic poll/reprice lifecycle
+	generic polling lifecycle
 		↓
 	OpenResult
 		↓
@@ -6934,11 +6934,7 @@ func (t *Trader) startEntryPoller(
 		entry,
 		entry.ResultC,
 		entry.OrderID,
-		entry.Side,
 		entry.Intent.Deadline,
-		entry.Intent.LimitPx,
-		entry.Intent.BaseAtLimit,
-		t.cfg.LimitPriceOffsetBps,
 	)
 }
 
@@ -6947,24 +6943,15 @@ func (t *Trader) runPendingEntryPoller(
 	entry *PendingEntry,
 	resultC chan OpenResult,
 	initialOrderID string,
-	side OrderSide,
 	deadline time.Time,
-	initialLimitPx float64,
-	initialBaseAtLimit float64,
-	offsetBps float64,
 ) {
 	// log.Printf(
 	// "[TRACE] postonly.poll.start "+
-	// "producer=%s side=%s init_id=%s "+
-	// "init_limit=%.8f init_base=%.8f "+
-	// "deadline=%s offset_bps=%.3f",
+	// "producer=%s side=%s init_id=%s deadline=%s",
 	// entry.Producer,
-	// side,
+	// entry.Side,
 	// initialOrderID,
-	// initialLimitPx,
-	// initialBaseAtLimit,
 	// deadline.Format(time.RFC3339),
-	// offsetBps,
 	// )
 
 	// defer log.Printf(
@@ -6976,8 +6963,6 @@ func (t *Trader) runPendingEntryPoller(
 	// )
 
 	orderID := initialOrderID
-	lastLimitPx := initialLimitPx
-	lastReprice := time.Now()
 
 	var sessionBase float64
 	var sessionQuote float64
@@ -6986,8 +6971,6 @@ func (t *Trader) runPendingEntryPoller(
 	var lastSeenBase float64
 	var lastSeenQuote float64
 	var lastSeenFee float64
-
-	var repriceCount int
 
 	/*
 		The poller may discover multiple producer lifecycle events before
@@ -7023,9 +7006,6 @@ func (t *Trader) runPendingEntryPoller(
 		transported by OpenResult.
 
 		By default, the first event discovered for a stage is retained.
-
-		replace=true is used only when the same lifecycle stage is
-		intentionally updated, such as stage=pending after repricing.
 	*/
 	addProducerEvent := func(
 		stage ProducerStage,
@@ -7132,56 +7112,6 @@ func (t *Trader) runPendingEntryPoller(
 		producerEvents[ProducerStageCancelRequested] = event
 	}
 
-	// Repricing may occur repeatedly within one producer attempt. Use a unique
-	// transport-map key for every occurrence while retaining the canonical
-	// ProducerEvent.Stage consumed by history and BOT OPS.
-	addRepriceProducerEvent := func(
-		stage ProducerStage,
-		sequence int,
-		when time.Time,
-		eventOrderID string,
-		detail string,
-		errorText string,
-		price float64,
-		base float64,
-	) {
-		if entry == nil || entry.Intent == nil {
-			return
-		}
-		decisionID := strings.TrimSpace(entry.Intent.DecisionID)
-		if decisionID == "" {
-			return
-		}
-		if when.IsZero() {
-			when = time.Now().UTC()
-		}
-		key := ProducerStage(fmt.Sprintf("%s_%06d", stage, sequence))
-		reason := strings.TrimSpace(entry.ProducerReason)
-		if strings.TrimSpace(detail) != "" {
-			reason += "|" + strings.TrimPrefix(strings.TrimSpace(detail), "|")
-		}
-		producerEvents[key] = ProducerEvent{
-			Time:       when,
-			CreatedAt:  entry.Intent.CreatedAt,
-			Producer:   entry.Producer,
-			Side:       fmt.Sprint(entry.Side),
-			Stage:      stage,
-			DecisionID: decisionID,
-			OrderID:    eventOrderID,
-			Reason:     reason,
-			Error:      errorText,
-			Price:      price,
-			BaseSize:   base,
-			QuoteValue: price * base,
-		}
-		log.Printf(
-			"[PRODUCER] stage=%s producer=%s side=%s decision_id=%s "+
-				"order_id=%s reason=%q error=%q",
-			stage, entry.Producer, entry.Side, decisionID,
-			eventOrderID, reason, errorText,
-		)
-	}
-
 poll:
 	for time.Now().Before(deadline) {
 		select {
@@ -7273,8 +7203,7 @@ poll:
 			// "[TRACE] postonly.poll.tick "+
 			// "producer=%s side=%s order_id=%s status=%s "+
 			// "price=%.8f base=%.8f quote=%.2f fee=%.6f "+
-			// "sess_agg[base=%.8f quote=%.2f fee=%.6f] "+
-			// "reprices=%d",
+			// "sess_agg[base=%.8f quote=%.2f fee=%.6f]",
 			// entry.Producer,
 			// side,
 			// orderID,
@@ -7286,7 +7215,6 @@ poll:
 			// sessionBase,
 			// sessionQuote,
 			// sessionFee,
-			// repriceCount,
 			// )
 
 			switch status {
@@ -7376,171 +7304,7 @@ poll:
 						"strategy_requested",
 						false,
 					)
-
-					// log.Printf(
-					// "[TRACE] postonly.reprice.skip.cancel_requested "+
-					// "producer=%s side=%s order_id=%s "+
-					// "last_status=%s",
-					// entry.Producer,
-					// side,
-					// orderID,
-					// status,
-					// )
-
-					lastReprice = time.Now()
-					break
 				}
-
-				repriceAfter := time.Duration(
-					t.cfg.RepriceIntervalMs,
-				) * time.Millisecond
-
-				if time.Since(lastReprice) <
-					repriceAfter {
-
-					break
-				}
-
-				// log.Printf(
-				// "[TRACE] postonly.reprice.try "+
-				// "producer=%s side=%s order_id=%s "+
-				// "status=%s last_limit=%.8f "+
-				// "reprice_count=%d",
-				// entry.Producer,
-				// side,
-				// orderID,
-				// status,
-				// lastLimitPx,
-				// repriceCount,
-				// )
-
-				newID,
-					newLastLimitPx,
-					newRepriceCount,
-					didReprice,
-					repriceObservation := t.maybeRepriceOnce(
-					pollCtx,
-					entry,
-					orderID,
-					initialLimitPx,
-					initialBaseAtLimit,
-					lastLimitPx,
-					offsetBps,
-					repriceCount,
-				)
-
-				if repriceObservation.Attempted {
-					sequence := repriceObservation.Sequence
-					outcome := "failed"
-					eventOrderID := repriceObservation.OldOrderID
-					if repriceObservation.Accepted {
-						outcome = "accepted"
-						eventOrderID = repriceObservation.NewOrderID
-					}
-					detail := fmt.Sprintf(
-						"reprice_sequence=%d|reprice_outcome=%s|old_order_id=%s|new_order_id=%s|old_limit=%.8f|new_limit=%.8f|new_base=%.8f|cancel_error=%q|place_error=%q",
-						sequence,
-						outcome,
-						repriceObservation.OldOrderID,
-						repriceObservation.NewOrderID,
-						repriceObservation.OldLimitPx,
-						repriceObservation.NewLimitPx,
-						repriceObservation.NewBase,
-						repriceObservation.CancelError,
-						repriceObservation.Error,
-					)
-					errorText := repriceObservation.Error
-					if errorText == "" && repriceObservation.CancelError != "" {
-						errorText = repriceObservation.CancelError
-					}
-					addRepriceProducerEvent(
-						ProducerStageRepriced,
-						sequence,
-						repriceObservation.CompletedAt,
-						eventOrderID,
-						detail,
-						errorText,
-						repriceObservation.NewLimitPx,
-						repriceObservation.NewBase,
-					)
-				}
-
-				if didReprice &&
-					newID != orderID {
-
-					// log.Printf(
-					// "[TRACE] postonly.reprice.swap "+
-					// "producer=%s side=%s old_id=%s "+
-					// "new_id=%s new_limit=%.8f count=%d",
-					// entry.Producer,
-					// side,
-					// orderID,
-					// newID,
-					// newLastLimitPx,
-					// newRepriceCount,
-					// )
-
-					oldID := orderID
-
-					orderID = newID
-					lastLimitPx = newLastLimitPx
-					repriceCount = newRepriceCount
-
-					lastSeenBase = 0
-					lastSeenQuote = 0
-					lastSeenFee = 0
-
-					/*
-						Repricing is still the same producer decision.
-
-						Update the transported pending stage so the drain can
-						update the existing ProducerAttempt's pending event
-						with the currently-live exchange OrderID.
-
-						No new ProducerAttempt or DecisionID is created.
-					*/
-					addProducerEvent(
-						ProducerStagePending,
-						newID,
-						nil,
-						true,
-					)
-
-					log.Printf(
-						"[PRODUCER] stage=pending "+
-							"producer=%s side=%s "+
-							"order_id=%s reason=%q "+
-							"repriced=%t",
-						entry.Producer,
-						entry.Side,
-						newID,
-						entry.ProducerReason,
-						true,
-					)
-
-					t.rekeyPendingEntry(
-						entry,
-						oldID,
-						newID,
-					)
-				} else {
-					// log.Printf(
-					// "[TRACE] postonly.reprice.skip "+
-					// "producer=%s side=%s order_id=%s "+
-					// "reason=no_guard_or_no_improve "+
-					// "last_limit=%.8f count=%d",
-					// entry.Producer,
-					// side,
-					// orderID,
-					// newLastLimitPx,
-					// newRepriceCount,
-					// )
-
-					lastLimitPx = newLastLimitPx
-					repriceCount = newRepriceCount
-				}
-
-				lastReprice = time.Now()
 
 			case "CANCELED",
 				"REJECTED",
@@ -7907,102 +7671,6 @@ func placedOrderFromAggregate(
 		CommissionUSD: feeUSD,
 	}
 }
-func (t *Trader) rekeyPendingEntry(
-	entry *PendingEntry,
-	oldOrderID string,
-	newOrderID string,
-) {
-	oldOrderID = strings.TrimSpace(oldOrderID)
-	newOrderID = strings.TrimSpace(newOrderID)
-
-	if entry == nil || entry.Intent == nil || newOrderID == "" {
-		return
-	}
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	current, exists := t.pendingEntries[oldOrderID]
-	if !exists || current != entry {
-		log.Printf(
-			"[WARN] pending.rekey.owner_mismatch "+
-				"producer=%s side=%s old_id=%s new_id=%s",
-			entry.Producer,
-			entry.Side,
-			oldOrderID,
-			newOrderID,
-		)
-
-		return
-	}
-
-	if existing, collision := t.pendingEntries[newOrderID]; collision &&
-		existing != entry {
-
-		log.Printf(
-			"[ERROR] pending.rekey.collision "+
-				"producer=%s side=%s old_id=%s new_id=%s",
-			entry.Producer,
-			entry.Side,
-			oldOrderID,
-			newOrderID,
-		)
-
-		return
-	}
-
-	delete(t.pendingEntries, oldOrderID)
-	if t.resourceManager != nil {
-		t.resourceManager.Release("pending-entry:" + oldOrderID)
-	}
-
-	if oldOrderID != "" {
-		entry.Intent.History = appendOrderHistory(
-			entry.Intent.History,
-			oldOrderID,
-			5,
-		)
-	}
-
-	entry.OrderID = newOrderID
-	entry.Intent.OrderID = newOrderID
-
-	t.pendingEntries[newOrderID] = entry
-
-	if isRecoveryReplacementProducer(entry.Producer) {
-		obligations, _ := t.recoveryObligationMapsLocked(entry.Producer)
-		if obligation := obligations[case3AObligationID(entry.Intent)]; obligation != nil {
-
-			obligation.ActiveOrderID = newOrderID
-			obligation.UpdatedAt = time.Now().UTC()
-		}
-	}
-}
-func appendOrderHistory(
-	history []string,
-	orderID string,
-	max int,
-) []string {
-	orderID = strings.TrimSpace(orderID)
-
-	if orderID == "" {
-		return history
-	}
-
-	for _, existing := range history {
-		if existing == orderID {
-			return history
-		}
-	}
-
-	history = append(history, orderID)
-
-	if max > 0 && len(history) > max {
-		history = history[len(history)-max:]
-	}
-
-	return history
-}
 func (t *Trader) pendingEntryCancelRequested(
 	entry *PendingEntry,
 ) bool {
@@ -8014,339 +7682,6 @@ func (t *Trader) pendingEntryCancelRequested(
 	defer t.mu.Unlock()
 
 	return entry.Intent.CancelRequested
-}
-func (t *Trader) maybeRepriceOnce(
-	pctx context.Context,
-	entry *PendingEntry,
-	orderID string,
-	initLimitPx float64,
-	initBaseAtLimit float64,
-	lastLimitPx float64,
-	offsetBps float64,
-	repriceCount int,
-) (
-	newOrderID string,
-	newLastLimitPx float64,
-	newRepriceCount int,
-	didReprice bool,
-	observation RepriceObservation,
-) {
-	if entry == nil {
-		return orderID, lastLimitPx, repriceCount, false, observation
-	}
-
-	intent := entry.Intent
-	if intent == nil {
-		return orderID, lastLimitPx, repriceCount, false, observation
-	}
-
-	side := entry.Side
-
-	rpStart := time.Now()
-
-	// Global guards
-	if !t.cfg.RepriceEnable {
-		return orderID, lastLimitPx, repriceCount, false, observation
-	}
-
-	if t.cfg.RepriceMaxCount > 0 &&
-		repriceCount >= t.cfg.RepriceMaxCount {
-		return orderID, lastLimitPx, repriceCount, false, observation
-	}
-
-	bid, ask, bErr := t.broker.GetBBO(
-		pctx,
-		t.cfg.ProductID,
-	)
-
-	useBBO := bErr == nil &&
-		bid > 0 &&
-		ask > bid
-
-	var newLimitPx float64
-
-	if useBBO {
-
-		if side == SideBuy {
-			newLimitPx = bid
-		} else {
-			newLimitPx = ask
-		}
-
-	} else {
-
-		ctxPx, cancelPx := context.WithTimeout(
-			pctx,
-			time.Second,
-		)
-
-		px, gErr := t.broker.GetNowPrice(
-			ctxPx,
-			t.cfg.ProductID,
-		)
-
-		cancelPx()
-
-		if gErr != nil || px <= 0 {
-			return orderID, lastLimitPx, repriceCount, false, observation
-		}
-
-		if side == SideBuy {
-			newLimitPx = px * (1.0 - offsetBps/10000.0)
-		} else {
-			newLimitPx = px * (1.0 + offsetBps/10000.0)
-		}
-	}
-
-	tick := t.cfg.PriceTick
-
-	if tick > 0 {
-
-		if side == SideBuy {
-			newLimitPx =
-				math.Floor(newLimitPx/tick) * tick
-		} else {
-			newLimitPx =
-				math.Ceil(newLimitPx/tick) * tick
-		}
-	}
-
-	if useBBO && tick > 0 {
-
-		if side == SideBuy {
-
-			if newLimitPx >= ask {
-
-				cand := ask - tick
-
-				if cand <= 0 {
-					return orderID, lastLimitPx, repriceCount, false, observation
-				}
-
-				newLimitPx = cand
-			}
-
-		} else {
-
-			if newLimitPx <= bid {
-				newLimitPx = bid + tick
-			}
-		}
-
-	} else if useBBO && tick <= 0 {
-
-		if side == SideBuy &&
-			newLimitPx >= ask {
-
-			newLimitPx =
-				math.Nextafter(ask, 0)
-		}
-
-		if side == SideSell &&
-			newLimitPx <= bid {
-
-			newLimitPx =
-				math.Nextafter(bid, +1)
-		}
-	}
-
-	shouldReprice :=
-		(tick > 0 &&
-			math.Abs(newLimitPx-lastLimitPx) >= tick) ||
-			(tick <= 0 &&
-				newLimitPx != lastLimitPx)
-
-	if shouldReprice &&
-		t.cfg.RepriceMaxDriftBps > 0 {
-
-		drift :=
-			math.Abs(
-				(newLimitPx-initLimitPx)/
-					initLimitPx,
-			) * 10000.0
-
-		if drift > t.cfg.RepriceMaxDriftBps {
-			shouldReprice = false
-		}
-	}
-
-	newBase := initBaseAtLimit
-
-	if intent.Quote > 0 {
-		newBase = intent.Quote / newLimitPx
-	}
-
-	if t.cfg.BaseStep > 0 {
-		newBase =
-			math.Floor(newBase/t.cfg.BaseStep) *
-				t.cfg.BaseStep
-	}
-
-	if shouldReprice &&
-		!(newBase > 0 &&
-			newBase*newLimitPx >= t.cfg.MinNotional) {
-
-		shouldReprice = false
-	}
-
-	driftBps := 0.0
-
-	if initLimitPx > 0 {
-		driftBps =
-			math.Abs(
-				(newLimitPx-initLimitPx)/
-					initLimitPx,
-			) * 10000.0
-	}
-
-	improveTicks := 0.0
-
-	if tick > 0 {
-		improveTicks =
-			math.Abs(newLimitPx-lastLimitPx) /
-				tick
-	}
-
-	notional := newBase * newLimitPx
-
-	notionalOK :=
-		newBase > 0 &&
-			notional >= t.cfg.MinNotional
-
-	log.Printf(
-		"[TRACE] postonly.reprice.eval elapsed_ms=%d side=%s order_id=%s "+
-			"use_bbo=%v bid=%.8f ask=%.8f "+
-			"init_limit=%.8f last_limit=%.8f candidate_limit=%.8f "+
-			"tick=%.8f improve_ticks=%.2f "+
-			"drift_bps=%.4f max_drift_bps=%.4f "+
-			"new_base=%.8f notional=%.2f min_notional=%.2f notional_ok=%v "+
-			"should_reprice=%v reprice_count=%d max_count=%d",
-		time.Since(rpStart).Milliseconds(),
-		side,
-		orderID,
-		useBBO,
-		bid,
-		ask,
-		initLimitPx,
-		lastLimitPx,
-		newLimitPx,
-		tick,
-		improveTicks,
-		driftBps,
-		t.cfg.RepriceMaxDriftBps,
-		newBase,
-		notional,
-		t.cfg.MinNotional,
-		notionalOK,
-		shouldReprice,
-		repriceCount,
-		t.cfg.RepriceMaxCount,
-	)
-
-	if !shouldReprice {
-		return orderID, lastLimitPx, repriceCount, false, observation
-	}
-
-	observation = RepriceObservation{
-		Attempted:  true,
-		Sequence:   repriceCount + 1,
-		OldOrderID: orderID,
-		OldLimitPx: lastLimitPx,
-		NewLimitPx: newLimitPx,
-		NewBase:    newBase,
-	}
-
-	if useBBO {
-		// log.Printf(
-		// "[TRACE] postonly.reprice.touch side=%s bid=%.8f ask=%.8f new=%.8f last=%.8f",
-		// side,
-		// bid,
-		// ask,
-		// newLimitPx,
-		// lastLimitPx,
-		// )
-	} else {
-		// log.Printf(
-		// "[TRACE] postonly.reprice.mark side=%s new=%.8f last=%.8f",
-		// side,
-		// newLimitPx,
-		// lastLimitPx,
-		// )
-	}
-
-	cancelErr := t.broker.CancelOrder(
-		pctx,
-		t.cfg.ProductID,
-		orderID,
-	)
-	if cancelErr != nil {
-		observation.CancelError = cancelErr.Error()
-	}
-
-	newID, perr :=
-		t.broker.PlaceLimitPostOnly(
-			pctx,
-			t.cfg.ProductID,
-			side,
-			newLimitPx,
-			newBase,
-		)
-
-	if perr != nil ||
-		strings.TrimSpace(newID) == "" {
-		observation.CompletedAt = time.Now().UTC()
-		if perr != nil {
-			observation.Error = perr.Error()
-		} else {
-			observation.Error = "repriced submission returned an empty exchange order id"
-		}
-		if observation.CancelError != "" {
-			observation.Error = "cancel_error=" + observation.CancelError + "|place_error=" + observation.Error
-		}
-
-		return orderID,
-			lastLimitPx,
-			repriceCount,
-			false,
-			observation
-	}
-	observation.Accepted = true
-	observation.CompletedAt = time.Now().UTC()
-	observation.NewOrderID = newID
-
-	// log.Printf(
-	// "[TRACE] postonly.reprice side=%s old_id=%s new_id=%s limit=%.8f baseReq=%.8f",
-	// side,
-	// orderID,
-	// newID,
-	// newLimitPx,
-	// newBase,
-	// )
-
-	// The poller owns the registry rekey after this function returns.
-	// Update only the repriced economic values here.
-	intent.LimitPx = newLimitPx
-	intent.BaseAtLimit = newBase
-
-	return newID,
-		newLimitPx,
-		repriceCount + 1,
-		true,
-		observation
-}
-
-type RepriceObservation struct {
-	Attempted   bool
-	Accepted    bool
-	Sequence    int
-	CompletedAt time.Time
-	OldOrderID  string
-	NewOrderID  string
-	OldLimitPx  float64
-	NewLimitPx  float64
-	NewBase     float64
-	CancelError string
-	Error       string
 }
 
 // Entry Drain result
@@ -8757,8 +8092,8 @@ func (t *Trader) drainPendingEntry(
 		/*
 			Decide whether this asynchronous result is safe to apply.
 
-			Repricing may create several exchange order IDs. Accept a fill
-			when it matches:
+			Older persisted state may contain several exchange order IDs.
+			Accept a fill when it matches:
 
 			  1. the current pending order ID; or
 			  2. an order ID recorded in PendingIntent.History.
@@ -8805,7 +8140,7 @@ func (t *Trader) drainPendingEntry(
 					/*
 						A real fill was reported, but its OrderID does not
 						match either the current pending order or its
-						reprice history.
+						legacy order history.
 
 						This is a drain-local lifecycle failure.
 
@@ -9948,24 +9283,6 @@ func (t *Trader) watchPendingExit(ctx context.Context, p *PendingExit) {
 	var lastSeenBase, lastSeenQuote, lastSeenFee float64
 
 	orderID := strings.TrimSpace(p.OrderID)
-	lastLimitPx := p.LimitPx
-	initLimit := lastLimitPx
-	lastReprice := time.Now()
-	repriceCount := 0
-
-	cfg := t.cfg
-	tick := cfg.PriceTick
-	baseStep := cfg.BaseStep
-	offsetBps := cfg.LimitPriceOffsetBps
-	minNotional := cfg.MinNotional
-	if minNotional <= 0 {
-		minNotional = cfg.OrderMinUSD
-	}
-
-	closeSide := SideSell
-	if p.Side == SideSell {
-		closeSide = SideBuy
-	}
 
 	accrue := func(ord *PlacedOrder) {
 		if ord == nil {
@@ -10060,127 +9377,6 @@ func (t *Trader) watchPendingExit(ctx context.Context, p *PendingExit) {
 				emit(orderID)
 				return
 			}
-		}
-
-		if cfg.RepriceEnable &&
-			cfg.RepriceIntervalMs > 0 &&
-			time.Since(lastReprice) >= time.Duration(cfg.RepriceIntervalMs)*time.Millisecond {
-
-			if cfg.RepriceMaxCount <= 0 || repriceCount < cfg.RepriceMaxCount {
-				ctxPx, cancelPx := context.WithTimeout(ctx, time.Second)
-				px, gErr := t.broker.GetNowPrice(ctxPx, p.ProductID)
-				cancelPx()
-
-				if gErr == nil && px > 0 {
-					newLimitPx := px
-					if closeSide == SideSell {
-						newLimitPx = px * (1.0 + offsetBps/10000.0)
-					} else {
-						newLimitPx = px * (1.0 - offsetBps/10000.0)
-					}
-
-					if tick > 0 {
-						if closeSide == SideSell {
-							newLimitPx = math.Ceil(newLimitPx/tick) * tick
-						} else {
-							newLimitPx = math.Floor(newLimitPx/tick) * tick
-						}
-					}
-
-					shouldReprice := (tick > 0 && math.Abs(newLimitPx-lastLimitPx) >= tick) ||
-						(tick <= 0 && newLimitPx != lastLimitPx)
-
-					if shouldReprice && cfg.RepriceMaxDriftBps > 0 && initLimit > 0 {
-						driftBps := math.Abs((newLimitPx-initLimit)/initLimit) * 10000.0
-						if driftBps > cfg.RepriceMaxDriftBps {
-							shouldReprice = false
-						}
-					}
-
-					if shouldReprice && tick > 0 && cfg.RepriceMinImprovTicks > 1 {
-						improveTicks := int(math.Abs(newLimitPx-lastLimitPx) / tick)
-
-						if closeSide == SideSell &&
-							!(newLimitPx > lastLimitPx && improveTicks >= cfg.RepriceMinImprovTicks) {
-							shouldReprice = false
-						}
-
-						if closeSide == SideBuy &&
-							!(newLimitPx < lastLimitPx && improveTicks >= cfg.RepriceMinImprovTicks) {
-							shouldReprice = false
-						}
-					}
-
-					newBase := p.BaseRequested
-					if baseStep > 0 {
-						newBase = math.Floor((newBase/baseStep)+1e-12) * baseStep
-					}
-
-					if shouldReprice && cfg.RepriceMinEdgeUSD > 0 && newBase > 0 {
-						edgeUSD := math.Abs(newLimitPx-lastLimitPx) * newBase
-						if edgeUSD < cfg.RepriceMinEdgeUSD {
-							shouldReprice = false
-						}
-					}
-
-					if shouldReprice && !(newBase > 0 && newBase*newLimitPx >= minNotional) {
-						shouldReprice = false
-					}
-
-					if shouldReprice {
-						oldID := orderID
-						_ = t.broker.CancelOrder(ctx, p.ProductID, oldID)
-
-						if oldOrd, oldErr := t.broker.GetOrder(ctx, p.ProductID, oldID); oldErr == nil && oldOrd != nil {
-							accrue(oldOrd)
-						}
-
-						newID, perr := t.broker.PlaceLimitPostOnly(ctx, p.ProductID, closeSide, newLimitPx, newBase)
-						newID = strings.TrimSpace(newID)
-
-						if perr == nil && newID != "" {
-							orderID = newID
-							lastLimitPx = newLimitPx
-							repriceCount++
-							lastSeenBase = 0
-							lastSeenQuote = 0
-							lastSeenFee = 0
-
-							t.apply(func(tt *Trader) {
-								delete(tt.pendingExits, oldID)
-
-								p.OrderID = newID
-								p.LimitPx = newLimitPx
-								p.BaseRequested = newBase
-								tt.pendingExits[newID] = p
-
-								book := tt.book(p.Side)
-								for _, lot := range book.Lots {
-									if lot != nil && strings.TrimSpace(lot.EntryOrderID) == strings.TrimSpace(p.EntryOrderID) {
-										lot.FixedTPOrderID = newID
-										break
-									}
-								}
-
-								_ = tt.saveStateFrom(tt.snapshotStateLocked())
-							})
-
-							// log.Printf(
-							// "[TRACE] pending_exit.reprice side=%s old_exit_id=%s new_exit_id=%s entry_id=%s limit=%.8f base=%.8f count=%d",
-							// p.Side,
-							// oldID,
-							// newID,
-							// p.EntryOrderID,
-							// newLimitPx,
-							// newBase,
-							// repriceCount,
-							// )
-						}
-					}
-				}
-			}
-
-			lastReprice = time.Now()
 		}
 
 		time.Sleep(200 * time.Millisecond)

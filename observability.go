@@ -28,7 +28,6 @@ const (
 	ProducerStageSubmissionStarted ProducerStage = "submission_started"
 	ProducerStageExchangeAccepted  ProducerStage = "exchange_accepted"
 	ProducerStagePending           ProducerStage = "pending"
-	ProducerStageRepriced          ProducerStage = "repriced"
 	ProducerStageFilled            ProducerStage = "filled"
 	ProducerStageCommitted         ProducerStage = "committed"
 	ProducerStageExited            ProducerStage = "exited"
@@ -872,21 +871,11 @@ func (t *Trader) recordProducerAttemptLocked(
 	}
 
 	for stage, event := range attempt.Events {
-		// The first pending event owns the transport breakdown measured at
-		// exchange acceptance and local registration. A later pending update
-		// (currently produced only by repricing) may advance the live OrderID,
-		// but must not erase broker/registration/persistence timing evidence.
+		// The first pending event owns both the original exchange OrderID and
+		// the transport breakdown measured at acceptance and registration.
+		// Preserve it if duplicate asynchronous data is drained later.
 		if stage == ProducerStagePending {
-			if prior, ok := existingAttempt.Events[ProducerStagePending]; ok &&
-				strings.Contains(prior.Reason, "|broker.elapsed_ms=") &&
-				!strings.Contains(event.Reason, "|broker.elapsed_ms=") {
-				if orderID := strings.TrimSpace(event.OrderID); orderID != "" {
-					prior.OrderID = orderID
-					prior.Reason = strings.TrimSpace(
-						prior.Reason + "|pending_order_id_updated=" + orderID,
-					)
-				}
-				existingAttempt.Events[stage] = prior
+			if _, ok := existingAttempt.Events[ProducerStagePending]; ok {
 				continue
 			}
 		}

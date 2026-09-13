@@ -155,14 +155,6 @@ func loadBotEnv() {
 		"LIMIT_TIMEOUT_SEC":      {},
 		"TP_MAKER_OFFSET_BPS":    {},
 
-		// --- repricer (maker-chase) guardrails ---
-		"REPRICE_ENABLE":           {},
-		"REPRICE_INTERVAL_MS":      {},
-		"REPRICE_MIN_IMPROV_TICKS": {},
-		"REPRICE_MIN_EDGE_USD":     {},
-		"REPRICE_MAX_DRIFT_BPS":    {},
-		"REPRICE_MAX_COUNT":        {},
-
 		// ramping
 		"RAMP_ENABLE":    {},
 		"RAMP_MODE":      {},

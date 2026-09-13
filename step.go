@@ -42,10 +42,6 @@
 //   - On timeout/error: set a per-side “recheck” flag permitting one market fallback later.
 //   - RehydratePending() can restore polling after restart using saved OrderID+Deadline.
 //
-// Repricing Guardrails (async maker path)
-//   - Optional repricing loop honors cfg: RepriceEnable, RepriceIntervalMs, RepriceMaxCount,
-//     RepriceMaxDriftBps, RepriceMinImprovTicks, RepriceMinEdgeUSD, PriceTick, BaseStep, MinNotional.
-//
 // Pyramiding & Equity Triggers
 //   - Pyramiding adds are side-aware and gated by spacing (seconds) and adverse-move thresholds,
 //     with optional exponential decay & latching. Equity triggers can stage sizes (25/50/75/100%).
@@ -79,7 +75,7 @@ import (
 	"time"
 )
 
-const Version = 204
+const Version = 205
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
