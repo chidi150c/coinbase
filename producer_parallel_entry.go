@@ -891,6 +891,19 @@ func (t *Trader) executeProducerAllocation(
 		return fmt.Sprintf("HOLD producer=%s", req.Producer), err
 	}
 
+	// Binance market responses can contain the confirmed base and cumulative
+	// quote while leaving Price unset because a market order has no submitted
+	// limit price. Resurrected recovery obligations use this direct taker path,
+	// so normalize their confirmed execution to VWAP before observability and
+	// commitEntryFill consume the PlacedOrder. Preserve a positive broker price.
+	if case3AResurrected &&
+		placed.Price <= 0 &&
+		placed.BaseSize > 0 &&
+		placed.QuoteSpent > 0 {
+
+		placed.Price = placed.QuoteSpent / placed.BaseSize
+	}
+
 	acceptedTime := time.Now().UTC()
 	acceptedEvent := ProducerEvent{
 		Time:       acceptedTime,

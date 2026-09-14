@@ -679,3 +679,36 @@ what event arms/releases it while regime remains UP;
 whether $80,000 should be cleared or replaced with a new reference;
 how to prevent immediate re-entry loops;
 and walk through price examples around $80,000 showing when SELL is blocked versus allowed.
+=================================\
+
+Issue 1 — Case3A confirmed market fills fail state commit because execution price is zero
+
+Case3A resurrection orders are successfully accepted and filled by Binance, but the direct-market execution path records an execution price of 0.00.
+
+The fill reaches commitEntryFill() with valid filled base and quote value but an invalid zero price. The commit is rejected with:
+
+error_code=commit_invalid_execution_price
+error=invalid execution price 0.00000000
+
+Confirmed examples:
+
+Order 66555224601: SELL fill of 0.00129 BTC, quote value $101.00184.
+Order 66556724057: SELL fill of 0.00129 BTC, quote value $101.2482171.
+
+Consequences:
+
+Binance executes the SELL and changes the real account balance.
+The bot fails to commit the corresponding Case3A replacement lot.
+The Case3A obligation may not be reduced or completed correctly.
+Exchange balances and bot state can diverge.
+The unresolved obligation may become eligible for resurrection again.
+Subsequent SELL producers may see distorted resource availability.
+
+Required correction:
+
+Obtain the confirmed average execution price from Binance.
+If Binance supplies only filled base and quote value, calculate:
+executionPrice := filledQuote / filledBase
+Validate that all three values are positive.
+Commit the confirmed fill exactly once.
+Reconcile orders 66555224601 and 66556724057 before allowing their obligations to submit again.
