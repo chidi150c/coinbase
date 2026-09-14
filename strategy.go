@@ -1165,29 +1165,29 @@ func (t *Trader) applyPyramidRawTransitions(
 }
 
 // --------------------------------------------------------------------------
-// 5. Apply confidence-adjusted Pyramid transitions for the final selected side.
+// 5. Apply confidence-adjusted Pyramid transitions independently per side.
 //
 // BUY:
 //   - update BUY win/latch state
-//   - optionally rebase stale SELL latch
 //
 // SELL:
 //   - update SELL win/latch state
-//   - optionally rebase stale BUY latch
 //
+// Win learning and latch handover are side-local timer maintenance. They must
+// not depend on the legacy entry signal. Decision-driven opposite-side rebasing
+// remains isolated in applyPyramidRebaseTransactions.
 // --------------------------------------------------------------------------
 func (t *Trader) applyPyramidDecisionTransitions(
 	pyramid PyramidResult,
-	legacySignal Signal,
 ) {
 	state := pyramid.State
 
-	if legacySignal == Buy && state.Buy.UpdateWin {
+	if state.Buy.UpdateWin {
 		t.winLowBuy =
 			state.Buy.NextWin
 	}
 
-	if legacySignal == Buy && state.Buy.UpdateLatched {
+	if state.Buy.UpdateLatched {
 		t.latchedGateBuy =
 			state.Buy.NextLatched
 
@@ -1211,12 +1211,12 @@ func (t *Trader) applyPyramidDecisionTransitions(
 		}
 	}
 
-	if legacySignal == Sell && state.Sell.UpdateWin {
+	if state.Sell.UpdateWin {
 		t.winHighSell =
 			state.Sell.NextWin
 	}
 
-	if legacySignal == Sell && state.Sell.UpdateLatched {
+	if state.Sell.UpdateLatched {
 		t.latchedGateSell =
 			state.Sell.NextLatched
 

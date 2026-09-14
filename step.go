@@ -1604,19 +1604,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		pyramidRaw.State,
 	)
 
-	// Construct the legacy AI+Logic direction before any producer override.
-	// This is the selected-side raw material that owns pre-producer Pyramid
-	// win/latch progression.
-	legacyDirection := evaluateLegacyDirection(
-		aiResult,
-		macdResult,
-		emaResult,
-	)
-
-	t.applyPyramidDecisionTransitions(
-		pyramidResult,
-		legacyDirection.Signal,
-	)
+	// Win learning and latch handover are global per side and advance from
+	// their own timer-qualified Pyramid transitions, independent of any entry
+	// producer or legacy direction.
+	t.applyPyramidDecisionTransitions(pyramidResult)
 
 	equityResult, _ := t.evaluateEquityProducerMaterial(
 		aiResult,
