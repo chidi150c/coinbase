@@ -76,6 +76,10 @@ type Position struct {
 	// was created to recover. RecoveryMethod identifies Mode A vs Mode B.
 	RecoveryNetUSD float64        `json:"recovery_net_usd,omitempty"`
 	RecoveryMethod RecoveryMethod `json:"recovery_method,omitempty"`
+	// RecoveryObligationID durably links the one active consolidated recovery
+	// position to its Case3A/Case3B obligation. Additional same-obligation fills
+	// are absorbed into this Position instead of becoming independent lots.
+	RecoveryObligationID string `json:"recovery_obligation_id,omitempty"`
 	// Case3AUpRecoveryUsed is per replacement lot. It is set only after the
 	// one-time UP-regime partial-recovery profit exit is confirmed filled.
 	Case3AUpRecoveryUsed bool `json:"case3a_up_recovery_used,omitempty"`
@@ -2431,6 +2435,8 @@ const (
 	Case3AObligationReady            Case3AObligationStatus = "ready"
 	Case3AObligationActive           Case3AObligationStatus = "active"
 	Case3AObligationReconcile        Case3AObligationStatus = "reconcile"
+	Case3AObligationPositionOpen   Case3AObligationStatus = "position_open"
+	Case3AObligationAugmentPending Case3AObligationStatus = "augmentation_pending"
 )
 
 // Case3AObligation is the durable economic requirement created by a
@@ -2453,6 +2459,9 @@ type Case3AObligation struct {
 	Status               Case3AObligationStatus `json:"status"`
 	ActiveOrderID        string                 `json:"active_order_id,omitempty"`
 	ActiveDecisionID     string                 `json:"active_decision_id,omitempty"`
+	ConsolidatedEntryOrderID     string  `json:"consolidated_entry_order_id,omitempty"`
+	AugmentationSequence         int     `json:"augmentation_sequence,omitempty"`
+	AugmentationTriggerLossUSD   float64 `json:"augmentation_trigger_loss_usd,omitempty"`
 	AttemptCount         int                    `json:"attempt_count"`
 	LastReason           string                 `json:"last_reason,omitempty"`
 	CreatedAt            time.Time              `json:"created_at"`
@@ -2676,6 +2685,33 @@ func case3AObligationID(intent *PendingIntent) string {
 	return strings.TrimSpace(intent.DecisionID)
 }
 
+func (t *Trader) recoveryPositionByIdentityLocked(
+	producer EntryProducer,
+	side OrderSide,
+	entryOrderID string,
+	obligationID string,
+) (*Position, *SideBook) {
+	entryOrderID = strings.TrimSpace(entryOrderID)
+	obligationID = strings.TrimSpace(obligationID)
+	if t == nil || entryOrderID == "" || obligationID == "" {
+		return nil, nil
+	}
+	book := t.book(side)
+	if book == nil {
+		return nil, nil
+	}
+	idx := t.findLotIndexByEntryIDLocked(side, entryOrderID)
+	if idx < 0 || idx >= len(book.Lots) {
+		return nil, nil
+	}
+	lot := book.Lots[idx]
+	if lot == nil || lot.Producer != producer ||
+		strings.TrimSpace(lot.RecoveryObligationID) != obligationID {
+		return nil, nil
+	}
+	return lot, book
+}
+
 func (t *Trader) recoveryObligationForSourceLocked(
 	producer EntryProducer,
 	sourceEntryOrderID string,
@@ -2854,6 +2890,25 @@ func (t *Trader) returnCase3AObligationToTargetWaitLocked(
 	obligation.ActiveOrderID = ""
 	obligation.ActiveDecisionID = ""
 	obligation.LastReason = strings.TrimSpace(reason)
+	if pending.RecoveryAugmentation {
+		// No confirmed fill means the consolidated position and its economics
+		// remain unchanged. Re-arm the same obligation for a future distinct
+		// threshold evaluation.
+		obligation.Status = Case3AObligationPositionOpen
+		obligation.AugmentationTriggerLossUSD = 0
+		if lot, _ := t.recoveryPositionByIdentityLocked(
+			pending.Producer,
+			pending.Side,
+			pending.ConsolidationEntryOrderID,
+			id,
+		); lot != nil {
+			lot.Case3AReplacementStarted = false
+			lot.Case3AReplacementOrderID = ""
+		}
+		obligation.UpdatedAt = time.Now().UTC()
+		delete(retries, id)
+		return
+	}
 	// ready identifies an accepted initial Case3A attempt (Mode A or Mode B)
 	// that has now failed out unfilled or only partially filled. The obligation
 	// takes over the remainder, but it cannot execute while the source position
@@ -2887,6 +2942,12 @@ func (t *Trader) prepareCase3AObligationFillLocked(
 
 	obligations, _ := t.recoveryObligationMapsLocked(pending.Producer)
 	obligation := obligations[case3AObligationID(pending)]
+	if pending.RecoveryAugmentation {
+		// The live destination retains its previous recovery amount. The
+		// augmentation trigger increment is applied atomically during
+		// consolidation, not apportioned out of the obligation here.
+		return obligation, 0
+	}
 	if obligation == nil || obligation.RemainingBase <= 0 {
 		return obligation, pending.RecoveryNetUSD
 	}
@@ -2928,7 +2989,39 @@ func (t *Trader) completeCase3AObligationLocked(
 	id := case3AObligationID(pending)
 	obligations, retries := t.recoveryObligationMapsLocked(pending.Producer)
 	delete(retries, id)
-	delete(obligations, id)
+	consolidatedEntryOrderID := strings.TrimSpace(
+		completed.ConsolidatedEntryOrderID,
+	)
+	if pending.RecoveryAugmentation {
+		consolidatedEntryOrderID = strings.TrimSpace(
+			pending.ConsolidationEntryOrderID,
+		)
+	}
+	if consolidatedEntryOrderID == "" {
+		consolidatedEntryOrderID = strings.TrimSpace(orderID)
+	}
+	if lot, _ := t.recoveryPositionByIdentityLocked(
+		pending.Producer,
+		pending.Side,
+		consolidatedEntryOrderID,
+		id,
+	); lot != nil {
+		// The obligation now owns the live consolidated recovery position and
+		// survives until that position's final recovery exit.
+		completed.Status = Case3AObligationPositionOpen
+		completed.ConsolidatedEntryOrderID = lot.EntryOrderID
+		completed.SourceEntryOrderID = lot.EntryOrderID
+		completed.ActiveOrderID = ""
+		completed.ActiveDecisionID = ""
+		completed.RemainingBase = 0
+		completed.RecoveryRemainingUSD = lot.RecoveryNetUSD
+		completed.ProfitGateUSD = lot.ProfitGateUSD
+		completed.AugmentationTriggerLossUSD = 0
+		completed.UpdatedAt = time.Now().UTC()
+		obligations[id] = completed
+	} else {
+		delete(obligations, id)
+	}
 
 	if err := t.saveStateNoLock(); err != nil {
 		// The exchange fill committed, but durable deletion was not confirmed.
@@ -2963,6 +3056,37 @@ func (t *Trader) commitCase3AObligationFillLocked(
 	obligation := obligations[id]
 	if obligation == nil {
 		return
+	}
+	if pending.RecoveryAugmentation {
+		// Whatever quantity the exchange authoritatively filled has already
+		// been consolidated. The unfilled remainder contributes no cost, fee,
+		// profit gate, or trigger-loss increment.
+		if lot, _ := t.recoveryPositionByIdentityLocked(
+			pending.Producer,
+			pending.Side,
+			pending.ConsolidationEntryOrderID,
+			id,
+		); lot != nil {
+			obligation.RemainingBase = 0
+			obligation.RecoveryRemainingUSD = lot.RecoveryNetUSD
+			obligation.ProfitGateUSD = lot.ProfitGateUSD
+			completed := *obligation
+			t.completeCase3AObligationLocked(pending, orderID, &completed)
+			return
+		}
+		obligation.Status = Case3AObligationReconcile
+		obligation.UpdatedAt = time.Now().UTC()
+		return
+	}
+	if strings.TrimSpace(obligation.ConsolidatedEntryOrderID) == "" {
+		if lot, _ := t.recoveryPositionByIdentityLocked(
+			pending.Producer,
+			pending.Side,
+			orderID,
+			id,
+		); lot != nil {
+			obligation.ConsolidatedEntryOrderID = lot.EntryOrderID
+		}
 	}
 
 	obligation.RemainingBase = math.Max(0, obligation.RemainingBase-filledBase)
@@ -3314,6 +3438,13 @@ func (t *Trader) closeLot(
 				reasonPrefix = "case3B"
 				modeABlockedStage = ProducerStageCase3BModeABlocked
 			}
+			recoveryAugmentation := lot.Producer == replacementProducer
+			if recoveryAugmentation && lot.Case3AReplacementStarted {
+				return fmt.Sprintf(
+					"RECOVERY_AUGMENTATION_EXISTS side=%s entry_id=%s augmentation_order_id=%s",
+					lot.Side, lot.EntryOrderID, lot.Case3AReplacementOrderID,
+				), false, nil
+			}
 
 			// A losing SELL threshold stop is the Case3A decision boundary.
 			// Create the producer lifecycle immediately so blocked recovery
@@ -3322,6 +3453,19 @@ func (t *Trader) closeLot(
 				Side:                lot.Side,
 				SourceEntryOrderID:  lot.EntryOrderID,
 				Producer:            replacementProducer,
+				RecoveryAugmentation: recoveryAugmentation,
+				ConsolidationEntryOrderID: func() string {
+					if recoveryAugmentation {
+						return lot.EntryOrderID
+					}
+					return ""
+				}(),
+				AugmentationTriggerLossUSD: func() float64 {
+					if recoveryAugmentation {
+						return recoveryLossUSD
+					}
+					return 0
+				}(),
 				PendingCancelPolicy: PendingSignalCancelDisabled,
 				ProducerReason: fmt.Sprintf(
 					reasonPrefix+"_decision|"+
@@ -3344,12 +3488,25 @@ func (t *Trader) closeLot(
 					"Case3A decision: failed to create producer lifecycle",
 				)
 			}
-			if existing := t.recoveryObligationForSourceLocked(
-				replacementProducer, lot.EntryOrderID,
-			); existing != nil {
+			var existing *Case3AObligation
+			if recoveryAugmentation && strings.TrimSpace(lot.RecoveryObligationID) != "" {
+				obligations, _ := t.recoveryObligationMapsLocked(replacementProducer)
+				existing = obligations[lot.RecoveryObligationID]
+			}
+			if existing == nil {
+				existing = t.recoveryObligationForSourceLocked(
+					replacementProducer, lot.EntryOrderID,
+				)
+			}
+			if existing != nil {
 				repl.ObligationID = existing.ObligationID
 			} else {
 				repl.ObligationID = repl.DecisionID
+			}
+			if recoveryAugmentation {
+				// Adoption path for recovery positions created by older state
+				// versions, which did not persist obligation ownership on Position.
+				lot.RecoveryObligationID = repl.ObligationID
 			}
 			repl.ProducerReason = strings.TrimSpace(
 				repl.ProducerReason +
@@ -3568,13 +3725,26 @@ func (t *Trader) closeLot(
 		repl.Quote = repl.LimitPx * repl.BaseAtLimit
 		obligations, _ := t.recoveryObligationMapsLocked(repl.Producer)
 		if existing := obligations[repl.ObligationID]; existing != nil {
-			repl.Side = existing.Side
-			repl.LimitPx = existing.TargetPrice
-			repl.BaseAtLimit = existing.RemainingBase
-			repl.Quote = repl.LimitPx * repl.BaseAtLimit
-			repl.RecoveryMethod = existing.RecoveryMethod
-			repl.RecoveryNetUSD = existing.RecoveryRemainingUSD
-			repl.ProfitGateUSD = existing.ProfitGateUSD
+			if repl.RecoveryAugmentation {
+				// The existing obligation owns the live consolidated position. Keep
+				// the freshly computed augmentation size and recovery increment; do
+				// not replace them with the completed initial-fill targets.
+				existing.TargetPrice = repl.LimitPx
+				existing.TargetBase = repl.BaseAtLimit
+				existing.RemainingBase = repl.BaseAtLimit
+				existing.AugmentationTriggerLossUSD = repl.AugmentationTriggerLossUSD
+				existing.AugmentationSequence++
+				existing.Status = Case3AObligationAugmentPending
+				existing.UpdatedAt = time.Now().UTC()
+			} else {
+				repl.Side = existing.Side
+				repl.LimitPx = existing.TargetPrice
+				repl.BaseAtLimit = existing.RemainingBase
+				repl.Quote = repl.LimitPx * repl.BaseAtLimit
+				repl.RecoveryMethod = existing.RecoveryMethod
+				repl.RecoveryNetUSD = existing.RecoveryRemainingUSD
+				repl.ProfitGateUSD = existing.ProfitGateUSD
+			}
 		}
 		obligation := t.ensureCase3AObligationLocked(&repl, "")
 		if obligation == nil {
@@ -3582,7 +3752,18 @@ func (t *Trader) closeLot(
 				"Case3A decision: failed to create durable obligation",
 			)
 		}
-		obligation.Status = Case3AObligationWaiting
+		if repl.RecoveryAugmentation {
+			obligation.Status = Case3AObligationAugmentPending
+			// Proposed augmentation economics are not committed until a confirmed
+			// fill is consolidated. Preserve the live position's authoritative
+			// recovery and ordinary-profit balances meanwhile.
+			obligation.RecoveryOriginalUSD = lot.RecoveryNetUSD
+			obligation.RecoveryRemainingUSD = lot.RecoveryNetUSD
+			obligation.ProfitGateUSD = t.lotProfitGateUSD(lot)
+			obligation.ConsolidatedEntryOrderID = lot.EntryOrderID
+		} else {
+			obligation.Status = Case3AObligationWaiting
+		}
 		obligation.UpdatedAt = time.Now().UTC()
 		if err := t.saveStateNoLock(); err != nil {
 			return "", false, fmt.Errorf(
@@ -3590,6 +3771,76 @@ func (t *Trader) closeLot(
 				err,
 			)
 		}
+	}
+
+	// A threshold stop on an existing Case3A/Case3B position is an
+	// augmentation trigger, not a loss exit. Start the already-selected
+	// same-side recovery entry and leave the source position untouched. Its
+	// confirmed fill is atomically absorbed by commitEntryFill.
+	if repl.Enabled && repl.RecoveryAugmentation {
+		attempt := recoveryAttempt
+		if attempt == nil {
+			return "", false, errors.New(
+				"Case3A augmentation: missing decision lifecycle",
+			)
+		}
+
+		t.mu.Unlock()
+		oid, augmentErr := t.startCase3AReplacement(ctx, &repl, attempt)
+		t.mu.Lock()
+
+		t.recordProducerAttemptLocked(attempt)
+		if err := t.saveProducerHistoryNoLock(); err != nil {
+			log.Printf(
+				"[WARN] producer history save failed producer=%s decision_id=%s err=%v",
+				attempt.Producer, attempt.DecisionID, err,
+			)
+		}
+
+		obligations, _ := t.recoveryObligationMapsLocked(repl.Producer)
+		obligation := obligations[repl.ObligationID]
+		if augmentErr != nil {
+			if obligation != nil && obligation.Status != Case3AObligationReconcile {
+				obligation.Status = Case3AObligationPositionOpen
+				obligation.ActiveOrderID = ""
+				obligation.ActiveDecisionID = ""
+				obligation.LastReason = fmt.Sprintf(
+					"augmentation_entry_failed: %v", augmentErr,
+				)
+				obligation.UpdatedAt = time.Now().UTC()
+				_ = t.saveStateNoLock()
+			}
+			return "", false, fmt.Errorf(
+				"Case3A augmentation failed; recovery loss exit suppressed entry_id=%s: %w",
+				entryOrderID, augmentErr,
+			)
+		}
+
+		if obligation != nil {
+			obligation.Status = Case3AObligationAugmentPending
+			obligation.ActiveOrderID = strings.TrimSpace(oid)
+			obligation.ActiveDecisionID = strings.TrimSpace(repl.DecisionID)
+			obligation.UpdatedAt = time.Now().UTC()
+		}
+		lot.Case3AReplacementStarted = true
+		lot.Case3AReplacementOrderID = oid
+		_ = t.saveStateNoLock()
+
+		return fmt.Sprintf(
+			"RECOVERY_AUGMENTATION_PENDING side=%s entry_id=%s augmentation_order_id=%s obligation_id=%s trigger_loss_usd=%.6f",
+			lot.Side, lot.EntryOrderID, oid, repl.ObligationID,
+			repl.AugmentationTriggerLossUSD,
+		), true, nil
+	}
+	if isRecoveryReplacementProducer(lot.Producer) &&
+		strings.HasPrefix(exitReason, "threshold_stop_loss") {
+		// Recovery lots are never closed at a threshold loss. If an
+		// augmentation could not be formed this tick, retain the position and
+		// let a later tick retry the trigger conditions.
+		return fmt.Sprintf(
+			"RECOVERY_LOSS_EXIT_SUPPRESSED side=%s entry_id=%s producer=%s",
+			lot.Side, lot.EntryOrderID, lot.Producer,
+		), false, nil
 	}
 
 	// ============================================================================
@@ -4564,6 +4815,15 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 			),
 		)
 	}
+	if isRecoveryReplacementProducer(lot.Producer) &&
+		strings.TrimSpace(lot.RecoveryObligationID) != "" {
+		obligations, _ := t.recoveryObligationMapsLocked(lot.Producer)
+		if obligation := obligations[lot.RecoveryObligationID]; obligation != nil {
+			obligation.RecoveryRemainingUSD = lot.RecoveryNetUSD
+			obligation.ProfitGateUSD = lot.ProfitGateUSD
+			obligation.UpdatedAt = time.Now().UTC()
+		}
+	}
 
 	removedWasRunner := false
 	for _, rid := range book.RunnerIDs {
@@ -4772,6 +5032,13 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 	}
 
 	book.Lots = append(book.Lots[:localIdx], book.Lots[localIdx+1:]...)
+	if isRecoveryReplacementProducer(lot.Producer) &&
+		strings.TrimSpace(lot.RecoveryObligationID) != "" &&
+		(case3AFinalRecovery || lot.RecoveryNetUSD <= case3AFillTol) {
+		obligations, retries := t.recoveryObligationMapsLocked(lot.Producer)
+		delete(retries, lot.RecoveryObligationID)
+		delete(obligations, lot.RecoveryObligationID)
+	}
 
 	if len(book.RunnerIDs) > 0 {
 		out := book.RunnerIDs[:0]
@@ -5483,6 +5750,9 @@ type PendingIntent struct {
 	SourceEntryOrderID  string                    `json:"source_entry_order_id,omitempty"`
 	SourceExitOrderID   string                    `json:"source_exit_order_id,omitempty"`
 	ObligationID        string                    `json:"case3a_obligation_id,omitempty"`
+	RecoveryAugmentation       bool                    `json:"recovery_augmentation,omitempty"`
+	ConsolidationEntryOrderID  string                  `json:"consolidation_entry_order_id,omitempty"`
+	AugmentationTriggerLossUSD float64                 `json:"augmentation_trigger_loss_usd,omitempty"`
 	PendingCancelPolicy PendingSignalCancelPolicy `json:"pending_cancel_policy,omitempty"`
 }
 
@@ -6714,7 +6984,11 @@ func (t *Trader) registerPendingEntry(
 		// Mode A or Mode B. Keep the associated obligation ready; active is
 		// reserved for resurrection ownership after that accepted initial
 		// attempt is unsuccessful or partial.
-		obligation.Status = Case3AObligationReady
+		if entry.Intent.RecoveryAugmentation {
+			obligation.Status = Case3AObligationAugmentPending
+		} else {
+			obligation.Status = Case3AObligationReady
+		}
 		obligation.ActiveOrderID = orderID
 		obligation.ActiveDecisionID = strings.TrimSpace(entry.Intent.DecisionID)
 		obligation.AttemptCount++
@@ -8860,6 +9134,7 @@ func (t *Trader) commitEntryFill(
 		ProfitGateUSD:    pending.ProfitGateUSD,
 		RecoveryNetUSD:   pending.RecoveryNetUSD,
 		RecoveryMethod:   pending.RecoveryMethod,
+		RecoveryObligationID: pending.ObligationID,
 
 		Producer: entry.Producer,
 	}
@@ -8887,10 +9162,121 @@ func (t *Trader) commitEntryFill(
 	// newLot.EntryOrderID,
 	// )
 
-	book.Lots = append(
-		book.Lots,
-		newLot,
+
+	destinationEntryOrderID := strings.TrimSpace(
+		pending.ConsolidationEntryOrderID,
 	)
+	if destinationEntryOrderID == "" &&
+		isRecoveryReplacementProducer(entry.Producer) {
+		obligations, _ := t.recoveryObligationMapsLocked(entry.Producer)
+		if obligation := obligations[pending.ObligationID]; obligation != nil {
+			destinationEntryOrderID = strings.TrimSpace(
+				obligation.ConsolidatedEntryOrderID,
+			)
+		}
+	}
+	destination, destinationBook := t.recoveryPositionByIdentityLocked(
+		entry.Producer,
+		side,
+		destinationEntryOrderID,
+		pending.ObligationID,
+	)
+	consolidateRecoveryFill := pending.RecoveryAugmentation ||
+		(isRecoveryReplacementProducer(entry.Producer) && destination != nil)
+	if consolidateRecoveryFill {
+		if destination == nil || destinationBook != book ||
+			destination.Side != side {
+			return &EntryProduceError{
+				Code: EntryProduceErrCommitNilPositionBook,
+				Producer: entry.Producer, Side: fmt.Sprint(side), OrderID: res.OrderID,
+				Err: fmt.Errorf(
+					"augmentation destination missing obligation_id=%s destination_entry_id=%s",
+					pending.ObligationID, pending.ConsolidationEntryOrderID,
+				),
+			}
+		}
+		if wanted := strings.TrimSpace(pending.ConsolidationEntryOrderID); pending.RecoveryAugmentation &&
+			wanted != "" &&
+			strings.TrimSpace(destination.EntryOrderID) != wanted {
+			return &EntryProduceError{
+				Code: EntryProduceErrCommitNilPositionBook,
+				Producer: entry.Producer, Side: fmt.Sprint(side), OrderID: res.OrderID,
+				Err: fmt.Errorf(
+					"augmentation destination changed obligation_id=%s wanted=%s found=%s",
+					pending.ObligationID, wanted, destination.EntryOrderID,
+				),
+			}
+		}
+
+		beforeBase := destination.SizeBase
+		beforeNotional := destination.OpenNotionalUSD
+		if beforeNotional <= 0 {
+			beforeNotional = destination.OpenPrice * destination.SizeBase
+		}
+		beforeFee := destination.EntryFee
+		beforeGate := t.lotProfitGateUSD(destination)
+		beforeRecovery := destination.RecoveryNetUSD
+
+		fillRatio := 1.0
+		if pending.BaseAtLimit > 0 && baseToUse < pending.BaseAtLimit {
+			fillRatio = baseToUse / pending.BaseAtLimit
+		}
+		if fillRatio < 0 {
+			fillRatio = 0
+		}
+		if fillRatio > 1 {
+			fillRatio = 1
+		}
+		triggerApplied := 0.0
+		profitAfter := beforeGate
+		if pending.RecoveryAugmentation {
+			triggerApplied = pending.AugmentationTriggerLossUSD * fillRatio
+			profitAfter += newLot.ProfitGateUSD * fillRatio
+		} else {
+			// A later partial fill of the same original obligation contributes
+			// its apportioned recovery, but not another copy of the ordinary gate.
+			triggerApplied = pending.RecoveryNetUSD
+			if profitAfter <= 0 {
+				profitAfter = newLot.ProfitGateUSD
+			}
+		}
+
+		destination.SizeBase = beforeBase + baseToUse
+		destination.OpenNotionalUSD = beforeNotional + quoteSpent
+		destination.OpenPrice = destination.OpenNotionalUSD / destination.SizeBase
+		destination.EntryFee = beforeFee + entryFee
+		destination.ProfitGateUSD = profitAfter
+		destination.RecoveryNetUSD = beforeRecovery + triggerApplied
+		destination.RecoveryMethod = pending.RecoveryMethod
+		destination.ProfitTrailActive = false
+		destination.ProfitPeakUSD = 0
+		destination.Take = 0
+		destination.Case3AReplacementStarted = false
+		destination.Case3AReplacementOrderID = ""
+		consolidationAudit := strings.TrimSpace(fmt.Sprintf(
+			"%s|recovery_consolidated=true|obligation_id=%s|absorbed_order_id=%s|"+
+				"before_base=%.8f|after_base=%.8f|before_cost=%.8f|after_cost=%.8f|"+
+				"before_fee=%.8f|after_fee=%.8f|before_profit_gate=%.8f|after_profit_gate=%.8f|"+
+				"before_recovery=%.8f|trigger_loss_applied=%.8f|after_recovery=%.8f",
+			destination.ProducerReason, pending.ObligationID, res.OrderID,
+			beforeBase, destination.SizeBase, beforeNotional, destination.OpenNotionalUSD,
+			beforeFee, destination.EntryFee, beforeGate, destination.ProfitGateUSD,
+			beforeRecovery, triggerApplied, destination.RecoveryNetUSD,
+		))
+		destination.ProducerReason = consolidationAudit
+		pending.ProducerReason = consolidationAudit
+		addCommitProducerEvent(
+			ProducerStage("consolidated"),
+			res.OrderID,
+			nil,
+			true,
+		)
+	} else {
+		book.Lots = append(
+			book.Lots,
+			newLot,
+		)
+	}
 
 	t.consolidateDust(
 		book,
@@ -9130,6 +9516,20 @@ func (t *Trader) Case3ACommitEligible(
 
 	if sourceEntryOrderID == "" {
 		return false
+	}
+
+	if entry.Intent.RecoveryAugmentation {
+		// An augmentation is valid only while its same-obligation destination
+		// remains live; that position is intentionally not exited.
+		lot, _ := t.recoveryPositionByIdentityLocked(
+			entry.Producer,
+			entry.Side,
+			entry.Intent.ConsolidationEntryOrderID,
+			entry.Intent.ObligationID,
+		)
+		return lot != nil &&
+			strings.TrimSpace(lot.EntryOrderID) ==
+				strings.TrimSpace(entry.Intent.ConsolidationEntryOrderID)
 	}
 
 	// The originating exit is considered successfully committed only after
