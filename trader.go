@@ -2435,9 +2435,9 @@ const (
 	Case3AObligationReady            Case3AObligationStatus = "ready"
 	Case3AObligationActive           Case3AObligationStatus = "active"
 	Case3AObligationReconcile        Case3AObligationStatus = "reconcile"
-	Case3AObligationPositionOpen   Case3AObligationStatus = "position_open"
-	Case3AObligationAugmentPending Case3AObligationStatus = "augmentation_pending"
-	Case3AObligationWaitingForFunds Case3AObligationStatus = "waiting_for_funds"
+	Case3AObligationPositionOpen     Case3AObligationStatus = "position_open"
+	Case3AObligationAugmentPending   Case3AObligationStatus = "augmentation_pending"
+	Case3AObligationWaitingForFunds  Case3AObligationStatus = "waiting_for_funds"
 )
 
 // Case3AObligation is the durable economic requirement created by a
@@ -2445,29 +2445,29 @@ const (
 // come and go; this record survives until the requested replacement quantity
 // has actually filled and committed.
 type Case3AObligation struct {
-	ObligationID         string                 `json:"obligation_id"`
-	OriginDecisionID     string                 `json:"origin_decision_id"`
-	SourceEntryOrderID   string                 `json:"source_entry_order_id"`
-	SourceExitOrderID    string                 `json:"source_exit_order_id,omitempty"`
-	Side                 OrderSide              `json:"side"`
-	RecoveryMethod       RecoveryMethod         `json:"recovery_method"`
-	TargetPrice          float64                `json:"target_price"`
-	TargetBase           float64                `json:"target_base"`
-	RemainingBase        float64                `json:"remaining_base"`
-	RecoveryOriginalUSD  float64                `json:"recovery_original_usd"`
-	RecoveryRemainingUSD float64                `json:"recovery_remaining_usd"`
-	ProfitGateUSD        float64                `json:"profit_gate_usd"`
-	Status               Case3AObligationStatus `json:"status"`
-	ActiveOrderID        string                 `json:"active_order_id,omitempty"`
-	ActiveDecisionID     string                 `json:"active_decision_id,omitempty"`
-	ConsolidatedEntryOrderID     string  `json:"consolidated_entry_order_id,omitempty"`
-	AugmentationSequence         int     `json:"augmentation_sequence,omitempty"`
-	AugmentationTriggerLossUSD   float64 `json:"augmentation_trigger_loss_usd,omitempty"`
-	AugmentationProfitGateUSD    float64 `json:"augmentation_profit_gate_usd,omitempty"`
-	AttemptCount         int                    `json:"attempt_count"`
-	LastReason           string                 `json:"last_reason,omitempty"`
-	CreatedAt            time.Time              `json:"created_at"`
-	UpdatedAt            time.Time              `json:"updated_at"`
+	ObligationID               string                 `json:"obligation_id"`
+	OriginDecisionID           string                 `json:"origin_decision_id"`
+	SourceEntryOrderID         string                 `json:"source_entry_order_id"`
+	SourceExitOrderID          string                 `json:"source_exit_order_id,omitempty"`
+	Side                       OrderSide              `json:"side"`
+	RecoveryMethod             RecoveryMethod         `json:"recovery_method"`
+	TargetPrice                float64                `json:"target_price"`
+	TargetBase                 float64                `json:"target_base"`
+	RemainingBase              float64                `json:"remaining_base"`
+	RecoveryOriginalUSD        float64                `json:"recovery_original_usd"`
+	RecoveryRemainingUSD       float64                `json:"recovery_remaining_usd"`
+	ProfitGateUSD              float64                `json:"profit_gate_usd"`
+	Status                     Case3AObligationStatus `json:"status"`
+	ActiveOrderID              string                 `json:"active_order_id,omitempty"`
+	ActiveDecisionID           string                 `json:"active_decision_id,omitempty"`
+	ConsolidatedEntryOrderID   string                 `json:"consolidated_entry_order_id,omitempty"`
+	AugmentationSequence       int                    `json:"augmentation_sequence,omitempty"`
+	AugmentationTriggerLossUSD float64                `json:"augmentation_trigger_loss_usd,omitempty"`
+	AugmentationProfitGateUSD  float64                `json:"augmentation_profit_gate_usd,omitempty"`
+	AttemptCount               int                    `json:"attempt_count"`
+	LastReason                 string                 `json:"last_reason,omitempty"`
+	CreatedAt                  time.Time              `json:"created_at"`
+	UpdatedAt                  time.Time              `json:"updated_at"`
 }
 
 type Case3AObligationSnapshot struct {
@@ -3483,9 +3483,9 @@ func (t *Trader) closeLot(
 			// Create the producer lifecycle immediately so blocked recovery
 			// attempts remain observable instead of disappearing silently.
 			repl = PendingIntent{
-				Side:                lot.Side,
-				SourceEntryOrderID:  lot.EntryOrderID,
-				Producer:            replacementProducer,
+				Side:                 lot.Side,
+				SourceEntryOrderID:   lot.EntryOrderID,
+				Producer:             replacementProducer,
 				RecoveryAugmentation: recoveryAugmentation,
 				ConsolidationEntryOrderID: func() string {
 					if recoveryAugmentation {
@@ -5813,13 +5813,13 @@ type PendingIntent struct {
 
 	// Empty for normal entries.
 	// Case3A uses this to identify the entry that caused the replacement.
-	SourceEntryOrderID  string                    `json:"source_entry_order_id,omitempty"`
-	SourceExitOrderID   string                    `json:"source_exit_order_id,omitempty"`
-	ObligationID        string                    `json:"case3a_obligation_id,omitempty"`
-	RecoveryAugmentation       bool                    `json:"recovery_augmentation,omitempty"`
-	ConsolidationEntryOrderID  string                  `json:"consolidation_entry_order_id,omitempty"`
-	AugmentationTriggerLossUSD float64                 `json:"augmentation_trigger_loss_usd,omitempty"`
-	PendingCancelPolicy PendingSignalCancelPolicy `json:"pending_cancel_policy,omitempty"`
+	SourceEntryOrderID         string                    `json:"source_entry_order_id,omitempty"`
+	SourceExitOrderID          string                    `json:"source_exit_order_id,omitempty"`
+	ObligationID               string                    `json:"case3a_obligation_id,omitempty"`
+	RecoveryAugmentation       bool                      `json:"recovery_augmentation,omitempty"`
+	ConsolidationEntryOrderID  string                    `json:"consolidation_entry_order_id,omitempty"`
+	AugmentationTriggerLossUSD float64                   `json:"augmentation_trigger_loss_usd,omitempty"`
+	PendingCancelPolicy        PendingSignalCancelPolicy `json:"pending_cancel_policy,omitempty"`
 }
 
 func (t *Trader) positionExistsByEntryOrderID(orderID string) bool {
@@ -9194,12 +9194,12 @@ func (t *Trader) commitEntryFill(
 		Version:         Version,
 		EntryOrderID:    res.OrderID,
 
-		RefundPortionUSD: pending.RefundPortionUSD,
-		ConfidenceMult:   pending.ConfidenceMult,
-		EntryMethod:      pending.EntryMethod,
-		ProfitGateUSD:    pending.ProfitGateUSD,
-		RecoveryNetUSD:   pending.RecoveryNetUSD,
-		RecoveryMethod:   pending.RecoveryMethod,
+		RefundPortionUSD:     pending.RefundPortionUSD,
+		ConfidenceMult:       pending.ConfidenceMult,
+		EntryMethod:          pending.EntryMethod,
+		ProfitGateUSD:        pending.ProfitGateUSD,
+		RecoveryNetUSD:       pending.RecoveryNetUSD,
+		RecoveryMethod:       pending.RecoveryMethod,
 		RecoveryObligationID: pending.ObligationID,
 
 		Producer: entry.Producer,
@@ -9228,7 +9228,6 @@ func (t *Trader) commitEntryFill(
 	// newLot.EntryOrderID,
 	// )
 
-
 	destinationEntryOrderID := strings.TrimSpace(
 		pending.ConsolidationEntryOrderID,
 	)
@@ -9253,7 +9252,7 @@ func (t *Trader) commitEntryFill(
 		if destination == nil || destinationBook != book ||
 			destination.Side != side {
 			return &EntryProduceError{
-				Code: EntryProduceErrCommitNilPositionBook,
+				Code:     EntryProduceErrCommitNilPositionBook,
 				Producer: entry.Producer, Side: fmt.Sprint(side), OrderID: res.OrderID,
 				Err: fmt.Errorf(
 					"augmentation destination missing obligation_id=%s destination_entry_id=%s",
@@ -9265,7 +9264,7 @@ func (t *Trader) commitEntryFill(
 			wanted != "" &&
 			strings.TrimSpace(destination.EntryOrderID) != wanted {
 			return &EntryProduceError{
-				Code: EntryProduceErrCommitNilPositionBook,
+				Code:     EntryProduceErrCommitNilPositionBook,
 				Producer: entry.Producer, Side: fmt.Sprint(side), OrderID: res.OrderID,
 				Err: fmt.Errorf(
 					"augmentation destination changed obligation_id=%s wanted=%s found=%s",
