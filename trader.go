@@ -2437,6 +2437,7 @@ const (
 	Case3AObligationReconcile        Case3AObligationStatus = "reconcile"
 	Case3AObligationPositionOpen   Case3AObligationStatus = "position_open"
 	Case3AObligationAugmentPending Case3AObligationStatus = "augmentation_pending"
+	Case3AObligationWaitingForFunds Case3AObligationStatus = "waiting_for_funds"
 )
 
 // Case3AObligation is the durable economic requirement created by a
@@ -2462,6 +2463,7 @@ type Case3AObligation struct {
 	ConsolidatedEntryOrderID     string  `json:"consolidated_entry_order_id,omitempty"`
 	AugmentationSequence         int     `json:"augmentation_sequence,omitempty"`
 	AugmentationTriggerLossUSD   float64 `json:"augmentation_trigger_loss_usd,omitempty"`
+	AugmentationProfitGateUSD    float64 `json:"augmentation_profit_gate_usd,omitempty"`
 	AttemptCount         int                    `json:"attempt_count"`
 	LastReason           string                 `json:"last_reason,omitempty"`
 	CreatedAt            time.Time              `json:"created_at"`
@@ -2895,7 +2897,9 @@ func (t *Trader) returnCase3AObligationToTargetWaitLocked(
 		// remain unchanged. Re-arm the same obligation for a future distinct
 		// threshold evaluation.
 		obligation.Status = Case3AObligationPositionOpen
+		obligation.RemainingBase = 0
 		obligation.AugmentationTriggerLossUSD = 0
+		obligation.AugmentationProfitGateUSD = 0
 		if lot, _ := t.recoveryPositionByIdentityLocked(
 			pending.Producer,
 			pending.Side,
@@ -3017,6 +3021,7 @@ func (t *Trader) completeCase3AObligationLocked(
 		completed.RecoveryRemainingUSD = lot.RecoveryNetUSD
 		completed.ProfitGateUSD = lot.ProfitGateUSD
 		completed.AugmentationTriggerLossUSD = 0
+		completed.AugmentationProfitGateUSD = 0
 		completed.UpdatedAt = time.Now().UTC()
 		obligations[id] = completed
 	} else {
@@ -3058,18 +3063,46 @@ func (t *Trader) commitCase3AObligationFillLocked(
 		return
 	}
 	if pending.RecoveryAugmentation {
-		// Whatever quantity the exchange authoritatively filled has already
-		// been consolidated. The unfilled remainder contributes no cost, fee,
-		// profit gate, or trigger-loss increment.
+		// Confirmed quantity has already been consolidated. Preserve any
+		// uncovered portion, with proportional frozen economics, under the same
+		// obligation in waiting_for_funds.
 		if lot, _ := t.recoveryPositionByIdentityLocked(
 			pending.Producer,
 			pending.Side,
 			pending.ConsolidationEntryOrderID,
 			id,
 		); lot != nil {
-			obligation.RemainingBase = 0
+			requestedBase := obligation.RemainingBase
+			if requestedBase <= 0 {
+				requestedBase = pending.BaseAtLimit
+			}
+			remainingBase := math.Max(0, requestedBase-filledBase)
 			obligation.RecoveryRemainingUSD = lot.RecoveryNetUSD
 			obligation.ProfitGateUSD = lot.ProfitGateUSD
+			const augmentationBaseTolerance = 1e-12
+			if remainingBase > augmentationBaseTolerance {
+				remainingRatio := 0.0
+				if requestedBase > 0 {
+					remainingRatio = remainingBase / requestedBase
+				}
+				obligation.RemainingBase = remainingBase
+				obligation.AugmentationTriggerLossUSD =
+					pending.AugmentationTriggerLossUSD * remainingRatio
+				obligation.AugmentationProfitGateUSD =
+					pending.ProfitGateUSD * remainingRatio
+				obligation.Status = Case3AObligationWaitingForFunds
+				obligation.ActiveOrderID = ""
+				obligation.ActiveDecisionID = ""
+				obligation.LastReason = fmt.Sprintf(
+					"reduced_augmentation_fill|order_id=%s|filled_base=%.8f|remaining_base=%.8f",
+					strings.TrimSpace(orderID), filledBase, remainingBase,
+				)
+				obligation.UpdatedAt = time.Now().UTC()
+				return
+			}
+			obligation.RemainingBase = 0
+			obligation.AugmentationTriggerLossUSD = 0
+			obligation.AugmentationProfitGateUSD = 0
 			completed := *obligation
 			t.completeCase3AObligationLocked(pending, orderID, &completed)
 			return
@@ -3482,12 +3515,6 @@ func (t *Trader) closeLot(
 				),
 			}
 
-			recoveryAttempt = newProducerIntentLifecycle(&repl)
-			if recoveryAttempt == nil {
-				return "", false, errors.New(
-					"Case3A decision: failed to create producer lifecycle",
-				)
-			}
 			var existing *Case3AObligation
 			if recoveryAugmentation && strings.TrimSpace(lot.RecoveryObligationID) != "" {
 				obligations, _ := t.recoveryObligationMapsLocked(replacementProducer)
@@ -3496,6 +3523,28 @@ func (t *Trader) closeLot(
 			if existing == nil {
 				existing = t.recoveryObligationForSourceLocked(
 					replacementProducer, lot.EntryOrderID,
+				)
+			}
+			if recoveryAugmentation &&
+				existing != nil &&
+				existing.Status == Case3AObligationWaitingForFunds {
+
+				// The same obligation already owns an unfilled augmentation.
+				// Keep its frozen quantity and economics intact. A threshold scan
+				// must not overwrite waiting_for_funds, increment the sequence, or
+				// submit another order on every hot-path cycle.
+				return fmt.Sprintf(
+					"RECOVERY_AUGMENTATION_WAITING_FOR_FUNDS side=%s entry_id=%s obligation_id=%s remaining_base=%.8f",
+					lot.Side,
+					lot.EntryOrderID,
+					existing.ObligationID,
+					existing.RemainingBase,
+				), false, nil
+			}
+			recoveryAttempt = newProducerIntentLifecycle(&repl)
+			if recoveryAttempt == nil {
+				return "", false, errors.New(
+					"Case3A decision: failed to create producer lifecycle",
 				)
 			}
 			if existing != nil {
@@ -3733,6 +3782,7 @@ func (t *Trader) closeLot(
 				existing.TargetBase = repl.BaseAtLimit
 				existing.RemainingBase = repl.BaseAtLimit
 				existing.AugmentationTriggerLossUSD = repl.AugmentationTriggerLossUSD
+				existing.AugmentationProfitGateUSD = repl.ProfitGateUSD
 				existing.AugmentationSequence++
 				existing.Status = Case3AObligationAugmentPending
 				existing.UpdatedAt = time.Now().UTC()
@@ -3761,6 +3811,8 @@ func (t *Trader) closeLot(
 			obligation.RecoveryRemainingUSD = lot.RecoveryNetUSD
 			obligation.ProfitGateUSD = t.lotProfitGateUSD(lot)
 			obligation.ConsolidatedEntryOrderID = lot.EntryOrderID
+			obligation.AugmentationTriggerLossUSD = repl.AugmentationTriggerLossUSD
+			obligation.AugmentationProfitGateUSD = repl.ProfitGateUSD
 		} else {
 			obligation.Status = Case3AObligationWaiting
 		}
@@ -3800,10 +3852,24 @@ func (t *Trader) closeLot(
 		obligations, _ := t.recoveryObligationMapsLocked(repl.Producer)
 		obligation := obligations[repl.ObligationID]
 		if augmentErr != nil {
-			if obligation != nil && obligation.Status != Case3AObligationReconcile {
-				obligation.Status = Case3AObligationPositionOpen
+			if obligation != nil {
+				switch {
+				case marketEntryErrorCode(augmentErr) == EntryProduceErrInsufficientBalance:
+					obligation.Status = Case3AObligationWaitingForFunds
+				case case3ADeferredRetryNeedsReconcile(augmentErr):
+					obligation.Status = Case3AObligationReconcile
+				default:
+					// Definite zero-fill rejection/cancellation: no economics
+					// changed, so the consolidated position remains authoritative.
+					obligation.Status = Case3AObligationPositionOpen
+				}
 				obligation.ActiveOrderID = ""
 				obligation.ActiveDecisionID = ""
+				if obligation.Status == Case3AObligationPositionOpen {
+					obligation.RemainingBase = 0
+					obligation.AugmentationTriggerLossUSD = 0
+					obligation.AugmentationProfitGateUSD = 0
+				}
 				obligation.LastReason = fmt.Sprintf(
 					"augmentation_entry_failed: %v", augmentErr,
 				)
