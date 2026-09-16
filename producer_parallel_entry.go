@@ -1269,6 +1269,26 @@ func (t *Trader) processParallelProducerEntriesLocked(
 			rejected.Status = AllocationRejected
 			rejected.Reason = AllocationReasonBalanceUnavailable
 			t.recordAllocationEventLocked(rejected, ProducerStageAllocationRejected)
+			if obligationID := strings.TrimSpace(d.Case3AObligationID); obligationID != "" {
+				obligations, _ := t.recoveryObligationMapsLocked(d.Producer)
+				if obligation := obligations[obligationID]; obligation != nil &&
+					obligation.Status != Case3AObligationReconcile {
+
+					obligation.Status = Case3AObligationWaitingForFunds
+					obligation.ActiveOrderID = ""
+					obligation.ActiveDecisionID = ""
+					obligation.LastReason =
+						"allocation_rejected|reason=balance_unavailable"
+					obligation.UpdatedAt = time.Now().UTC()
+					if err := t.saveStateNoLock(); err != nil {
+						log.Printf(
+							"[ERROR] recovery.obligation.waiting_for_funds_save_failed obligation_id=%s err=%v",
+							obligationID,
+							err,
+						)
+					}
+				}
+			}
 			t.recordProducerAttemptLocked(attempt)
 			continue
 		}
@@ -1419,6 +1439,7 @@ func (t *Trader) processParallelProducerEntriesLocked(
 	plan := coordinator.Allocate(snapshot, requests, balanceAvailable)
 
 	approved := make([]ProducerResourceAllocation, 0, len(plan.Allocations))
+	recoveryObligationStateChanged := false
 
 	// Refund creation keeps historical replacement semantics. Parallel allocation
 	// can produce multiple same-side funding shortfalls in one coordinator tick,
@@ -1455,6 +1476,36 @@ func (t *Trader) processParallelProducerEntriesLocked(
 			if allocation.Reason == AllocationReasonLotCapacity {
 				log.Printf("[DEBUG] GATE1 lot cap reached (%d); HOLD", t.cfg.MaxConcurrentLots)
 			}
+
+			obligationID := strings.TrimSpace(
+				allocation.Request.Decision.Case3AObligationID,
+			)
+			if obligationID != "" &&
+				(allocation.Reason == AllocationReasonInsufficientFunding ||
+					allocation.Reason == AllocationReasonBalanceUnavailable ||
+					allocation.Reason == AllocationReasonBelowMinNotional) {
+
+				obligations, _ := t.recoveryObligationMapsLocked(
+					allocation.Request.Producer,
+				)
+				if obligation := obligations[obligationID]; obligation != nil &&
+					obligation.Status != Case3AObligationReconcile {
+
+					obligation.Status = Case3AObligationWaitingForFunds
+					obligation.ActiveOrderID = ""
+					obligation.ActiveDecisionID = ""
+					obligation.LastReason = fmt.Sprintf(
+						"allocation_rejected|reason=%s|requested_base=%.8f|allocated_base=%.8f|available_quote=%.8f|available_base=%.8f",
+						allocation.Reason,
+						allocation.Request.CoreBase,
+						allocation.AllocatedBase,
+						snapshot.SpareQuote,
+						snapshot.SpareBase,
+					)
+					obligation.UpdatedAt = time.Now().UTC()
+					recoveryObligationStateChanged = true
+				}
+			}
 		}
 
 		// Funding shortfall is meaningful for both rejected and partial grants.
@@ -1471,6 +1522,14 @@ func (t *Trader) processParallelProducerEntriesLocked(
 				)
 			}
 			approved = append(approved, allocation)
+		}
+	}
+	if recoveryObligationStateChanged {
+		if err := t.saveStateNoLock(); err != nil {
+			log.Printf(
+				"[ERROR] recovery.obligation.waiting_for_funds_save_failed err=%v",
+				err,
+			)
 		}
 	}
 
