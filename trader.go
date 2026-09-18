@@ -242,6 +242,20 @@ type ExitResult struct {
 	Pending *PendingExit
 }
 
+// ProducerFundingSuppression remembers an ordinary producer opportunity that
+// reached allocation while its side had less than the exchange-minimum usable
+// funding. It is deliberately runtime-only: it deduplicates consecutive
+// hotpath evaluations and does not own producer, order, position, Case3, or
+// refund lifecycle state.
+type ProducerFundingSuppression struct {
+	Producer        EntryProducer
+	Side            OrderSide
+	ResourceKind    ResourceKind
+	MinimumResource float64
+	ResourceStep    float64
+	RejectedAt      time.Time
+}
+
 type Trader struct {
 	cfg                   Config
 	broker                Broker
@@ -270,6 +284,11 @@ type Trader struct {
 	// committed account-equity snapshot so its continuation remains
 	// equity-referenced.
 	producerContinuationReferences ProducerContinuationReferences
+
+	// Runtime-only deduplication for repeated insufficient-funding decisions.
+	// Entries are cleared as soon as the producer-side opportunity disappears
+	// or its frozen funding snapshot can support an exchange-valid order.
+	producerFundingSuppressions map[string]ProducerFundingSuppression
 
 	// NEW: path to persisted state file
 	stateFile string

@@ -1127,6 +1127,123 @@ func (t *Trader) preserveFundingFailureDebugLocked(
 	}
 }
 
+func producerFundingSuppressionKey(producer EntryProducer, side OrderSide) string {
+	return string(producer) + "|" + string(side)
+}
+
+func fundingSnapshotResource(snapshot ResourceSnapshot, kind ResourceKind) float64 {
+	switch kind {
+	case ResourceKindQuote:
+		return snapshot.SpareQuote
+	case ResourceKindBase:
+		return snapshot.SpareBase
+	default:
+		return math.Inf(1)
+	}
+}
+
+// filterFundingSuppressedDecisionsLocked runs before newProducerDecisionLifecycle.
+// Consequently, a suppressed repeat creates neither a new DecisionID nor a new
+// trade-attempt marker. The caller holds t.mu.
+func (t *Trader) filterFundingSuppressedDecisionsLocked(
+	decisions []EntryDecision,
+	snapshot ResourceSnapshot,
+) []EntryDecision {
+	if len(t.producerFundingSuppressions) == 0 {
+		return decisions
+	}
+
+	active := make(map[string]struct{}, len(decisions))
+	filtered := make([]EntryDecision, 0, len(decisions))
+	for _, decision := range decisions {
+		side, ok := decision.SignalToSide()
+		if !ok {
+			filtered = append(filtered, decision)
+			continue
+		}
+
+		key := producerFundingSuppressionKey(decision.Producer, side)
+		active[key] = struct{}{}
+		suppression, exists := t.producerFundingSuppressions[key]
+		if !exists {
+			filtered = append(filtered, decision)
+			continue
+		}
+
+		usable := snapDownResource(
+			fundingSnapshotResource(snapshot, suppression.ResourceKind),
+			suppression.ResourceStep,
+		)
+		if usable+1e-9 >= suppression.MinimumResource {
+			delete(t.producerFundingSuppressions, key)
+			filtered = append(filtered, decision)
+			continue
+		}
+
+		log.Printf(
+			"[TRACE] producer.funding_suppressed producer=%s side=%s usable=%.8f minimum=%.8f rejected_at=%s",
+			decision.Producer,
+			side,
+			usable,
+			suppression.MinimumResource,
+			suppression.RejectedAt.Format(time.RFC3339Nano),
+		)
+	}
+
+	// If the producer-side no longer qualifies, its next qualification is a new
+	// opportunity and must not inherit the old suppression.
+	for key := range t.producerFundingSuppressions {
+		if _, stillActive := active[key]; !stillActive {
+			delete(t.producerFundingSuppressions, key)
+		}
+	}
+	if len(t.producerFundingSuppressions) == 0 {
+		t.producerFundingSuppressions = nil
+	}
+	return filtered
+}
+
+// rememberInsufficientFundingSuppressionLocked records only the narrow case in
+// which the immutable snapshot itself is below the minimum executable resource.
+// Rejections caused by priority competition keep their historical per-tick
+// behavior because changing that would alter allocation semantics.
+func (t *Trader) rememberInsufficientFundingSuppressionLocked(
+	allocation ProducerResourceAllocation,
+	snapshot ResourceSnapshot,
+) {
+	req := allocation.Request
+	if isRecoveryReplacementProducer(req.Producer) ||
+		strings.TrimSpace(req.Decision.Case3AObligationID) != "" {
+		return
+	}
+	if req.ResourceKind != ResourceKindQuote && req.ResourceKind != ResourceKindBase {
+		return
+	}
+	minimum := req.MinimumResource
+	if minimum <= 0 {
+		return
+	}
+	usable := snapDownResource(
+		fundingSnapshotResource(snapshot, req.ResourceKind),
+		req.ResourceStep,
+	)
+	if usable+1e-9 >= minimum {
+		return
+	}
+	if t.producerFundingSuppressions == nil {
+		t.producerFundingSuppressions = make(map[string]ProducerFundingSuppression)
+	}
+	key := producerFundingSuppressionKey(req.Producer, req.Side)
+	t.producerFundingSuppressions[key] = ProducerFundingSuppression{
+		Producer:        req.Producer,
+		Side:            req.Side,
+		ResourceKind:    req.ResourceKind,
+		MinimumResource: minimum,
+		ResourceStep:    req.ResourceStep,
+		RejectedAt:      time.Now().UTC(),
+	}
+}
+
 // processParallelProducerEntriesLocked owns the complete ordinary producer
 // batch after all shared evaluator materials have been computed. The caller
 // must hold t.mu. The function returns with t.mu UNLOCKED.
@@ -1171,6 +1288,9 @@ func (t *Trader) processParallelProducerEntriesLocked(
 		return nil
 	}
 	if len(decisions) == 0 {
+		// No producer opportunity is currently active. A later occurrence must be
+		// treated as a new opportunity even if account funding is still unchanged.
+		t.producerFundingSuppressions = nil
 		if err := reserveIndependentExitsOnly(); err != nil {
 			t.mu.Unlock()
 			startIndependentExits(false)
@@ -1180,6 +1300,26 @@ func (t *Trader) processParallelProducerEntriesLocked(
 		startIndependentExits(true)
 		return mergeIndependentExitResults(
 			StepResult{Msg: "FLAT", Raw: aiRaw, Signal: Flat}, nil,
+			independentExitResults,
+		)
+	}
+
+	// Remove repeated decisions for the same still-active producer-side
+	// opportunity before a lifecycle/DecisionID is created. Suppression is used
+	// only when the frozen snapshot cannot fund the minimum exchange-valid
+	// resource. This intentionally does not alter priority competition, partial
+	// allocation, Case3 obligations, refund obligations, or order handling.
+	decisions = t.filterFundingSuppressedDecisionsLocked(decisions, snapshot)
+	if len(decisions) == 0 {
+		if err := reserveIndependentExitsOnly(); err != nil {
+			t.mu.Unlock()
+			startIndependentExits(false)
+			return StepResult{Msg: "HOLD exit preflight reservation failed", Raw: aiRaw, Signal: Flat}, err
+		}
+		t.mu.Unlock()
+		startIndependentExits(true)
+		return mergeIndependentExitResults(
+			StepResult{Msg: "HOLD funding-suppressed producer opportunities", Raw: aiRaw, Signal: Flat}, nil,
 			independentExitResults,
 		)
 	}
@@ -1505,6 +1645,10 @@ func (t *Trader) processParallelProducerEntriesLocked(
 					obligation.UpdatedAt = time.Now().UTC()
 					recoveryObligationStateChanged = true
 				}
+			}
+
+			if allocation.Reason == AllocationReasonInsufficientFunding {
+				t.rememberInsufficientFundingSuppressionLocked(allocation, snapshot)
 			}
 		}
 
