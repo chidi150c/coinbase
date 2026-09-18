@@ -147,6 +147,7 @@ func loadBotEnv() {
 		"TRAIL_DISTANCE_PCT_RUNNER": {},
 		"TRAIL_DISTANCE_PCT_SCALP":  {},
 		"PROFIT_GATE_USD":           {},
+		"AI_TRANSITION_SEED_USD":    {},
 
 		// order routing (maker-first)
 		"ORDER_TYPE":             {},

@@ -99,6 +99,9 @@ type Position struct {
 
 	Case3AReplacementOrderID string        `json:"case3_b_replacement_order_id"`
 	Producer                 EntryProducer `json:"entry_producer,omitempty"`
+	AITransitionRolloverPending bool       `json:"ai_transition_rollover_pending,omitempty"`
+	AITransitionNextRetryAt     time.Time  `json:"ai_transition_next_retry_at,omitempty"`
+	AITransitionCapitalUSD      float64    `json:"ai_transition_capital_usd,omitempty"`
 }
 
 // --- NEW: per-side book (authoritative store) ---
@@ -186,6 +189,7 @@ type BotState struct {
 	SpareBuyUSD        float64
 	SpareSellUSD       float64
 	PreviousAIRaw      Signal
+	AITransitionInitialized bool
 	// Standardized durable continuation references keyed by producer + side.
 	// Market-price producers store committed execution price; Equity stores
 	// committed account equity in the same map.
@@ -275,6 +279,7 @@ type Trader struct {
 
 	equityUSD     float64
 	previousAIRaw Signal
+	aiTransitionInitialized bool
 
 	// Standardized continuation memory for every ordinary producer.
 	//
@@ -1681,6 +1686,7 @@ func (t *Trader) snapshotStateLocked() BotState {
 		WinHighSell:    t.winHighSell,
 		LatchedGateBuy: t.latchedGateBuy,
 		PreviousAIRaw:  t.previousAIRaw,
+		AITransitionInitialized: t.aiTransitionInitialized,
 		ProducerContinuationReferences: cloneProducerContinuationReferences(
 			t.producerContinuationReferences,
 		),
@@ -1816,6 +1822,22 @@ func (t *Trader) loadState() error {
 	t.winHighSell = st.WinHighSell
 	t.latchedGateBuy = st.LatchedGateBuy
 	t.previousAIRaw = st.PreviousAIRaw
+	t.aiTransitionInitialized = st.AITransitionInitialized
+	// Cold-state compatibility: a confirmed tagged lot is authoritative proof
+	// that the one-time seed filled, even when the flag predates this schema.
+	if !t.aiTransitionInitialized {
+		for _, side := range []OrderSide{SideBuy, SideSell} {
+			for _, lot := range t.book(side).Lots {
+				if lot != nil && lot.Producer == EntryProducerAITransitionTrader {
+					t.aiTransitionInitialized = true
+					break
+				}
+			}
+			if t.aiTransitionInitialized {
+				break
+			}
+		}
+	}
 	t.producerContinuationReferences =
 		cloneProducerContinuationReferences(
 			st.ProducerContinuationReferences,
@@ -3399,6 +3421,8 @@ func (t *Trader) closeLot(
 			localIdx,
 		)
 	}
+	isAITransitionRollover := lot.Producer == EntryProducerAITransitionTrader &&
+		strings.HasPrefix(exitReason, "ai_transition_rollover")
 
 	entryOrderID := strings.TrimSpace(lot.EntryOrderID)
 	if entryOrderID == "" {
@@ -3423,6 +3447,13 @@ func (t *Trader) closeLot(
 	// 	Determine the amount to close:
 	// Read the lot size.
 	baseRequestedRaw := lot.SizeBase
+	// A SELL-side AITransition lot represents the dedicated quote capital
+	// waiting to buy back BTC. Spend that capital (net of the estimated taker
+	// fee) so realized gains/losses compound into the next BUY-side quantity.
+	if isAITransitionRollover && lot.Side == SideSell && lot.AITransitionCapitalUSD > 0 {
+		feeRate := t.cfg.FeeRatePct / 100.0
+		baseRequestedRaw = lot.AITransitionCapitalUSD / (livePrice * (1 + feeRate))
+	}
 	// Round it down to the exchange's allowed base step.
 	baseRequested := floorToStep(baseRequestedRaw, t.cfg.BaseStep)
 	// Skip the exit if nothing remains after rounding.
@@ -4827,6 +4858,9 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 	}
 
 	lot := book.Lots[localIdx]
+	isAITransitionRollover := lot != nil &&
+		lot.Producer == EntryProducerAITransitionTrader &&
+		strings.HasPrefix(exitReason, "ai_transition_rollover")
 
 	entryPortion := 0.0
 	if baseRequested > 0 {
@@ -5028,6 +5062,66 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 
 	t.lastExits = append(t.lastExits, rec)
 
+	// One confirmed rollover fill is both the accounting exit of the old side
+	// and the entry basis of the opposite side. Only confirmed quantity moves.
+	// Repeated partial fills consolidate into the already-created destination
+	// lot, while the unfilled source remainder retains rollover ownership.
+	if isAITransitionRollover {
+		destinationSide := SideSell
+		if lot.Side == SideSell {
+			destinationSide = SideBuy
+		}
+		destinationBook := t.book(destinationSide)
+		var destination *Position
+		for _, existing := range destinationBook.Lots {
+			if existing != nil &&
+				existing.Producer == EntryProducerAITransitionTrader &&
+				!existing.AITransitionRolloverPending {
+				destination = existing
+				break
+			}
+		}
+		if destination == nil {
+			destination = &Position{
+				OpenPrice: priceExec,
+				Side: destinationSide,
+				SizeBase: baseFilled,
+				OpenTime: exitTime,
+				EntryFee: 0,
+				OpenNotionalUSD: math.Max(0, quoteExec-exitFee),
+				ProducerReason: strings.TrimSpace(
+					fmt.Sprintf("ai_transition_rollover_fill|source_entry_order_id=%s|exit_order_id=%s", lot.EntryOrderID, exitOrderID),
+				),
+				ExitMode: ExitModeScalpFixedTP,
+				Version: Version,
+				EntryOrderID: exitOrderID,
+				ConfidenceMult: lot.ConfidenceMult,
+				ProfitGateUSD: lot.ProfitGateUSD,
+				EntryMethod: string(EntryProducerAITransitionTrader),
+				Producer: EntryProducerAITransitionTrader,
+				AITransitionCapitalUSD: math.Max(0, quoteExec-exitFee),
+			}
+			destinationBook.Lots = append(destinationBook.Lots, destination)
+		} else {
+			beforeBase := destination.SizeBase
+			destination.SizeBase += baseFilled
+			destination.OpenNotionalUSD += math.Max(0, quoteExec-exitFee)
+			destination.AITransitionCapitalUSD += math.Max(0, quoteExec-exitFee)
+			if destination.SizeBase > 0 {
+				destination.OpenPrice =
+					(beforeBase*destination.OpenPrice + baseFilled*priceExec) /
+						destination.SizeBase
+			}
+			destination.ProducerReason = strings.TrimSpace(
+				destination.ProducerReason + fmt.Sprintf(
+					"|ai_transition_rollover_absorbed=true|source_entry_order_id=%s|exit_order_id=%s|filled_base=%.8f",
+					lot.EntryOrderID, exitOrderID, baseFilled,
+				),
+			)
+		}
+		t.aiTransitionInitialized = true
+	}
+
 	/*
 	   Producer economics must capture every authoritative realized exit
 	   contribution before any partial-exit residual is resized,
@@ -5131,7 +5225,18 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 	}
 
 	if isPartial {
+		aiCapitalBefore := lot.AITransitionCapitalUSD
 		lot.SizeBase = baseRequested - baseFilled
+		if isAITransitionRollover {
+			if baseRequested > 0 && aiCapitalBefore > 0 {
+				lot.AITransitionCapitalUSD = math.Max(
+					0,
+					aiCapitalBefore*(1-baseFilled/baseRequested),
+				)
+			}
+			lot.AITransitionRolloverPending = true
+			lot.AITransitionNextRetryAt = time.Now().UTC().Add(30 * time.Second)
+		}
 		lot.EntryFee -= entryPortion
 		if lot.EntryFee < 0 {
 			lot.EntryFee = 0
@@ -9287,6 +9392,9 @@ func (t *Trader) commitEntryFill(
 
 		Producer: entry.Producer,
 	}
+	if entry.Producer == EntryProducerAITransitionTrader {
+		newLot.AITransitionCapitalUSD = quoteSpent
+	}
 
 	if newLot.ConfidenceMult <= 0 {
 		newLot.ConfidenceMult = 0
@@ -9424,6 +9532,12 @@ func (t *Trader) commitEntryFill(
 			book.Lots,
 			newLot,
 		)
+	}
+
+	if entry.Producer == EntryProducerAITransitionTrader {
+		// Only a confirmed, locally committed fill initializes the one-time
+		// producer. Accepted, pending, rejected and zero-fill orders never do.
+		t.aiTransitionInitialized = true
 	}
 
 	t.consolidateDust(

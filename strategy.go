@@ -1960,6 +1960,43 @@ func (t *Trader) collectEntryProducerDecisions(
 		decisions = append(decisions, normalLegacy)
 	}
 
+	// Seed AITransitionTrader exactly once. The producer reacts only to a real
+	// raw-AI transition and uses the ordinary producer lifecycle for accounting.
+	// A pending seed on either side prevents duplicate submission while the
+	// exchange result is unresolved.
+	if !t.aiTransitionInitialized &&
+		pendingCounts.Count(EntryProducerAITransitionTrader, SideBuy) == 0 &&
+		pendingCounts.Count(EntryProducerAITransitionTrader, SideSell) == 0 {
+		seedSignal := Flat
+		if ai.Raw == Buy && (t.previousAIRaw == Sell || t.previousAIRaw == Flat) {
+			seedSignal = Buy
+		} else if ai.Raw == Sell && (t.previousAIRaw == Buy || t.previousAIRaw == Flat) {
+			seedSignal = Sell
+		}
+		if seedSignal != Flat {
+			seed := baseDecision
+			seed.Signal = seedSignal
+			seed.LegacySignal = seedSignal
+			seed.Producer = EntryProducerAITransitionTrader
+			seed.PendingCancelPolicy = PendingSignalCancelDisabled
+			seed.ProducerReason = fmt.Sprintf(
+				"ai_transition_seed|previous_ai=%s|current_ai=%s|seed_usd=%.8f",
+				t.previousAIRaw,
+				ai.Raw,
+				t.cfg.AITransitionSeedUSD,
+			)
+			applyStandardProducerEconomics(
+				&seed,
+				EntryProducerAITransitionTrader,
+				false,
+				0,
+				0,
+				true,
+			)
+			decisions = append(decisions, seed)
+		}
+	}
+
 	return baseDecision, decisions
 }
 

@@ -27,6 +27,7 @@ type Config struct {
 	GateTF                string // e.g., "ONE_MINUTE"
 	MaxDailyLossPct       float64
 	RiskPerTradeUSD       float64
+	AITransitionSeedUSD   float64
 	USDEquity             float64
 	SellEquityTriggerMult float64
 	BuyEquityTriggerMult  float64
@@ -142,6 +143,7 @@ func loadConfigFromEnv() Config {
 		// Universal, unprefixed knobs\
 		MaxDailyLossPct:       getEnvFloat("MAX_DAILY_LOSS_PCT", 1.0),
 		RiskPerTradeUSD:       getEnvFloat("RISK_PER_TRADE_USD", 80.0),
+		AITransitionSeedUSD:   getEnvFloat("AI_TRANSITION_SEED_USD", 70.0),
 		USDEquity:             getEnvFloat("USD_EQUITY", 1000.0),
 		SellEquityTriggerMult: getEnvFloat("SELL_EQUITY_TRIGGER_MULT", 1.05),
 		BuyEquityTriggerMult:  getEnvFloat("BUY_EQUITY_TRIGGER_MULT", 0.95),

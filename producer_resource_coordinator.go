@@ -117,6 +117,7 @@ type ProducerResourceRequest struct {
 	ResourceStep      float64
 
 	ConsumesLotSlot bool
+	RequireFullAllocation bool
 
 	ConfidenceMult float64
 	ProfitGateUSD  float64
@@ -359,6 +360,24 @@ func (c ProducerResourceCoordinator) Allocate(
 					}
 				}
 
+				// The one-time AITransitionTrader seed is dedicated capital. Do not
+				// silently create a smaller seed when the frozen snapshot cannot fund
+				// the complete request. A broker-confirmed partial fill is different:
+				// it remains authoritative and is committed by the normal fill path.
+				if req.RequireFullAllocation &&
+					allocatedResource+1e-12 < req.RequestedResource {
+					allocation.Reason = AllocationReasonInsufficientFunding
+					shortResource := math.Max(0, req.RequestedResource-allocatedResource)
+					switch resourceKind {
+					case ResourceKindQuote:
+						allocation.FundingShortfallUSD = shortResource
+					case ResourceKindBase:
+						allocation.FundingShortfallUSD = shortResource * snapshot.Price
+					}
+					plan.Allocations = append(plan.Allocations, allocation)
+					continue
+				}
+
 				if allocatedResource+1e-12 < req.MinimumResource {
 					if groupAvailable <= 0 {
 						allocation.Reason = AllocationReasonInsufficientFunding
@@ -515,13 +534,17 @@ func (t *Trader) buildProducerResourceRequestLocked(
 		return ProducerResourceRequest{}, fmt.Errorf("missing resource priority for producer %s", d.Producer)
 	}
 
+	isAITransitionSeed := d.Producer == EntryProducerAITransitionTrader
 	baseUSD := t.cfg.RiskPerTradeUSD
+	if isAITransitionSeed {
+		baseUSD = t.cfg.AITransitionSeedUSD
+	}
 	if baseUSD <= 0 {
 		baseUSD = minNotional
 	}
 	quote := baseUSD
 
-	if t.cfg.VolRiskAdjust {
+	if t.cfg.VolRiskAdjust && !isAITransitionSeed {
 		f := volRiskFactor(execHistory)
 		if f <= 0 {
 			f = 1
@@ -532,7 +555,7 @@ func (t *Trader) buildProducerResourceRequestLocked(
 	book := t.book(side)
 	isEquity := d.Producer == EntryProducerEquity
 
-	if t.cfg.RampEnable && !isEquity {
+	if t.cfg.RampEnable && !isEquity && !isAITransitionSeed {
 		k := rampCount(book, price, minNotional)
 		if rc := runnerCount(book); rc > 0 && k >= rc {
 			k -= rc
@@ -673,7 +696,7 @@ func (t *Trader) buildProducerResourceRequestLocked(
 				t.equityStageSell = equityStageNext
 			}
 		}
-	} else {
+	} else if !isAITransitionSeed {
 		quote *= confMult
 	}
 
@@ -681,12 +704,21 @@ func (t *Trader) buildProducerResourceRequestLocked(
 		quote = minNotional
 	}
 	base := quote / price
+	if isAITransitionSeed {
+		if side == SideBuy && snapshot.QuoteStep > 0 {
+			quote = snapDownResource(quote, snapshot.QuoteStep)
+			base = quote / price
+		} else if side == SideSell && snapshot.BaseStep > 0 {
+			base = snapDownResource(base, snapshot.BaseStep)
+			quote = base * price
+		}
+	}
 
 	coreQuote := quote
 	coreBase := base
 	refundRequestedUSD := 0.0
 	const refundMinConf = 0.60
-	if confMult >= refundMinConf {
+	if confMult >= refundMinConf && !isAITransitionSeed {
 		if side == SideSell && t.refundBuyUSD > 0 {
 			refundRequestedUSD = t.refundBuyUSD
 			extraBase := refundRequestedUSD / price
@@ -752,6 +784,7 @@ func (t *Trader) buildProducerResourceRequestLocked(
 		RequestedQuote:     quote,
 		RequestedBase:      base,
 		ConsumesLotSlot:    d.Producer != EntryProducerEquity,
+		RequireFullAllocation: isAITransitionSeed,
 		ConfidenceMult:     confMult,
 		ProfitGateUSD:      entryProfitGateUSD,
 		EntryMethod:        string(d.Producer),

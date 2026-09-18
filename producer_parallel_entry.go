@@ -896,8 +896,7 @@ func (t *Trader) executeProducerAllocation(
 	// limit price. Resurrected recovery obligations use this direct taker path,
 	// so normalize their confirmed execution to VWAP before observability and
 	// commitEntryFill consume the PlacedOrder. Preserve a positive broker price.
-	if case3AResurrected &&
-		placed.Price <= 0 &&
+	if placed.Price <= 0 &&
 		placed.BaseSize > 0 &&
 		placed.QuoteSpent > 0 {
 
@@ -1589,6 +1588,7 @@ func (t *Trader) processParallelProducerEntriesLocked(
 	var shortBuyUSD, shortSellUSD float64
 	for _, allocation := range plan.Allocations {
 		if allocation.FundingShortfallUSD <= 0 ||
+			allocation.Request.Producer == EntryProducerAITransitionTrader ||
 			strings.TrimSpace(allocation.Request.Decision.Case3AObligationID) != "" {
 			continue
 		}

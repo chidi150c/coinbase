@@ -88,6 +88,7 @@ type EntryProducer string
 type ProducerPriority int
 
 const (
+	ProducerPriorityAITransitionTrader ProducerPriority = 900
 	ProducerPriorityCase3AReplacement ProducerPriority = 800
 	ProducerPriorityCase3BReplacement ProducerPriority = 800
 	ProducerPriorityCase11A           ProducerPriority = 700
@@ -107,6 +108,8 @@ const (
 	EntryProducerNone EntryProducer = ""
 
 	EntryProducerNormalLegacy EntryProducer = "NormalLegacy"
+
+	EntryProducerAITransitionTrader EntryProducer = "AITransitionTrader"
 
 	EntryProducerEquity EntryProducer = "Equity"
 
@@ -137,6 +140,8 @@ const (
 // coordination. Do not derive allocation priority from ProducerTier.
 func producerPriorityFor(producer EntryProducer) ProducerPriority {
 	switch producer {
+	case EntryProducerAITransitionTrader:
+		return ProducerPriorityAITransitionTrader
 	case EntryProducerCase3AReplacement:
 		return ProducerPriorityCase3AReplacement
 	case EntryProducerCase3BReplacement:
@@ -241,7 +246,8 @@ func producerTierFor(producer EntryProducer) (ProducerTier, float64) {
 		EntryProducerCase14BUptrendBuy:
 		return ProducerTierMid, MidTierProducerMultiplier
 
-	case EntryProducerCase13APeakSell,
+	case EntryProducerAITransitionTrader,
+		EntryProducerCase13APeakSell,
 		EntryProducerCase13BBottomBuy,
 		EntryProducerCase15BDowntrendRecoveryBuy,
 		EntryProducerCase15AUptrendRecoverySell,
@@ -542,6 +548,8 @@ type EntryPolicy struct {
 
 func entryPolicyForSource(source EntryProducer) EntryPolicy {
 	switch source {
+	case EntryProducerAITransitionTrader:
+		return EntryPolicy{}
 
 	case EntryProducerNormalLegacy:
 		return EntryPolicy{

@@ -206,6 +206,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	t.producerAllocationMu.Lock()
 	defer t.producerAllocationMu.Unlock()
 	var deferredIndependentExits []exitCandidate
+	var aiTransitionCandidates []exitCandidate
 	t.reconcileResourceQuarantines(ctx)
 
 	// Use wall clock as authoritative "now" for pyramiding timings; fall back for zero candle time.
@@ -817,6 +818,21 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 			for i := 0; i < len(book.Lots); {
 				lot := book.Lots[i]
+
+				// AITransitionTrader owns its rollover lifecycle. Retain the already
+				// scanned immutable identity for authorization after AI fan-in, and
+				// bypass every ordinary profit/stop-loss/Case3 exit rule.
+				if lot != nil && lot.Producer == EntryProducerAITransitionTrader {
+					aiTransitionCandidates = append(aiTransitionCandidates, exitCandidate{
+						side: side,
+						idx: i,
+						entryOrderID: lot.EntryOrderID,
+						reason: "ai_transition_rollover",
+					})
+					lot.FixedTPWorking = false
+					i++
+					continue
+				}
 
 				if lot.SizeBase*price < minNotional {
 					lot.FixedTPWorking = false
@@ -1569,6 +1585,57 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			Raw:    aiResult.Raw,
 			Signal: Flat,
 		}, nil
+	}
+
+	// Authorize at most one retained AITransitionTrader lot after AI fan-in.
+	// A previously-started partial/rejected rollover owns the slot until its
+	// remainder completes; otherwise a fresh opposite raw-AI transition starts
+	// the rollover. No second book traversal is performed here.
+	transitionToBuy := aiResult.Raw == Buy &&
+		(t.previousAIRaw == Sell || t.previousAIRaw == Flat)
+	transitionToSell := aiResult.Raw == Sell &&
+		(t.previousAIRaw == Buy || t.previousAIRaw == Flat)
+	chooseAITransition := func(pendingOnly bool) bool {
+		for _, candidate := range aiTransitionCandidates {
+			book := t.book(candidate.side)
+			idx := -1
+			for i, positioned := range book.Lots {
+				if positioned != nil && positioned.EntryOrderID == candidate.entryOrderID {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 || idx >= len(book.Lots) {
+				continue
+			}
+			lot := book.Lots[idx]
+			if lot == nil || lot.FixedTPOrderID != "" ||
+				lot.AITransitionRolloverPending != pendingOnly ||
+				(!lot.AITransitionNextRetryAt.IsZero() && wallNow.Before(lot.AITransitionNextRetryAt)) {
+				continue
+			}
+			if !pendingOnly &&
+				!((candidate.side == SideBuy && transitionToSell) ||
+					(candidate.side == SideSell && transitionToBuy)) {
+				continue
+			}
+			lot.AITransitionRolloverPending = true
+			lot.AITransitionNextRetryAt = wallNow.Add(30 * time.Second)
+			candidate.idx = idx
+			candidate.decision = fmt.Sprintf(
+				"producer=%s|previous_ai=%s|current_ai=%s|resume=%t",
+				EntryProducerAITransitionTrader,
+				t.previousAIRaw,
+				aiResult.Raw,
+				pendingOnly,
+			)
+			deferredIndependentExits = append(deferredIndependentExits, candidate)
+			return true
+		}
+		return false
+	}
+	if !chooseAITransition(true) {
+		chooseAITransition(false)
 	}
 
 	// ----------------------------------------------------------

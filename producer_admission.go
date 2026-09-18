@@ -149,7 +149,8 @@ func (t *Trader) evaluateProducerAdmissionLocked(
 
 	// LongOnly is a producer admission policy, not a resource-allocation rule.
 	if side == SideSell &&
-		t.cfg.LongOnly {
+		t.cfg.LongOnly &&
+		d.Producer != EntryProducerAITransitionTrader {
 
 		return producerAdmissionBlocked(
 			EntryProduceErrDecisionLongOnlyBlocked,
