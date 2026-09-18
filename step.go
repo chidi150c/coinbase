@@ -75,7 +75,7 @@ import (
 	"time"
 )
 
-const Version = 208
+const Version = 209
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -713,12 +713,22 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 
 			lot.ExitMode = ExitModeScalpFixedTP
 
-			lot.Take =
-				activationPrice(
+			if isRecoveryReplacementProducer(lot.Producer) &&
+				lot.RecoveryNetUSD > 0 &&
+				lot.RecoveryReferencePrice > 0 {
+				lot.Take = recoveryActivationPrice(
 					lot,
 					gateUSD,
 					t.cfg.FeeRatePct,
 				)
+				return
+			}
+
+			lot.Take = activationPrice(
+				lot,
+				gateUSD,
+				t.cfg.FeeRatePct,
+			)
 		}
 
 		// Case3A recovery replacements keep all existing exit logic. This helper
@@ -728,12 +738,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		//   RecoveryByPositionSize  (Mode A)
 		//   RecoveryByProfitTarget  (Mode B)
 		//
-		//   UP:
-		//     existing exit behavior is unchanged.
+		//   Favorable regime (UP for Case3A, DOWN for Case3B):
+		//     each confirmed cycle may recover one fresh ProfitGateUSD.
 		//
-		//   DOWN / NORMAL:
-		//     the replacement may not take a profit exit until fee-aware net PnL
-		//     has reached:
+		//   Other regimes:
+		//     retain the legacy all-remaining requirement:
 		//
 		//         lot.ProfitGateUSD + lot.RecoveryNetUSD
 		//
@@ -752,19 +761,26 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				return true
 			}
 
-			// First Case3A profit exit while the replacement is in UP:
-			// allow the ordinary ProfitGateUSD exit. The confirmed-fill
-			// path credits realized recovery and marks Case3AUpRecoveryUsed.
+			// In the favorable recovery regime, every recovery cycle may realize
+			// one complete ordinary ProfitGateUSD. The first cycle uses the
+			// consolidated entry NET; later cycles use only fresh NET measured
+			// from the preceding confirmed recovery fill.
 			favorableRecoveryRegime :=
 				(lot.Producer == EntryProducerCase3AReplacement && t.MarketRegime == RegimeUp) ||
 					(lot.Producer == EntryProducerCase3BReplacement && t.MarketRegime == RegimeDown)
-			if favorableRecoveryRegime &&
-				!lot.Case3AUpRecoveryUsed {
-				return net >= lot.ProfitGateUSD
+			if favorableRecoveryRegime {
+				if lot.RecoveryReferencePrice <= 0 {
+					return net >= lot.ProfitGateUSD
+				}
+				return recoveryCycleNet(
+					lot,
+					price,
+					t.cfg.FeeRatePct,
+				) >= lot.ProfitGateUSD
 			}
 
-			// After the one-time UP recovery exit has been used, or in
-			// NORMAL/DOWN, require ordinary profit plus remaining recovery.
+			// Outside the favorable recovery regime, retain the legacy protection:
+			// require ordinary profit plus the complete remaining recovery balance.
 			requiredNet :=
 				lot.ProfitGateUSD +
 					lot.RecoveryNetUSD

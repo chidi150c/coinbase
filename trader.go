@@ -80,9 +80,12 @@ type Position struct {
 	// position to its Case3A/Case3B obligation. Additional same-obligation fills
 	// are absorbed into this Position instead of becoming independent lots.
 	RecoveryObligationID string `json:"recovery_obligation_id,omitempty"`
-	// Case3AUpRecoveryUsed is per replacement lot. It is set only after the
-	// one-time UP-regime partial-recovery profit exit is confirmed filled.
-	Case3AUpRecoveryUsed bool `json:"case3a_up_recovery_used,omitempty"`
+	// RecoveryReferencePrice and RecoveryReferenceFeeUSD define the start of
+	// the next recovery cycle. Zero means no partial recovery has committed yet,
+	// so the first cycle uses the consolidated lot's original entry economics.
+	// They are changed only after an exchange-confirmed recovery fill.
+	RecoveryReferencePrice  float64 `json:"recovery_reference_price,omitempty"`
+	RecoveryReferenceFeeUSD float64 `json:"recovery_reference_fee_usd,omitempty"`
 
 	// --- NEW: track maker-first TP exit order id (post-only limit attempt) ---
 	FixedTPOrderID   string  `json:"-"`
@@ -1557,6 +1560,51 @@ func activationPrice(lot *Position, usdGate float64, feeRatePct float64) float64
 		return 1e-9
 	}
 	return (op - (usdGate+lot.EntryFee)/B) / den
+}
+
+// recoveryActivationPrice returns the mark price that earns usdGate of fresh
+// NET profit from the preceding confirmed recovery fill. Unlike
+// activationPrice, it deliberately does not reuse the consolidated OpenPrice
+// or EntryFee, which would count previously realized movement again.
+func recoveryActivationPrice(lot *Position, usdGate float64, feeRatePct float64) float64 {
+	if lot == nil || lot.RecoveryReferencePrice <= 0 || lot.SizeBase <= 0 {
+		return 0
+	}
+
+	B := lot.SizeBase
+	fr := feeRatePct / 100.0
+	ref := lot.RecoveryReferencePrice
+	refFee := lot.RecoveryReferenceFeeUSD
+
+	if lot.Side == SideBuy {
+		den := 1.0 - fr
+		if den <= 0 {
+			den = 1e-9
+		}
+		return (ref + (usdGate+refFee)/B) / den
+	}
+
+	den := 1.0 + fr
+	if den <= 0 {
+		return 1e-9
+	}
+	return (ref - (usdGate+refFee)/B) / den
+}
+
+// recoveryCycleNet calculates only the NET earned since the preceding
+// confirmed recovery fill. It prevents the original entry-to-market movement
+// from being credited again on every repeated recovery cycle.
+func recoveryCycleNet(lot *Position, price float64, feeRatePct float64) float64 {
+	if lot == nil || lot.RecoveryReferencePrice <= 0 || lot.SizeBase <= 0 || price <= 0 {
+		return 0
+	}
+
+	gross := (price - lot.RecoveryReferencePrice) * lot.SizeBase
+	if lot.Side == SideSell {
+		gross = (lot.RecoveryReferencePrice - price) * lot.SizeBase
+	}
+	estExitFee := lot.SizeBase * price * (feeRatePct / 100.0)
+	return gross - lot.RecoveryReferenceFeeUSD - estExitFee
 }
 
 // ---- labels ----
@@ -4807,14 +4855,21 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 	recoveryFavorableRegime :=
 		(lot.Producer == EntryProducerCase3AReplacement && t.MarketRegime == RegimeUp) ||
 			(lot.Producer == EntryProducerCase3BReplacement && t.MarketRegime == RegimeDown)
-	case3AUpRecoveryCandidate :=
+	case3ACycleNet := pl
+	if lot.RecoveryReferencePrice > 0 {
+		cycleGross := (priceExec - lot.RecoveryReferencePrice) * baseFilled
+		if lot.Side == SideSell {
+			cycleGross = (lot.RecoveryReferencePrice - priceExec) * baseFilled
+		}
+		case3ACycleNet = cycleGross - lot.RecoveryReferenceFeeUSD - exitFee
+	}
+	case3ARecoveryCycleCandidate :=
 		case3AFullFill &&
 			isRecoveryReplacementProducer(lot.Producer) &&
 			case3ARecoveryBefore > 0 &&
-			!lot.Case3AUpRecoveryUsed &&
 			recoveryFavorableRegime &&
 			!strings.HasPrefix(exitReason, "threshold_stop_loss") &&
-			pl >= lot.ProfitGateUSD
+			case3ACycleNet+case3AFillTol >= lot.ProfitGateUSD
 
 	case3AUpPartialRecovery := false
 	case3AFinalRecovery := false
@@ -4822,27 +4877,35 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 	case3ARecoveryAfter := case3ARecoveryBefore
 	case3ARecoveryExcessPnL := 0.0
 
-	if case3AUpRecoveryCandidate {
+	if case3ARecoveryCycleCandidate {
 		// Apply the authoritative realized NET PnL exactly once to the
 		// lot-specific recovery obligation. Do NOT clamp at zero: a negative
 		// value is valid and records recovery overshoot.
-		case3ARecoveredNet = pl
-		case3ARecoveryAfter = case3ARecoveryBefore - pl
+		case3ARecoveredNet = case3ACycleNet
+		case3ARecoveryAfter = case3ARecoveryBefore - case3ACycleNet
 		lot.RecoveryNetUSD = case3ARecoveryAfter
 
 		if case3ARecoveryAfter > case3AFillTol {
 			case3AUpPartialRecovery = true
-			lot.Case3AUpRecoveryUsed = true
+			lot.RecoveryReferencePrice = priceExec
+			lot.RecoveryReferenceFeeUSD = exitFee
+			lot.ProfitTrailActive = false
+			lot.ProfitPeakUSD = 0
+			lot.FixedTPWorking = false
+			lot.Take = 0
 
 			// Carry the partial state on the live lot so subsequent exit
-			// decisions continue from the exact remaining obligation.
+			// decisions require a fresh ProfitGateUSD from this confirmed fill.
 			lot.ProducerReason = strings.TrimSpace(
 				lot.ProducerReason + fmt.Sprintf(
-					"|case3a_up_partial_recovery=true|up_recovery_used=true"+
-						"|recovery_net_before=%.6f|recovered_net=%.6f|recovery_net_after=%.6f",
+					"|case3a_up_partial_recovery=true"+
+						"|recovery_net_before=%.6f|recovered_net=%.6f|recovery_net_after=%.6f"+
+						"|recovery_reference_price=%.8f|recovery_reference_fee_usd=%.8f",
 					case3ARecoveryBefore,
 					case3ARecoveredNet,
 					case3ARecoveryAfter,
+					lot.RecoveryReferencePrice,
+					lot.RecoveryReferenceFeeUSD,
 				),
 			)
 		} else {
@@ -4851,7 +4914,8 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 			case3AFinalRecovery = true
 			case3ARecoveryExcessPnL = math.Max(0, -case3ARecoveryAfter)
 		}
-	} else if case3AFullFill &&
+	} else if !recoveryFavorableRegime &&
+		case3AFullFill &&
 		isRecoveryReplacementProducer(lot.Producer) &&
 		case3ARecoveryBefore > 0 &&
 		!strings.HasPrefix(exitReason, "threshold_stop_loss") &&
@@ -5025,8 +5089,8 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 
 	// A confirmed full Case3A UP recovery fill may intentionally leave an
 	// unrecovered bookkeeping obligation. Preserve that lot so the next tick
-	// can evaluate the remaining RecoveryNetUSD. The one-time easy UP gate has
-	// already been consumed by Case3AUpRecoveryUsed=true.
+	// can evaluate the remaining RecoveryNetUSD. The confirmed fill price and
+	// fee above become the baseline for the next fresh recovery cycle.
 	if !isPartial &&
 		case3AUpPartialRecovery &&
 		lot.RecoveryNetUSD > 0 {
