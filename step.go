@@ -931,7 +931,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 								(1.0 - offBps/10000.0)
 					}
 
-					lot.Take = makerExitPx
 					lot.FixedTPWorking = true
 
 					cand := exitCandidate{
@@ -941,6 +940,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						reason:       exitD.ExitReason,
 						decision:     decisionExitReason(exitD),
 						net:          net,
+						makerLimitPx: makerExitPx,
 					}
 
 					profitL2 = append(
@@ -1039,7 +1039,6 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						} else {
 							exitD.ExitClass = "L1_THRESHOLD_WARNING"
 							cand.decision = decisionExitReason(exitD)
-							stopL1 = append(stopL1, cand)
 
 							// Arm/update maker-friendly exit limit price to be near current mark price.
 							offBps := t.cfg.TPMakerOffsetBps
@@ -1050,14 +1049,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							if lot.Side == SideSell && offBps > 0 {
 								makerExitPx = price * (1.0 - offBps/10000.0)
 							}
-							// place/re-post every tick while gate holds (minimal emulation)
-							if !lot.FixedTPWorking || (lot.Side == SideBuy && makerExitPx < lot.Take) || (lot.Side == SideSell && makerExitPx > lot.Take) {
-								lot.Take = makerExitPx
-								lot.FixedTPWorking = true
-								// log.Printf("[TRACE] stop_l1.post side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
-							} else {
-								// log.Printf("[TRACE] stop_l1.repost side=%s idx=%d price=%.8f net=%.6f", lot.Side, i, lot.Take, net)
-							}
+							// Keep lot.Take as the activation/preview target. Carry the
+							// executable maker price with this specific exit attempt.
+							cand.makerLimitPx = makerExitPx
+							lot.FixedTPWorking = true
+							stopL1 = append(stopL1, cand)
 						}
 						i++
 						continue
@@ -1087,9 +1083,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				case ExitModeScalpFixedTP:
 					//-------flow reminder-----------------------------
 					// ProfitGate passed
-					// arm Take as maker-friendly limit
+					// carry a fresh maker-friendly limit with the exit candidate
 					// call closeLot()
-					// closeLot tries post-only at Take
+					// closeLot tries post-only at the carried limit
 					// if not filled by timeout, fallback market
 					//-------------------------------------------------------
 
@@ -1133,31 +1129,9 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						makerExitPx = price * (1.0 - offBps/10000.0)
 					}
 
-					if !lot.FixedTPWorking ||
-						(lot.Side == SideBuy && makerExitPx < lot.Take) ||
-						(lot.Side == SideSell && makerExitPx > lot.Take) {
-
-						lot.Take = makerExitPx
-						lot.FixedTPWorking = true
-
-						// log.Printf(
-						// "[TRACE] tp.post side=%s idx=%d price=%.8f net=%.6f entry_id=%s",
-						// lot.Side,
-						// i,
-						// lot.Take,
-						// net,
-						// lot.EntryOrderID,
-						// )
-					} else {
-						// log.Printf(
-						// "[TRACE] tp.repost side=%s idx=%d price=%.8f net=%.6f entry_id=%s",
-						// lot.Side,
-						// i,
-						// lot.Take,
-						// net,
-						// lot.EntryOrderID,
-						// )
-					}
+					// lot.Take remains the fee-adjusted activation/preview target.
+					// It must not become the executable post-only price.
+					lot.FixedTPWorking = true
 
 					notional := lot.SizeBase * price
 					if notional < minNotional {
@@ -1173,6 +1147,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						reason:       exitD.ExitReason,
 						decision:     decisionExitReason(exitD),
 						net:          net,
+						makerLimitPx: makerExitPx,
 					}
 
 					if strongProfitExit {
@@ -1622,6 +1597,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			lot.AITransitionRolloverPending = true
 			lot.AITransitionNextRetryAt = wallNow.Add(30 * time.Second)
 			candidate.idx = idx
+			candidate.makerLimitPx = price
+			offBps := t.cfg.TPMakerOffsetBps
+			if candidate.side == SideBuy && offBps > 0 {
+				candidate.makerLimitPx = price * (1.0 + offBps/10000.0)
+			}
+			if candidate.side == SideSell && offBps > 0 {
+				candidate.makerLimitPx = price * (1.0 - offBps/10000.0)
+			}
 			candidate.decision = fmt.Sprintf(
 				"producer=%s|previous_ai=%s|current_ai=%s|resume=%t",
 				EntryProducerAITransitionTrader,
@@ -1972,6 +1955,7 @@ type exitCandidate struct {
 	reason       string
 	decision     string
 	net          float64
+	makerLimitPx float64
 }
 
 // consolidateDust collapses tiny (notional < minNotional) lots on a side.

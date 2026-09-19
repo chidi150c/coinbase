@@ -3285,6 +3285,7 @@ func (t *Trader) fanOutExits(
 				cand.entryOrderID,
 				cand.reason,
 				cand.decision,
+				cand.makerLimitPx,
 				hotStart,
 			)
 			log.Printf(
@@ -3331,6 +3332,7 @@ func (t *Trader) closeLotByEntryID(
 	entryOrderID string,
 	exitReason string,
 	exitDecision string,
+	makerLimitPx float64,
 	hotStart time.Time,
 ) (string, bool, error) {
 	entryOrderID = strings.TrimSpace(entryOrderID)
@@ -3373,6 +3375,7 @@ func (t *Trader) closeLotByEntryID(
 		idx,
 		exitReason,
 		exitDecision,
+		makerLimitPx,
 		hotStart,
 	)
 
@@ -3388,6 +3391,7 @@ func (t *Trader) closeLot(
 	localIdx int,
 	exitReason string,
 	exitDecision string,
+	makerLimitPx float64,
 	hotStart time.Time,
 ) (string, bool, error) {
 
@@ -4232,7 +4236,10 @@ func (t *Trader) closeLot(
 
 	if usePendingMakerExit {
 
-		limitPx := lot.Take
+		// lot.Take is the fee-adjusted activation/preview target. It is not an
+		// executable order price. Use the maker price captured when this exit
+		// attempt was authorized, or derive a fresh one if none was supplied.
+		limitPx := makerLimitPx
 
 		if limitPx <= 0 {
 			limitPx = livePrice
@@ -4287,6 +4294,9 @@ func (t *Trader) closeLot(
 		}
 
 		if err != nil {
+			if currentIdx >= 0 && currentIdx < len(book.Lots) && book.Lots[currentIdx] != nil {
+				book.Lots[currentIdx].FixedTPWorking = false
+			}
 			log.Printf(
 				"[ERROR] pending_exit.start_failed side=%s entry_id=%s limit=%.8f base=%.8f err=%v",
 				lot.Side,
