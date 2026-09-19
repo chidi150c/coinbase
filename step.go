@@ -1566,6 +1566,12 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// A previously-started partial/rejected rollover owns the slot until its
 	// remainder completes; otherwise a fresh opposite raw-AI transition starts
 	// the rollover. No second book traversal is performed here.
+	//
+	// NORMAL adds a symmetric profitability guard. A captured BUY->SELL or
+	// SELL->BUY rollover remains pending only while raw AI still supports that
+	// direction, and it cannot submit until activationPrice confirms that the
+	// source cost, entry fee, estimated exit fee and low-tier NET profit are
+	// covered. UP and DOWN retain the existing transition behavior.
 	transitionToBuy := aiResult.Raw == Buy &&
 		(t.previousAIRaw == Sell || t.previousAIRaw == Flat)
 	transitionToSell := aiResult.Raw == Sell &&
@@ -1585,15 +1591,80 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			}
 			lot := book.Lots[idx]
 			if lot == nil || lot.FixedTPOrderID != "" ||
-				lot.AITransitionRolloverPending != pendingOnly ||
-				(!lot.AITransitionNextRetryAt.IsZero() && wallNow.Before(lot.AITransitionNextRetryAt)) {
+				lot.AITransitionRolloverPending != pendingOnly {
 				continue
 			}
-			if !pendingOnly &&
-				!((candidate.side == SideBuy && transitionToSell) ||
-					(candidate.side == SideSell && transitionToBuy)) {
+
+			freshOppositeTransition :=
+				(candidate.side == SideBuy && transitionToSell) ||
+					(candidate.side == SideSell && transitionToBuy)
+			aiSupportsRollover :=
+				(candidate.side == SideBuy && aiResult.Raw == Sell) ||
+					(candidate.side == SideSell && aiResult.Raw == Buy)
+
+			if !pendingOnly && !freshOppositeTransition {
 				continue
 			}
+
+			if t.MarketRegime == RegimeNormal {
+				if pendingOnly && !aiSupportsRollover {
+					// No exchange order owns the lot (FixedTPOrderID was checked
+					// above), so the pre-submission rollover may be cancelled when
+					// its initiating raw-AI direction reverses.
+					lot.AITransitionRolloverPending = false
+					lot.AITransitionNextRetryAt = time.Time{}
+					_ = t.saveStateNoLock()
+					log.Printf(
+						"[DEBUG] AITransition.normal_cancel side=%s entry_id=%s previous_ai=%s current_ai=%s",
+						candidate.side,
+						candidate.entryOrderID,
+						t.previousAIRaw,
+						aiResult.Raw,
+					)
+					continue
+				}
+
+				if !pendingOnly {
+					// Capture the transition before previousAIRaw is advanced by
+					// afterStepStateUpdate. The same flag owns target waiting,
+					// submission, partial-fill remainder and retry.
+					lot.AITransitionRolloverPending = true
+					lot.AITransitionNextRetryAt = time.Time{}
+					_ = t.saveStateNoLock()
+				}
+
+				requiredNetUSD :=
+					t.cfg.ProfitGateUSD * LowTierProducerMultiplier
+				requiredPrice := activationPrice(
+					lot,
+					requiredNetUSD,
+					t.cfg.FeeRatePct,
+				)
+				priceReached := requiredPrice > 0 &&
+					((candidate.side == SideBuy && price >= requiredPrice) ||
+						(candidate.side == SideSell && price <= requiredPrice))
+
+				if !priceReached {
+					if !pendingOnly {
+						log.Printf(
+							"[DEBUG] AITransition.normal_wait side=%s entry_id=%s raw_ai=%s price=%.8f required_price=%.8f required_net_usd=%.8f",
+							candidate.side,
+							candidate.entryOrderID,
+							aiResult.Raw,
+							price,
+							requiredPrice,
+							requiredNetUSD,
+						)
+					}
+					return true
+				}
+			}
+
+			if !lot.AITransitionNextRetryAt.IsZero() &&
+				wallNow.Before(lot.AITransitionNextRetryAt) {
+				return true
+			}
+
 			lot.AITransitionRolloverPending = true
 			lot.AITransitionNextRetryAt = wallNow.Add(30 * time.Second)
 			candidate.idx = idx
@@ -1606,11 +1677,19 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				candidate.makerLimitPx = price * (1.0 - offBps/10000.0)
 			}
 			candidate.decision = fmt.Sprintf(
-				"producer=%s|previous_ai=%s|current_ai=%s|resume=%t",
+				"producer=%s|previous_ai=%s|current_ai=%s|resume=%t|regime=%s|normal_profit_protected=%t|normal_required_net_usd=%.8f|normal_required_price=%.8f",
 				EntryProducerAITransitionTrader,
 				t.previousAIRaw,
 				aiResult.Raw,
 				pendingOnly,
+				t.MarketRegime,
+				t.MarketRegime == RegimeNormal,
+				t.cfg.ProfitGateUSD*LowTierProducerMultiplier,
+				activationPrice(
+					lot,
+					t.cfg.ProfitGateUSD*LowTierProducerMultiplier,
+					t.cfg.FeeRatePct,
+				),
 			)
 			deferredIndependentExits = append(deferredIndependentExits, candidate)
 			return true
