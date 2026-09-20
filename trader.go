@@ -5100,7 +5100,12 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 				EntryFee: 0,
 				OpenNotionalUSD: math.Max(0, quoteExec-exitFee),
 				ProducerReason: strings.TrimSpace(
-					fmt.Sprintf("ai_transition_rollover_fill|source_entry_order_id=%s|exit_order_id=%s", lot.EntryOrderID, exitOrderID),
+					fmt.Sprintf(
+						"ai_transition_rollover_fill|regime=%s|source_entry_order_id=%s|exit_order_id=%s",
+						t.MarketRegime,
+						lot.EntryOrderID,
+						exitOrderID,
+					),
 				),
 				ExitMode: ExitModeScalpFixedTP,
 				Version: Version,
@@ -5124,8 +5129,8 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 			}
 			destination.ProducerReason = strings.TrimSpace(
 				destination.ProducerReason + fmt.Sprintf(
-					"|ai_transition_rollover_absorbed=true|source_entry_order_id=%s|exit_order_id=%s|filled_base=%.8f",
-					lot.EntryOrderID, exitOrderID, baseFilled,
+					"|ai_transition_rollover_absorbed=true|regime=%s|source_entry_order_id=%s|exit_order_id=%s|filled_base=%.8f",
+					t.MarketRegime, lot.EntryOrderID, exitOrderID, baseFilled,
 				),
 			)
 		}

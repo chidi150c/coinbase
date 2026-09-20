@@ -75,7 +75,7 @@ import (
 	"time"
 )
 
-const Version = 210
+const Version = 211
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -827,7 +827,10 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 						side: side,
 						idx: i,
 						entryOrderID: lot.EntryOrderID,
-						reason: "ai_transition_rollover",
+						reason: fmt.Sprintf(
+							"ai_transition_rollover|regime=%s",
+							t.MarketRegime,
+						),
 					})
 					lot.FixedTPWorking = false
 					i++
