@@ -824,8 +824,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// bypass every ordinary profit/stop-loss/Case3 exit rule.
 				if lot != nil && lot.Producer == EntryProducerAITransitionTrader {
 					aiTransitionCandidates = append(aiTransitionCandidates, exitCandidate{
-						side: side,
-						idx: i,
+						side:         side,
+						idx:          i,
 						entryOrderID: lot.EntryOrderID,
 						reason: fmt.Sprintf(
 							"ai_transition_rollover|regime=%s",

@@ -1980,9 +1980,10 @@ func (t *Trader) collectEntryProducerDecisions(
 			seed.Producer = EntryProducerAITransitionTrader
 			seed.PendingCancelPolicy = PendingSignalCancelDisabled
 			seed.ProducerReason = fmt.Sprintf(
-				"ai_transition_seed|previous_ai=%s|current_ai=%s|seed_usd=%.8f",
+				"ai_transition_seed|previous_ai=%s|current_ai=%s|regime=%s|seed_usd=%.8f",
 				t.previousAIRaw,
 				ai.Raw,
+				t.MarketRegime,
 				t.cfg.AITransitionSeedUSD,
 			)
 			applyStandardProducerEconomics(

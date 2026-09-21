@@ -97,11 +97,11 @@ type Position struct {
 	ProfitPeakUSD            float64 `json:"profit_peak_usd,omitempty"`
 	Case3AReplacementStarted bool    `json:"case3_b_replacement_started"`
 
-	Case3AReplacementOrderID string        `json:"case3_b_replacement_order_id"`
-	Producer                 EntryProducer `json:"entry_producer,omitempty"`
-	AITransitionRolloverPending bool       `json:"ai_transition_rollover_pending,omitempty"`
-	AITransitionNextRetryAt     time.Time  `json:"ai_transition_next_retry_at,omitempty"`
-	AITransitionCapitalUSD      float64    `json:"ai_transition_capital_usd,omitempty"`
+	Case3AReplacementOrderID    string        `json:"case3_b_replacement_order_id"`
+	Producer                    EntryProducer `json:"entry_producer,omitempty"`
+	AITransitionRolloverPending bool          `json:"ai_transition_rollover_pending,omitempty"`
+	AITransitionNextRetryAt     time.Time     `json:"ai_transition_next_retry_at,omitempty"`
+	AITransitionCapitalUSD      float64       `json:"ai_transition_capital_usd,omitempty"`
 }
 
 // --- NEW: per-side book (authoritative store) ---
@@ -181,14 +181,14 @@ type BotState struct {
 	Exits           []ExitRecord
 
 	// --- NEW (persist pending maker-first opens & recheck flags) ---
-	PendingRecheckBuy  bool
-	PendingRecheckSell bool
-	RefundBuyUSD       float64
-	RefundSellUSD      float64
-	RefundObligations  map[string]*RefundObligation
-	SpareBuyUSD        float64
-	SpareSellUSD       float64
-	PreviousAIRaw      Signal
+	PendingRecheckBuy       bool
+	PendingRecheckSell      bool
+	RefundBuyUSD            float64
+	RefundSellUSD           float64
+	RefundObligations       map[string]*RefundObligation
+	SpareBuyUSD             float64
+	SpareSellUSD            float64
+	PreviousAIRaw           Signal
 	AITransitionInitialized bool
 	// Standardized durable continuation references keyed by producer + side.
 	// Market-price producers store committed execution price; Equity stores
@@ -277,8 +277,8 @@ type Trader struct {
 	producerAllocationMu sync.Mutex
 	statePersistMu       sync.Mutex
 
-	equityUSD     float64
-	previousAIRaw Signal
+	equityUSD               float64
+	previousAIRaw           Signal
 	aiTransitionInitialized bool
 
 	// Standardized continuation memory for every ordinary producer.
@@ -1680,12 +1680,12 @@ func (t *Trader) snapshotStateLocked() BotState {
 		BookBuy:  *t.book(SideBuy),
 		BookSell: *t.book(SideSell),
 
-		LastAddBuy:     t.lastAddBuy,
-		LastAddSell:    t.lastAddSell,
-		WinLowBuy:      t.winLowBuy,
-		WinHighSell:    t.winHighSell,
-		LatchedGateBuy: t.latchedGateBuy,
-		PreviousAIRaw:  t.previousAIRaw,
+		LastAddBuy:              t.lastAddBuy,
+		LastAddSell:             t.lastAddSell,
+		WinLowBuy:               t.winLowBuy,
+		WinHighSell:             t.winHighSell,
+		LatchedGateBuy:          t.latchedGateBuy,
+		PreviousAIRaw:           t.previousAIRaw,
 		AITransitionInitialized: t.aiTransitionInitialized,
 		ProducerContinuationReferences: cloneProducerContinuationReferences(
 			t.producerContinuationReferences,
@@ -5093,11 +5093,11 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 		}
 		if destination == nil {
 			destination = &Position{
-				OpenPrice: priceExec,
-				Side: destinationSide,
-				SizeBase: baseFilled,
-				OpenTime: exitTime,
-				EntryFee: 0,
+				OpenPrice:       priceExec,
+				Side:            destinationSide,
+				SizeBase:        baseFilled,
+				OpenTime:        exitTime,
+				EntryFee:        0,
 				OpenNotionalUSD: math.Max(0, quoteExec-exitFee),
 				ProducerReason: strings.TrimSpace(
 					fmt.Sprintf(
@@ -5107,13 +5107,13 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 						exitOrderID,
 					),
 				),
-				ExitMode: ExitModeScalpFixedTP,
-				Version: Version,
-				EntryOrderID: exitOrderID,
-				ConfidenceMult: lot.ConfidenceMult,
-				ProfitGateUSD: lot.ProfitGateUSD,
-				EntryMethod: string(EntryProducerAITransitionTrader),
-				Producer: EntryProducerAITransitionTrader,
+				ExitMode:               ExitModeScalpFixedTP,
+				Version:                Version,
+				EntryOrderID:           exitOrderID,
+				ConfidenceMult:         lot.ConfidenceMult,
+				ProfitGateUSD:          lot.ProfitGateUSD,
+				EntryMethod:            string(EntryProducerAITransitionTrader),
+				Producer:               EntryProducerAITransitionTrader,
 				AITransitionCapitalUSD: math.Max(0, quoteExec-exitFee),
 			}
 			destinationBook.Lots = append(destinationBook.Lots, destination)

@@ -116,7 +116,7 @@ type ProducerResourceRequest struct {
 	MinimumResource   float64
 	ResourceStep      float64
 
-	ConsumesLotSlot bool
+	ConsumesLotSlot       bool
 	RequireFullAllocation bool
 
 	ConfidenceMult float64
@@ -775,26 +775,26 @@ func (t *Trader) buildProducerResourceRequestLocked(
 	}
 
 	req := ProducerResourceRequest{
-		Decision:           d,
-		Intent:             intent,
-		Attempt:            attempt,
-		Producer:           d.Producer,
-		Side:               side,
-		Priority:           priority,
-		RequestedQuote:     quote,
-		RequestedBase:      base,
-		ConsumesLotSlot:    d.Producer != EntryProducerEquity,
+		Decision:              d,
+		Intent:                intent,
+		Attempt:               attempt,
+		Producer:              d.Producer,
+		Side:                  side,
+		Priority:              priority,
+		RequestedQuote:        quote,
+		RequestedBase:         base,
+		ConsumesLotSlot:       d.Producer != EntryProducerEquity,
 		RequireFullAllocation: isAITransitionSeed,
-		ConfidenceMult:     confMult,
-		ProfitGateUSD:      entryProfitGateUSD,
-		EntryMethod:        string(d.Producer),
-		Take:               take,
-		EquityStageChosen:  equityStageChosen,
-		EquityStageNext:    equityStageNext,
-		EquityStageValid:   equityStageValid,
-		RefundRequestedUSD: refundRequestedUSD,
-		CoreQuote:          coreQuote,
-		CoreBase:           coreBase,
+		ConfidenceMult:        confMult,
+		ProfitGateUSD:         entryProfitGateUSD,
+		EntryMethod:           string(d.Producer),
+		Take:                  take,
+		EquityStageChosen:     equityStageChosen,
+		EquityStageNext:       equityStageNext,
+		EquityStageValid:      equityStageValid,
+		RefundRequestedUSD:    refundRequestedUSD,
+		CoreQuote:             coreQuote,
+		CoreBase:              coreBase,
 	}
 	if req.EntryMethod == "" {
 		req.EntryMethod = "UNKNOWN"

@@ -89,19 +89,19 @@ type ProducerPriority int
 
 const (
 	ProducerPriorityAITransitionTrader ProducerPriority = 900
-	ProducerPriorityCase3AReplacement ProducerPriority = 800
-	ProducerPriorityCase3BReplacement ProducerPriority = 800
-	ProducerPriorityCase11A           ProducerPriority = 700
-	ProducerPriorityCase11B           ProducerPriority = 600
-	ProducerPriorityCase13A           ProducerPriority = 500
-	ProducerPriorityCase13B           ProducerPriority = 400
-	ProducerPriorityCase14B           ProducerPriority = 300
-	ProducerPriorityEquity            ProducerPriority = 200
-	ProducerPriorityNormalLegacy      ProducerPriority = 100
-	ProducerPriorityCase15B           ProducerPriority = 99
-	ProducerPriorityCase16A           ProducerPriority = 98
-	ProducerPriorityCase16B           ProducerPriority = 97
-	ProducerPriorityCase15A           ProducerPriority = 96
+	ProducerPriorityCase3AReplacement  ProducerPriority = 800
+	ProducerPriorityCase3BReplacement  ProducerPriority = 800
+	ProducerPriorityCase11A            ProducerPriority = 700
+	ProducerPriorityCase11B            ProducerPriority = 600
+	ProducerPriorityCase13A            ProducerPriority = 500
+	ProducerPriorityCase13B            ProducerPriority = 400
+	ProducerPriorityCase14B            ProducerPriority = 300
+	ProducerPriorityEquity             ProducerPriority = 200
+	ProducerPriorityNormalLegacy       ProducerPriority = 100
+	ProducerPriorityCase15B            ProducerPriority = 99
+	ProducerPriorityCase16A            ProducerPriority = 98
+	ProducerPriorityCase16B            ProducerPriority = 97
+	ProducerPriorityCase15A            ProducerPriority = 96
 )
 
 const (
