@@ -100,6 +100,16 @@ func (m *ResourceManager) State() ResourceLedgerState {
 	return state
 }
 
+func (m *ResourceManager) Reservation(id string) (ResourceReservation, bool) {
+	if m == nil {
+		return ResourceReservation{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	reservation, ok := m.reservations[strings.TrimSpace(id)]
+	return reservation, ok
+}
+
 func validateResourceReservation(reservation ResourceReservation) error {
 	if strings.TrimSpace(reservation.ID) == "" {
 		return errors.New("resource reservation missing ID")

@@ -449,7 +449,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			if _, retryPending := queue.retries[obligation.ObligationID]; retryPending {
 				continue
 			}
-			if obligation.Status == Case3AObligationWaiting {
+			if obligation.Status == Case3AObligationWaiting ||
+				obligation.Status == Case3AObligationWaitingForFunds {
 				// The source exit has now committed; the original Mode A or Mode B
 				// attempt can no longer own execution, so resurrection becomes active.
 				obligation.Status = Case3AObligationActive
@@ -1814,7 +1815,8 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			obligation := batch.obligations[obligationID]
 			if obligation == nil ||
 				(obligation.Status != Case3AObligationActive &&
-					obligation.Status != Case3AObligationWaitingForTarget) ||
+					obligation.Status != Case3AObligationWaitingForTarget &&
+					obligation.Status != Case3AObligationWaitingForFunds) ||
 				obligation.Status == Case3AObligationReconcile ||
 				strings.TrimSpace(obligation.ActiveOrderID) != "" ||
 				obligation.RemainingBase <= 0 ||

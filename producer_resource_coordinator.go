@@ -131,6 +131,12 @@ type ProducerResourceRequest struct {
 	RefundRequestedUSD float64
 	CoreQuote          float64
 	CoreBase           float64
+
+	// OwnedReservedResource is funding already withheld by ResourceManager for
+	// this exact Case3 obligation. The coordinator may unlock it only for the
+	// owning request; ordinary producers never receive this credit.
+	ReservedOwnerID       string
+	OwnedReservedResource float64
 }
 
 type AllocationStatus string
@@ -258,8 +264,10 @@ func (c ProducerResourceCoordinator) Allocate(
 		return left < right
 	})
 
-	spareQuote := math.Max(0, snapshot.SpareQuote)
-	spareBase := math.Max(0, snapshot.SpareBase)
+	remainingReservedQuote := math.Max(0, snapshot.ReservedQuote)
+	remainingReservedBase := math.Max(0, snapshot.ReservedBase)
+	consumedQuote := 0.0
+	consumedBase := 0.0
 	lotSlots := snapshot.AvailableLotSlots
 
 	for start := 0; start < len(sorted); {
@@ -275,6 +283,7 @@ func (c ProducerResourceCoordinator) Allocate(
 			groupRequested := 0.0
 			groupCoreRequested := 0.0
 			groupRefundRequested := 0.0
+			groupOwnedReserved := 0.0
 			for _, req := range group {
 				if req.ResourceKind != resourceKind {
 					continue
@@ -283,6 +292,7 @@ func (c ProducerResourceCoordinator) Allocate(
 				groupRequested += math.Max(0, req.RequestedResource)
 				groupCoreRequested += producerRequestCoreResource(req)
 				groupRefundRequested += producerRequestRefundResource(req)
+				groupOwnedReserved += math.Max(0, req.OwnedReservedResource)
 			}
 			if len(members) == 0 {
 				continue
@@ -291,9 +301,11 @@ func (c ProducerResourceCoordinator) Allocate(
 			groupAvailable := groupRequested
 			switch resourceKind {
 			case ResourceKindQuote:
-				groupAvailable = spareQuote
+				owned := math.Min(groupOwnedReserved, remainingReservedQuote)
+				groupAvailable = math.Max(0, snapshot.AvailQuote-consumedQuote-(remainingReservedQuote-owned))
 			case ResourceKindBase:
-				groupAvailable = spareBase
+				owned := math.Min(groupOwnedReserved, remainingReservedBase)
+				groupAvailable = math.Max(0, snapshot.AvailBase-consumedBase-(remainingReservedBase-owned))
 			}
 
 			// Preserve old producer sizing order: core sizing/funding is resolved
@@ -467,16 +479,8 @@ func (c ProducerResourceCoordinator) Allocate(
 
 				switch resourceKind {
 				case ResourceKindQuote:
-					spareQuote -= allocation.AllocatedQuote
-					if spareQuote < 0 {
-						spareQuote = 0
-					}
 					plan.ReservedQuote += allocation.AllocatedQuote
 				case ResourceKindBase:
-					spareBase -= allocation.AllocatedBase
-					if spareBase < 0 {
-						spareBase = 0
-					}
 					plan.ReservedBase += allocation.AllocatedBase
 				}
 				if req.ConsumesLotSlot && lotSlots > 0 {
@@ -484,6 +488,29 @@ func (c ProducerResourceCoordinator) Allocate(
 					plan.ReservedLots++
 				}
 				plan.Allocations = append(plan.Allocations, allocation)
+			}
+
+			groupUsed := 0.0
+			for _, allocation := range plan.Allocations {
+				if allocation.Request.Priority != priority || allocation.Request.ResourceKind != resourceKind {
+					continue
+				}
+				switch resourceKind {
+				case ResourceKindQuote:
+					groupUsed += allocation.AllocatedQuote
+				case ResourceKindBase:
+					groupUsed += allocation.AllocatedBase
+				}
+			}
+			switch resourceKind {
+			case ResourceKindQuote:
+				released := math.Min(groupUsed, math.Min(groupOwnedReserved, remainingReservedQuote))
+				remainingReservedQuote -= released
+				consumedQuote += groupUsed
+			case ResourceKindBase:
+				released := math.Min(groupUsed, math.Min(groupOwnedReserved, remainingReservedBase))
+				remainingReservedBase -= released
+				consumedBase += groupUsed
 			}
 		}
 		start = end

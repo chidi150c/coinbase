@@ -2675,7 +2675,8 @@ func evaluateRecoveryObligationResurrections(
 			snapshot.RemainingBase <= 0 ||
 			snapshot.SourcePositionExists ||
 			(snapshot.Status != Case3AObligationActive &&
-				snapshot.Status != Case3AObligationWaitingForTarget) ||
+				snapshot.Status != Case3AObligationWaitingForTarget &&
+				snapshot.Status != Case3AObligationWaitingForFunds) ||
 			snapshot.Status == Case3AObligationReconcile {
 			continue
 		}
@@ -5695,6 +5696,44 @@ func (t *Trader) producerResourceReservationsLocked() (
 	return t.resourceManager.Totals()
 }
 
+func (t *Trader) recoveryObligationReservationLocked(
+	prefix string,
+	obligationID string,
+	producer EntryProducer,
+	kind ResourceReservationKind,
+	obligation *Case3AObligation,
+	price float64,
+	feeMult float64,
+) ResourceReservation {
+	r := ResourceReservation{
+		ID: prefix + obligationID, OwnerID: obligationID,
+		Kind: kind, State: ResourceReservationPending, Producer: producer,
+		Side: obligation.Side, Informational: true, CreatedAt: obligation.CreatedAt,
+	}
+	if obligation.RemainingBase <= 0 ||
+		obligation.Status == Case3AObligationReconcile ||
+		obligation.Status == Case3AObligationPositionOpen ||
+		obligation.Status == Case3AObligationAugmentPending ||
+		strings.TrimSpace(obligation.ActiveOrderID) != "" {
+		return r
+	}
+	switch obligation.Side {
+	case SideBuy:
+		reservePrice := obligation.TargetPrice
+		if reservePrice <= 0 {
+			reservePrice = price
+		}
+		r.QuoteUSD = obligation.RemainingBase * reservePrice * feeMult
+		r.Informational = r.QuoteUSD <= 0
+	case SideSell:
+		if t.cfg.RequireBaseForShort {
+			r.Base = obligation.RemainingBase
+			r.Informational = r.Base <= 0
+		}
+	}
+	return r
+}
+
 // rebuildDerivedResourceLedgerLocked reconstructs durable ownership records
 // from authoritative Trader lifecycle state while preserving live submission
 // and reconciliation quarantines. Caller holds t.mu.
@@ -5771,21 +5810,19 @@ func (t *Trader) rebuildDerivedResourceLedgerLocked(price float64) error {
 		if obligation == nil {
 			continue
 		}
-		records = append(records, ResourceReservation{
-			ID: "case3a:" + id, OwnerID: id, Kind: ResourceReservationCase3A,
-			State: ResourceReservationPending, Producer: EntryProducerCase3AReplacement,
-			Side: obligation.Side, Informational: true, CreatedAt: obligation.CreatedAt,
-		})
+		records = append(records, t.recoveryObligationReservationLocked(
+			"case3a:", id, EntryProducerCase3AReplacement,
+			ResourceReservationCase3A, obligation, price, feeMult,
+		))
 	}
 	for id, obligation := range t.Case3BObligations {
 		if obligation == nil {
 			continue
 		}
-		records = append(records, ResourceReservation{
-			ID: "case3b:" + id, OwnerID: id, Kind: ResourceReservationCase3B,
-			State: ResourceReservationPending, Producer: EntryProducerCase3BReplacement,
-			Side: obligation.Side, Informational: true, CreatedAt: obligation.CreatedAt,
-		})
+		records = append(records, t.recoveryObligationReservationLocked(
+			"case3b:", id, EntryProducerCase3BReplacement,
+			ResourceReservationCase3B, obligation, price, feeMult,
+		))
 	}
 	return t.resourceManager.ReplaceDerived(records)
 }

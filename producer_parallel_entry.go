@@ -1536,6 +1536,22 @@ func (t *Trader) processParallelProducerEntriesLocked(
 				req.MinimumResource = resourceRequestMinBase(snapshot)
 				req.ResourceStep = snapshot.BaseStep
 			}
+
+			reservationPrefix := "case3a:"
+			if d.Producer == EntryProducerCase3BReplacement {
+				reservationPrefix = "case3b:"
+			}
+			reservationID := reservationPrefix + strings.TrimSpace(d.Case3AObligationID)
+			if reservation, exists := t.resourceManager.Reservation(reservationID); exists &&
+				!reservation.Informational {
+				req.ReservedOwnerID = reservationID
+				switch req.ResourceKind {
+				case ResourceKindQuote:
+					req.OwnedReservedResource = reservation.QuoteUSD
+				case ResourceKindBase:
+					req.OwnedReservedResource = reservation.Base
+				}
+			}
 		}
 
 		requestAvailable := req.RequestedResource
