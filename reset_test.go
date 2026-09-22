@@ -6,6 +6,7 @@ import (
 	"math"
 	"sync"
 	"testing"
+	"time"
 )
 
 type resetTestBroker struct {
@@ -85,10 +86,10 @@ func (b *resetTestBroker) ListOpenOrderIDs(context.Context, string) ([]string, e
 
 func newResetTestTrader(b *resetTestBroker) *Trader {
 	return NewTrader(Config{
-		ProductID:           "BTC-USDT",
-		OrderMinUSD:         10,
-		PersistState:        false,
-		AIFeatureDim:        8,
+		ProductID:       "BTC-USDT",
+		OrderMinUSD:     10,
+		PersistState:    false,
+		AIFeatureDim:    8,
 		ProducerHistoryFile: "",
 	}, b)
 }
@@ -133,5 +134,39 @@ func TestCancelAndReconcileAllOrdersUsesPerOrderBrokerPath(t *testing.T) {
 	}
 	if len(b.open) != 0 {
 		t.Fatalf("open orders remain: %v", b.open)
+	}
+}
+
+func TestInstallCleanResetStatePreservesModelWeightsAndLastFit(t *testing.T) {
+	b := &resetTestBroker{price: 100, quote: 500, base: 5, open: map[string]bool{}}
+	trader := newResetTestTrader(b)
+	trader.model = NewLogisticModel(3)
+	trader.model.W = []float64{0.25, -0.5, 0.75}
+	trader.model.B = 0.125
+	lastFit := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	trader.lastFit = lastFit
+
+	err := trader.installCleanResetState(balanceSnapshot{
+		SymQuote: "USDT", AvailQuote: 500, QuoteStep: 0.01,
+		SymBase: "BTC", AvailBase: 5, BaseStep: 0.00000001,
+		UpdatedAt: time.Now(),
+	}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trader.lastFit != lastFit {
+		t.Fatalf("lastFit changed during reset: got %s want %s", trader.lastFit, lastFit)
+	}
+	want := []float64{0.25, -0.5, 0.75}
+	if len(trader.model.W) != len(want) {
+		t.Fatalf("weight count=%d want=%d", len(trader.model.W), len(want))
+	}
+	for i := range want {
+		if trader.model.W[i] != want[i] {
+			t.Fatalf("weight[%d]=%.8f want %.8f", i, trader.model.W[i], want[i])
+		}
+	}
+	if trader.model.B != 0.125 {
+		t.Fatalf("bias=%.8f want 0.125", trader.model.B)
 	}
 }

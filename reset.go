@@ -188,10 +188,10 @@ func (t *Trader) installCleanResetState(snapshot balanceSnapshot, price float64)
 	t.equityUSD = snapshot.AvailQuote + snapshot.AvailBase*price
 	t.dailyStart = midnightUTC(now)
 	t.dailyPnL = 0
-	t.lastFit = time.Time{}
-	if t.model != nil {
-		*t.model = *NewLogisticModel(t.model.FeatDim)
-	}
+	// Model weights and LastFit are analytical training state, not exchange or
+	// trading-lifecycle state. Preserve them across an account reset so the bot
+	// does not temporarily trade with zero weights or require an unscheduled
+	// retraining cycle.
 	t.pos = nil
 	t.didConsolidateStartup = false
 	t.books = map[OrderSide]*SideBook{SideBuy: {RunnerIDs: []int{}}, SideSell: {RunnerIDs: []int{}}}
