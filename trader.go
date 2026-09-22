@@ -276,7 +276,6 @@ type Trader struct {
 	// snapshot while the current AllocationPlan is being realized.
 	producerAllocationMu sync.Mutex
 	statePersistMu       sync.Mutex
-	resetController      *ResetController
 
 	equityUSD               float64
 	previousAIRaw           Signal
@@ -455,7 +454,6 @@ func NewTrader(cfg Config, broker Broker) *Trader {
 			map[string]PendingReplacementRetry,
 		),
 		resourceManager: NewResourceManager(ResourceLedgerState{}),
-		resetController: NewResetController(),
 		RefundObligations: make(
 			map[string]*RefundObligation,
 		),
@@ -5806,13 +5804,7 @@ func (t *Trader) reconcileResourceQuarantines(ctx context.Context) {
 		if productID == "" {
 			productID = t.cfg.ProductID
 		}
-		var order *PlacedOrder
-		var err error
-		if broker, ok := t.broker.(ClientOrderLookupBroker); ok {
-			order, err = broker.GetOrderByClientID(ctx, productID, lookupID)
-		} else {
-			order, err = t.broker.GetOrder(ctx, productID, lookupID)
-		}
+		order, err := t.broker.GetOrder(ctx, productID, lookupID)
 		if err != nil || order == nil {
 			continue
 		}
