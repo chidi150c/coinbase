@@ -423,6 +423,8 @@ type Trader struct {
 	// Gate Analysis sampling throttle only. Historical points live on disk,
 	// not in the Trader heap.
 	gateAnalysisLastSampleUnix int64
+
+	resetController *ResetController
 }
 
 func NewTrader(cfg Config, broker Broker) *Trader {
@@ -470,6 +472,7 @@ func NewTrader(cfg Config, broker Broker) *Trader {
 		producerContinuationReferences: make(
 			ProducerContinuationReferences,
 		),
+		resetController: &ResetController{},
 	}
 
 	// Start centralized state manager goroutine

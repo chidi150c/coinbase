@@ -714,6 +714,7 @@ def order_market(
     product_id: Optional[str] = Query(default=None),
     side: Optional[str] = Query(default=None),
     quote_size: Optional[str] = Query(default=None),
+    client_order_id: Optional[str] = Query(default=None),
     body: Optional[Dict] = Body(default=None),
 ):
     # Optional JSON body fallback (no behavior change for existing clients using query params)
@@ -722,6 +723,7 @@ def order_market(
         side = (side or body.get("side"))
         qs = body.get("quote_size")
         quote_size = quote_size or (str(qs) if qs is not None else None)
+        client_order_id = client_order_id or body.get("client_order_id")
 
     # Validate required fields after merging
     if not product_id or not side or not quote_size:
@@ -729,8 +731,23 @@ def order_market(
 
     sym = _normalize_symbol(product_id)
     side = side.upper()
-    payload = _binance_signed_post("/api/v3/order",
-        {"symbol": sym, "side": side, "type": "MARKET", "quoteOrderQty": quote_size})
+    params = {"symbol": sym, "side": side, "type": "MARKET", "quoteOrderQty": quote_size}
+    if client_order_id:
+        params["newClientOrderId"] = client_order_id
+    try:
+        payload = _binance_signed_post("/api/v3/order", params)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        duplicate = "duplicate" in str(detail.get("binance_msg", "")).lower()
+        if not client_order_id or not duplicate:
+            raise
+        # The caller deliberately retries the same reset transaction ID after
+        # an ambiguous timeout. Resolve the already-created Binance order
+        # instead of submitting another economic action.
+        payload = _binance_signed(
+            "/api/v3/order",
+            {"symbol": sym, "origClientOrderId": client_order_id},
+        )
 
     order_id = payload.get("orderId")
     resp = {
@@ -773,6 +790,12 @@ def order_market(
         pass
     return resp
 
+@app.get("/orders/open")
+def orders_open(product_id: str = Query(default=SYMBOL)):
+    sym = _normalize_symbol(product_id)
+    orders = _binance_signed("/api/v3/openOrders", {"symbol": sym})
+    return {"order_ids": [str(order.get("orderId")) for order in orders if order.get("orderId") is not None]}
+
 # --- Post-only limit (LIMIT_MAKER). Body or query accepted. Returns {order_id} ---
 @app.post("/order/limit_post_only")
 def order_limit_post_only(
@@ -780,6 +803,7 @@ def order_limit_post_only(
     side: Optional[str] = Query(default=None),
     limit_price: Optional[str] = Query(default=None),
     base_size: Optional[str] = Query(default=None),
+    client_order_id: Optional[str] = Query(default=None),
     body: Optional[Dict] = Body(default=None),
 ):
     # Merge JSON body fallback if provided
@@ -790,6 +814,7 @@ def order_limit_post_only(
         bs          = body.get("base_size")
         limit_price = limit_price or (str(lp) if lp is not None else None)
         base_size   = base_size   or (str(bs) if bs is not None else None)
+        client_order_id = client_order_id or body.get("client_order_id")
 
     # Validate
     if not product_id or not side or not limit_price or not base_size:
@@ -798,17 +823,26 @@ def order_limit_post_only(
     sym = _normalize_symbol(product_id)
     side = side.upper()
     # LIMIT_MAKER is Binance's post-only order. It is rejected if it would trade immediately.
-    payload = _binance_signed_post(
-        "/api/v3/order",
-        {
-            "symbol": sym,
-            "side": side,
-            "type": "LIMIT_MAKER",
-            "price": str(limit_price),
-            "quantity": str(base_size),
-            # timeInForce not required for LIMIT_MAKER
-        },
-    )
+    params = {
+        "symbol": sym,
+        "side": side,
+        "type": "LIMIT_MAKER",
+        "price": str(limit_price),
+        "quantity": str(base_size),
+    }
+    if client_order_id:
+        params["newClientOrderId"] = client_order_id
+    try:
+        payload = _binance_signed_post("/api/v3/order", params)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        duplicate = "duplicate" in str(detail.get("binance_msg", "")).lower()
+        if not client_order_id or not duplicate:
+            raise
+        payload = _binance_signed(
+            "/api/v3/order",
+            {"symbol": sym, "origClientOrderId": client_order_id},
+        )
     order_id = payload.get("orderId")
     if not order_id:
         # surface upstream details if absent

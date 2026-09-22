@@ -585,6 +585,19 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 
 				cancelPx()
 
+				// Full reset is a tick-boundary interrupt. No new step begins while
+				// cancellation, reconciliation, balancing, and clean persistence run.
+				if trader.resetController.ResetRequested() {
+					resetCtx, cancelReset := context.WithTimeout(ctx, 45*time.Second)
+					err := trader.executeFullSystemReset(resetCtx, px)
+					cancelReset()
+					if err != nil {
+						log.Printf("[RESET] failed: %v; trading remains paused", err)
+						time.Sleep(time.Duration(trader.cfg.TickInterval()) * time.Second)
+						continue
+					}
+				}
+
 				//=====================================================================
 				//=====================================================================
 				// Step trader

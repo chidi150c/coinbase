@@ -96,6 +96,13 @@ type IdempotentBroker interface {
 	PlaceLimitPostOnlyWithClientID(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64, clientOrderID string) (string, error)
 }
 
+// OpenOrderLister is an optional maintenance capability. Reset uses it only
+// to discover exchange orders; cancellation and reconciliation still go
+// through Broker.CancelOrder and Broker.GetOrder.
+type OpenOrderLister interface {
+	ListOpenOrderIDs(ctx context.Context, product string) ([]string, error)
+}
+
 func stableClientOrderID(ownerID string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(ownerID)))
 	return "bot-" + hex.EncodeToString(sum[:16])

@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -71,6 +73,38 @@ func main() {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/ops/full-reset", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "method_not_allowed"})
+			return
+		}
+		expected := strings.TrimSpace(os.Getenv("FULL_RESET_TOKEN"))
+		provided := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		if expected == "" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "full_reset_not_configured"})
+			return
+		}
+		if len(provided) != len(expected) || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
+		requestID, accepted := trader.requestFullSystemReset()
+		if !accepted {
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "already_requested", "request_id": requestID})
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":     "accepted",
+			"request_id": requestID,
+			"message":    "full reset will run at the next tick boundary",
+		})
+	})
 
 	srv := &http.Server{Addr: fmt.Sprintf(":%d", cfg.Port), Handler: mux}
 	go func() {
