@@ -303,10 +303,25 @@ func (b *BinanceBridge) GetAvailableQuote(ctx context.Context, product string) (
 // --- Orders (market by quote), exact body/shape as broker_bridge.go expects ---
 
 func (b *BinanceBridge) PlaceMarketQuote(ctx context.Context, product string, side OrderSide, quoteUSD float64) (*PlacedOrder, error) {
+	return b.placeMarketQuote(ctx, product, side, quoteUSD, "")
+}
+
+func (b *BinanceBridge) PlaceMarketQuoteWithClientID(ctx context.Context, product string, side OrderSide, quoteUSD float64, clientOrderID string) (*PlacedOrder, error) {
+	clientOrderID = strings.TrimSpace(clientOrderID)
+	if clientOrderID == "" {
+		return nil, fmt.Errorf("market order client ID is empty")
+	}
+	return b.placeMarketQuote(ctx, product, side, quoteUSD, clientOrderID)
+}
+
+func (b *BinanceBridge) placeMarketQuote(ctx context.Context, product string, side OrderSide, quoteUSD float64, clientOrderID string) (*PlacedOrder, error) {
 	body := map[string]any{
 		"product_id": product,
 		"side":       side, // IMPORTANT: mirror broker_bridge.go (no .String())
 		"quote_size": fmt.Sprintf("%.8f", quoteUSD),
+	}
+	if strings.TrimSpace(clientOrderID) != "" {
+		body["client_order_id"] = strings.TrimSpace(clientOrderID)
 	}
 	data, _ := json.Marshal(body)
 	u := fmt.Sprintf("%s/order/market", b.base)
@@ -446,6 +461,18 @@ func (b *BinanceBridge) PlaceMarketBase(ctx context.Context, product string, sid
 // --- NEW: Post-only limit (LIMIT_MAKER) with size/price snapping to exchange filters ---
 // Returns the created order ID (best-effort), or an error.
 func (b *BinanceBridge) PlaceLimitPostOnly(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64) (string, error) {
+	return b.placeLimitPostOnly(ctx, product, side, limitPrice, baseSize, "")
+}
+
+func (b *BinanceBridge) PlaceLimitPostOnlyWithClientID(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64, clientOrderID string) (string, error) {
+	clientOrderID = strings.TrimSpace(clientOrderID)
+	if clientOrderID == "" {
+		return "", errors.New("post-only client ID is empty")
+	}
+	return b.placeLimitPostOnly(ctx, product, side, limitPrice, baseSize, clientOrderID)
+}
+
+func (b *BinanceBridge) placeLimitPostOnly(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64, clientOrderID string) (string, error) {
 	// Snap base size to step (floor) using the bridge's balance endpoint (same as broker_bridge.go style).
 	_, _, baseStep, err := b.GetAvailableBase(ctx, product)
 	if err == nil && baseStep > 0 {
@@ -480,6 +507,9 @@ func (b *BinanceBridge) PlaceLimitPostOnly(ctx context.Context, product string, 
 		"side":        side, // "BUY" or "SELL"
 		"limit_price": priceStr,
 		"base_size":   sizeStr,
+	}
+	if clientOrderID != "" {
+		body["client_order_id"] = clientOrderID
 	}
 	data, _ := json.Marshal(body)
 	u := fmt.Sprintf("%s/order/limit_post_only", b.base)
@@ -523,6 +553,33 @@ func (b *BinanceBridge) GetOrder(ctx context.Context, product, orderID string) (
 	return b.fetchOrder(ctx, product, orderID)
 }
 
+func (b *BinanceBridge) GetOrderByClientID(ctx context.Context, product, clientOrderID string) (*PlacedOrder, error) {
+	u := fmt.Sprintf(
+		"%s/order-by-client/%s?product_id=%s",
+		b.base,
+		url.PathEscape(strings.TrimSpace(clientOrderID)),
+		url.QueryEscape(product),
+	)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := b.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		xb, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("bridge order get by client ID %d: %s", resp.StatusCode, string(xb))
+	}
+	var ordJSON placedOrderJSON
+	if err := json.NewDecoder(resp.Body).Decode(&ordJSON); err != nil {
+		return nil, err
+	}
+	return toPlacedOrder(ordJSON), nil
+}
+
 func (b *BinanceBridge) CancelOrder(ctx context.Context, product, orderID string) error {
 	u := fmt.Sprintf("%s/order/%s", b.base, url.PathEscape(orderID))
 	req, err := http.NewRequestWithContext(ctx, "DELETE", u, nil)
@@ -541,8 +598,38 @@ func (b *BinanceBridge) CancelOrder(ctx context.Context, product, orderID string
 	return nil
 }
 
+// CancelAllOpenOrders is the reset-grade cancellation primitive.  The bridge
+// performs the bulk cancel and independently verifies Binance reports no open
+// orders before this method returns success.
+func (b *BinanceBridge) CancelAllOpenOrders(ctx context.Context, product string) error {
+	u := fmt.Sprintf("%s/orders/open?product_id=%s", b.base, url.QueryEscape(product))
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := b.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return newBinanceBridgeError(resp.StatusCode, body)
+	}
+	var result struct {
+		OpenCount int `json:"open_count"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
+	if result.OpenCount != 0 {
+		return fmt.Errorf("cancel all open orders verification returned %d open orders", result.OpenCount)
+	}
+	return nil
+}
+
 func (b *BinanceBridge) fetchOrder(ctx context.Context, product, orderID string) (*PlacedOrder, error) {
-	u := fmt.Sprintf("%s/order/%s", b.base, url.PathEscape(orderID))
+	u := fmt.Sprintf("%s/order/%s?product_id=%s", b.base, url.PathEscape(orderID), url.QueryEscape(product))
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return nil, err

@@ -191,6 +191,11 @@ _accounts_cache: Optional[Dict] = None
 _accounts_cache_ts_ms: Optional[int] = None
 _ACCOUNTS_CACHE_TTL_MS = 2000  # ms
 
+def _invalidate_accounts_cache() -> None:
+    global _accounts_cache, _accounts_cache_ts_ms
+    _accounts_cache = None
+    _accounts_cache_ts_ms = None
+
 # Simple build tag/banner so we can confirm which image is running
 BUILD_TAG = "bridge-binance-accounts-cache-v1"
 
@@ -714,6 +719,7 @@ def order_market(
     product_id: Optional[str] = Query(default=None),
     side: Optional[str] = Query(default=None),
     quote_size: Optional[str] = Query(default=None),
+    client_order_id: Optional[str] = Query(default=None),
     body: Optional[Dict] = Body(default=None),
 ):
     # Optional JSON body fallback (no behavior change for existing clients using query params)
@@ -722,6 +728,7 @@ def order_market(
         side = (side or body.get("side"))
         qs = body.get("quote_size")
         quote_size = quote_size or (str(qs) if qs is not None else None)
+        client_order_id = client_order_id or body.get("client_order_id")
 
     # Validate required fields after merging
     if not product_id or not side or not quote_size:
@@ -729,8 +736,16 @@ def order_market(
 
     sym = _normalize_symbol(product_id)
     side = side.upper()
-    payload = _binance_signed_post("/api/v3/order",
-        {"symbol": sym, "side": side, "type": "MARKET", "quoteOrderQty": quote_size})
+    order_params = {
+        "symbol": sym,
+        "side": side,
+        "type": "MARKET",
+        "quoteOrderQty": quote_size,
+    }
+    if client_order_id:
+        order_params["newClientOrderId"] = str(client_order_id)
+    payload = _binance_signed_post("/api/v3/order", order_params)
+    _invalidate_accounts_cache()
 
     order_id = payload.get("orderId")
     resp = {
@@ -780,6 +795,7 @@ def order_limit_post_only(
     side: Optional[str] = Query(default=None),
     limit_price: Optional[str] = Query(default=None),
     base_size: Optional[str] = Query(default=None),
+    client_order_id: Optional[str] = Query(default=None),
     body: Optional[Dict] = Body(default=None),
 ):
     # Merge JSON body fallback if provided
@@ -790,6 +806,7 @@ def order_limit_post_only(
         bs          = body.get("base_size")
         limit_price = limit_price or (str(lp) if lp is not None else None)
         base_size   = base_size   or (str(bs) if bs is not None else None)
+        client_order_id = client_order_id or body.get("client_order_id")
 
     # Validate
     if not product_id or not side or not limit_price or not base_size:
@@ -798,16 +815,18 @@ def order_limit_post_only(
     sym = _normalize_symbol(product_id)
     side = side.upper()
     # LIMIT_MAKER is Binance's post-only order. It is rejected if it would trade immediately.
+    order_params = {
+        "symbol": sym,
+        "side": side,
+        "type": "LIMIT_MAKER",
+        "price": str(limit_price),
+        "quantity": str(base_size),
+    }
+    if client_order_id:
+        order_params["newClientOrderId"] = str(client_order_id)
     payload = _binance_signed_post(
         "/api/v3/order",
-        {
-            "symbol": sym,
-            "side": side,
-            "type": "LIMIT_MAKER",
-            "price": str(limit_price),
-            "quantity": str(base_size),
-            # timeInForce not required for LIMIT_MAKER
-        },
+        order_params,
     )
     order_id = payload.get("orderId")
     if not order_id:
@@ -858,12 +877,42 @@ def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
         pass
     return resp
 
+@app.get("/order-by-client/{client_order_id}")
+def order_get_by_client_id(client_order_id: str, product_id: str = Query(default=SYMBOL)):
+    sym = _normalize_symbol(product_id)
+    od = _binance_signed(
+        "/api/v3/order",
+        {"symbol": sym, "origClientOrderId": client_order_id},
+    )
+    return order_get(str(od.get("orderId")), product_id)
+
 # --- Cancel order endpoint (DELETE) to align with broker.CancelOrder ---
 @app.delete("/order/{order_id}")
 def order_cancel(order_id: str, product_id: str = Query(default=SYMBOL)):
     sym = _normalize_symbol(product_id)
     _ = _binance_signed_delete("/api/v3/order", {"symbol": sym, "orderId": order_id})
     return {"ok": True, "order_id": str(order_id)}
+
+@app.delete("/orders/open")
+def orders_cancel_all(product_id: str = Query(default=SYMBOL)):
+    """Cancel every open order and verify the symbol is empty before success."""
+    sym = _normalize_symbol(product_id)
+    _binance_signed_delete("/api/v3/openOrders", {"symbol": sym})
+    remaining = None
+    for _ in range(5):
+        remaining = _binance_signed("/api/v3/openOrders", {"symbol": sym})
+        if not isinstance(remaining, list):
+            raise HTTPException(status_code=502, detail="Binance open-order verification returned an invalid payload")
+        if not remaining:
+            break
+        time.sleep(0.2)
+    if remaining:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Open orders remain after bulk cancel: {len(remaining)}",
+        )
+    _invalidate_accounts_cache()
+    return {"ok": True, "open_count": 0}
 
 # ---- Runner ----
 async def _runner():

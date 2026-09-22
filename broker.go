@@ -96,6 +96,20 @@ type IdempotentBroker interface {
 	PlaceLimitPostOnlyWithClientID(ctx context.Context, product string, side OrderSide, limitPrice, baseSize float64, clientOrderID string) (string, error)
 }
 
+// FullResetBroker is an optional live-broker capability used by the destructive
+// full-system reset.  It must cancel *all* open orders for the product and must
+// not return success until a subsequent exchange query confirms none remain.
+// A reset fails closed when the active broker does not provide this capability.
+type FullResetBroker interface {
+	CancelAllOpenOrders(ctx context.Context, product string) error
+}
+
+// ClientOrderLookupBroker reconciles a submission whose HTTP outcome is
+// uncertain by using the caller-owned durable client order ID.
+type ClientOrderLookupBroker interface {
+	GetOrderByClientID(ctx context.Context, product, clientOrderID string) (*PlacedOrder, error)
+}
+
 func stableClientOrderID(ownerID string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(ownerID)))
 	return "bot-" + hex.EncodeToString(sum[:16])
