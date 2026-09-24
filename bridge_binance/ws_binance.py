@@ -774,6 +774,8 @@ def order_market(
                 "price": str(price),
                 "size": str(qty),
                 "fee": str(commission),
+                "commission": str(commission),
+                "commissionAsset": str(t.get("commissionAsset", "")),
                 "liquidity": "T" if t.get("isBuyerMaker") else "M",
                 "time": _now_iso(),
             })
@@ -876,6 +878,8 @@ def order_get(order_id: str, product_id: str = Query(default=SYMBOL)):
                 "price": str(price),
                 "size": str(qty),
                 "fee": str(commission),
+                "commission": str(commission),
+                "commissionAsset": str(t.get("commissionAsset", "")),
                 "liquidity": "T" if t.get("isBuyerMaker") else "M",
                 "time": _now_iso(),
             })

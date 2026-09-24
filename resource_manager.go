@@ -19,6 +19,7 @@ const (
 	ResourceReservationRefund       ResourceReservationKind = "refund"
 	ResourceReservationCase3A       ResourceReservationKind = "case3a"
 	ResourceReservationCase3B       ResourceReservationKind = "case3b"
+	ResourceReservationCase3C       ResourceReservationKind = "case3c"
 	ResourceReservationSubmission   ResourceReservationKind = "submission"
 	ResourceReservationQuarantine   ResourceReservationKind = "quarantine"
 
@@ -272,7 +273,8 @@ func (m *ResourceManager) ReplaceDerived(reservations []ResourceReservation) err
 		case ResourceReservationLot, ResourceReservationPendingEntry,
 			ResourceReservationPendingExit, ResourceReservationRefund,
 			ResourceReservationCase3A,
-			ResourceReservationCase3B:
+			ResourceReservationCase3B,
+			ResourceReservationCase3C:
 			delete(m.reservations, id)
 		}
 	}

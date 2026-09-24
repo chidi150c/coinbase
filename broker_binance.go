@@ -863,7 +863,9 @@ func formatWithStepBinance(x, step float64, fallbackDec int) string {
 type fillJSON struct {
 	Price           string `json:"price"`
 	Qty             string `json:"qty"`
+	Size            string `json:"size"`
 	Commission      string `json:"commission"`
+	Fee             string `json:"fee"`
 	CommissionAsset string `json:"commissionAsset"`
 }
 
@@ -890,6 +892,7 @@ type placedOrderJSON struct {
 func toPlacedOrder(j placedOrderJSON) *PlacedOrder {
 	out := &PlacedOrder{
 		ID:            j.ID,
+		ProductID:     j.ProductID,
 		Price:         parseFloat(j.Price),
 		BaseSize:      parseFloat(j.BaseSize),
 		QuoteSpent:    parseFloat(j.QuoteSpent),
@@ -910,23 +913,33 @@ func toPlacedOrder(j placedOrderJSON) *PlacedOrder {
 	}
 
 	// Prefer fill-level commission data because it includes CommissionAsset.
+	var baseAssetCommission float64
 	if len(j.Fills) > 0 {
 		var sumUSD float64
+		baseAsset := binanceProductBaseAsset(j.ProductID)
 
 		for _, f := range j.Fills {
 			commission := parseFloat(f.Commission)
+			if commission <= 0 {
+				commission = parseFloat(f.Fee)
+			}
 			if commission <= 0 {
 				continue
 			}
 
 			fillPrice := parseFloat(f.Price)
 			commissionAsset := strings.ToUpper(strings.TrimSpace(f.CommissionAsset))
+			if baseAsset != "" && commissionAsset == baseAsset {
+				baseAssetCommission += commission
+			}
 
-			switch commissionAsset {
-			case "USDT", "USD":
+			switch {
+			case commissionAsset == "USDT" || commissionAsset == "USDC" ||
+				commissionAsset == "BUSD" || commissionAsset == "FDUSD" ||
+				commissionAsset == "TUSD" || commissionAsset == "USD":
 				sumUSD += commission
 
-			case "BTC":
+			case baseAsset != "" && commissionAsset == baseAsset:
 				if fillPrice <= 0 {
 					fillPrice = out.Price
 				}
@@ -951,6 +964,7 @@ func toPlacedOrder(j placedOrderJSON) *PlacedOrder {
 		}
 
 		out.CommissionUSD = sumUSD
+		out.CommissionBase = baseAssetCommission
 	} else {
 		out.CommissionUSD = parseFloat(j.CommissionUSD)
 
@@ -988,4 +1002,15 @@ func toPlacedOrder(j placedOrderJSON) *PlacedOrder {
 	}
 
 	return out
+}
+
+func binanceProductBaseAsset(product string) string {
+	normalized := strings.ToUpper(strings.TrimSpace(product))
+	normalized = strings.NewReplacer("-", "", "_", "", "/", "").Replace(normalized)
+	for _, quote := range []string{"FDUSD", "USDT", "USDC", "BUSD", "TUSD", "USD", "BTC", "ETH", "BNB"} {
+		if strings.HasSuffix(normalized, quote) && len(normalized) > len(quote) {
+			return strings.TrimSuffix(normalized, quote)
+		}
+	}
+	return ""
 }

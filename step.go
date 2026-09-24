@@ -75,7 +75,7 @@ import (
 	"time"
 )
 
-const Version = 213
+const Version = 214
 
 // ---- Runner helpers (minimal addition to support multiple runners) ----
 func isRunner(book *SideBook, idx int) bool {
@@ -824,6 +824,37 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// scanned immutable identity for authorization after AI fan-in, and
 				// bypass every ordinary profit/stop-loss/Case3 exit rule.
 				if lot != nil && lot.Producer == EntryProducerAITransitionTrader {
+					// Case3C reuses the established same-side Case3 augmentation path,
+					// but only while NORMAL. The augmentation decision precedes AI
+					// rollover authorization on this tick and never closes the source.
+					if t.MarketRegime == RegimeNormal && enableStopLoss {
+						refreshTakePreview(lot)
+						net, _ := computeGate(lot)
+						if net <= lossLimit {
+							offBps := t.cfg.TPMakerOffsetBps
+							makerExitPx := price
+							if lot.Side == SideBuy && offBps > 0 {
+								makerExitPx = price * (1.0 + offBps/10000.0)
+							} else if lot.Side == SideSell && offBps > 0 {
+								makerExitPx = price * (1.0 - offBps/10000.0)
+							}
+							stopL1 = append(stopL1, exitCandidate{
+								side: side, idx: i, entryOrderID: lot.EntryOrderID,
+								reason: "threshold_stop_loss", net: net,
+								makerLimitPx: makerExitPx,
+								decision: decisionExitReason(ExitDecision{
+									Side: lot.Side, MarketRegime: t.MarketRegime,
+									RegimeMult: t.RegimeMultiplier,
+									ExitReason: "threshold_stop_loss", ExitClass: "CASE3C_AUGMENTATION",
+									ExitNetPNLUSD: net, StopLossPNLUSD: t.cfg.StopLossPnLUSD,
+									StopLossLimitUSD: lossLimit,
+								}),
+							})
+							lot.FixedTPWorking = true
+							i++
+							continue
+						}
+					}
 					aiTransitionCandidates = append(aiTransitionCandidates, exitCandidate{
 						side:         side,
 						idx:          i,

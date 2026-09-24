@@ -736,6 +736,77 @@ func (t *Trader) recordProducerRealizedPnLLocked(
 	return true
 }
 
+// recordAITransitionRolloverEntryLocked represents the entry half of one
+// confirmed AITransition rollover in the existing producer lifecycle. The
+// exchange order that exited the source lot is also the destination lot's
+// EntryOrderID, so it is the canonical correlation key for the new attempt.
+// Caller must hold t.mu.
+func (t *Trader) recordAITransitionRolloverEntryLocked(
+	orderID string,
+	side OrderSide,
+	reason string,
+	filledAt time.Time,
+	price float64,
+	base float64,
+	quote float64,
+) bool {
+	orderID = strings.TrimSpace(orderID)
+	if t == nil || orderID == "" || base <= 0 {
+		return false
+	}
+	if t.findProducerAttemptByEntryOrderIDLocked(
+		EntryProducerAITransitionTrader,
+		orderID,
+	) != nil {
+		return false
+	}
+	if filledAt.IsZero() {
+		filledAt = time.Now().UTC()
+	}
+	decisionID := FormatDecisionID(
+		EntryProducerAITransitionTrader,
+		filledAt,
+	)
+	// Millisecond DecisionIDs are normally unique. A deterministic order-ID
+	// suffix closes the collision window without creating another identity
+	// system.
+	if history := t.producerHistory[EntryProducerAITransitionTrader]; history != nil {
+		if _, exists := history.Attempts[decisionID]; exists {
+			decisionID += "_" + orderID
+		}
+	}
+	attempt := &ProducerAttempt{
+		DecisionID: decisionID,
+		CreatedAt:  filledAt,
+		HotStart:   filledAt,
+		Producer:   EntryProducerAITransitionTrader,
+		Side:       string(side),
+		Events:     make(map[ProducerStage]ProducerEvent),
+	}
+	for _, stage := range []ProducerStage{
+		ProducerStageDecision,
+		ProducerStageExchangeAccepted,
+		ProducerStageFilled,
+		ProducerStageCommitted,
+	} {
+		attempt.Events[stage] = ProducerEvent{
+			Time:       filledAt,
+			CreatedAt:  filledAt,
+			Producer:   EntryProducerAITransitionTrader,
+			Side:       string(side),
+			Stage:      stage,
+			DecisionID: decisionID,
+			OrderID:    orderID,
+			Reason:     reason,
+			Price:      price,
+			BaseSize:   base,
+			QuoteValue: quote,
+		}
+	}
+	t.recordProducerAttemptLocked(attempt)
+	return true
+}
+
 // recordProducerAttemptLocked registers or enriches one producer attempt in
 // the in-memory producer history.
 //

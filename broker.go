@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"math"
 	"strings"
 	"time"
 )
@@ -47,10 +48,20 @@ type PlacedOrder struct {
 	BaseSize      float64   `json:"base_size,omitempty"`   // filled base
 	QuoteSpent    float64   `json:"quote_spent,omitempty"` // spent quote
 	CommissionUSD float64   `json:"commission_total_usd,string,omitempty"`
-	Liquidity     string    `json:"liquidity,omitempty"` // "M" or "T"
-	Fills         []Fill    `json:"fills,omitempty"`
-	CreateTime    time.Time `json:"-"` // optional client-side timestamp; not from bridge
-	Status        string    `json:"status"`
+	// CommissionBase is the portion of commission charged in the product's
+	// base asset. BaseSize stays gross; BUY ownership nets this exactly once.
+	CommissionBase float64   `json:"commission_base,string,omitempty"`
+	Liquidity      string    `json:"liquidity,omitempty"` // "M" or "T"
+	Fills          []Fill    `json:"fills,omitempty"`
+	CreateTime     time.Time `json:"-"` // optional client-side timestamp; not from bridge
+	Status         string    `json:"status"`
+}
+
+func netCreditedBase(side OrderSide, grossBase, commissionBase float64) float64 {
+	if side != SideBuy || commissionBase <= 0 {
+		return grossBase
+	}
+	return math.Max(0, grossBase-commissionBase)
 }
 
 // Fill is optional detail for post-trade analysis.
