@@ -1923,6 +1923,17 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	)
 
 	log.Printf(
+		"[AI_V201] Raw=%s Decision=%s pUp=%.5f confidence=%.2f buyTh=%.5f sellTh=%.5f price=%.8f ",
+		tickDecision.Raw,
+		tickDecision.Signal,
+		tickDecision.PUp,
+		tickDecision.Confidence,
+		tickDecision.BuyThreshold,
+		tickDecision.SellThreshold,
+		price,
+	)
+
+	log.Printf(
 		"[TRACE] hotpath.after_decision elapsed_ms=%d producer_candidates=%d",
 		time.Since(hotStart).Milliseconds(),
 		len(decisions),

@@ -1302,54 +1302,54 @@ func exitCSVRow(e ExitRecord) []string {
 func decisionEntryReason(d EntryDecision) string {
 	parts := make([]string, 0, 100)
 
-	// // Append an evaluator's pipe-delimited key=value materials as
-	// // first-class canonical fields with a side/evaluator prefix.
-	// //
-	// // Example:
-	// //   side=BUY|price=62987.36|gatePass=false
-	// //
-	// // Becomes:
-	// //   pyr_buy_side=BUY|pyr_buy_price=62987.36|pyr_buy_gatePass=false
-	// appendPrefixedFields := func(prefix, reason string) {
-	// 	for _, token := range strings.Split(reason, "|") {
-	// 		token = strings.TrimSpace(token)
-	// 		if token == "" {
-	// 			continue
-	// 		}
+	// Append an evaluator's pipe-delimited key=value materials as
+	// first-class canonical fields with a side/evaluator prefix.
+	//
+	// Example:
+	//   side=BUY|price=62987.36|gatePass=false
+	//
+	// Becomes:
+	//   pyr_buy_side=BUY|pyr_buy_price=62987.36|pyr_buy_gatePass=false
+	appendPrefixedFields := func(prefix, reason string) {
+		for _, token := range strings.Split(reason, "|") {
+			token = strings.TrimSpace(token)
+			if token == "" {
+				continue
+			}
 
-	// 		key, value, found := strings.Cut(token, "=")
-	// 		if !found {
-	// 			// Preserve an unexpected non-key/value diagnostic instead
-	// 			// of silently discarding it.
-	// 			parts = append(
-	// 				parts,
-	// 				fmt.Sprintf(
-	// 					"%s_diagnostic=%s",
-	// 					prefix,
-	// 					token,
-	// 				),
-	// 			)
-	// 			continue
-	// 		}
+			key, value, found := strings.Cut(token, "=")
+			if !found {
+				// Preserve an unexpected non-key/value diagnostic instead
+				// of silently discarding it.
+				parts = append(
+					parts,
+					fmt.Sprintf(
+						"%s_diagnostic=%s",
+						prefix,
+						token,
+					),
+				)
+				continue
+			}
 
-	// 		key = strings.TrimSpace(key)
-	// 		value = strings.TrimSpace(value)
+			key = strings.TrimSpace(key)
+			value = strings.TrimSpace(value)
 
-	// 		if key == "" {
-	// 			continue
-	// 		}
+			if key == "" {
+				continue
+			}
 
-	// 		parts = append(
-	// 			parts,
-	// 			fmt.Sprintf(
-	// 				"%s_%s=%s",
-	// 				prefix,
-	// 				key,
-	// 				value,
-	// 			),
-	// 		)
-	// 	}
-	// }
+			parts = append(
+				parts,
+				fmt.Sprintf(
+					"%s_%s=%s",
+					prefix,
+					key,
+					value,
+				),
+			)
+		}
+	}
 
 	// -----------------------------------------------------------------
 	// AI / model context.
@@ -1380,35 +1380,35 @@ func decisionEntryReason(d EntryDecision) string {
 	// MACD raw materials and interpretation.
 	// -----------------------------------------------------------------
 
-	// parts = append(
-	// 	parts,
-	// 	fmt.Sprintf("logic_macd_line=%.5f", d.LogicMACDLine),
-	// 	fmt.Sprintf("logic_macd_line_prev6=%.5f", d.LogicMACDLinePrev6),
-	// 	fmt.Sprintf("logic_macd_turn=%.5f", d.LogicMACDTurn),
-	// 	fmt.Sprintf("logic_macd_hist=%.5f", d.LogicMACDHist),
-	// 	fmt.Sprintf("logic_macd_dhist=%.5f", d.LogicMACDDHist),
-	// 	fmt.Sprintf("logic_macd_dsmooth=%.5f", d.LogicMACDDSmooth),
-	// 	fmt.Sprintf("logic_macd_strong_positive=%t", d.LogicMACDStrongPositive),
-	// 	fmt.Sprintf("logic_macd_strong_negative=%t", d.LogicMACDStrongNegative),
-	// 	fmt.Sprintf("logic_macd_momentum_down=%t", d.LogicMACDMomentumDown),
-	// 	fmt.Sprintf("logic_macd_momentum_up=%t", d.LogicMACDMomentumUp),
-	// )
+	parts = append(
+		parts,
+		fmt.Sprintf("logic_macd_line=%.5f", d.LogicMACDLine),
+		fmt.Sprintf("logic_macd_line_prev6=%.5f", d.LogicMACDLinePrev6),
+		fmt.Sprintf("logic_macd_turn=%.5f", d.LogicMACDTurn),
+		fmt.Sprintf("logic_macd_hist=%.5f", d.LogicMACDHist),
+		fmt.Sprintf("logic_macd_dhist=%.5f", d.LogicMACDDHist),
+		fmt.Sprintf("logic_macd_dsmooth=%.5f", d.LogicMACDDSmooth),
+		fmt.Sprintf("logic_macd_strong_positive=%t", d.LogicMACDStrongPositive),
+		fmt.Sprintf("logic_macd_strong_negative=%t", d.LogicMACDStrongNegative),
+		fmt.Sprintf("logic_macd_momentum_down=%t", d.LogicMACDMomentumDown),
+		fmt.Sprintf("logic_macd_momentum_up=%t", d.LogicMACDMomentumUp),
+	)
 
 	// -----------------------------------------------------------------
 	// EMA raw materials and pattern interpretation.
 	// -----------------------------------------------------------------
 
-	// parts = append(
-	// 	parts,
-	// 	fmt.Sprintf("logic_ema_spread=%.6f", d.LogicEMASpread),
-	// 	fmt.Sprintf("logic_ema2050=%.6f", d.LogicEMA2050),
-	// 	fmt.Sprintf("logic_pattern_high_peak=%t", d.LogicPatternHighPeak),
-	// 	fmt.Sprintf("logic_pattern_low_bottom=%t", d.LogicPatternLowBottom),
-	// 	fmt.Sprintf("logic_pattern_price_down_up=%t", d.LogicPatternPriceDownUp),
-	// 	fmt.Sprintf("logic_pattern_price_up_down=%t", d.LogicPatternPriceUpDown),
-	// 	fmt.Sprintf("logic_pattern_buy=%t", d.LogicPatternBuy),
-	// 	fmt.Sprintf("logic_pattern_sell=%t", d.LogicPatternSell),
-	// )
+	parts = append(
+		parts,
+		fmt.Sprintf("logic_ema_spread=%.6f", d.LogicEMASpread),
+		fmt.Sprintf("logic_ema2050=%.6f", d.LogicEMA2050),
+		fmt.Sprintf("logic_pattern_high_peak=%t", d.LogicPatternHighPeak),
+		fmt.Sprintf("logic_pattern_low_bottom=%t", d.LogicPatternLowBottom),
+		fmt.Sprintf("logic_pattern_price_down_up=%t", d.LogicPatternPriceDownUp),
+		fmt.Sprintf("logic_pattern_price_up_down=%t", d.LogicPatternPriceUpDown),
+		fmt.Sprintf("logic_pattern_buy=%t", d.LogicPatternBuy),
+		fmt.Sprintf("logic_pattern_sell=%t", d.LogicPatternSell),
+	)
 
 	// -----------------------------------------------------------------
 	// Case xx Entry Producers.
@@ -1437,10 +1437,10 @@ func decisionEntryReason(d EntryDecision) string {
 	// Each item is promoted to a prefixed canonical key=value field.
 	// -----------------------------------------------------------------
 
-	// appendPrefixedFields(
-	// 	"pyr_buy",
-	// 	d.Pyramid.Buy.Reason,
-	// )
+	appendPrefixedFields(
+		"pyr_buy",
+		d.Pyramid.Buy.Reason,
+	)
 
 	// AdversePass is carried directly by PyramidResult and may not be
 	// present inside the evaluator's reason string.
@@ -1456,10 +1456,10 @@ func decisionEntryReason(d EntryDecision) string {
 	// SELL Pyramid raw materials.
 	// -----------------------------------------------------------------
 
-	// appendPrefixedFields(
-	// 	"pyr_sell",
-	// 	d.Pyramid.Sell.Reason,
-	// )
+	appendPrefixedFields(
+		"pyr_sell",
+		d.Pyramid.Sell.Reason,
+	)
 
 	parts = append(
 		parts,
@@ -1477,10 +1477,10 @@ func decisionEntryReason(d EntryDecision) string {
 	// and final trigger states. Promote every item to a canonical field.
 	// -----------------------------------------------------------------
 
-	// appendPrefixedFields(
-	// 	"equity",
-	// 	d.Equity.Reason,
-	// )
+	appendPrefixedFields(
+		"equity",
+		d.Equity.Reason,
+	)
 
 	// -----------------------------------------------------------------
 	// Decision flow.
