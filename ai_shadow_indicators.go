@@ -279,3 +279,4 @@ func shadowindicatorRSIValue(avgGain, avgLoss float64) float64 {
 		return 100.0 - 100.0/(1.0+avgGain/avgLoss)
 	}
 }
+

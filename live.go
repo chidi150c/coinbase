@@ -52,7 +52,7 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 	log.Printf("[SAFETY] LONG_ONLY=%v | ORDER_MIN_USD=%.2f | RISK_PER_TRADE_USD=%.2f | MAX_DAILY_LOSS_PCT=%.2f | TAKE_PROFIT_PCT=%.2f | STOP_LOSS_PNL_USD=%.2f | MAX_HISTORY_CANDLES=%d",
 		trader.cfg.LongOnly, trader.cfg.OrderMinUSD, trader.cfg.RiskPerTradeUSD,
 		trader.cfg.MaxDailyLossPct, trader.cfg.TakeProfitPct, trader.cfg.StopLossPnLUSD, trader.cfg.MaxHistoryCandles)
-	shadow30Model := startShadow30(ctx, trader.cfg.ProductID, trader.cfg.GateTF)
+	shadow30Model := startShadow30(ctx, trader.broker, trader.cfg.ProductID, trader.cfg.GateTF)
 
 	// --- Startup health-gate ---
 	if trader.cfg.BridgeURL != "" {

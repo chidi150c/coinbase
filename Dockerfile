@@ -21,7 +21,6 @@ RUN CGO_ENABLED=${CGO_ENABLED} GOOS=${GOOS} GOARCH=${GOARCH} \
 FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
 COPY --from=builder /out/bot /app/bot
-COPY --from=builder /src/shadow_models /app/shadow_models
 USER nonroot:nonroot
 EXPOSE 8080
 ENTRYPOINT ["/app/bot"]
