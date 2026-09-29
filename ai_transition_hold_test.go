@@ -29,9 +29,9 @@ func TestAITransitionHoldingClockAndNetGiveback(t *testing.T) {
 
 func TestAITransitionLosingRolloverFollowsDestinationRegime(t *testing.T) {
 	for _, tc := range []struct {
-		side   OrderSide
+		side OrderSide
 		regime MarketRegime
-		want   bool
+		want bool
 	}{
 		{SideSell, RegimeUp, true},
 		{SideBuy, RegimeUp, false},

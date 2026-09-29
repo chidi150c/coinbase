@@ -59,6 +59,7 @@ func (t *Trader) buildResourceSnapshotLocked(
 	price float64,
 	minNotional float64,
 ) (ResourceSnapshot, bool) {
+	if price > 0 { t.fundingMarkPrice = price }
 	balance, ok := t.getBalanceSpare(
 		maxAge,
 		reservedShortQuoteWithFee,

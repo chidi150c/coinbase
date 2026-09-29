@@ -1636,9 +1636,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// source cost, entry fee, estimated exit fee and low-tier NET profit are
 	// covered. UP and DOWN retain the existing transition behavior.
 	transitionPrevious := t.previousAIRaw
-	if transitionCh != nil {
-		transitionPrevious = t.previousAITransitionRaw
-	}
+	if transitionCh != nil { transitionPrevious = t.previousAITransitionRaw }
 	transitionToBuy := transitionAI.Err == nil && transitionAI.Raw == Buy &&
 		(transitionPrevious == Sell || transitionPrevious == Flat)
 	transitionToSell := transitionAI.Err == nil && transitionAI.Raw == Sell &&
@@ -1667,7 +1665,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 					(candidate.side == SideSell && transitionToBuy)
 			aiSupportsRollover :=
 				(candidate.side == SideBuy && transitionAI.Err == nil && transitionAI.Raw == Sell) ||
-					(candidate.side == SideSell && transitionAI.Err == nil && transitionAI.Raw == Buy)
+				(candidate.side == SideSell && transitionAI.Err == nil && transitionAI.Raw == Buy)
 			expired, unlocked, giveback := aiTransitionHoldStatus(lot, wallNow, lot.UnrealizedPnLUSD)
 			profitGiveback := giveback || lot.AITransitionGivebackPending
 
@@ -2501,6 +2499,7 @@ func (t *Trader) refreshBalanceSnapshot(ctx context.Context) error {
 		UpdatedAt: time.Now(),
 	})
 
+	t.requestReportSave()
 	return nil
 }
 
@@ -2527,6 +2526,7 @@ func (t *Trader) startBalanceRefresher(ctx context.Context) {
 					cancel()
 
 					if err != nil {
+						t.requestReportSave()
 						log.Printf(
 							"[WARN] balance.cache.refresh.failed elapsed_ms=%d err=%v",
 							time.Since(started).Milliseconds(),

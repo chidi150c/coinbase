@@ -104,7 +104,7 @@ type Position struct {
 	AITransitionCapitalUSD      float64       `json:"ai_transition_capital_usd,omitempty"`
 	AITransitionTargetArmed     bool          `json:"ai_transition_target_armed,omitempty"`
 	AITransitionPeakNetUSD      float64       `json:"ai_transition_peak_net_usd,omitempty"`
-	AITransitionGivebackPending bool          `json:"ai_transition_giveback_pending,omitempty"`
+	AITransitionGivebackPending bool         `json:"ai_transition_giveback_pending,omitempty"`
 }
 
 // --- NEW: per-side book (authoritative store) ---
@@ -150,6 +150,7 @@ type RefundObligation struct {
 // BotState is the persistent snapshot of trader state.
 // NOTE: Persist ONLY the SideBook-based schema now.
 type BotState struct {
+	FundingSnapshot FundingReport `json:"funding_snapshot"`
 	EquityUSD      float64
 	DailyStart     time.Time
 	DailyPnL       float64
@@ -283,13 +284,13 @@ type Trader struct {
 	producerAllocationMu sync.Mutex
 	statePersistMu       sync.Mutex
 
-	equityUSD                float64
-	previousAIRaw            Signal
-	previousAITransitionRaw  Signal
-	aiTransition30           *shadow30
-	aiTransition30Requested  bool
+	equityUSD               float64
+	previousAIRaw           Signal
+	previousAITransitionRaw Signal
+	aiTransition30          *shadow30
+	aiTransition30Requested bool
 	lastAITransition30Notice time.Time
-	aiTransitionInitialized  bool
+	aiTransitionInitialized bool
 
 	// Standardized continuation memory for every ordinary producer.
 	//
@@ -406,6 +407,11 @@ type Trader struct {
 
 	balanceSnapshot balanceSnapshot
 
+	fundingMarkPrice float64
+	reportSaveOnce sync.Once
+	reportSaveCh chan struct{}
+	stateSequence uint64
+	stateWrittenSequence uint64
 	balanceRefreshOnce sync.Once
 	balanceRefreshStop chan struct{}
 	// Unified asynchronous entry registry; key = exchange OrderID.
@@ -1669,28 +1675,27 @@ func signalLabel(s Signal) string {
 
 // saveState builds a snapshot under a read lock, then writes it without holding any locks.
 func (t *Trader) saveState() error {
-	if t.stateFile == "" || !t.cfg.PersistState {
-		return nil
-	}
-	t.mu.RLock()
-	st := t.snapshotStateLocked()
-	t.mu.RUnlock()
-	return t.saveStateFrom(st)
+ if t.stateFile == "" || !t.cfg.PersistState { return nil }
+ t.mu.RLock()
+ bs, seq, err := t.encodeStateLocked()
+ t.mu.RUnlock()
+ if err != nil { return err }
+ return t.writeStateBytes(bs, seq)
 }
 
-// saveStateNoLock writes out the current in-memory state assuming the caller holds the write lock
-// or otherwise guarantees stability; it does not take any locks.
+// Caller holds t.mu. Required lifecycle saves remain synchronous.
 func (t *Trader) saveStateNoLock() error {
-	if t.stateFile == "" || !t.cfg.PersistState {
-		return nil
-	}
-	st := t.snapshotStateLocked()
-	return t.saveStateFrom(st)
+ if t.stateFile == "" || !t.cfg.PersistState { return nil }
+ bs, seq, err := t.encodeStateLocked()
+ if err != nil { return err }
+ return t.writeStateBytes(bs, seq)
 }
 
 // snapshotStateLocked builds the BotState assuming the caller already holds t.mu (write or read if immutable reads).
 func (t *Trader) snapshotStateLocked() BotState {
+	funding := t.fundingReportLocked(time.Now())
 	return BotState{
+		FundingSnapshot: funding,
 		EquityUSD:      t.equityUSD,
 		DailyStart:     t.dailyStart,
 		DailyPnL:       t.dailyPnL,
@@ -1732,8 +1737,8 @@ func (t *Trader) snapshotStateLocked() BotState {
 		RefundBuyUSD:              t.refundBuyUSD,
 		RefundSellUSD:             t.refundSellUSD,
 		RefundObligations:         t.RefundObligations,
-		SpareBuyUSD:               t.SpareBuyUSD,
-		SpareSellUSD:              t.SpareSellUSD,
+		SpareBuyUSD:               funding.SpareBuyUSD,
+		SpareSellUSD:              funding.SpareSellUSD,
 		PendingExits:              t.pendingExits,
 		PendingEntries:            t.pendingEntries,
 		MarketRegime:              t.MarketRegime,
@@ -1752,24 +1757,6 @@ func (t *Trader) snapshotStateLocked() BotState {
 		PendingCase3CRetries:      t.PendingCase3CRetries,
 		ResourceLedger:            t.resourceManager.State(),
 	}
-}
-
-// saveStateFrom writes the provided snapshot to disk.
-func (t *Trader) saveStateFrom(st BotState) error {
-	if t.stateFile == "" || !t.cfg.PersistState {
-		return nil
-	}
-	t.statePersistMu.Lock()
-	defer t.statePersistMu.Unlock()
-	bs, err := json.MarshalIndent(st, "", " ")
-	if err != nil {
-		return err
-	}
-	tmp := t.stateFile + ".tmp"
-	if err := os.WriteFile(tmp, bs, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, t.stateFile)
 }
 
 func (t *Trader) loadState() error {

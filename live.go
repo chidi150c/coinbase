@@ -32,10 +32,10 @@ import (
 )
 
 type StepResult struct {
-	Msg             string
-	Raw             Signal
-	Signal          Signal
-	TransitionRaw   Signal
+	Msg    string
+	Raw    Signal
+	Signal Signal
+	TransitionRaw Signal
 	TransitionValid bool
 }
 
@@ -378,6 +378,8 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 		// NOTE: async maker-first entry goroutines are spawned from trader.step(ctx, ...)
 		// and are cancelable via this ctx on shutdown.
 		lastCandleSync := time.Now().UTC()
+
+		trader.startReportSaver(ctx)
 
 		// Warm the balance cache once before the trading loop.
 		// This delay occurs only during startup, not in the order hot path.

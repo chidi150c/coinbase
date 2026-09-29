@@ -3,9 +3,9 @@ package main
 import "time"
 
 const (
-	aiTransitionHoldPeriod   = 100 * time.Minute
+	aiTransitionHoldPeriod = 100 * time.Minute
 	aiTransitionNetTargetUSD = 1.0
-	aiTransitionGivebackUSD  = 0.20
+	aiTransitionGivebackUSD = 0.20
 )
 
 // aiTransitionHoldStatus updates the durable peak for a single filled lot.
