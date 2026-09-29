@@ -824,6 +824,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				// scanned immutable identity for authorization after AI fan-in, and
 				// bypass every ordinary profit/stop-loss/Case3 exit rule.
 				if lot != nil && lot.Producer == EntryProducerAITransitionTrader {
+					// Keep the target peak current even while Case3C owns this tick.
+					// The same fee-aware net calculation is used for the profit trail.
+					computeGate(lot)
+					wasArmed, priorPeak := lot.AITransitionTargetArmed, lot.AITransitionPeakNetUSD
+					aiTransitionHoldStatus(lot, wallNow, lot.UnrealizedPnLUSD)
+					if wasArmed != lot.AITransitionTargetArmed || priorPeak != lot.AITransitionPeakNetUSD {
+						_ = t.saveStateNoLock()
+					}
 					// Case3C reuses the established same-side Case3 augmentation path,
 					// but only while NORMAL. The augmentation decision precedes AI
 					// rollover authorization on this tick and never closes the source.
@@ -1488,6 +1496,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	//2. Fan out only AI, MACD and EMA
 	//-----------------------------------------------------------
 	aiCh := make(chan AIResult, 1)
+	var transitionCh chan AIResult
+	if t.aiTransition30Requested {
+		transitionCh = make(chan AIResult, 1)
+		transitionCandles := append([]Candle(nil), execHistory...)
+		go func() {
+			transitionCh <- t.aiTransition30.transitionAI(transitionCandles, price, wallNow)
+		}()
+	}
 	macdSnapCh := make(chan MACDSnapshotResult, 1)
 	emaCh := make(chan EMAPatternResult, 1)
 
@@ -1517,6 +1533,18 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// 4. Fan in the concurrent results
 	// -------------------------------------------------------
 	aiResult := <-aiCh
+	transitionAI := aiResult
+	if transitionCh != nil {
+		select {
+		case transitionAI = <-transitionCh:
+		default:
+			transitionAI = AIResult{Raw: Flat, Err: fmt.Errorf("transition model still evaluating")}
+		}
+		if transitionAI.Err != nil && wallNow.Sub(t.lastAITransition30Notice) >= time.Minute {
+			log.Printf("[AI_TRANSITION_30] skipped tick: %v", transitionAI.Err)
+			t.lastAITransition30Notice = wallNow
+		}
+	}
 	macdSnapshot := <-macdSnapCh
 	emaResult := <-emaCh
 
@@ -1607,10 +1635,14 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 	// direction, and it cannot submit until activationPrice confirms that the
 	// source cost, entry fee, estimated exit fee and low-tier NET profit are
 	// covered. UP and DOWN retain the existing transition behavior.
-	transitionToBuy := aiResult.Raw == Buy &&
-		(t.previousAIRaw == Sell || t.previousAIRaw == Flat)
-	transitionToSell := aiResult.Raw == Sell &&
-		(t.previousAIRaw == Buy || t.previousAIRaw == Flat)
+	transitionPrevious := t.previousAIRaw
+	if transitionCh != nil {
+		transitionPrevious = t.previousAITransitionRaw
+	}
+	transitionToBuy := transitionAI.Err == nil && transitionAI.Raw == Buy &&
+		(transitionPrevious == Sell || transitionPrevious == Flat)
+	transitionToSell := transitionAI.Err == nil && transitionAI.Raw == Sell &&
+		(transitionPrevious == Buy || transitionPrevious == Flat)
 	chooseAITransition := func(pendingOnly bool) bool {
 		for _, candidate := range aiTransitionCandidates {
 			book := t.book(candidate.side)
@@ -1634,39 +1666,52 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				(candidate.side == SideBuy && transitionToSell) ||
 					(candidate.side == SideSell && transitionToBuy)
 			aiSupportsRollover :=
-				(candidate.side == SideBuy && aiResult.Raw == Sell) ||
-					(candidate.side == SideSell && aiResult.Raw == Buy)
+				(candidate.side == SideBuy && transitionAI.Err == nil && transitionAI.Raw == Sell) ||
+					(candidate.side == SideSell && transitionAI.Err == nil && transitionAI.Raw == Buy)
+			expired, unlocked, giveback := aiTransitionHoldStatus(lot, wallNow, lot.UnrealizedPnLUSD)
+			profitGiveback := giveback || lot.AITransitionGivebackPending
 
-			if !pendingOnly && !freshOppositeTransition {
+			if !pendingOnly && !freshOppositeTransition && !profitGiveback {
 				continue
 			}
+			if pendingOnly && !profitGiveback && transitionAI.Err == nil && !aiSupportsRollover {
+				// No exchange order owns the lot (FixedTPOrderID was checked
+				// above). Do not retain a stale AI opinion through the hold.
+				lot.AITransitionRolloverPending = false
+				lot.AITransitionNextRetryAt = time.Time{}
+				_ = t.saveStateNoLock()
+				log.Printf(
+					"[DEBUG] AITransition.normal_cancel side=%s entry_id=%s previous_ai=%s current_ai=%s",
+					candidate.side,
+					candidate.entryOrderID,
+					transitionPrevious,
+					transitionAI.Raw,
+				)
+				continue
+			}
+			if transitionAI.Err != nil && !profitGiveback {
+				continue
+			}
+			if !pendingOnly {
+				// Capture a fresh AI transition before previous raw advances.
+				lot.AITransitionRolloverPending = true
+				lot.AITransitionNextRetryAt = time.Time{}
+			}
+			givebackNewlyPending := profitGiveback && !lot.AITransitionGivebackPending
+			if profitGiveback {
+				lot.AITransitionGivebackPending = true
+			}
+			if !pendingOnly || givebackNewlyPending {
+				_ = t.saveStateNoLock()
+			}
+			if !unlocked {
+				return true
+			}
+			if !profitGiveback && !aiTransitionLosingRolloverAllowed(candidate.side, t.MarketRegime, lot.UnrealizedPnLUSD) {
+				return true
+			}
 
-			if t.MarketRegime == RegimeNormal {
-				if pendingOnly && !aiSupportsRollover {
-					// No exchange order owns the lot (FixedTPOrderID was checked
-					// above), so the pre-submission rollover may be cancelled when
-					// its initiating raw-AI direction reverses.
-					lot.AITransitionRolloverPending = false
-					lot.AITransitionNextRetryAt = time.Time{}
-					_ = t.saveStateNoLock()
-					log.Printf(
-						"[DEBUG] AITransition.normal_cancel side=%s entry_id=%s previous_ai=%s current_ai=%s",
-						candidate.side,
-						candidate.entryOrderID,
-						t.previousAIRaw,
-						aiResult.Raw,
-					)
-					continue
-				}
-
-				if !pendingOnly {
-					// Capture the transition before previousAIRaw is advanced by
-					// afterStepStateUpdate. The same flag owns target waiting,
-					// submission, partial-fill remainder and retry.
-					lot.AITransitionRolloverPending = true
-					lot.AITransitionNextRetryAt = time.Time{}
-					_ = t.saveStateNoLock()
-				}
+			if t.MarketRegime == RegimeNormal && !profitGiveback {
 
 				requiredNetUSD :=
 					t.cfg.ProfitGateUSD * LowTierProducerMultiplier
@@ -1685,7 +1730,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 							"[DEBUG] AITransition.normal_wait side=%s entry_id=%s raw_ai=%s price=%.8f required_price=%.8f required_net_usd=%.8f",
 							candidate.side,
 							candidate.entryOrderID,
-							aiResult.Raw,
+							transitionAI.Raw,
 							price,
 							requiredPrice,
 							requiredNetUSD,
@@ -1712,13 +1757,16 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 				candidate.makerLimitPx = price * (1.0 - offBps/10000.0)
 			}
 			candidate.decision = fmt.Sprintf(
-				"producer=%s|previous_ai=%s|current_ai=%s|resume=%t|regime=%s|normal_profit_protected=%t|normal_required_net_usd=%.8f|normal_required_price=%.8f",
+				"producer=%s|previous_ai=%s|current_ai=%s|resume=%t|regime=%s|hold_expired=%t|profit_giveback=%t|peak_net_usd=%.8f|normal_profit_protected=%t|normal_required_net_usd=%.8f|normal_required_price=%.8f",
 				EntryProducerAITransitionTrader,
-				t.previousAIRaw,
-				aiResult.Raw,
+				transitionPrevious,
+				transitionAI.Raw,
 				pendingOnly,
 				t.MarketRegime,
-				t.MarketRegime == RegimeNormal,
+				expired,
+				profitGiveback,
+				lot.AITransitionPeakNetUSD,
+				t.MarketRegime == RegimeNormal && !profitGiveback,
 				t.cfg.ProfitGateUSD*LowTierProducerMultiplier,
 				activationPrice(
 					lot,
@@ -2001,7 +2049,7 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 			close(resultsCh)
 		}()
 	}
-	return t.processParallelProducerEntriesLocked(
+	stepResult, stepErr := t.processParallelProducerEntriesLocked(
 		ctx,
 		decisions,
 		resourceSnapshot,
@@ -2018,6 +2066,11 @@ func (t *Trader) step(ctx context.Context, execHistory []Candle, signalHistory [
 		independentExitStart,
 		deferredIndependentExits,
 	)
+	if stepErr == nil && transitionCh != nil && transitionAI.Err == nil {
+		stepResult.TransitionRaw = transitionAI.Raw
+		stepResult.TransitionValid = true
+	}
+	return stepResult, stepErr
 }
 
 // -----------------------------------------------------------------------------

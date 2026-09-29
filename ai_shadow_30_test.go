@@ -169,3 +169,52 @@ func TestShadow30RejectsStaleHistoryWithoutRepeatedFetch(t *testing.T) {
 		t.Fatalf("stale retry not bounded: err=%v fetches=%d", err, count)
 	}
 }
+
+func TestShadow30TransitionUsesClassAndDirectionalConfidence(t *testing.T) {
+	modelPath, clusterPath := shadowTestPaths()
+	s, err := loadShadow30(modelPath, clusterPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join("testdata", "ai_shadow", "candles_120.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var history []Candle
+	if err := json.Unmarshal(b, &history); err != nil {
+		t.Fatal(err)
+	}
+	var expected struct {
+		TickPrice  float64 `json:"tick_price"`
+		Class      string  `json:"class"`
+		Confidence float64 `json:"confidence"`
+	}
+	b, err = os.ReadFile(filepath.Join("testdata", "ai_shadow", "expected.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &expected); err != nil {
+		t.Fatal(err)
+	}
+	result := s.transitionAI(history, expected.TickPrice, history[len(history)-1].Time.Add(time.Minute))
+	if result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	wantRaw := Flat
+	switch expected.Class {
+	case "BUY":
+		wantRaw = Buy
+	case "SELL":
+		wantRaw = Sell
+	}
+	wantConfidence := expected.Confidence
+	if wantRaw == Flat {
+		wantConfidence = 0
+	}
+	if result.Raw != wantRaw || math.Abs(result.Confidence-wantConfidence) > 1e-6 {
+		t.Fatalf("transition raw=%s confidence=%.6f, want %s %.6f", result.Raw, result.Confidence, wantRaw, wantConfidence)
+	}
+	if result := s.transitionAI(history, expected.TickPrice, history[len(history)-1].Time.Add(3*time.Minute)); result.Err == nil {
+		t.Fatal("stale shadow decision permitted to drive producer")
+	}
+}

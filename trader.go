@@ -102,6 +102,9 @@ type Position struct {
 	AITransitionRolloverPending bool          `json:"ai_transition_rollover_pending,omitempty"`
 	AITransitionNextRetryAt     time.Time     `json:"ai_transition_next_retry_at,omitempty"`
 	AITransitionCapitalUSD      float64       `json:"ai_transition_capital_usd,omitempty"`
+	AITransitionTargetArmed     bool          `json:"ai_transition_target_armed,omitempty"`
+	AITransitionPeakNetUSD      float64       `json:"ai_transition_peak_net_usd,omitempty"`
+	AITransitionGivebackPending bool          `json:"ai_transition_giveback_pending,omitempty"`
 }
 
 // --- NEW: per-side book (authoritative store) ---
@@ -189,6 +192,7 @@ type BotState struct {
 	SpareBuyUSD             float64
 	SpareSellUSD            float64
 	PreviousAIRaw           Signal
+	PreviousAITransitionRaw Signal `json:"previous_ai_transition_raw,omitempty"`
 	AITransitionInitialized bool
 	// Standardized durable continuation references keyed by producer + side.
 	// Market-price producers store committed execution price; Equity stores
@@ -279,9 +283,13 @@ type Trader struct {
 	producerAllocationMu sync.Mutex
 	statePersistMu       sync.Mutex
 
-	equityUSD               float64
-	previousAIRaw           Signal
-	aiTransitionInitialized bool
+	equityUSD                float64
+	previousAIRaw            Signal
+	previousAITransitionRaw  Signal
+	aiTransition30           *shadow30
+	aiTransition30Requested  bool
+	lastAITransition30Notice time.Time
+	aiTransitionInitialized  bool
 
 	// Standardized continuation memory for every ordinary producer.
 	//
@@ -1699,6 +1707,7 @@ func (t *Trader) snapshotStateLocked() BotState {
 		WinHighSell:             t.winHighSell,
 		LatchedGateBuy:          t.latchedGateBuy,
 		PreviousAIRaw:           t.previousAIRaw,
+		PreviousAITransitionRaw: t.previousAITransitionRaw,
 		AITransitionInitialized: t.aiTransitionInitialized,
 		ProducerContinuationReferences: cloneProducerContinuationReferences(
 			t.producerContinuationReferences,
@@ -1837,6 +1846,7 @@ func (t *Trader) loadState() error {
 	t.winHighSell = st.WinHighSell
 	t.latchedGateBuy = st.LatchedGateBuy
 	t.previousAIRaw = st.PreviousAIRaw
+	t.previousAITransitionRaw = st.PreviousAITransitionRaw
 	t.aiTransitionInitialized = st.AITransitionInitialized
 	// Cold-state compatibility: a confirmed tagged lot is authoritative proof
 	// that the one-time seed filled, even when the flag predates this schema.
@@ -5196,6 +5206,11 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 			destination.SizeBase += destinationBaseFilled
 			destination.OpenNotionalUSD += math.Max(0, quoteExec-exitFee)
 			destination.AITransitionCapitalUSD += math.Max(0, quoteExec-exitFee)
+			// Each confirmed partial rollover entry restarts the holding clock.
+			destination.OpenTime = exitTime
+			destination.AITransitionTargetArmed = false
+			destination.AITransitionPeakNetUSD = 0
+			destination.AITransitionGivebackPending = false
 			if destination.SizeBase > 0 {
 				destination.OpenPrice =
 					(beforeBase*destination.OpenPrice + destinationBaseFilled*priceExec) /
@@ -9710,6 +9725,13 @@ func (t *Trader) commitEntryFill(
 		destination.RecoveryMethod = pending.RecoveryMethod
 		destination.ProfitTrailActive = false
 		destination.ProfitPeakUSD = 0
+		if entry.Producer == EntryProducerAITransitionTrader {
+			// Case3C is a new confirmed entry in the consolidated lot.
+			destination.OpenTime = now
+			destination.AITransitionTargetArmed = false
+			destination.AITransitionPeakNetUSD = 0
+			destination.AITransitionGivebackPending = false
+		}
 		destination.Take = 0
 		destination.Case3AReplacementStarted = false
 		destination.Case3AReplacementOrderID = ""

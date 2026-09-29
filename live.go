@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,9 +32,11 @@ import (
 )
 
 type StepResult struct {
-	Msg    string
-	Raw    Signal
-	Signal Signal
+	Msg             string
+	Raw             Signal
+	Signal          Signal
+	TransitionRaw   Signal
+	TransitionValid bool
 }
 
 // runLive executes the real-time loop with cadence intervalSec (seconds).
@@ -53,6 +56,15 @@ func runLive(ctx context.Context, trader *Trader, intervalSec int) {
 		trader.cfg.LongOnly, trader.cfg.OrderMinUSD, trader.cfg.RiskPerTradeUSD,
 		trader.cfg.MaxDailyLossPct, trader.cfg.TakeProfitPct, trader.cfg.StopLossPnLUSD, trader.cfg.MaxHistoryCandles)
 	shadow30Model := startShadow30(ctx, trader.broker, trader.cfg.ProductID, trader.cfg.GateTF)
+	if strings.EqualFold(os.Getenv("AI_TRANSITION_30_ENABLED"), "true") {
+		trader.aiTransition30Requested = true
+		if shadow30Model == nil {
+			log.Printf("[AI_TRANSITION_30] unavailable: shadow model failed to load; producer will skip transitions")
+		} else {
+			trader.aiTransition30 = shadow30Model
+			log.Printf("[AI_TRANSITION_30] enabled model=%s", shadow30Model.model.Model.ModelID)
+		}
+	}
 
 	// --- Startup health-gate ---
 	if trader.cfg.BridgeURL != "" {

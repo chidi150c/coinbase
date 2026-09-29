@@ -8,20 +8,22 @@ import (
 	"math"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
 const shadow30Schema = "coinbase-v2-ai-engineered-30-cluster6-all-1m-v1"
 const shadow24Schema = "coinbase-v2-ai-engineered-24-all-1m-v1"
 
-// Shadow30 never submits orders or changes Trader state. Both artifacts are
-// immutable after loading. Version201 remains the sole trading model.
+// The shadow worker never submits orders. Both artifacts are immutable after
+// loading. The separate AITransitionTrader switch can consume its raw class.
 type shadow30 struct {
 	model      shadow30Envelope
 	cluster    shadow30Cluster
 	jobs       chan shadow30Job
 	fetch      func(context.Context) ([]Candle, error)
 	repaired   []Candle // worker-owned; never written back to version201
+	repairedMu sync.RWMutex
 	lastRepair time.Time
 	lastIssue  time.Time
 }
@@ -153,7 +155,7 @@ func (s *shadow30) Run(ctx context.Context) {
 				s.logIssue(job.tick, err)
 				continue
 			}
-			prediction, group, confidence, probs, err := s.evaluate(history, job.price)
+			prediction, group, confidence, probs, err := s.evaluate(append([]Candle(nil), history...), job.price)
 			if err != nil {
 				s.logIssue(job.tick, err)
 				continue
@@ -171,9 +173,11 @@ func (s *shadow30) Run(ctx context.Context) {
 // runs in this worker, never in Submit or the trading tick goroutine.
 func (s *shadow30) historyForTick(ctx context.Context, job shadow30Job) ([]Candle, error) {
 	history := job.candles
+	s.repairedMu.RLock()
 	if len(s.repaired) > 0 && (len(history) == 0 || !history[len(history)-1].Time.After(s.repaired[len(s.repaired)-1].Time)) {
 		history = s.repaired
 	}
+	s.repairedMu.RUnlock()
 	check := func(c []Candle) error {
 		if len(c) < 52 {
 			return fmt.Errorf("insufficient one-minute candles")
@@ -208,6 +212,7 @@ func (s *shadow30) historyForTick(ctx context.Context, job shadow30Job) ([]Candl
 	}
 	// Keep the earlier warmup candles so EMA initialization stays close to
 	// version201's full execution history; replace the overlapping tail only.
+	s.repairedMu.Lock()
 	base := job.candles
 	if len(s.repaired) > len(base) {
 		base = s.repaired
@@ -219,10 +224,54 @@ func (s *shadow30) historyForTick(ctx context.Context, job shadow30Job) ([]Candl
 	s.repaired = append(append([]Candle(nil), base[:prefix]...), batch...)
 	if err := check(s.repaired); err != nil {
 		s.repaired = nil
+		s.repairedMu.Unlock()
 		return nil, err
 	}
+	history = s.repaired
+	s.repairedMu.Unlock()
 	log.Printf("[AI_SHADOW] repaired one-minute history candles=%d latest=%s", len(batch), batch[len(batch)-1].Time.Format(time.RFC3339))
-	return s.repaired, nil
+	return history, nil
+}
+
+// transitionAI runs beside version201's model fanout. It does not fetch or
+// mutate trading history. A missing current one-minute history inhibits this
+// producer for the tick rather than borrowing the legacy 5-minute opinion.
+func (s *shadow30) transitionAI(candles []Candle, price float64, tick time.Time) AIResult {
+	result := AIResult{Raw: Flat}
+	if s == nil {
+		result.Err = fmt.Errorf("transition model unavailable")
+		return result
+	}
+	history := candles
+	s.repairedMu.RLock()
+	if len(s.repaired) > 0 && (len(history) == 0 || !history[len(history)-1].Time.After(s.repaired[len(s.repaired)-1].Time)) {
+		history = s.repaired
+	}
+	history = append([]Candle(nil), history...)
+	s.repairedMu.RUnlock()
+	if len(history) < 52 {
+		result.Err = fmt.Errorf("insufficient transition history")
+		return result
+	}
+	last := len(history) - 1
+	if age := tick.Sub(history[last].Time); age < 0 || age > 2*time.Minute {
+		result.Err = fmt.Errorf("stale transition history")
+		return result
+	}
+	class, _, confidence, _, err := s.evaluate(history, price)
+	if err != nil {
+		result.Err = err
+		return result
+	}
+	switch class {
+	case "BUY":
+		result.Raw, result.Confidence = Buy, confidence
+	case "SELL":
+		result.Raw, result.Confidence = Sell, confidence
+	default:
+		result.Raw, result.Confidence = Flat, 0
+	}
+	return result
 }
 
 func (s *shadow30) logIssue(tick time.Time, err error) {

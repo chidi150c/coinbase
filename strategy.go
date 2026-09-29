@@ -2477,6 +2477,9 @@ func (t *Trader) afterStepStateUpdate(wallNow time.Time, res StepResult) {
 	defer t.mu.Unlock()
 
 	t.previousAIRaw = res.Raw
+	if res.TransitionValid {
+		t.previousAITransitionRaw = res.TransitionRaw
+	}
 
 	if t.RecentLow > 0 {
 		t.PreviousRecentLow = t.RecentLow
