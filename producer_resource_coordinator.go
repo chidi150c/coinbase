@@ -9,6 +9,20 @@ import (
 	"time"
 )
 
+const minimumTradeProfitGateUSD = 0.30
+
+func finalEntryProfitGateUSD(configured, confidence, multiplier, recoveryAdd float64) float64 {
+	ordinaryProfit := configured * confidence * multiplier
+	if ordinaryProfit < minimumTradeProfitGateUSD {
+		ordinaryProfit = minimumTradeProfitGateUSD
+	}
+	return ordinaryProfit + recoveryAdd
+}
+
+func inheritedAITransitionProfitGateUSD(source float64) float64 {
+	return math.Max(minimumTradeProfitGateUSD, source)
+}
+
 // ResourceKind identifies the shared account resource consumed by a new entry.
 type ResourceKind string
 
@@ -636,11 +650,12 @@ func (t *Trader) buildProducerResourceRequestLocked(
 		)
 	}
 
-	baseEntryProfitGateUSD := t.cfg.ProfitGateUSD * confMult
-	if baseEntryProfitGateUSD < 0.30 {
-		baseEntryProfitGateUSD = 0.30
-	}
-	entryProfitGateUSD := baseEntryProfitGateUSD*profitGateMultiplier + t.recoveryTargetAddUSD()
+	entryProfitGateUSD := finalEntryProfitGateUSD(
+		t.cfg.ProfitGateUSD,
+		confMult,
+		profitGateMultiplier,
+		t.recoveryTargetAddUSD(),
+	)
 
 	equityStageChosen := -1
 	equityStageNext := -1

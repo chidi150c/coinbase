@@ -4789,25 +4789,8 @@ func (t *Trader) findLotIndexByEntryIDLocked(
 }
 
 func (t *Trader) currentSpareBaseLocked(ctx context.Context) (float64, float64, error) {
-	var reservedLongBase float64
-
-	if bb := t.book(SideBuy); bb != nil {
-		for _, lot := range bb.Lots {
-			reservedLongBase += lot.SizeBase
-		}
-	}
-
-	if t.cfg.RequireBaseForShort {
-		for _, entry := range t.pendingEntries {
-			if entry == nil ||
-				entry.Completed ||
-				entry.Intent == nil ||
-				entry.Side != SideSell {
-				continue
-			}
-
-			reservedLongBase += entry.Intent.BaseAtLimit
-		}
+	if t.resourceManager == nil {
+		return 0, 0, errors.New("current spare base: nil ResourceManager")
 	}
 
 	t.mu.Unlock()
@@ -4820,8 +4803,9 @@ func (t *Trader) currentSpareBaseLocked(ctx context.Context) (float64, float64, 
 	if baseStep <= 0 {
 		return 0, 0, fmt.Errorf("invalid baseStep %.8f", baseStep)
 	}
+	_, reservedBase := t.resourceManager.Totals()
 
-	spareBase := availBase - reservedLongBase
+	spareBase := availBase - reservedBase
 	if spareBase < 0 {
 		spareBase = 0
 	}
@@ -4830,15 +4814,8 @@ func (t *Trader) currentSpareBaseLocked(ctx context.Context) (float64, float64, 
 }
 
 func (t *Trader) currentSpareQuoteLocked(ctx context.Context) (float64, error) {
-	var reservedQuote float64
-	for _, entry := range t.pendingEntries {
-		if entry == nil ||
-			entry.Completed ||
-			entry.Intent == nil ||
-			entry.Side != SideBuy {
-			continue
-		}
-		reservedQuote += entry.Intent.Quote
+	if t.resourceManager == nil {
+		return 0, errors.New("current spare quote: nil ResourceManager")
 	}
 
 	t.mu.Unlock()
@@ -4847,6 +4824,7 @@ func (t *Trader) currentSpareQuoteLocked(ctx context.Context) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
+	reservedQuote, _ := t.resourceManager.Totals()
 
 	spareQuote := availQuote - reservedQuote
 	if spareQuote < 0 {
@@ -5162,6 +5140,9 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 				break
 			}
 		}
+		if destination != nil {
+			destination.ProfitGateUSD = math.Max(minimumTradeProfitGateUSD, destination.ProfitGateUSD)
+		}
 		if destination == nil {
 			destination = &Position{
 				OpenPrice:       priceExec,
@@ -5182,7 +5163,7 @@ func (t *Trader) applyFilledExitLocked(livePrice float64, priceExec float64, bas
 				Version:                Version,
 				EntryOrderID:           exitOrderID,
 				ConfidenceMult:         lot.ConfidenceMult,
-				ProfitGateUSD:          lot.ProfitGateUSD,
+				ProfitGateUSD:          inheritedAITransitionProfitGateUSD(lot.ProfitGateUSD),
 				EntryMethod:            string(EntryProducerAITransitionTrader),
 				Producer:               EntryProducerAITransitionTrader,
 				AITransitionCapitalUSD: math.Max(0, quoteExec-exitFee),
